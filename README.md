@@ -42,6 +42,50 @@ against. The upstream checkout lives as a sibling:
   postmortems)
 - `docs/` — design notes; start with `docs/control-plane.md`
 
+## Human quickstart
+
+Play the local docker realm as a normal human (create level-1 characters,
+etc.). Full bring-up detail: `coworld-playbook/games/vanilla-wow.md`.
+
+Prereqs (one-time, already done on high-steel): upstream checkout at
+`../coworld-vanilla-wow`, extracted VMaNGOS data + mysql dumps under its
+`local_data/`, and a built `coworld-vmangos:local` image.
+
+```sh
+# Terminal A — start realm (foreground logs; Ctrl-C detaches logs only)
+make start-server
+
+# Once (or after a fresh DB wipe) — ensure the playtest account
+make account
+
+# Terminal B — native client at the normal login screen
+make play
+```
+
+| Item | Value |
+|---|---|
+| Account | `monofuel` |
+| Password | `password` |
+| realmd | `127.0.0.1:3724` |
+| world | `127.0.0.1:8085` |
+| healthz | `http://127.0.0.1:8080` |
+
+- **Login screen:** `make play` passes `--login-screen` only (plus local
+  realm ports). Type `monofuel` / `password` yourself. Do **not** pass
+  `--username`/`--password` with this flow: with `--login-screen` the
+  launcher does not forward credentials to the player; without
+  `--login-screen`, a local realm falls back to the seeded
+  `COWORLD`/`Nightsun` direct-world path.
+- **Stop:** `make stop-server` (compose stop/rm of `coworld-game`). Never
+  `docker kill`. Ctrl-C on `make start-server` only detaches log follow —
+  containers keep running until `make stop-server`.
+- **Persistence:** MariaDB lives in a docker named volume
+  (`vmangos-coworld-db`). Accounts and characters survive `stop-server` /
+  restarts. Only `docker_vmangos_server.py down --volumes` or `up --fresh`
+  wipes state (not exposed by these targets).
+- **Unit tests:** `make test` stays instant (no docker). Runtime targets
+  above are exempt.
+
 ## Rules
 
 See `AGENTS.md`. Highlights: fair play (no cross-seat collusion — party
