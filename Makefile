@@ -26,7 +26,7 @@ COMPOSE_FILE := infra/compose.vmangos.yml
 ACCOUNT_USER := monofuel
 ACCOUNT_PASS := password
 
-.PHONY: test test-lua test-python test-nim system pin-check integration-test start-server stop-server server-logging logs account play shadow breadcrumbs
+.PHONY: test test-lua test-python test-nim system pin-check integration-test start-server stop-server server-logging logs account play play-classic shadow breadcrumbs
 
 # Unit tier only. test-python is stdlib-only (projection + intent_mapping + optional
 # lua_runner smoke); it is wired into `make test` because it needs no venv/network.
@@ -251,3 +251,10 @@ play:
 			--realm-host=127.0.0.1 \
 			--realm-port=3724 \
 			--world-port=8085'
+
+# Launch the GENUINE 1.12.1 client under wine against the local realm
+# (see docs/play-classic.md). First run assembles local_classic/ (Data/
+# symlinked from wow-classic-data, WTF/Interface copied) and inits a wine
+# prefix. Login monofuel / password. Do not run unattended (opens a GUI).
+play-classic:
+	@nix develop --command tools/play_classic.sh
