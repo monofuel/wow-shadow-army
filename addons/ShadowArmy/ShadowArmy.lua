@@ -8,7 +8,7 @@ ShadowArmy = ShadowArmy or {}
 
 -- Bump on every edit. The System watches Chat.log for "<SA> loaded rev=..."
 -- after sending a reload — a new rev proves the edit actually loaded.
-local REV = "r5"
+local REV = "r6"
 
 local function say(msg)
   DEFAULT_CHAT_FRAME:AddMessage("|cFF9482C9[ShadowArmy]|r " .. tostring(msg))
@@ -203,12 +203,25 @@ local function setAuto(on)
 end
 
 local autoBtn = CreateFrame("Button", "ShadowArmyAutoBtn", panel, "UIPanelButtonTemplate")
-autoBtn:SetWidth(110)
+autoBtn:SetWidth(96)
 autoBtn:SetHeight(20)
-autoBtn:SetPoint("BOTTOM", panel, "BOTTOM", 0, 8)
+autoBtn:SetPoint("BOTTOMLEFT", panel, "BOTTOMLEFT", 8, 8)
 autoBtn:SetText("Auto: OFF")
 autoBtn:SetScript("OnClick", function()
   setAuto(not auto.enabled)
+end)
+
+-- Remote-reload button: hidden until The System requests a reload. It must
+-- be a click because this build ignores programmatic ReloadUI (see the
+-- driver notes) — a mouse click is the hardware event that makes it legal.
+local reloadBtn = CreateFrame("Button", "ShadowArmyReloadBtn", panel, "UIPanelButtonTemplate")
+reloadBtn:SetWidth(96)
+reloadBtn:SetHeight(20)
+reloadBtn:SetPoint("BOTTOMRIGHT", panel, "BOTTOMRIGHT", -8, 8)
+reloadBtn:SetText("|cFF44FF44Reload!|r")
+reloadBtn:Hide()
+reloadBtn:SetScript("OnClick", function()
+  ReloadUI()
 end)
 
 --------------------------------------------------------------------------
@@ -305,26 +318,9 @@ end
 -- handler (r2) and from a deferred OnUpdate frame (r3/r4), while the same
 -- call from the /sa slash handler works. Working theory: this client gates
 -- programmatic UI reload on hardware-event context (the slash path starts
--- from a keypress). r5: still try the free paths (combat may have been a
--- confound), then fall back to a one-click reload button — a mouse click IS
--- a hardware event, so ReloadUI from its OnClick works like the slash path.
+-- from a keypress). So: try the free paths, then light up the panel's
+-- Reload! button — a mouse click IS a hardware event, so its OnClick works.
 local pendingReload = 0 -- countdown of escalation steps; 0 = idle
-local reloadBtn -- created lazily on first fallback
-
-local function showReloadButton()
-  if not reloadBtn then
-    reloadBtn = CreateFrame("Button", "ShadowArmyReloadBtn", UIParent,
-      "UIPanelButtonTemplate")
-    reloadBtn:SetWidth(220)
-    reloadBtn:SetHeight(28)
-    reloadBtn:SetPoint("TOP", UIParent, "TOP", 0, -140)
-    reloadBtn:SetText("|cFF9482C9ShadowArmy:|r click to finish reload")
-    reloadBtn:SetScript("OnClick", function()
-      ReloadUI()
-    end)
-  end
-  reloadBtn:Show()
-end
 
 local driver = CreateFrame("Frame", "ShadowArmyDriver", UIParent)
 driver:SetScript("OnUpdate", function()
@@ -335,8 +331,9 @@ driver:SetScript("OnUpdate", function()
     elseif pendingReload == 1 then
       ConsoleExec("reloadui")
     elseif pendingReload == 0 then
-      emit("reload-click", "auto paths no-op; showing one-click button")
-      showReloadButton()
+      emit("reload-click", "auto paths no-op; showing panel reload button")
+      panel:Show() -- the button lives in the panel; unhide if /sa'd away
+      reloadBtn:Show()
     end
     return
   end
@@ -406,6 +403,9 @@ frame:RegisterEvent("PLAYER_ENTER_COMBAT")
 frame:RegisterEvent("PLAYER_LEAVE_COMBAT")
 -- The System inbound: GM announce arrives as CHAT_MSG_SYSTEM
 frame:RegisterEvent("CHAT_MSG_SYSTEM")
+-- auto-loot: vanilla has no always-auto-loot option (that's a TBC setting),
+-- and LootSlot isn't protected in 1.12 — vacuum the window on open
+frame:RegisterEvent("LOOT_OPENED")
 
 frame:SetScript("OnEvent", function()
   if event == "PLAYER_ENTERING_WORLD" then
@@ -431,6 +431,14 @@ frame:SetScript("OnEvent", function()
     auto.melee = true
   elseif event == "PLAYER_LEAVE_COMBAT" then
     auto.melee = false
+  elseif event == "LOOT_OPENED" then
+    -- Backwards: LootSlot removes entries, so forward indexing skips slots.
+    local n = GetNumLootItems()
+    local i = n
+    while i >= 1 do
+      LootSlot(i)
+      i = i - 1
+    end
   elseif event == "CHAT_MSG_SYSTEM" then
     -- The System speaks via GM `announce`, which arrives as CHAT_MSG_SYSTEM:
     -- "|cffff0000[System Message]: <SYS> reload|r". Strip color codes, look for
