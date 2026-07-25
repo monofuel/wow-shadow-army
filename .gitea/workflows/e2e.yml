@@ -271,7 +271,12 @@ jobs:
             echo "host_ws=${HOST_WS:-}"
           } >> "$GITHUB_OUTPUT"
 
-          HOST_IP="$(ip -4 route show default 2>/dev/null | awk '{print $3; exit}')"
+          # monolab-builder image may lack iproute2 (`ip`) — 127 under
+          # pipefail killed run 3 here. Try several resolvers, tolerate all.
+          HOST_IP="$( (ip -4 route show default 2>/dev/null || true) | awk '{print $3; exit}' )"
+          if [ -z "$HOST_IP" ] && [ -r /proc/net/route ]; then
+            HOST_IP="$(awk '$2=="00000000" {print strtonum("0x" substr($3,7,2)) "." strtonum("0x" substr($3,5,2)) "." strtonum("0x" substr($3,3,2)) "." strtonum("0x" substr($3,1,2)); exit}' /proc/net/route 2>/dev/null || true)"
+          fi
           if [ -z "$HOST_IP" ]; then
             HOST_IP="172.17.0.1"
           fi
