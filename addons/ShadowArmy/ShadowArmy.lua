@@ -55,7 +55,7 @@ end
 
 local panel = CreateFrame("Frame", "ShadowArmyPanel", UIParent)
 panel:SetWidth(210)
-panel:SetHeight(130)
+panel:SetHeight(160)
 panel:SetPoint("RIGHT", UIParent, "RIGHT", -40, 60)
 panel:SetBackdrop({
   bgFile = "Interface\\Tooltips\\UI-Tooltip-Background",
@@ -92,8 +92,106 @@ local line4 = makeLine(line3)
 local line5 = makeLine(line4, -6) -- buff watch / warnings
 
 -- (v0.1 had Nearest-foe/Attack buttons; removed — they duplicated Tab and
--- the T auto-attack keybind. Buttons-can-act is proven; future buttons
--- should do things the default UI can't.)
+-- the T auto-attack keybind. Rule: a button earns its place only by doing
+-- something the default UI can't. Full-auto combat qualifies.)
+
+--------------------------------------------------------------------------
+-- Auto-combat: toggle + warlock rotation. When ON and you target an
+-- attackable enemy, the advisor plays the fight: Corruption up, Shadow
+-- Bolt while mana holds, wand otherwise, melee as last resort.
+-- Uses only spells the character has LEARNED (spellbook scan) — the
+-- human still trains everything at the trainer themselves.
+--------------------------------------------------------------------------
+
+local auto = {
+  enabled = false,
+  casting = false,   -- SPELLCAST_START..STOP window (cast-time spells)
+  gcdUntil = 0,      -- our own 1.6s guard after any cast request
+  shooting = false,  -- wand auto-repeat active (don't re-toggle it off!)
+  melee = false,     -- auto-attack swing loop active
+  known = {},        -- lowercase spell name -> true
+}
+
+local function scanSpellbook()
+  auto.known = {}
+  local i = 1
+  while true do
+    local name = GetSpellName(i, "spell")
+    if not name then break end
+    auto.known[string.lower(name)] = true
+    i = i + 1
+  end
+end
+
+-- 1.12 UnitDebuff returns the TEXTURE first; names aren't exposed.
+local CORRUPTION_TEX = "Interface\\Icons\\Spell_Shadow_AbominationExplosion"
+
+local function targetHasDebuff(texture)
+  local i = 1
+  while true do
+    local tex = UnitDebuff("target", i)
+    if not tex then return false end
+    if tex == texture then return true end
+    i = i + 1
+  end
+end
+
+local function castNow(spell)
+  CastSpellByName(spell)
+  auto.gcdUntil = GetTime() + 1.6
+end
+
+local function rotationStep()
+  if not auto.enabled then return end
+  if not UnitExists("target") then return end
+  if UnitIsDeadOrGhost("target") or not UnitCanAttack("player", "target") then return end
+  if auto.casting or GetTime() < auto.gcdUntil then return end
+
+  local manaPct = 0
+  if UnitManaMax("player") > 0 then
+    manaPct = UnitMana("player") / UnitManaMax("player") * 100
+  end
+  local inCastRange = CheckInteractDistance("target", 4)  -- ~28yd
+
+  -- Priority: DoT up -> nuke while mana holds -> wand -> melee.
+  if inCastRange and auto.known["corruption"] and manaPct > 25
+      and not targetHasDebuff(CORRUPTION_TEX) then
+    castNow("Corruption")
+    return
+  end
+  if inCastRange and auto.known["shadow bolt"] and manaPct > 30 then
+    castNow("Shadow Bolt")
+    return
+  end
+  if inCastRange and auto.known["shoot"] and not auto.shooting then
+    -- wand toggle: casting Shoot while already repeating would turn it OFF
+    CastSpellByName("Shoot")
+    return
+  end
+  if not auto.melee and CheckInteractDistance("target", 3) then
+    AttackTarget()
+  end
+end
+
+local function setAuto(on)
+  auto.enabled = on
+  local label = on and "|cFF44FF44Auto: ON|r" or "Auto: OFF"
+  ShadowArmyAutoBtn:SetText(label)
+  say(on and "auto-combat ON — target something and watch"
+        or "auto-combat OFF — back to manual")
+  -- /say lands in the server's Chat.log, labeling the breadcrumb corpus:
+  -- everything between ON/OFF markers is addon play, not human play.
+  SendChatMessage("<ShadowArmy> auto-combat " .. (on and "ON" or "OFF"), "SAY")
+end
+
+local autoBtn = CreateFrame("Button", "ShadowArmyAutoBtn", panel, "UIPanelButtonTemplate")
+autoBtn:SetWidth(110)
+autoBtn:SetHeight(20)
+autoBtn:SetPoint("BOTTOM", panel, "BOTTOM", 0, 8)
+autoBtn:SetText("Auto: OFF")
+autoBtn:SetScript("OnClick", function()
+  setAuto(not auto.enabled)
+end)
 
 --------------------------------------------------------------------------
 -- Live refresh: event-driven where possible, plus a 0.5s tick for the
@@ -182,6 +280,7 @@ end
 
 local acc = 0
 panel:SetScript("OnUpdate", function()
+  rotationStep() -- every frame; internal gcd/cast guards do the pacing
   acc = acc + arg1
   if acc < 0.5 then return end
   acc = 0
@@ -201,12 +300,42 @@ end)
 
 local frame = CreateFrame("Frame", "ShadowArmyFrame", UIParent)
 frame:RegisterEvent("PLAYER_ENTERING_WORLD")
+frame:RegisterEvent("LEARNED_SPELL_IN_TAB")
+-- cast-time spell window (Shadow Bolt): don't stack cast requests
+frame:RegisterEvent("SPELLCAST_START")
+frame:RegisterEvent("SPELLCAST_STOP")
+frame:RegisterEvent("SPELLCAST_FAILED")
+frame:RegisterEvent("SPELLCAST_INTERRUPTED")
+-- wand auto-repeat state (casting Shoot again would TOGGLE it off)
+frame:RegisterEvent("START_AUTOREPEAT_SPELL")
+frame:RegisterEvent("STOP_AUTOREPEAT_SPELL")
+-- melee swing loop state
+frame:RegisterEvent("PLAYER_ENTER_COMBAT")
+frame:RegisterEvent("PLAYER_LEAVE_COMBAT")
 
 frame:SetScript("OnEvent", function()
   if event == "PLAYER_ENTERING_WORLD" then
     grind.startTime = GetTime()
     grind.startXP = UnitXP("player")
+    scanSpellbook()
+    -- QoL defaults the advisor asserts on every login:
+    SetCVar("instantQuestText", 1) -- no slow quest-text crawl
     say("ARISE. Advisor online for " .. UnitName("player") .. " — /sa to toggle panel")
+  elseif event == "LEARNED_SPELL_IN_TAB" then
+    scanSpellbook()
+  elseif event == "SPELLCAST_START" then
+    auto.casting = true
+  elseif event == "SPELLCAST_STOP" or event == "SPELLCAST_FAILED"
+      or event == "SPELLCAST_INTERRUPTED" then
+    auto.casting = false
+  elseif event == "START_AUTOREPEAT_SPELL" then
+    auto.shooting = true
+  elseif event == "STOP_AUTOREPEAT_SPELL" then
+    auto.shooting = false
+  elseif event == "PLAYER_ENTER_COMBAT" then
+    auto.melee = true
+  elseif event == "PLAYER_LEAVE_COMBAT" then
+    auto.melee = false
   end
 end)
 
