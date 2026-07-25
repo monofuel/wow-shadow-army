@@ -55,7 +55,7 @@ end
 
 local panel = CreateFrame("Frame", "ShadowArmyPanel", UIParent)
 panel:SetWidth(210)
-panel:SetHeight(150)
+panel:SetHeight(165)
 panel:SetPoint("RIGHT", UIParent, "RIGHT", -40, 60)
 panel:SetBackdrop({
   bgFile = "Interface\\Tooltips\\UI-Tooltip-Background",
@@ -89,6 +89,7 @@ line1:SetJustifyH("LEFT")
 local line2 = makeLine(line1)
 local line3 = makeLine(line2)
 local line4 = makeLine(line3)
+local line5 = makeLine(line4, -6) -- buff watch / warnings
 
 -- Buttons: Tab-target nearest enemy, and attack current target.
 -- 1.12 has no protected functions — these are legal addon calls.
@@ -119,6 +120,63 @@ end)
 -- clock-ish lines. Range bucket via CheckInteractDistance (1.12 addons
 -- get no world coordinates for other units — buckets are what we have).
 --------------------------------------------------------------------------
+
+-- Buff watch: warn when a tracked self-buff is missing or expiring.
+-- 1.12 API quirk: GetPlayerBuff/GetPlayerBuffTimeLeft give remaining time,
+-- but buff NAMES aren't exposed directly — identify by texture instead
+-- (stable across ranks). Demon Skin and Demon Armor share the watch slot:
+-- either one counts as "armored".
+local WATCHED_BUFFS = {
+  {
+    label = "Demon Skin",
+    textures = {
+      "Interface\\Icons\\Spell_Shadow_RagingScream",  -- Demon Skin
+      "Interface\\Icons\\Spell_Shadow_SpectralSight", -- Demon Armor (lvl 20+)
+    },
+    warnBelow = 300, -- seconds; warn under 5 minutes
+  },
+}
+
+local function buffTimeLeftByTexture(textures)
+  local i = 0
+  while true do
+    local buffIndex = GetPlayerBuff(i, "HELPFUL")
+    if buffIndex < 0 then
+      return nil
+    end
+    local tex = GetPlayerBuffTexture(buffIndex)
+    if tex then
+      for _, want in ipairs(textures) do
+        if tex == want then
+          return GetPlayerBuffTimeLeft(buffIndex)
+        end
+      end
+    end
+    i = i + 1
+  end
+end
+
+local lastNag = 0
+local function buffWatchLine()
+  local warnings = nil
+  for _, watch in ipairs(WATCHED_BUFFS) do
+    local left = buffTimeLeftByTexture(watch.textures)
+    local warn
+    if not left then
+      warn = string.format("|cFFFF4444%s MISSING|r", watch.label)
+    elseif left < watch.warnBelow then
+      warn = string.format("|cFFFFAA00%s %dm left|r", watch.label, math.ceil(left / 60))
+    end
+    if warn then
+      warnings = warnings and (warnings .. "  " .. warn) or warn
+    end
+  end
+  if warnings and (GetTime() - lastNag) > 60 then
+    lastNag = GetTime()
+    say("buff watch: " .. warnings) -- chat nag at most once a minute
+  end
+  return warnings or "|cFF44FF44buffs OK|r"
+end
 
 local function targetSummary()
   if not UnitExists("target") then
@@ -154,6 +212,7 @@ panel:SetScript("OnUpdate", function()
   local t1, t2 = targetSummary()
   line3:SetText(t1)
   line4:SetText(t2)
+  line5:SetText(buffWatchLine())
 end)
 
 --------------------------------------------------------------------------
