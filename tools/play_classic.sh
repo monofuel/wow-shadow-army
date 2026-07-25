@@ -45,6 +45,17 @@ done
 # Local realm, always (snapshot's realmlist points at the old tailnet host).
 printf 'set realmlist 127.0.0.1\n' > "$CLIENT/realmlist.wtf"
 
+# Our addons: symlink each addons/* into the client (repo is the source of
+# truth; wine follows host symlinks). New addons still need a client restart
+# once (TOC scan at launch); code edits only need /console reloadui.
+for addon in "$REPO_ROOT"/addons/*/; do
+  name="$(basename "$addon")"
+  if [ ! -e "$CLIENT/Interface/AddOns/$name" ]; then
+    ln -s "${addon%/}" "$CLIENT/Interface/AddOns/$name"
+    echo "[play-classic] linked addon $name"
+  fi
+done
+
 # OpenGL renderer (runs better under wine than the d3d path) + windowed.
 CONFIG="$CLIENT/WTF/Config.wtf"
 if [ -f "$CONFIG" ]; then

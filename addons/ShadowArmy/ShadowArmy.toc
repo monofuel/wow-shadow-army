@@ -1,0 +1,6 @@
+## Interface: 11200
+## Title: |cFF9482C9Shadow Army|r
+## Notes: Advisor HUD + command channel for the shadow army (hello world stage)
+## Version: 0.1.0
+
+ShadowArmy.lua
