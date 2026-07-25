@@ -81,6 +81,54 @@ directly. Advice generation and advice rendering never mix — same
 one-dispatch-path rule as The System's faces. Transfer becomes free
 instead of a rebuild.
 
+## Client fork: Nim client vs real 1.12 client for the human seat
+
+The realm is stock VMaNGOS 1.12.1 — a genuine 1.12 Blizzard client connects
+to it (that is what VMaNGOS exists to serve), and the client files are
+already in wow-classic-data. That opens a fork for how the *human* receives
+advice:
+
+- **Nim client (current path):** no addon/Lua surface at all. Advice
+  arrives as chat text from the advisor shadow. Zero new stack; works
+  today.
+- **Real 1.12 client (option):** full vanilla addon sandbox — the
+  protected-function lockdown came in 2.0, so 1.12 addons may freely call
+  `ReloadUI()`, register slash commands, and react to chat events. A thin
+  advisor addon could parse the shadow's whispers (structured text) and
+  render them as a HUD: quest arrows, route lines, danger flashes —
+  Questie-grade UX instead of chat spam. Cost: a second client stack to
+  babysit, and `(verify)` that the real client runs at all under
+  wine/NixOS against our realm.
+
+### Live iteration loop (the exciting part)
+
+1.12's addon environment makes mid-session improvement automatable:
+`ReloadUI()` re-reads all addon Lua from disk without leaving the game,
+and an addon can trigger it itself — e.g. on a `!reload` whisper from a
+trusted sender. So the loop becomes:
+
+1. Human, in-game, asks for help or a change in party chat ("advisor,
+   show gather nodes on the minimap").
+2. The LLM tier (Racha / The System) edits the advisor's code on disk —
+   addon Lua for the HUD rendering, and/or the shadow-side tool that
+   generates the recommendation objects.
+3. Advisor whispers `!reload` handled by the addon → `ReloadUI()` → the
+   human sees the improvement seconds later, without leaving the game.
+4. The improved *generation* logic (the structured recommendation side)
+   trickles down to bot policies for free — bots consume the objects
+   directly, per the transfer hedge above. Only the HUD rendering is
+   human-specific.
+
+This is the toolsmithing rail from architecture.md wearing a product
+face: the human's requests are the feature backlog, arriving at play-time,
+verified by the requester seconds after deployment. Note our own Lua tool
+tier already hot-reloads by construction (brain/lua_runner.py spawns a
+fresh interpreter per decide, so edits apply on the next tick) — the same
+property, achieved statelessly. Caveat for both sides: a syntax error in
+a freshly-written file fails the next call rather than keeping the old
+version running — the toolsmithing rail should parse-check (`luac -p`)
+before overwriting a live file.
+
 ## Open questions before building
 
 1. Does the human client emit frames over nim_control, or does the
@@ -94,6 +142,9 @@ instead of a rebuild.
    the human's subsequent behavior followed it. That's the hypothesis's
    measurement, and it needs to be in from day one — retrofitting the
    metric later loses the baseline.
+5. Does the real 1.12 client run under wine/NixOS against our realm, and
+   is the addon sandbox worth the second stack? `(verify — gates the HUD
+   path above; the chat-text path needs none of it)`
 
 First concrete step when we build: same frame-capture session as
 command-channel.md (chat, marks, targeting) plus quest pickup/turn-in and
