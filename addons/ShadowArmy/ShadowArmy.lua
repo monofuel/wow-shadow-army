@@ -298,6 +298,28 @@ end)
 -- Events
 --------------------------------------------------------------------------
 
+-- Instant quest text, 1.12 style: there is no CVar for this (that arrived
+-- post-vanilla). The quest/gossip text crawl is QuestFrame's type-out
+-- effect; the classic fix is hooking the scroll frames' OnShow to call
+-- the "text finished" path immediately. QuestFrameDetailPanel shows quest
+-- description; QuestFrameProgressPanel the turn-in text.
+local function instantQuestText()
+  -- The crawl is driven by the detail panel's OnUpdate revealing text over
+  -- time; killing it + forcing alpha shows everything at once. Progress
+  -- panel = quest turn-in text.
+  if QuestFrameDetailPanel then
+    QuestFrameDetailPanel:SetScript("OnUpdate", nil)
+    QuestFrameDetailPanel:SetScript("OnShow", function()
+      if QuestDetailScrollChildFrame then
+        QuestDetailScrollChildFrame:SetAlpha(1)
+      end
+    end)
+  end
+  if QuestFrameProgressPanel then
+    QuestFrameProgressPanel:SetScript("OnUpdate", nil)
+  end
+end
+
 local frame = CreateFrame("Frame", "ShadowArmyFrame", UIParent)
 frame:RegisterEvent("PLAYER_ENTERING_WORLD")
 frame:RegisterEvent("LEARNED_SPELL_IN_TAB")
@@ -319,7 +341,7 @@ frame:SetScript("OnEvent", function()
     grind.startXP = UnitXP("player")
     scanSpellbook()
     -- QoL defaults the advisor asserts on every login:
-    SetCVar("instantQuestText", 1) -- no slow quest-text crawl
+    instantQuestText() -- no slow quest-text crawl (no CVar for this in 1.12)
     say("ARISE. Advisor online for " .. UnitName("player") .. " — /sa to toggle panel")
   elseif event == "LEARNED_SPELL_IN_TAB" then
     scanSpellbook()
