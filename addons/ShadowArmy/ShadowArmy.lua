@@ -55,7 +55,7 @@ end
 
 local panel = CreateFrame("Frame", "ShadowArmyPanel", UIParent)
 panel:SetWidth(210)
-panel:SetHeight(165)
+panel:SetHeight(130)
 panel:SetPoint("RIGHT", UIParent, "RIGHT", -40, 60)
 panel:SetBackdrop({
   bgFile = "Interface\\Tooltips\\UI-Tooltip-Background",
@@ -91,29 +91,9 @@ local line3 = makeLine(line2)
 local line4 = makeLine(line3)
 local line5 = makeLine(line4, -6) -- buff watch / warnings
 
--- Buttons: Tab-target nearest enemy, and attack current target.
--- 1.12 has no protected functions — these are legal addon calls.
-local targetBtn = CreateFrame("Button", "ShadowArmyTargetBtn", panel, "UIPanelButtonTemplate")
-targetBtn:SetWidth(90)
-targetBtn:SetHeight(20)
-targetBtn:SetPoint("BOTTOMLEFT", panel, "BOTTOMLEFT", 10, 8)
-targetBtn:SetText("Nearest foe")
-targetBtn:SetScript("OnClick", function()
-  TargetNearestEnemy()
-end)
-
-local attackBtn = CreateFrame("Button", "ShadowArmyAttackBtn", panel, "UIPanelButtonTemplate")
-attackBtn:SetWidth(90)
-attackBtn:SetHeight(20)
-attackBtn:SetPoint("BOTTOMRIGHT", panel, "BOTTOMRIGHT", -10, 8)
-attackBtn:SetText("Attack")
-attackBtn:SetScript("OnClick", function()
-  if UnitExists("target") and UnitCanAttack("player", "target") then
-    AttackTarget()
-  else
-    say("no attackable target — try Nearest foe first")
-  end
-end)
+-- (v0.1 had Nearest-foe/Attack buttons; removed — they duplicated Tab and
+-- the T auto-attack keybind. Buttons-can-act is proven; future buttons
+-- should do things the default UI can't.)
 
 --------------------------------------------------------------------------
 -- Live refresh: event-driven where possible, plus a 0.5s tick for the
