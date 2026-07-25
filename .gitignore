@@ -1,5 +1,6 @@
 # Runtime / local only — never commit
 local_data/
+sessions/
 __pycache__/
 *.py[cod]
 *.egg-info/

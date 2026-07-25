@@ -26,7 +26,7 @@ COMPOSE_FILE := infra/compose.vmangos.yml
 ACCOUNT_USER := monofuel
 ACCOUNT_PASS := password
 
-.PHONY: test test-lua test-python test-nim system pin-check integration-test start-server stop-server account play shadow
+.PHONY: test test-lua test-python test-nim system pin-check integration-test start-server stop-server server-logging logs account play shadow breadcrumbs
 
 # Unit tier only. test-python is stdlib-only (projection + intent_mapping + optional
 # lua_runner smoke); it is wired into `make test` because it needs no venv/network.
@@ -40,8 +40,10 @@ test-lua:
 # Python unit tier: plain dicts + stdlib unittest. No pydantic/msgpack required.
 # Runtime brain (brain.shadow) needs upstream deps — use:
 #   uv run --project $(UPSTREAM) python -m brain.shadow ...
+# breadcrumbs: DB poller diff logic (fixture dicts only; no mariadb in unit tier).
 test-python:
 	@python3 -m unittest discover -s brain/tests -p 'test_*.py' -v
+	@python3 -m unittest discover -s breadcrumbs/tests -p 'test_*.py' -v
 
 # Optional Nim unit tier (enum maps / pure parsers). Not part of `make test`
 # so CI and bare hosts without nim stay green. PATH-nim first, else nix develop
@@ -105,6 +107,13 @@ shadow:
 	@cd "$(CURDIR)" && uv run --project "$(UPSTREAM)" python -m brain.shadow \
 		--slot $(SLOT) --leader-name $(LEADER) --party-members $(PARTY) $(EXTRA)
 
+# DB breadcrumb poller: JSONL session stream from characters MariaDB while a
+# human plays. Requires realm up (docker exec → mariadb). Not unit tier.
+# Example: make breadcrumbs CHARACTER=Murist
+CHARACTER ?= Murist
+breadcrumbs:
+	@python3 breadcrumbs/poller.py --character "$(CHARACTER)"
+
 # Bring up the local VMaNGOS/Coworld realm, then attach to container logs.
 # Operator `up` is detached (compose up -d). Ctrl-C only detaches from logs;
 # containers keep running. Use `make stop-server` to stop cleanly.
@@ -133,6 +142,70 @@ stop-server:
 	fi; \
 	cd "$(UPSTREAM)"; \
 	$(OPERATOR) down
+
+# Server-side breadcrumb logging (see docs/breadcrumbs.md for the why of each
+# key). Writes vmangos.mangosd_config_overrides into the operator's config.json
+# and restarts the realm so configure_vmangos.py re-applies them into
+# mangosd.conf/realmd.conf. Upstream stays read-only; only local_data/ changes.
+#
+# LogLevel.File=4 is load-bearing: combat/spellcast/moves go through
+# DEBUG_FILTER_LOG (LOG_LVL_DEBUG=4) into Server.log, so clearing the
+# LogFilter_* keys alone emits nothing. Console stays at 2 on purpose —
+# coworld-game's docker json log is unrotated.
+LOG_DIR := /coworld-run/logs
+MANGOSD_LOG_OVERRIDES := \
+	LogsDir=$(LOG_DIR) \
+	LogLevel.File=4 \
+	LogLevel.Console=2 \
+	LogLevel.DB=4 \
+	LogFilter_Combat=0 \
+	LogFilter_SpellCast=0 \
+	LogFilter_Damage=0 \
+	LogFilter_PlayerMoves=0 \
+	LogFilter_PeriodicAffects=0 \
+	LogFile.Basic=Server.log \
+	LogFile.Chat=Chat.log \
+	LogFile.Char=Char.log \
+	LogFile.Movement=Movement.log \
+	LogFile.Timestamp=0 \
+	LogsDB.Chat=1 \
+	LogsDB.Characters=1 \
+	LogsDB.LevelUp=1 \
+	PlayerSave.Interval=20000 \
+	PlayerSave.Stats.MinLevel=1 \
+	PlayerSave.Stats.SaveOnlyOnLogout=0
+REALMD_LOG_OVERRIDES := \
+	LogsDir=$(LOG_DIR) \
+	LogFile=Realmd.log \
+	LogFileLevel=2
+# Host-visible landing zone for every log file (bind mount of /coworld-run).
+SERVER_LOG_DIR := $(UPSTREAM)/local_data/coworld-run/logs
+
+server-logging:
+	@set -e; \
+	if [ ! -d "$(UPSTREAM)" ]; then \
+		echo "error: upstream checkout missing: $(UPSTREAM)" >&2; exit 1; \
+	fi; \
+	mkdir -p "$(SERVER_LOG_DIR)"; \
+	cd "$(UPSTREAM)"; \
+	$(OPERATOR) write-config --force \
+		$(foreach kv,$(MANGOSD_LOG_OVERRIDES),--mangosd-config-override '$(kv)') \
+		$(foreach kv,$(REALMD_LOG_OVERRIDES),--realmd-config-override '$(kv)'); \
+	echo ""; \
+	echo "Restarting realm so the overrides reach mangosd.conf/realmd.conf."; \
+	$(OPERATOR) down; \
+	$(OPERATOR) up --smoke; \
+	echo ""; \
+	echo "Logs now land in $(SERVER_LOG_DIR)"; \
+	ls -la "$(SERVER_LOG_DIR)"
+
+# Tail the harvested server logs on the host (no docker exec needed).
+logs:
+	@if [ ! -d "$(SERVER_LOG_DIR)" ]; then \
+		echo "error: $(SERVER_LOG_DIR) missing; run make server-logging first" >&2; exit 1; \
+	fi; \
+	tail -F $(SERVER_LOG_DIR)/Chat.log $(SERVER_LOG_DIR)/Char.log \
+		$(SERVER_LOG_DIR)/Server.log
 
 # Idempotently ensure player account monofuel / password on the local realm.
 # Uses upstream manage_coworld_accounts.py (SRP v/s via game.vmangos_auth).
