@@ -26,7 +26,7 @@ COMPOSE_FILE := infra/compose.vmangos.yml
 ACCOUNT_USER := monofuel
 ACCOUNT_PASS := password
 
-.PHONY: test test-lua test-python test-nim system integration-test start-server stop-server account play shadow
+.PHONY: test test-lua test-python test-nim system pin-check integration-test start-server stop-server account play shadow
 
 # Unit tier only. test-python is stdlib-only (projection + intent_mapping + optional
 # lua_runner smoke); it is wired into `make test` because it needs no venv/network.
@@ -76,8 +76,22 @@ system:
 		echo "error: nim not on PATH and no flake/shell.nix fallback" >&2; exit 1; \
 	fi
 
-integration-test:
-	@echo "integration tier not wired yet: needs local realm + a bot seat (docs/control-plane.md)"; exit 1
+# Pin-drift only: HEAD of ../coworld-vanilla-wow must match upstream.lock.
+# Also checks files brain/upstream.py imports still exist.
+pin-check:
+	@if [ ! -d "$(UPSTREAM)" ]; then \
+		echo "error: upstream checkout missing: $(UPSTREAM)" >&2; exit 1; \
+	fi
+	@cd "$(CURDIR)" && uv run --project "$(UPSTREAM)" python -m unittest \
+		tests.integration.test_pin_drift -v
+
+# Integration tier: pin-check + recorded wire_*.bin replay through real
+# EnvironmentFrame (upstream client) → frame_projection → lua tools → intent_mapping.
+# No live services, no docker, no realm. Needs uv + upstream project deps + lua5.3.
+# Never wired into `make test` (unit stays instant / stdlib-only).
+integration-test: pin-check
+	@cd "$(CURDIR)" && uv run --project "$(UPSTREAM)" python -m unittest discover \
+		-s tests/integration -p 'test_*.py' -v
 
 # Live shadow brain against a running nim_control socket (not unit tier).
 # Requires: realm up, headless reference player, uv + upstream project deps.
