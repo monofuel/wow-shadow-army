@@ -199,50 +199,38 @@ repo + sibling upstream at pin, build realm image, push tags above. Data
 dirs stay out of the build context (`.dockerignore` + no `COPY` of
 `local_data` / wow-classic-data).
 
-### (c) Data cache — seed once from private `Monolab/wow-classic-data`
+### (c) Data — gitea actions cache keyed on an immutable snapshot
 
-~8GB zip provenance / ~15G on disk after extract (see that repo's
-README). Cloning this on every nightly would waste bandwidth and time.
+`Monolab/wow-classic-data` is a snapshot of the 2006 client: it is
+effectively **immutable**, which makes caching trivial — a static cache
+key never needs invalidation. Use the standard gitea `actions/cache`
+(same mechanism as crewrift's nimby cache), NOT runner-local docker
+volumes: the cache server is central, so it behaves identically across
+all runners with zero per-host state.
 
-**Runner-local cache pattern (clone once):**
-
-Use a **host-persistent Docker named volume** so it survives ephemeral
-job containers and does not require expanding `valid_volumes`:
-
-```text
-volume name:  monolab-wow-classic-data
-marker file:  /data/.seeded   (inside the volume)
-layout:       mirrors wow-classic-data (Coworld-WoW-Classic/, vmangos-db/)
-```
-
-Seed algorithm (e2e job preamble):
-
-```sh
-VOL=monolab-wow-classic-data
-docker volume create "$VOL" >/dev/null
-if ! docker run --rm -v "$VOL":/data alpine test -f /data/.seeded; then
-  # one-time: clone private mirror with a token that can read Monolab/*
-  docker run --rm -v "$VOL":/data -e GIT_TOKEN="..." alpine sh -c '
-    apk add --no-cache git
-    git clone --depth 1 \
-      "https://oauth2:${GIT_TOKEN}@gitea.solution-nine.monofuel.dev/Monolab/wow-classic-data.git" \
-      /data/repo
-    # optional: flatten to expected paths; touch marker last
-    touch /data/.seeded
-  '
-fi
-# compose mounts the volume read-only into the realm container(s)
-# at the paths VANILLA_WOW_EXTRACTED_DATA_DIR / VMANGOS_MYSQL_DUMPS_DIR expect
+```yaml
+- uses: actions/cache@v4
+  with:
+    path: local_data/wow-classic-data
+    key: wow-classic-data-v1   # bump ONLY if the snapshot ever changes
+- name: Fetch data on cache miss
+  run: |
+    [ -d local_data/wow-classic-data/.git ] || \
+      git clone --depth 1 \
+        ssh://git@10.11.4.11:222/Monolab/wow-classic-data.git \
+        local_data/wow-classic-data
+# compose bind-/volume-mounts these paths read-only where
+# VANILLA_WOW_EXTRACTED_DATA_DIR / VMANGOS_MYSQL_DUMPS_DIR expect them
 ```
 
 Notes:
 
-- Re-seed only when we deliberately bump a data pin (delete volume or
-  remove `.seeded` + change clone ref). Document the pin (commit SHA of
-  wow-classic-data) next to `upstream.lock` when e2e lands.
-- Never `docker commit` a container that had this volume mounted into a
-  pushed image.
-- Job logs must not `tar`/`cat` large binary assets out as artifacts.
+- Worst case (cold cache AND miss on clone) it's one ~8GB LAN transfer
+  from our own gitea on a *nightly* job — fine. If the gitea cache
+  server rejects entries this large, drop the cache step entirely and
+  just clone every run; measure before optimizing further.
+- Never `docker commit` a container that had this data mounted, never
+  COPY it into pushed image layers, never tar/cat it out as artifacts.
 
 ### (d) Triggers
 
