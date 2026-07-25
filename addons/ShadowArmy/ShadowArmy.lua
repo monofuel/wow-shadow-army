@@ -278,9 +278,22 @@ local function targetSummary()
     string.format("  %d/%d hp, %s", hp, hpMax, range)
 end
 
+-- Rotation driver lives on its OWN always-shown frame — NOT the panel.
+-- (OnUpdate only fires for visible frames; hiding the panel via /sa must
+-- not kill auto-combat.) pcall so a rotation bug reports instead of
+-- dying silently when scriptErrors is off.
+local driver = CreateFrame("Frame", "ShadowArmyDriver", UIParent)
+driver:SetScript("OnUpdate", function()
+  if not auto.enabled then return end
+  local ok, err = pcall(rotationStep)
+  if not ok and err ~= auto.lastErr then
+    auto.lastErr = err
+    say("|cFFFF4444rotation error:|r " .. tostring(err))
+  end
+end)
+
 local acc = 0
 panel:SetScript("OnUpdate", function()
-  rotationStep() -- every frame; internal gcd/cast guards do the pacing
   acc = acc + arg1
   if acc < 0.5 then return end
   acc = 0
