@@ -26,14 +26,22 @@ COMPOSE_FILE := infra/compose.vmangos.yml
 ACCOUNT_USER := monofuel
 ACCOUNT_PASS := password
 
-.PHONY: test test-lua test-nim system integration-test start-server stop-server account play
+.PHONY: test test-lua test-python test-nim system integration-test start-server stop-server account play shadow
 
-test: test-lua
+# Unit tier only. test-python is stdlib-only (projection + intent_mapping + optional
+# lua_runner smoke); it is wired into `make test` because it needs no venv/network.
+test: test-lua test-python
 
 test-lua:
 	@rc=0; for t in lua/tests/test_*.lua; do \
 		echo "== $$t"; LUA_PATH="lua/?.lua;lua/tools/?.lua;;" $(RUN_LUA) $$t || rc=1; \
 	done; exit $$rc
+
+# Python unit tier: plain dicts + stdlib unittest. No pydantic/msgpack required.
+# Runtime brain (brain.shadow) needs upstream deps — use:
+#   uv run --project $(UPSTREAM) python -m brain.shadow ...
+test-python:
+	@python3 -m unittest discover -s brain/tests -p 'test_*.py' -v
 
 # Optional Nim unit tier (enum maps / pure parsers). Not part of `make test`
 # so CI and bare hosts without nim stay green. PATH-nim first, else nix develop
@@ -70,6 +78,18 @@ system:
 
 integration-test:
 	@echo "integration tier not wired yet: needs local realm + a bot seat (docs/control-plane.md)"; exit 1
+
+# Live shadow brain against a running nim_control socket (not unit tier).
+# Requires: realm up, headless reference player, uv + upstream project deps.
+# Example:
+#   make shadow SLOT=0 LEADER=Botpriest PARTY=Botpriest,Botwarrior EXTRA='--move-fallback --max-seconds 60'
+SLOT ?= 0
+LEADER ?= Botpriest
+PARTY ?= Botpriest,Botwarrior
+EXTRA ?=
+shadow:
+	@cd "$(CURDIR)" && uv run --project "$(UPSTREAM)" python -m brain.shadow \
+		--slot $(SLOT) --leader-name $(LEADER) --party-members $(PARTY) $(EXTRA)
 
 # Bring up the local VMaNGOS/Coworld realm, then attach to container logs.
 # Operator `up` is detached (compose up -d). Ctrl-C only detaches from logs;

@@ -84,7 +84,10 @@ make play
   restarts. Only `docker_vmangos_server.py down --volumes` or `up --fresh`
   wipes state (not exposed by these targets).
 - **Unit tests:** `make test` stays instant (no docker). Runtime targets
-  above are exempt.
+  above are exempt. Includes Lua tools + stdlib Python projection/intent
+  tests (`make test-python`). Live brain needs upstream deps via
+  `uv run --project ../coworld-vanilla-wow python -m brain.shadow …`
+  (see `brain/README.md`, `docs/control-plane.md`, `docs/milestone-1-evidence.md`).
 
 ## Rules
 
