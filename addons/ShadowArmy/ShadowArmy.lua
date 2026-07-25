@@ -8,7 +8,7 @@ ShadowArmy = ShadowArmy or {}
 
 -- Bump on every edit. The System watches Chat.log for "<SA> loaded rev=..."
 -- after sending a reload — a new rev proves the edit actually loaded.
-local REV = "r1"
+local REV = "r5"
 
 local function say(msg)
   DEFAULT_CHAT_FRAME:AddMessage("|cFF9482C9[ShadowArmy]|r " .. tostring(msg))
@@ -300,8 +300,46 @@ end
 -- (OnUpdate only fires for visible frames; hiding the panel via /sa must
 -- not kill auto-combat.) pcall so a rotation bug reports instead of
 -- dying silently when scriptErrors is off.
+-- Deferred remote reload: live findings — ReloadUI() and
+-- ConsoleExec("reloadui") are both silently no-ops from a CHAT_MSG_SYSTEM
+-- handler (r2) and from a deferred OnUpdate frame (r3/r4), while the same
+-- call from the /sa slash handler works. Working theory: this client gates
+-- programmatic UI reload on hardware-event context (the slash path starts
+-- from a keypress). r5: still try the free paths (combat may have been a
+-- confound), then fall back to a one-click reload button — a mouse click IS
+-- a hardware event, so ReloadUI from its OnClick works like the slash path.
+local pendingReload = 0 -- countdown of escalation steps; 0 = idle
+local reloadBtn -- created lazily on first fallback
+
+local function showReloadButton()
+  if not reloadBtn then
+    reloadBtn = CreateFrame("Button", "ShadowArmyReloadBtn", UIParent,
+      "UIPanelButtonTemplate")
+    reloadBtn:SetWidth(220)
+    reloadBtn:SetHeight(28)
+    reloadBtn:SetPoint("TOP", UIParent, "TOP", 0, -140)
+    reloadBtn:SetText("|cFF9482C9ShadowArmy:|r click to finish reload")
+    reloadBtn:SetScript("OnClick", function()
+      ReloadUI()
+    end)
+  end
+  reloadBtn:Show()
+end
+
 local driver = CreateFrame("Frame", "ShadowArmyDriver", UIParent)
 driver:SetScript("OnUpdate", function()
+  if pendingReload > 0 then
+    pendingReload = pendingReload - 1
+    if pendingReload == 2 then
+      ReloadUI() -- if this works we never reach the next step
+    elseif pendingReload == 1 then
+      ConsoleExec("reloadui")
+    elseif pendingReload == 0 then
+      emit("reload-click", "auto paths no-op; showing one-click button")
+      showReloadButton()
+    end
+    return
+  end
   if not auto.enabled then return end
   local ok, err = pcall(rotationStep)
   if not ok and err ~= auto.lastErr then
@@ -407,7 +445,9 @@ frame:SetScript("OnEvent", function()
     if not verb then return end
     verb = string.lower(verb)
     if verb == "reload" then
-      ReloadUI()
+      -- "reloading" without a following "loaded" = the reload never ran.
+      emit("reloading", "rev=" .. REV)
+      pendingReload = 3 -- escalation ladder runs on the driver; see above
     elseif verb == "ping" then
       emit("pong", "rev=" .. REV)
     elseif verb == "status" then
