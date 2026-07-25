@@ -342,7 +342,8 @@ jobs:
               --smoke
           else
             echo "[e2e] host config not writable from job — compose up directly"
-            docker compose -f infra/compose.vmangos.yml --profile coworld up -d coworld-game
+            # Image is pre-loaded (coworld-vmangos:local) — never build in CI.
+            docker compose -f infra/compose.vmangos.yml --profile coworld up -d --no-build coworld-game
             # Wait + provision manually
             deadline=$((SECONDS + 180))
             while [ $SECONDS -lt $deadline ]; do
