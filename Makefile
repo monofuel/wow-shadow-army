@@ -26,7 +26,7 @@ COMPOSE_FILE := infra/compose.vmangos.yml
 ACCOUNT_USER := monofuel
 ACCOUNT_PASS := password
 
-.PHONY: test test-lua integration-test start-server stop-server account play
+.PHONY: test test-lua test-nim system integration-test start-server stop-server account play
 
 test: test-lua
 
@@ -34,6 +34,39 @@ test-lua:
 	@rc=0; for t in lua/tests/test_*.lua; do \
 		echo "== $$t"; LUA_PATH="lua/?.lua;lua/tools/?.lua;;" $(RUN_LUA) $$t || rc=1; \
 	done; exit $$rc
+
+# Optional Nim unit tier (enum maps / pure parsers). Not part of `make test`
+# so CI and bare hosts without nim stay green. PATH-nim first, else nix develop
+# if a flake appears later (same pattern as crewrift-prime-bots).
+test-nim:
+	@if command -v nim >/dev/null 2>&1; then \
+		rc=0; \
+		for t in system/tests/test_*.nim; do \
+			echo "== $$t =="; \
+			nim r --hints:off --warnings:off "$$t" || rc=1; \
+		done; \
+		exit $$rc; \
+	elif [ -f flake.nix ] || [ -f shell.nix ]; then \
+		rc=0; \
+		for t in system/tests/test_*.nim; do \
+			echo "== $$t =="; \
+			nix develop --command nim r --hints:off --warnings:off "$$t" || rc=1; \
+		done; \
+		exit $$rc; \
+	else \
+		echo "error: nim not on PATH and no flake/shell.nix fallback" >&2; exit 1; \
+	fi
+
+# The System: mummy dashboard + MCPort on :7777 (see system/README.md).
+# Needs a running realm for live roster data (docker exec → mariadb SELECT).
+system:
+	@if command -v nim >/dev/null 2>&1; then \
+		nim r system/system_server.nim; \
+	elif [ -f flake.nix ] || [ -f shell.nix ]; then \
+		nix develop --command nim r system/system_server.nim; \
+	else \
+		echo "error: nim not on PATH and no flake/shell.nix fallback" >&2; exit 1; \
+	fi
 
 integration-test:
 	@echo "integration tier not wired yet: needs local realm + a bot seat (docs/control-plane.md)"; exit 1
