@@ -130,44 +130,30 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-uv-e2e-
 
-      - name: Login to gitea registry
+      - name: Load realm images from wow-ci-images
         env:
-          # Gitea Actions' built-in token authenticates to the same-instance
-          # container registry (packages live under Monolab, same owner as
-          # this repo). GIT_PAT (if set) is the fallback for scope surprises.
-          BUILTIN_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GIT_PAT: ${{ secrets.GIT_PAT }}
+          CI_DEPLOY_KEY: ${{ secrets.CI_DEPLOY_KEY }}
         run: |
           set -euo pipefail
-          if echo "$BUILTIN_TOKEN" | docker login gitea.solution-nine.monofuel.dev               -u "$GITHUB_ACTOR" --password-stdin 2>/dev/null; then
-            echo "[e2e] registry login via built-in actions token"
-          elif [ -n "${GIT_PAT:-}" ] && echo "$GIT_PAT" | docker login               gitea.solution-nine.monofuel.dev -u monofuel --password-stdin; then
-            echo "[e2e] registry login via GIT_PAT"
-          else
-            echo "error: registry login failed (built-in token rejected and no usable GIT_PAT)" >&2
-            exit 1
-          fi
-
-      - name: Pull realm image and tag :local
-        run: |
-          set -euo pipefail
-          # Image tags match the upstream.lock short SHA (prereq push:
-          # monolab/coworld-*:98220fead). compose.vmangos.yml expects
-          # coworld-vmangos:local — pull pin + retag; NO --build on operator up.
+          # Gitea Actions' built-in token cannot authenticate to this
+          # instance's container registry (verified live: login rejected even
+          # with packages linked to the repo). Images travel as pin-tagged
+          # tars in private Monolab/wow-ci-images instead, fetched over the
+          # same read-only deploy key as the code/data mirrors.
           IMAGE_PIN="${{ steps.pin.outputs.short }}"
-          IMG="${REGISTRY}/monolab/coworld-vmangos:${IMAGE_PIN}"
-          echo "[e2e] docker pull $IMG"
-          docker pull "$IMG"
-          docker tag "$IMG" coworld-vmangos:local
-          # Sibling runtime tags (reference-player binary extract + optional compose refs).
-          for name in coworld-reference-player-runtime coworld-vmangos-native-runtime coworld-king-richard-runtime; do
-            src="${REGISTRY}/monolab/${name}:${IMAGE_PIN}"
-            if docker pull "$src"; then
-              docker tag "$src" "${name}:local"
-            else
-              echo "[e2e] warn: could not pull $src (ok if unused without --build)"
-            fi
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$CI_DEPLOY_KEY" > ~/.ssh/ci_deploy_key
+          chmod 600 ~/.ssh/ci_deploy_key
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/ci_deploy_key -o StrictHostKeyChecking=accept-new"
+          rm -rf /tmp/wow-ci-images
+          git clone --depth 1 ssh://git@10.11.4.11:222/Monolab/wow-ci-images.git /tmp/wow-ci-images
+          for name in coworld-vmangos coworld-reference-player-runtime; do
+            tar="/tmp/wow-ci-images/${name}-${IMAGE_PIN}.tar.gz"
+            test -f "$tar" || { echo "error: missing $tar (regenerate per wow-ci-images README after a pin bump)" >&2; exit 1; }
+            gunzip -c "$tar" | docker load
+            docker tag "${name}:local" "${name}:local" 2>/dev/null || true
           done
+          rm -rf /tmp/wow-ci-images
           docker image ls | grep -E 'coworld-vmangos|reference-player' || true
 
       - name: Extract headless reference player binary
@@ -185,7 +171,7 @@ jobs:
           # scratch image has no shell/entrypoint — force a dummy command so
           # `docker create` accepts the container for `docker cp`.
           cid="$(docker create --entrypoint '' \
-            "${REGISTRY}/monolab/coworld-reference-player-runtime:${IMAGE_PIN}" \
+            coworld-reference-player-runtime:local \
             /vanilla-wow-reference-player)"
           docker cp "${cid}:/vanilla-wow-reference-player" bin/vanilla-wow-reference-player
           docker rm "$cid"
