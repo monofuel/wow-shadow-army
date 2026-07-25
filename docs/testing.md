@@ -1,0 +1,221 @@
+# Testing — wow-shadow-army
+
+Doctrine baseline: racha_notes `Programming/testing.md` (three tiers,
+unit must be stupid fast, CI green checkmark on every push, mechanism-
+shaped assertions). This file maps that doctrine onto **this** repo.
+
+## Tiers (this repo)
+
+| Tier | Make target | Required? | What it is here |
+|---|---|---|---|
+| **Unit** | `make test` | **YES — every push** | Lua tool library under `lua/tests/test_*.lua`. Instant: no network, no docker, no sleeps, no realm. Today: plain assertions over tool decide tables. |
+| **Integration** | `make integration-test` | optional; **not wired yet** | Recorded-frame fixtures (MessagePack/projected plain tables) exercised against Lua tools + brain projection. No live services, no realm, no docker. Coming with the fixtures task. |
+| **e2e** | `make e2e-test` (planned) | optional; **not wired yet** | Full stack: VMaNGOS realm + headless reference player + brain/Lua seat. Nightly cron + manual dispatch only (see e2e plan). |
+
+Rules that stay fixed:
+
+- `make test` is the unit glob only. Integration/e2e never sneak into it.
+- Unit suite stays green and instant before every commit (`AGENTS.md`).
+- Assert mechanisms (decide kinds, hold reasons, "leader not visible → hold"),
+  not magic radii or tuning constants. Pin literals only when the value
+  *is* the contract (wire labels, protocol names).
+
+## Unit CI (wired)
+
+`.gitea/workflows/test.yml` on `monolab-builder`:
+
+1. checkout
+2. `apt-get install -y lua5.3` (same apt pattern as crewrift-prime-bots;
+   Makefile prefers `lua5.3` then `lua`)
+3. `make test`
+
+No docker, no nix, no nim. Current tools have zero Lua module deps
+(no cjson/socket yet); add packages to the install step only when a unit
+test actually needs them.
+
+## Copyright / data boundary
+
+`Monolab/wow-classic-data` is a **private** mirror of Blizzard-derived
+client + VMaNGOS server data (see that repo's README). Rules for every
+tier and every artifact we ever publish:
+
+- **Private infra only.** Never push the tree, a tarball of it, or a
+  public GitHub/Gitea release containing it.
+- **Never into public artifacts.** No public CI logs that dump DBC
+  contents, no public workflow artifacts, no public container registry
+  tags.
+- **Never into image layers.** Realm images we push to the Gitea package
+  registry must contain only server binaries/config entrypoints. Mount
+  maps/vmaps/mmaps/DBCs and mysql dumps at **run time** from a runner-
+  local data cache. A `COPY` of wow-classic-data into a Dockerfile is a
+  hard fail.
+- Images that *are* private (Gitea package registry under Monolab,
+  auth-gated) still must not bake the data in — the layer history is a
+  durable leak surface and bloats every pull.
+
+## e2e plan (design only — not implemented)
+
+Cost-gated per doctrine: full realm + bot is heavy. Run **nightly +
+manual**, never on every push.
+
+### (a) Runner docker availability — finding
+
+**Yes: monolab-builder job containers have Docker via the host socket.**
+
+Evidence (read-only, from monolab infra + sibling CI; did not probe the
+runner by pushing commits):
+
+| Source | What it shows |
+|---|---|
+| `Monolab/monolab` role `docker-gitea-runner` `templates/docker-compose.yml.j2` | act_runner mounts `/var/run/docker.sock` into the runner container |
+| same role `templates/config.yaml.j2` | `DOCKER_HOST: unix:///var/run/docker.sock`; label `monolab-builder:docker://gitea.solution-nine.monofuel.dev/monofuel/monolab/monolab-builder:latest` |
+| `Monolab/monolab/docs/gentoo-images.md` | Explicit: "The act runner bind-mounts `/var/run/docker.sock` into job containers" |
+| `Racha/.gitea/workflows/build.yml` | `runs-on: monolab-builder` then `docker/setup-buildx-action`, `docker run`, `docker push` — live proof the label can drive the host daemon |
+
+Caveats for e2e design:
+
+- Job containers are **not** DinD; they drive the **host** docker daemon.
+  `docker compose up` creates sibling containers on the host network
+  namespace of the runner host (same pattern as local `make start-server`).
+- `container.privileged` defaults **false**; host-sock is enough for
+  compose, not a blank check for nested privileged DinD.
+- Job bind-mounts from host are restricted by `valid_volumes` (today:
+  certs + `/opt/gitea-runner/grok` only). Do **not** assume an arbitrary
+  host path is mountable into the *job* container. Prefer Docker named
+  volumes / compose mounts (those go through the host daemon and do not
+  need `valid_volumes`).
+- Docker CLI may need to be present in the job image or installed in a
+  step; buildx-using workflows already exercise this path successfully.
+
+### (b) Realm images → Gitea container registry
+
+**Registry host:** `gitea.solution-nine.monofuel.dev`  
+**Auth:** package write via `secrets.GIT_PAT` (same as Racha/monky/monolab
+image workflows: `docker/login-action` with `username: monolab`).  
+**CA:** runner already injects monolab CA certs; buildx configs often pin:
+
+```toml
+[registry."gitea.solution-nine.monofuel.dev"]
+  ca = ["/usr/local/share/ca-certificates/monolab-ca.crt",
+        "/usr/local/share/ca-certificates/monolab-int-ca.crt"]
+```
+
+**Tag convention** (match monolab package path style used by racha/monky):
+
+```
+gitea.solution-nine.monofuel.dev/monolab/wow-shadow-army/<image>:<tag>
+```
+
+Proposed images (built from upstream pin in `upstream.lock`, **without**
+baking data):
+
+| Image | Role |
+|---|---|
+| `.../coworld-vmangos:<pin-sha>` | Realm (realmd/mangosd) — binary/config only |
+| `.../coworld-vmangos:latest` | Moving tip of the pin we currently test |
+| optional later: `.../reference-player:<pin-sha>` | Headless client for bot seat |
+
+Build job (future, separate workflow or e2e prep workflow): checkout this
+repo + sibling upstream at pin, build realm image, push tags above. Data
+dirs stay out of the build context (`.dockerignore` + no `COPY` of
+`local_data` / wow-classic-data).
+
+### (c) Data cache — seed once from private `Monolab/wow-classic-data`
+
+~8GB zip provenance / ~15G on disk after extract (see that repo's
+README). Cloning this on every nightly would waste bandwidth and time.
+
+**Runner-local cache pattern (clone once):**
+
+Use a **host-persistent Docker named volume** so it survives ephemeral
+job containers and does not require expanding `valid_volumes`:
+
+```text
+volume name:  monolab-wow-classic-data
+marker file:  /data/.seeded   (inside the volume)
+layout:       mirrors wow-classic-data (Coworld-WoW-Classic/, vmangos-db/)
+```
+
+Seed algorithm (e2e job preamble):
+
+```sh
+VOL=monolab-wow-classic-data
+docker volume create "$VOL" >/dev/null
+if ! docker run --rm -v "$VOL":/data alpine test -f /data/.seeded; then
+  # one-time: clone private mirror with a token that can read Monolab/*
+  docker run --rm -v "$VOL":/data -e GIT_TOKEN="..." alpine sh -c '
+    apk add --no-cache git
+    git clone --depth 1 \
+      "https://oauth2:${GIT_TOKEN}@gitea.solution-nine.monofuel.dev/Monolab/wow-classic-data.git" \
+      /data/repo
+    # optional: flatten to expected paths; touch marker last
+    touch /data/.seeded
+  '
+fi
+# compose mounts the volume read-only into the realm container(s)
+# at the paths VANILLA_WOW_EXTRACTED_DATA_DIR / VMANGOS_MYSQL_DUMPS_DIR expect
+```
+
+Notes:
+
+- Re-seed only when we deliberately bump a data pin (delete volume or
+  remove `.seeded` + change clone ref). Document the pin (commit SHA of
+  wow-classic-data) next to `upstream.lock` when e2e lands.
+- Never `docker commit` a container that had this volume mounted into a
+  pushed image.
+- Job logs must not `tar`/`cat` large binary assets out as artifacts.
+
+### (d) Triggers
+
+```yaml
+on:
+  schedule:
+    - cron: "0 7 * * *"   # nightly 07:00 UTC — adjust once wall-clock preference is known
+  workflow_dispatch:        # manual: "run e2e now"
+# deliberately NOT on: push
+```
+
+Unit workflow stays on `push` + `workflow_dispatch`. E2e is a **separate**
+workflow file when implemented (e.g. `.gitea/workflows/e2e.yml`) so a
+red nightly cannot block the unit checkmark.
+
+### (e) Mechanism-shaped e2e assertions
+
+Not "reach level 2 in 90s" or hard-coded map coords. Prefer:
+
+1. **Realm up:** `healthz` (or compose health) becomes ready within timeout.
+2. **Seat attaches:** headless reference player + control socket accept a
+   connection (`wow-sdk control doctor --backend nim` or equivalent at pin).
+3. **Frame contract:** at least one environment frame projects into the
+   plain-table shape Lua tools consume (`self_unit` present).
+4. **Tool mechanism under live frames:** with a known party leader unit
+   visible outside near radius, `follow_leader.decide` returns
+   `kind == "move_to_unit"` and the live `unit_id` — not a scripted
+   coordinate. Leader missing/not visible → `hold` /
+   `leader_not_visible` (same contracts as unit tests).
+5. **Fair play:** no out-of-band seat recognition; party membership comes
+   only from game observations.
+
+Timeouts and readiness polls live only in e2e; unit tier remains sleep-
+free.
+
+### (f) Concrete next steps (implementation order)
+
+1. **Keep unit CI green** (this workflow). Add Lua packages only when deps appear.
+2. **Fixtures task:** recorded frames + `make integration-test` (no docker).
+3. **Data pin file** (e.g. `data.lock` next to `upstream.lock`) recording
+   `Monolab/wow-classic-data` commit SHA for reproducible e2e.
+4. **One-shot seed script** for the named volume (runnable on the runner
+   host or as a `workflow_dispatch` "seed-only" job).
+5. **Image build workflow** for `coworld-vmangos` at `upstream.lock` pin →
+   push to `gitea.solution-nine.monofuel.dev/monolab/wow-shadow-army/...`
+   with a strict `.dockerignore` excluding all Blizzard-derived trees.
+6. **`.gitea/workflows/e2e.yml`:** nightly + dispatch; pull images; mount
+   volume; compose up; run mechanism assertions; always compose down
+   (no volume wipe).
+7. **First green nightly** against follow_leader + monofuel (or Bot*) as
+   leader; expand coverage only after that is boringly stable.
+
+Until steps 3–6 exist, e2e stays local: `make start-server` + manual seat
+bring-up per `docs/control-plane.md` and coworld-playbook
+`games/vanilla-wow.md`.

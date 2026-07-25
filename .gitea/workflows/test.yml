@@ -1,0 +1,25 @@
+name: Tests
+
+# Unit CI only (2026-07-24). Green checkmark on every push.
+# One cheap leg: lua unit suite via `make test` (lua/tests/test_*.lua).
+# No nim yet (repo has no nim code), no docker, no realm.
+# Integration (recorded-frame fixtures) and e2e (full realm+bot) are
+# designed in docs/testing.md — not wired here. Pattern cribbed from
+# crewrift-prime-bots/.gitea/workflows/test.yml (lua apt install on
+# monolab-builder). Testing doctrine: racha_notes Programming/testing.md.
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  lua-tests:
+    runs-on: monolab-builder
+    steps:
+      - uses: actions/checkout@v3
+      - name: Install lua 5.3
+        run: |
+          apt-get update
+          apt-get install -y lua5.3
+      - name: Unit suite
+        run: make test
