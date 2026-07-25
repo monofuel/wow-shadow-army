@@ -26,7 +26,7 @@ COMPOSE_FILE := infra/compose.vmangos.yml
 ACCOUNT_USER := monofuel
 ACCOUNT_PASS := password
 
-.PHONY: test test-lua test-python test-nim system pin-check integration-test start-server stop-server server-logging logs account play play-classic shadow breadcrumbs
+.PHONY: test test-lua test-python test-nim system pin-check integration-test start-server stop-server server-logging logs account soap-account play play-classic shadow breadcrumbs
 
 # Unit tier only. test-python is stdlib-only (projection + intent_mapping + optional
 # lua_runner smoke); it is wired into `make test` because it needs no venv/network.
@@ -173,7 +173,10 @@ MANGOSD_LOG_OVERRIDES := \
 	LogsDB.LevelUp=1 \
 	PlayerSave.Interval=20000 \
 	PlayerSave.Stats.MinLevel=1 \
-	PlayerSave.Stats.SaveOnlyOnLogout=0
+	PlayerSave.Stats.SaveOnlyOnLogout=0 \
+	SOAP.Enabled=1 \
+	SOAP.IP=0.0.0.0 \
+	SOAP.Port=7878
 REALMD_LOG_OVERRIDES := \
 	LogsDir=$(LOG_DIR) \
 	LogFile=Realmd.log \
@@ -229,6 +232,32 @@ account:
 		--db-password mangos \
 		--apply; \
 	echo "account ready: $(ACCOUNT_USER) / $(ACCOUNT_PASS)"
+
+# Dedicated GM account for The System's SOAP writes (announce only — see
+# system/README.md "Scoped write exception"). Two steps because VMaNGOS reads
+# security from account_access, NOT account.gmlevel (AccountMgr::GetSecurity →
+# GetAccountPersistentData, cached at startup): 1) SRP account row via the
+# upstream script, 2) account_access gmlevel 6 (SEC_ADMINISTRATOR — the SOAP
+# handler requires >= 6). A realm restart is needed after the gmlevel change
+# because the security cache loads once at boot.
+SOAP_USER := system
+SOAP_PASS := shadowsoap
+soap-account:
+	@set -e; \
+	cd "$(UPSTREAM)"; \
+	cid=$$(docker compose -f "$(COMPOSE_FILE)" --profile coworld ps -q coworld-game); \
+	if [ -z "$$cid" ]; then \
+		echo "error: coworld-game is not running; make start-server first" >&2; exit 1; \
+	fi; \
+	uv run python server/scripts/manage_coworld_accounts.py \
+		--entrant "$(SOAP_USER):$(SOAP_USER):$(SOAP_PASS)" \
+		--mysql-container "$$cid" \
+		--host 127.0.0.1 --port 3306 \
+		--db-user mangos --db-password mangos \
+		--apply; \
+	docker exec "$$cid" mariadb -umangos -pmangos realmd -e \
+		"REPLACE INTO account_access (id, gmlevel, RealmID) SELECT id, 6, -1 FROM account WHERE username = UPPER('$(SOAP_USER)')"; \
+	echo "SOAP account ready: $(SOAP_USER) (gmlevel 6). Restart the realm if it was created just now."
 
 # Launch the native client for HUMAN play against the local realm.
 # --login-screen: land at GlueXML login (no auto world entry). Credentials are

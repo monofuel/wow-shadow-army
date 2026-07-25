@@ -6,8 +6,26 @@
 
 ShadowArmy = ShadowArmy or {}
 
+-- Bump on every edit. The System watches Chat.log for "<SA> loaded rev=..."
+-- after sending a reload — a new rev proves the edit actually loaded.
+local REV = "r1"
+
 local function say(msg)
   DEFAULT_CHAT_FRAME:AddMessage("|cFF9482C9[ShadowArmy]|r " .. tostring(msg))
+end
+
+-- /say lands in the server's Chat.log; The System tails it. This is
+-- the addon's only outbound channel.
+local lastEmitMsg, lastEmitTime = nil, 0
+local function emit(kind, text)
+  local msg = "<SA> " .. kind .. " " .. text
+  local now = GetTime()
+  if msg == lastEmitMsg and (now - lastEmitTime) < 30 then
+    return
+  end
+  lastEmitMsg = msg
+  lastEmitTime = now
+  SendChatMessage(msg, "SAY")
 end
 
 --------------------------------------------------------------------------
@@ -181,7 +199,7 @@ local function setAuto(on)
         or "auto-combat OFF — back to manual")
   -- /say lands in the server's Chat.log, labeling the breadcrumb corpus:
   -- everything between ON/OFF markers is addon play, not human play.
-  SendChatMessage("<ShadowArmy> auto-combat " .. (on and "ON" or "OFF"), "SAY")
+  emit("auto", on and "ON" or "OFF")
 end
 
 local autoBtn = CreateFrame("Button", "ShadowArmyAutoBtn", panel, "UIPanelButtonTemplate")
@@ -289,6 +307,7 @@ driver:SetScript("OnUpdate", function()
   if not ok and err ~= auto.lastErr then
     auto.lastErr = err
     say("|cFFFF4444rotation error:|r " .. tostring(err))
+    emit("err", "rotation: " .. tostring(err))
   end
 end)
 
@@ -347,6 +366,8 @@ frame:RegisterEvent("STOP_AUTOREPEAT_SPELL")
 -- melee swing loop state
 frame:RegisterEvent("PLAYER_ENTER_COMBAT")
 frame:RegisterEvent("PLAYER_LEAVE_COMBAT")
+-- The System inbound: GM announce arrives as CHAT_MSG_SYSTEM
+frame:RegisterEvent("CHAT_MSG_SYSTEM")
 
 frame:SetScript("OnEvent", function()
   if event == "PLAYER_ENTERING_WORLD" then
@@ -356,6 +377,7 @@ frame:SetScript("OnEvent", function()
     -- QoL defaults the advisor asserts on every login:
     instantQuestText() -- no slow quest-text crawl (no CVar for this in 1.12)
     say("ARISE. Advisor online for " .. UnitName("player") .. " — /sa to toggle panel")
+    emit("loaded", "rev=" .. REV)
   elseif event == "LEARNED_SPELL_IN_TAB" then
     scanSpellbook()
   elseif event == "SPELLCAST_START" then
@@ -371,6 +393,33 @@ frame:SetScript("OnEvent", function()
     auto.melee = true
   elseif event == "PLAYER_LEAVE_COMBAT" then
     auto.melee = false
+  elseif event == "CHAT_MSG_SYSTEM" then
+    -- The System speaks via GM `announce`, which arrives as CHAT_MSG_SYSTEM:
+    -- "|cffff0000[System Message]: <SYS> reload|r". Strip color codes, look for
+    -- the <SYS> marker, dispatch a WHITELISTED verb. Never eval arbitrary code.
+    local msg = arg1 or ""
+    msg = string.gsub(msg, "|c%x%x%x%x%x%x%x%x", "")
+    msg = string.gsub(msg, "|r", "")
+    local _, _, cmd = string.find(msg, "<SYS>%s*(.+)$")
+    if not cmd then return end
+    cmd = string.gsub(cmd, "%s+$", "")
+    local _, _, verb, rest = string.find(cmd, "^(%S+)%s*(.*)$")
+    if not verb then return end
+    verb = string.lower(verb)
+    if verb == "reload" then
+      ReloadUI()
+    elseif verb == "ping" then
+      emit("pong", "rev=" .. REV)
+    elseif verb == "status" then
+      local xph = grindStats()
+      emit("status", string.format("lvl=%d hp=%d/%d zone=%s xph=%d",
+        UnitLevel("player"), UnitHealth("player"), UnitHealthMax("player"),
+        GetZoneText(), xph))
+    elseif verb == "say" then
+      say(rest)
+    else
+      emit("err", "unknown sys command: " .. verb)
+    end
   end
 end)
 
