@@ -1,0 +1,526 @@
+name: E2E
+
+# Full stack: VMaNGOS realm + headless reference player + brain mechanism
+# assertions. Nightly + manual only — never on push (keeps unit checkmark clean).
+# Design: docs/testing.md § e2e plan. Mechanism contract: docs/milestone-1-evidence.md
+# (movement_blocked without navmesh is EXPECTED and OK).
+#
+# Secrets (repo settings):
+#   CI_DEPLOY_KEY — Monolab org secret: read-only ssh deploy key installed
+#                   on Monolab/coworld-vanilla-wow + Monolab/wow-classic-data.
+#   GIT_PAT       — repo secret: package pull for the gitea registry (same
+#                   pattern as Racha/monky image workflows).
+
+on:
+  schedule:
+    - cron: "0 7 * * *"   # nightly 07:00 UTC
+  workflow_dispatch:
+
+env:
+  # Distinct host ports so a runner never collides with a human local realm
+  # (3724/8085/8080/3307) or a second CI job on the same host.
+  COGAME_HOST_PORT: "18080"
+  VMANGOS_REALMD_HOST_PORT: "13724"
+  VMANGOS_WORLD_HOST_PORT: "18085"
+  VMANGOS_DB_HOST_PORT: "13307"
+  WOW_SDK_NIM_CONTROL_PORT: "14114"
+  WOW_SDK_NIM_CONTROL_HOST: "127.0.0.1"
+  REGISTRY: gitea.solution-nine.monofuel.dev
+  # Isolate compose project/volumes from any other coworld stack on the host.
+  COMPOSE_PROJECT_NAME: wow-e2e
+
+jobs:
+  e2e:
+    runs-on: monolab-builder
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Resolve pin + paths
+        id: pin
+        run: |
+          set -euo pipefail
+          PIN="$(awk '{print $2; exit}' upstream.lock)"
+          echo "sha=$PIN" >> "$GITHUB_OUTPUT"
+          echo "short=${PIN:0:9}" >> "$GITHUB_OUTPUT"
+          SIBLING="$(dirname "$GITHUB_WORKSPACE")/coworld-vanilla-wow"
+          echo "upstream=$SIBLING" >> "$GITHUB_OUTPUT"
+          echo "[e2e] pin=$PIN workspace=$GITHUB_WORKSPACE sibling=$SIBLING"
+
+      - name: Checkout upstream mirror at pin
+        env:
+          # Read-only deploy key (Monolab org secret) installed on both
+          # private mirrors; see docs/testing.md auth section.
+          CI_DEPLOY_KEY: ${{ secrets.CI_DEPLOY_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "$CI_DEPLOY_KEY" ]; then
+            echo "error: org secret CI_DEPLOY_KEY missing" >&2
+            exit 1
+          fi
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$CI_DEPLOY_KEY" > ~/.ssh/ci_deploy_key
+          chmod 600 ~/.ssh/ci_deploy_key
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/ci_deploy_key -o StrictHostKeyChecking=accept-new"
+          PIN="${{ steps.pin.outputs.sha }}"
+          SIBLING="${{ steps.pin.outputs.upstream }}"
+          MIRROR_URL="ssh://git@10.11.4.11:222/Monolab/coworld-vanilla-wow.git"
+          echo "[e2e] cloning mirror → $SIBLING @ $PIN"
+          rm -rf "$SIBLING"
+          mkdir -p "$SIBLING"
+          git -C "$SIBLING" init -q
+          git -C "$SIBLING" remote add origin "$MIRROR_URL"
+          if ! git -C "$SIBLING" fetch --depth 1 --filter=blob:none origin "$PIN"; then
+            echo "[e2e] direct pin fetch failed — fetching main then checkout"
+            git -C "$SIBLING" fetch --depth 50 --filter=blob:none origin main
+            git -C "$SIBLING" checkout --force "$PIN"
+          else
+            git -C "$SIBLING" checkout --force FETCH_HEAD
+          fi
+          echo "[e2e] mirror HEAD=$(git -C "$SIBLING" rev-parse HEAD)"
+
+      - name: Cache wow-classic-data
+        uses: actions/cache@v4
+        with:
+          path: local_data/wow-classic-data
+          key: wow-classic-data-v1
+
+      - name: Fetch data on cache miss
+        env:
+          CI_DEPLOY_KEY: ${{ secrets.CI_DEPLOY_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -d local_data/wow-classic-data/.git ]; then
+            echo "[e2e] data cache hit (local_data/wow-classic-data present)"
+            exit 0
+          fi
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$CI_DEPLOY_KEY" > ~/.ssh/ci_deploy_key
+          chmod 600 ~/.ssh/ci_deploy_key
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/ci_deploy_key -o StrictHostKeyChecking=accept-new"
+          echo "[e2e] data cache miss — cloning Monolab/wow-classic-data (large, LAN)"
+          mkdir -p local_data
+          git clone --depth 1 \
+            ssh://git@10.11.4.11:222/Monolab/wow-classic-data.git \
+            local_data/wow-classic-data
+          # Sanity: paths the operator expects (docs/testing.md + data README).
+          test -d local_data/wow-classic-data/Coworld-WoW-Classic/vmangos-5875-data
+          test -d local_data/wow-classic-data/vmangos-db/mysql-dump
+          echo "[e2e] data ready"
+
+      - name: Install tools (uv, lua, curl)
+        run: |
+          set -euo pipefail
+          apt-get update
+          apt-get install -y lua5.3 curl ca-certificates
+          if ! command -v uv >/dev/null 2>&1; then
+            curl -LsSf https://astral.sh/uv/install.sh | sh
+            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          fi
+          export PATH="$HOME/.local/bin:$PATH"
+          uv --version
+
+      - name: Cache uv
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cache/uv
+            ~/.local/share/uv
+          key: ${{ runner.os }}-uv-e2e-${{ hashFiles('upstream.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-uv-e2e-
+
+      - name: Login to gitea registry
+        env:
+          # Gitea Actions' built-in token authenticates to the same-instance
+          # container registry (packages live under Monolab, same owner as
+          # this repo). GIT_PAT (if set) is the fallback for scope surprises.
+          BUILTIN_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GIT_PAT: ${{ secrets.GIT_PAT }}
+        run: |
+          set -euo pipefail
+          if echo "$BUILTIN_TOKEN" | docker login gitea.solution-nine.monofuel.dev               -u "$GITHUB_ACTOR" --password-stdin 2>/dev/null; then
+            echo "[e2e] registry login via built-in actions token"
+          elif [ -n "${GIT_PAT:-}" ] && echo "$GIT_PAT" | docker login               gitea.solution-nine.monofuel.dev -u monofuel --password-stdin; then
+            echo "[e2e] registry login via GIT_PAT"
+          else
+            echo "error: registry login failed (built-in token rejected and no usable GIT_PAT)" >&2
+            exit 1
+          fi
+
+      - name: Pull realm image and tag :local
+        run: |
+          set -euo pipefail
+          # Image tags match the upstream.lock short SHA (prereq push:
+          # monolab/coworld-*:98220fead). compose.vmangos.yml expects
+          # coworld-vmangos:local — pull pin + retag; NO --build on operator up.
+          IMAGE_PIN="${{ steps.pin.outputs.short }}"
+          IMG="${REGISTRY}/monolab/coworld-vmangos:${IMAGE_PIN}"
+          echo "[e2e] docker pull $IMG"
+          docker pull "$IMG"
+          docker tag "$IMG" coworld-vmangos:local
+          # Sibling runtime tags (reference-player binary extract + optional compose refs).
+          for name in coworld-reference-player-runtime coworld-vmangos-native-runtime coworld-king-richard-runtime; do
+            src="${REGISTRY}/monolab/${name}:${IMAGE_PIN}"
+            if docker pull "$src"; then
+              docker tag "$src" "${name}:local"
+            else
+              echo "[e2e] warn: could not pull $src (ok if unused without --build)"
+            fi
+          done
+          docker image ls | grep -E 'coworld-vmangos|reference-player' || true
+
+      - name: Extract headless reference player binary
+        run: |
+          set -euo pipefail
+          # Investigation: coworld-reference-player-runtime:<pin> is a scratch
+          # artifact image containing ONLY /vanilla-wow-reference-player
+          # (see player/Dockerfile reference_player_runtime_artifact stage).
+          # Cheapest reliable path: docker create + docker cp the binary into
+          # the job workspace, then run it on the job host (monolab-builder
+          # has glibc; OpenSSL/GL load dynamically). Avoids nimby rebuild and
+          # avoids plain `nimby sync` workspace mode.
+          IMAGE_PIN="${{ steps.pin.outputs.short }}"
+          mkdir -p bin
+          # scratch image has no shell/entrypoint — force a dummy command so
+          # `docker create` accepts the container for `docker cp`.
+          cid="$(docker create --entrypoint '' \
+            "${REGISTRY}/monolab/coworld-reference-player-runtime:${IMAGE_PIN}" \
+            /vanilla-wow-reference-player)"
+          docker cp "${cid}:/vanilla-wow-reference-player" bin/vanilla-wow-reference-player
+          docker rm "$cid"
+          chmod +x bin/vanilla-wow-reference-player
+          file bin/vanilla-wow-reference-player || true
+          ls -la bin/vanilla-wow-reference-player
+
+      - name: Wire data paths + host path for docker.sock binds
+        id: data
+        run: |
+          set -euo pipefail
+          UPSTREAM="${{ steps.pin.outputs.upstream }}"
+          # Job-visible paths (we can read/write these).
+          DATA_ROOT="${GITHUB_WORKSPACE}/local_data/wow-classic-data"
+          EXTRACTED_JOB="${DATA_ROOT}/Coworld-WoW-Classic/vmangos-5875-data"
+          DUMPS_JOB="${DATA_ROOT}/vmangos-db/mysql-dump"
+          CFG_JOB="${GITHUB_WORKSPACE}/local_data/ci-coworld-config"
+          RUN_JOB="${GITHUB_WORKSPACE}/local_data/ci-coworld-run"
+          CAP_JOB="${GITHUB_WORKSPACE}/local_data/ci-coworld-captures"
+          RT_JOB="${GITHUB_WORKSPACE}/local_data/ci-nim-runtime"
+          mkdir -p "$CFG_JOB" "$RUN_JOB" "$CAP_JOB" "$RT_JOB"
+          test -d "$EXTRACTED_JOB"
+          test -d "$DUMPS_JOB"
+
+          # Host dockerd resolves bind-mount sources on the HOST, not inside the
+          # job container (docker.sock, not DinD). Resolve the host path of
+          # GITHUB_WORKSPACE via this container's mount list; fall back to
+          # docker-volume materialization if inspect fails.
+          self_id="$(hostname)"
+          HOST_WS=""
+          if docker inspect "$self_id" >/dev/null 2>&1; then
+            HOST_WS="$(docker inspect -f '{{range .Mounts}}{{println .Destination .Source}}{{end}}' "$self_id" \
+              | awk -v dest="$GITHUB_WORKSPACE" '$1 == dest {print $2; exit}')"
+            if [ -z "$HOST_WS" ]; then
+              HOST_WS="$(docker inspect -f '{{range .Mounts}}{{println .Destination .Source}}{{end}}' "$self_id" \
+                | awk '$1 == "/workspace" || $1 == "/github/workspace" {print $2; exit}')"
+            fi
+          fi
+
+          if [ -n "$HOST_WS" ]; then
+            echo "[e2e] host workspace path: $HOST_WS"
+            # Map job-relative local_data → host for compose binds.
+            rel_local="local_data"
+            EXTRACTED="${HOST_WS}/${rel_local}/wow-classic-data/Coworld-WoW-Classic/vmangos-5875-data"
+            DUMPS="${HOST_WS}/${rel_local}/wow-classic-data/vmangos-db/mysql-dump"
+            CFG="${HOST_WS}/${rel_local}/ci-coworld-config"
+            RUN="${HOST_WS}/${rel_local}/ci-coworld-run"
+            CAP="${HOST_WS}/${rel_local}/ci-coworld-captures"
+          else
+            echo "[e2e] WARN: could not resolve host workspace — materializing named volumes"
+            # docker cp job files into volumes; compose binds volume mountpoints.
+            materialize() {
+              local vol="$1" src="$2"
+              docker volume create "$vol" >/dev/null
+              local cid
+              cid="$(docker create -v "${vol}:/data" alpine:3.20)"
+              if [ -d "$src" ]; then
+                docker cp "${src}/." "${cid}:/data/"
+              fi
+              docker rm "$cid" >/dev/null
+              docker volume inspect -f '{{.Mountpoint}}' "$vol"
+            }
+            RUN_ID="${GITHUB_RUN_ID:-local}"
+            EXTRACTED="$(materialize "wow-e2e-extracted-${RUN_ID}" "$EXTRACTED_JOB")"
+            DUMPS="$(materialize "wow-e2e-dumps-${RUN_ID}" "$DUMPS_JOB")"
+            CFG="$(materialize "wow-e2e-config-${RUN_ID}" "$CFG_JOB")"
+            RUN="$(materialize "wow-e2e-run-${RUN_ID}" "$RUN_JOB")"
+            CAP="$(materialize "wow-e2e-cap-${RUN_ID}" "$CAP_JOB")"
+          fi
+
+          # Upstream checkout is also a sibling of workspace — map to host if possible.
+          if [ -n "$HOST_WS" ]; then
+            UPSTREAM_HOST="$(dirname "$HOST_WS")/coworld-vanilla-wow"
+          else
+            # Materialize is not used for upstream (operator needs the tree for
+            # scripts). Compose file path is only needed on the host for -f;
+            # docker compose -f with a job path fails. Copy compose file via
+            # stdin is awkward — require host path. Re-clone is last resort.
+            UPSTREAM_HOST="$UPSTREAM"
+            if [ -z "$HOST_WS" ]; then
+              echo "[e2e] attempting docker inspect on parent paths for upstream" >&2
+            fi
+          fi
+
+          {
+            echo "extracted=$EXTRACTED"
+            echo "dumps=$DUMPS"
+            echo "config=$CFG"
+            echo "run=$RUN"
+            echo "captures=$CAP"
+            echo "runtime=$RT_JOB"
+            echo "config_job=$CFG_JOB"
+            echo "run_job=$RUN_JOB"
+            echo "captures_job=$CAP_JOB"
+            echo "upstream=$UPSTREAM"
+            echo "upstream_host=$UPSTREAM_HOST"
+            echo "host_ws=${HOST_WS:-}"
+          } >> "$GITHUB_OUTPUT"
+
+          HOST_IP="$(ip -4 route show default 2>/dev/null | awk '{print $3; exit}')"
+          if [ -z "$HOST_IP" ]; then
+            HOST_IP="172.17.0.1"
+          fi
+          echo "host_ip=$HOST_IP" >> "$GITHUB_OUTPUT"
+          echo "[e2e] host_ip=$HOST_IP extracted=$EXTRACTED"
+
+      - name: Start realm (operator up, no --build)
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.local/bin:$PATH"
+          UPSTREAM="${{ steps.data.outputs.upstream }}"
+          # Compose bind sources must be HOST paths (docker.sock). Operator
+          # write-config must write JOB paths first, then we re-export host
+          # paths for compose if they differ.
+          CFG_JOB="${{ steps.data.outputs.config_job }}"
+          RUN_JOB="${{ steps.data.outputs.run_job }}"
+          CAP_JOB="${{ steps.data.outputs.captures_job }}"
+          mkdir -p "$CFG_JOB" "$RUN_JOB" "$CAP_JOB"
+
+          export COMPOSE_PROJECT_NAME="wow-e2e-${GITHUB_RUN_ID:-local}"
+          echo "COMPOSE_PROJECT_NAME=$COMPOSE_PROJECT_NAME" >> "$GITHUB_ENV"
+          export COGAME_HOST_PORT VMANGOS_REALMD_HOST_PORT VMANGOS_WORLD_HOST_PORT VMANGOS_DB_HOST_PORT
+
+          HOST_IP="${{ steps.data.outputs.host_ip }}"
+          echo "[e2e] starting realm on ports http=$COGAME_HOST_PORT realmd=$VMANGOS_REALMD_HOST_PORT world=$VMANGOS_WORLD_HOST_PORT db=$VMANGOS_DB_HOST_PORT"
+
+          cd "$UPSTREAM"
+          # 1) Write config into job-visible dirs.
+          export VANILLA_WOW_EXTRACTED_DATA_DIR="${{ steps.data.outputs.extracted }}"
+          export VMANGOS_MYSQL_DUMPS_DIR="${{ steps.data.outputs.dumps }}"
+          export COWORLD_CONFIG_DIR="$CFG_JOB"
+          export COWORLD_RUN_DIR="$RUN_JOB"
+          export VMANGOS_CAPTURES_DIR="$CAP_JOB"
+          uv run python server/scripts/docker_vmangos_server.py write-config --force
+
+          # 2) Point compose at host-visible paths (may equal job paths when
+          # HOST_WS resolved; volume mountpoints otherwise).
+          export VANILLA_WOW_EXTRACTED_DATA_DIR="${{ steps.data.outputs.extracted }}"
+          export VMANGOS_MYSQL_DUMPS_DIR="${{ steps.data.outputs.dumps }}"
+          export COWORLD_CONFIG_DIR="${{ steps.data.outputs.config }}"
+          export COWORLD_RUN_DIR="${{ steps.data.outputs.run }}"
+          export VMANGOS_CAPTURES_DIR="${{ steps.data.outputs.captures }}"
+
+          # If host config path differs from job path, copy config into place
+          # via a throwaway container bind (host path as volume source).
+          if [ "$CFG_JOB" != "$COWORLD_CONFIG_DIR" ]; then
+            echo "[e2e] syncing config job→host path via docker cp"
+            cid="$(docker create -v "${COWORLD_CONFIG_DIR}:/data" alpine:3.20)"
+            docker cp "${CFG_JOB}/." "${cid}:/data/"
+            docker rm "$cid" >/dev/null
+          fi
+
+          # 3) Operator up uses current env (host paths) for compose + smoke + provision.
+          # write-config may rewrite config on host path — ensure dir is writable.
+          # If host path is a volume mountpoint owned by root, write-config --force
+          # from the job may fail; prefer compose-only after the docker cp sync.
+          if [ -w "$COWORLD_CONFIG_DIR" ] || [ "$CFG_JOB" = "$COWORLD_CONFIG_DIR" ]; then
+            uv run python server/scripts/docker_vmangos_server.py up \
+              --http-host "$HOST_IP" \
+              --realmd-host "$HOST_IP" \
+              --world-host "$HOST_IP" \
+              --timeout-seconds 180 \
+              --smoke
+          else
+            echo "[e2e] host config not writable from job — compose up directly"
+            docker compose -f infra/compose.vmangos.yml --profile coworld up -d coworld-game
+            # Wait + provision manually
+            deadline=$((SECONDS + 180))
+            while [ $SECONDS -lt $deadline ]; do
+              code="$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 2 "http://${HOST_IP}:${COGAME_HOST_PORT}/healthz" || true)"
+              if [ "$code" = "200" ]; then break; fi
+              sleep 3
+            done
+            cid="$(docker compose -f infra/compose.vmangos.yml --profile coworld ps -q coworld-game)"
+            uv run python server/scripts/provision_local_backend.py \
+              --stack a --container "$cid" \
+              --db-user mangos --db-password mangos --seed-gm-account
+          fi
+          echo "[e2e] realm up + provisioned"
+
+      - name: Wait for healthz
+        run: |
+          set -euo pipefail
+          HOST_IP="${{ steps.data.outputs.host_ip }}"
+          URL="http://${HOST_IP}:${COGAME_HOST_PORT}/healthz"
+          echo "[e2e] waiting for $URL"
+          deadline=$((SECONDS + 180))
+          while [ $SECONDS -lt $deadline ]; do
+            code="$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 2 "$URL" || true)"
+            if [ "$code" = "200" ]; then
+              echo "[e2e] healthz 200"
+              exit 0
+            fi
+            echo "[e2e] healthz code=$code — retry"
+            sleep 3
+          done
+          echo "error: healthz not ready" >&2
+          exit 1
+
+      - name: Ensure bot account + patch realmlist for host ports
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.local/bin:$PATH"
+          UPSTREAM="${{ steps.data.outputs.upstream }}"
+          HOST_IP="${{ steps.data.outputs.host_ip }}"
+          export COMPOSE_PROJECT_NAME
+          export VANILLA_WOW_EXTRACTED_DATA_DIR="${{ steps.data.outputs.extracted }}"
+          export VMANGOS_MYSQL_DUMPS_DIR="${{ steps.data.outputs.dumps }}"
+          export COWORLD_CONFIG_DIR="${{ steps.data.outputs.config }}"
+          export COWORLD_RUN_DIR="${{ steps.data.outputs.run }}"
+          export VMANGOS_CAPTURES_DIR="${{ steps.data.outputs.captures }}"
+          export COGAME_HOST_PORT VMANGOS_REALMD_HOST_PORT VMANGOS_WORLD_HOST_PORT VMANGOS_DB_HOST_PORT
+          cd "$UPSTREAM"
+          cid="$(docker compose -f infra/compose.vmangos.yml --profile coworld ps -q coworld-game)"
+          if [ -z "$cid" ]; then
+            echo "error: coworld-game not running" >&2
+            exit 1
+          fi
+          # Idempotent; operator provision already seeds bot1 — this matches
+          # make account pattern against the CI container.
+          uv run python server/scripts/manage_coworld_accounts.py \
+            --entrant "bot1:bot1:bot1" \
+            --mysql-container "$cid" \
+            --host 127.0.0.1 \
+            --port 3306 \
+            --db-user mangos \
+            --db-password mangos \
+            --apply
+          echo "[e2e] account bot1 ready"
+          # Bootstrap realmlist defaults to 127.0.0.1:8085. Host publish uses
+          # remapped ports (e.g. 18085→8085). Headless client runs in the job
+          # (bridge network) and must be told the host gateway + host world port.
+          docker exec "$cid" mariadb -umangos -pmangos logon -e \
+            "UPDATE realmlist SET address='${HOST_IP}', localAddress='${HOST_IP}', port=${VMANGOS_WORLD_HOST_PORT} WHERE id=1;"
+          echo "[e2e] realmlist → ${HOST_IP}:${VMANGOS_WORLD_HOST_PORT}"
+
+      - name: Start headless reference player
+        run: |
+          set -euo pipefail
+          HOST_IP="${{ steps.data.outputs.host_ip }}"
+          RT="${{ steps.data.outputs.runtime }}"
+          EXTRACTED="${{ steps.data.outputs.extracted }}"
+          BIN="${GITHUB_WORKSPACE}/bin/vanilla-wow-reference-player"
+          LOG="${GITHUB_WORKSPACE}/local_data/ci-reference-player.log"
+          mkdir -p "$RT"
+          # AUTONOMOUS=0 keeps the seat up without navmesh planner exit
+          # (docs/milestone-1-evidence.md). Control socket on CI port.
+          export VANILLA_WOW_EXTRACTED_DATA_DIR="$EXTRACTED"
+          export VANILLA_WOW_PLAYER_REALM_HOST="$HOST_IP"
+          export VANILLA_WOW_PLAYER_REALM_PORT="$VMANGOS_REALMD_HOST_PORT"
+          export VANILLA_WOW_PLAYER_USERNAME=bot1
+          export VANILLA_WOW_PLAYER_PASSWORD=bot1
+          export VANILLA_WOW_PLAYER_CHARACTER_NAME=Botwarrior
+          export WOW_SDK_NIM_RUNTIME_SLOT=0
+          export WOW_SDK_NIM_RUNTIME_DIR="$RT"
+          export WOW_SDK_NIM_CONTROL_HOST=127.0.0.1
+          export WOW_SDK_NIM_CONTROL_PORT
+          export VANILLA_WOW_PLAYER_AUTONOMOUS=0
+          # Optional world-port override if the binary honors it; realmlist
+          # patch above is the authoritative path.
+          export VANILLA_WOW_PLAYER_WORLD_PORT="$VMANGOS_WORLD_HOST_PORT"
+          echo "[e2e] launching reference player → log $LOG"
+          # Job-local binary; control socket listens on job 127.0.0.1 so the
+          # brain step (same job container) can attach without host gateway.
+          nohup "$BIN" --scenario=nim-control >"$LOG" 2>&1 &
+          echo $! > "${GITHUB_WORKSPACE}/local_data/ci-reference-player.pid"
+          # Wait for listen line or control port.
+          deadline=$((SECONDS + 120))
+          while [ $SECONDS -lt $deadline ]; do
+            if grep -Eq "control socket listening|Nim binary control socket" "$LOG" 2>/dev/null; then
+              echo "[e2e] control socket log line seen"
+              break
+            fi
+            if (echo >/dev/tcp/127.0.0.1/"$WOW_SDK_NIM_CONTROL_PORT") >/dev/null 2>&1; then
+              echo "[e2e] control port open"
+              break
+            fi
+            sleep 2
+          done
+          tail -n 40 "$LOG" || true
+          if ! (echo >/dev/tcp/127.0.0.1/"$WOW_SDK_NIM_CONTROL_PORT") >/dev/null 2>&1; then
+            echo "error: control socket not open on 127.0.0.1:$WOW_SDK_NIM_CONTROL_PORT" >&2
+            echo "--- full log ---" >&2
+            cat "$LOG" >&2 || true
+            exit 1
+          fi
+
+      - name: Mechanism e2e (brain + control socket)
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.local/bin:$PATH"
+          UPSTREAM="${{ steps.data.outputs.upstream }}"
+          export WOW_SDK_NIM_CONTROL_HOST=127.0.0.1
+          export WOW_SDK_NIM_CONTROL_PORT
+          cd "$GITHUB_WORKSPACE"
+          echo "[e2e] running mechanism_e2e against 127.0.0.1:$WOW_SDK_NIM_CONTROL_PORT"
+          uv run --project "$UPSTREAM" python -m tests.e2e.mechanism_e2e \
+            --slot 0 \
+            --host 127.0.0.1 \
+            --port "$WOW_SDK_NIM_CONTROL_PORT" \
+            --leader-name Botpriest \
+            --party-members Botpriest,Botwarrior \
+            --move-fallback \
+            --max-seconds 90 \
+            --min-frames 5 \
+            --connect-wait-seconds 60
+          echo "[e2e] mechanism assertions passed"
+
+      - name: Teardown
+        if: always()
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.local/bin:$PATH"
+          echo "[e2e] teardown start"
+          # Stop reference player first (never leave a seat on a shared runner).
+          if [ -f "${GITHUB_WORKSPACE}/local_data/ci-reference-player.pid" ]; then
+            pid="$(cat "${GITHUB_WORKSPACE}/local_data/ci-reference-player.pid" || true)"
+            if [ -n "${pid:-}" ] && kill -0 "$pid" 2>/dev/null; then
+              kill "$pid" || true
+              sleep 1
+              kill -9 "$pid" 2>/dev/null || true
+            fi
+          fi
+          # Operator down — never docker kill.
+          UPSTREAM="${{ steps.pin.outputs.upstream }}"
+          if [ -d "$UPSTREAM" ]; then
+            export VANILLA_WOW_EXTRACTED_DATA_DIR="${{ steps.data.outputs.extracted }}"
+            export VMANGOS_MYSQL_DUMPS_DIR="${{ steps.data.outputs.dumps }}"
+            export COWORLD_CONFIG_DIR="${{ steps.data.outputs.config }}"
+            export COWORLD_RUN_DIR="${{ steps.data.outputs.run }}"
+            export VMANGOS_CAPTURES_DIR="${{ steps.data.outputs.captures }}"
+            export COGAME_HOST_PORT VMANGOS_REALMD_HOST_PORT VMANGOS_WORLD_HOST_PORT VMANGOS_DB_HOST_PORT
+            export COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-wow-e2e-${GITHUB_RUN_ID:-local}}"
+            cd "$UPSTREAM"
+            uv run python server/scripts/docker_vmangos_server.py down || true
+          fi
+          docker logout "${REGISTRY}" 2>/dev/null || true
+          echo "[e2e] teardown done"

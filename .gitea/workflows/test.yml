@@ -1,11 +1,9 @@
 name: Tests
 
-# Unit CI only (2026-07-24). Green checkmark on every push.
-# One cheap leg: lua unit suite via `make test` (lua/tests/test_*.lua).
-# No nim yet (repo has no nim code), no docker, no realm.
-# Integration (recorded-frame fixtures) and e2e (full realm+bot) are
-# designed in docs/testing.md — not wired here. Pattern cribbed from
-# crewrift-prime-bots/.gitea/workflows/test.yml (lua apt install on
+# Unit + integration CI. Unit stays first and cheap (green checkmark on every
+# push). Integration needs the private Monolab/coworld-vanilla-wow mirror at
+# the upstream.lock pin as a sibling path (see docs/testing.md).
+# House style: crewrift-prime-bots/.gitea/workflows/test.yml (apt lua on
 # monolab-builder). Testing doctrine: racha_notes Programming/testing.md.
 
 on:
@@ -23,3 +21,81 @@ jobs:
           apt-get install -y lua5.3
       - name: Unit suite
         run: make test
+
+  # Recorded-frame fixtures through real upstream EnvironmentFrame + pin drift.
+  # No docker, no realm. Needs private mirror checkout + uv + lua5.3.
+  integration-tests:
+    runs-on: monolab-builder
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Checkout upstream mirror at pin
+        env:
+          # CI_DEPLOY_KEY (Monolab org secret): read-only deploy key installed
+          # on Monolab/coworld-vanilla-wow and Monolab/wow-classic-data.
+          # GITHUB_TOKEN is repo-scoped and cannot read other private repos.
+          CI_DEPLOY_KEY: ${{ secrets.CI_DEPLOY_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "$CI_DEPLOY_KEY" ]; then
+            echo "error: org secret CI_DEPLOY_KEY missing (read-only deploy key for the private mirrors)" >&2
+            exit 1
+          fi
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$CI_DEPLOY_KEY" > ~/.ssh/ci_deploy_key
+          chmod 600 ~/.ssh/ci_deploy_key
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/ci_deploy_key -o StrictHostKeyChecking=accept-new"
+          PIN="$(awk '{print $2; exit}' upstream.lock)"
+          if [ -z "$PIN" ]; then
+            echo "error: could not parse SHA from upstream.lock" >&2
+            exit 1
+          fi
+          # Sibling of GITHUB_WORKSPACE so ../coworld-vanilla-wow resolves
+          # for Makefile UPSTREAM and tests/integration/test_pin_drift.py.
+          SIBLING="$(dirname "$GITHUB_WORKSPACE")/coworld-vanilla-wow"
+          MIRROR_URL="ssh://git@10.11.4.11:222/Monolab/coworld-vanilla-wow.git"
+          echo "[integration] cloning mirror → $SIBLING @ $PIN"
+          rm -rf "$SIBLING"
+          mkdir -p "$SIBLING"
+          git -C "$SIBLING" init -q
+          git -C "$SIBLING" remote add origin "$MIRROR_URL"
+          # Fetch the pin SHA (not floating main). Depth-1 is enough for pin-check
+          # + uv project files; blob filter keeps the transfer small.
+          if ! git -C "$SIBLING" fetch --depth 1 --filter=blob:none origin "$PIN"; then
+            echo "[integration] direct pin fetch failed — fetching main then checkout"
+            git -C "$SIBLING" fetch --depth 50 --filter=blob:none origin main
+            git -C "$SIBLING" checkout --force "$PIN"
+          else
+            git -C "$SIBLING" checkout --force FETCH_HEAD
+          fi
+          echo "[integration] mirror HEAD=$(git -C "$SIBLING" rev-parse HEAD)"
+
+      - name: Install lua 5.3 + uv
+        run: |
+          set -euo pipefail
+          apt-get update
+          apt-get install -y lua5.3 curl ca-certificates
+          if ! command -v uv >/dev/null 2>&1; then
+            curl -LsSf https://astral.sh/uv/install.sh | sh
+            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+            export PATH="$HOME/.local/bin:$PATH"
+          fi
+          uv --version
+          lua5.3 -v
+
+      - name: Cache uv
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cache/uv
+            ~/.local/share/uv
+          key: ${{ runner.os }}-uv-integration-${{ hashFiles('upstream.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-uv-integration-
+
+      - name: Integration suite
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.local/bin:$PATH"
+          make pin-check
+          make integration-test

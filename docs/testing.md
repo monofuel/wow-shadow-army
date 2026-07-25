@@ -9,8 +9,8 @@ shaped assertions). This file maps that doctrine onto **this** repo.
 | Tier | Make target | Required? | What it is here |
 |---|---|---|---|
 | **Unit** | `make test` | **YES — every push** | Lua tool library under `lua/tests/test_*.lua` + stdlib Python under `brain/tests/`. Instant: no network, no docker, no sleeps, no realm. |
-| **Integration** | `make integration-test` | optional; **local only** (not CI) | Recorded-frame fixtures (`tests/fixtures/frames/wire_*.bin`) decoded through the **real** upstream `EnvironmentFrame` client, projected, run through real Lua tools, intent-mapped. Also pin-drift vs `upstream.lock`. No live services, no realm, no docker. |
-| **e2e** | `make e2e-test` (planned) | optional; **not wired yet** | Full stack: VMaNGOS realm + headless reference player + brain/Lua seat. Nightly cron + manual dispatch only (see e2e plan). |
+| **Integration** | `make integration-test` | **YES — every push** (separate job; unit stays independent) | Recorded-frame fixtures (`tests/fixtures/frames/wire_*.bin`) decoded through the **real** upstream `EnvironmentFrame` client, projected, run through real Lua tools, intent-mapped. Also pin-drift vs `upstream.lock`. No live services, no realm, no docker. |
+| **e2e** | `tests/e2e/mechanism_e2e.py` | optional; **nightly + dispatch only** | Full stack: VMaNGOS realm + headless reference player + brain mechanism assertions. Never on push (see e2e plan + `.gitea/workflows/e2e.yml`). |
 
 Rules that stay fixed:
 
@@ -22,7 +22,7 @@ Rules that stay fixed:
 
 ## Unit CI (wired)
 
-`.gitea/workflows/test.yml` on `monolab-builder`:
+`.gitea/workflows/test.yml` job `lua-tests` on `monolab-builder`:
 
 1. checkout
 2. `apt-get install -y lua5.3` (same apt pattern as crewrift-prime-bots;
@@ -31,12 +31,34 @@ Rules that stay fixed:
 
 No docker, no nix, no nim. Current tools have zero Lua module deps
 (no cjson/socket yet); add packages to the install step only when a unit
-test actually needs them.
+test actually needs them. Unit job stays independent of integration so a
+mirror/token problem cannot hide a unit failure behind a single job.
 
-**Integration is deliberately not in CI** (see § Integration CI prerequisites
-below). Push checkmark stays unit-only.
+## Integration tier (IMPLEMENTED — local + CI)
 
-## Integration tier (IMPLEMENTED — local)
+### CI job (`integration-tests` in `test.yml`)
+
+Runs on every push / workflow_dispatch **in parallel with** `lua-tests`
+(unit stays first in the file and does not depend on integration):
+
+1. checkout this repo
+2. HTTPS clone private mirror `Monolab/coworld-vanilla-wow` into
+   `$(dirname $GITHUB_WORKSPACE)/coworld-vanilla-wow` (sibling so
+   `../coworld-vanilla-wow` resolves), then `git checkout` the SHA from
+   `upstream.lock`
+3. install `lua5.3` + `uv` (curl installer if missing)
+4. cache `~/.cache/uv` keyed on `upstream.lock`
+5. `make pin-check && make integration-test`
+
+**Cross-repo auth:** `GITHUB_TOKEN` is repo-scoped and cannot read other
+private Monolab repos. Jobs use the **`CI_DEPLOY_KEY` Monolab org secret**
+(created 2026-07-24): a read-only ssh deploy key installed on
+`Monolab/coworld-vanilla-wow` and `Monolab/wow-classic-data`. Clones go
+over `ssh://git@10.11.4.11:222/...` with `GIT_SSH_COMMAND` pointing at the
+key. Registry login tries the built-in actions token first, `GIT_PAT`
+fallback.
+
+## Integration tier (local)
 
 ### How to run
 
@@ -92,25 +114,13 @@ re-decode sketch and how wire probes were taken during milestone 1.
 After an intentional upstream pin bump: update `upstream.lock`, re-capture
 if the frame schema changed, then `make integration-test`.
 
-### Integration CI prerequisites (not wired)
+### Integration CI prerequisites (satisfied)
 
-The Gitea runner clones **only this repo**. Integration needs:
-
-1. **Private upstream on the runner.** Mirror `coworld-vanilla-wow` to Gitea
-   the same way `Monolab/wow-classic-data` is mirrored (private org repo +
-   token-readable clone). Public GitHub Metta-AI checkout is not available
-   to the job without secrets and still must land at the **pin**, not tip.
-2. **Checkout step** at the SHA in `upstream.lock` (sibling path or
-   `WOW_SHADOW_UPSTREAM`), not a floating branch.
-3. **`uv` + upstream project install** so `uv run --project <upstream>` can
-   import pydantic/msgpack for `EnvironmentFrame`.
-4. **`lua5.3`** (already installed for unit CI).
-
-Until (1)–(3) exist, keep integration **local-only**. Do not add an
-integration job to `.gitea/workflows/test.yml` — a red job that cannot
-fetch private upstream would block the unit checkmark. When ready, prefer
-a **separate** workflow (e.g. `integration.yml`) with `workflow_dispatch` /
-optional schedule so unit CI stays green without upstream.
+1. Private mirror `Monolab/coworld-vanilla-wow` on gitea (branch main, pin
+   in `upstream.lock`).
+2. Checkout at pin as sibling path (workflow step above).
+3. `uv` + upstream project install on the runner.
+4. `lua5.3` on the runner.
 
 ## Copyright / data boundary
 
@@ -132,10 +142,11 @@ tier and every artifact we ever publish:
   auth-gated) still must not bake the data in — the layer history is a
   durable leak surface and bloats every pull.
 
-## e2e plan (design only — not implemented)
+## e2e plan (wired — `.gitea/workflows/e2e.yml`)
 
 Cost-gated per doctrine: full realm + bot is heavy. Run **nightly +
-manual**, never on every push.
+manual**, never on every push. Workflow file: `.gitea/workflows/e2e.yml`.
+Harness: `tests/e2e/mechanism_e2e.py`.
 
 ### (a) Runner docker availability — finding
 
@@ -217,11 +228,17 @@ all runners with zero per-host state.
   run: |
     [ -d local_data/wow-classic-data/.git ] || \
       git clone --depth 1 \
-        ssh://git@10.11.4.11:222/Monolab/wow-classic-data.git \
+        "https://oauth2:${TOKEN}@gitea.solution-nine.monofuel.dev/Monolab/wow-classic-data.git" \
         local_data/wow-classic-data
-# compose bind-/volume-mounts these paths read-only where
-# VANILLA_WOW_EXTRACTED_DATA_DIR / VMANGOS_MYSQL_DUMPS_DIR expect them
+# TOKEN = secrets.MIRROR_TOKEN or secrets.GIT_PAT
+# Operator paths:
+#   VANILLA_WOW_EXTRACTED_DATA_DIR = <data>/Coworld-WoW-Classic/vmangos-5875-data
+#   VMANGOS_MYSQL_DUMPS_DIR        = <data>/vmangos-db/mysql-dump
 ```
+
+**Why HTTPS+token instead of the ssh://10.11.4.11:222 form:** job containers
+do not carry monofuel deploy keys; house `GIT_PAT` / `MIRROR_TOKEN` already
+authenticate to gitea HTTPS. Same private data, no per-host SSH state.
 
 Notes:
 
@@ -246,44 +263,51 @@ Unit workflow stays on `push` + `workflow_dispatch`. E2e is a **separate**
 workflow file when implemented (e.g. `.gitea/workflows/e2e.yml`) so a
 red nightly cannot block the unit checkmark.
 
-### (e) Mechanism-shaped e2e assertions
+### (e) Mechanism-shaped e2e assertions (implemented)
 
-Not "reach level 2 in 90s" or hard-coded map coords. Prefer:
+`tests/e2e/mechanism_e2e.py` (not position / XP):
 
-1. **Realm up:** `healthz` (or compose health) becomes ready within timeout.
-2. **Seat attaches:** headless reference player + control socket accept a
-   connection (`wow-sdk control doctor --backend nim` or equivalent at pin).
-3. **Frame contract:** at least one environment frame projects into the
-   plain-table shape Lua tools consume (`self_unit` present).
-4. **Tool mechanism under live frames:** with a known party leader unit
-   visible outside near radius, `follow_leader.decide` returns
-   `kind == "move_to_unit"` and the live `unit_id` — not a scripted
-   coordinate. Leader missing/not visible → `hold` /
-   `leader_not_visible` (same contracts as unit tests).
-5. **Fair play:** no out-of-band seat recognition; party membership comes
-   only from game observations.
+1. **Realm up:** operator `up --smoke` + curl healthz 200 on CI ports.
+2. **Control socket:** TCP accept on `WOW_SDK_NIM_CONTROL_PORT` (CI default
+   `14114`).
+3. **StatusRequest** answers.
+4. **GoalRequest(leveling, selection_mode=external)** accepted (revision
+   bump observed).
+5. **≥5 EnvironmentFrames** received.
+6. **≥1 ActionSelectionRequest** settlement (any `success` value —
+   `movement_blocked` without navmesh is OK; **do not** assert position
+   change). See `docs/milestone-1-evidence.md`.
 
-Timeouts and readiness polls live only in e2e; unit tier remains sleep-
-free.
+Headless seat path (chosen after inspecting the registry image):
+`coworld-reference-player-runtime:<pin>` is a **scratch artifact** with only
+`/vanilla-wow-reference-player`. CI does `docker create` + `docker cp` into
+`bin/`, then runs the binary in the job with `AUTONOMOUS=0` (cheaper and more
+reliable than rebuilding via nimby; never plain `nimby sync` workspace mode).
 
-### (f) Concrete next steps (implementation order)
+CI ports (env overrides on operator): `13724` / `18085` / `18080` / `13307`
+so a runner never collides with a human local realm. Compose project
+`wow-e2e-$RUN_ID`. Registry login: `docker/login-action` + `secrets.GIT_PAT`
+(house style). Teardown: operator `down` + docker logout (`if: always()`).
 
-1. **Keep unit CI green** (this workflow). Add Lua packages only when deps appear.
-2. **Fixtures + integration** — done locally (`make integration-test`). CI
-   still blocked on private upstream mirror (see § Integration CI prerequisites).
-3. **Data pin file** (e.g. `data.lock` next to `upstream.lock`) recording
-   `Monolab/wow-classic-data` commit SHA for reproducible e2e.
-4. **One-shot seed script** for the named volume (runnable on the runner
-   host or as a `workflow_dispatch` "seed-only" job).
-5. **Image build workflow** for `coworld-vmangos` at `upstream.lock` pin →
-   push to `gitea.solution-nine.monofuel.dev/monolab/wow-shadow-army/...`
-   with a strict `.dockerignore` excluding all Blizzard-derived trees.
-6. **`.gitea/workflows/e2e.yml`:** nightly + dispatch; pull images; mount
-   volume; compose up; run mechanism assertions; always compose down
-   (no volume wipe).
-7. **First green nightly** against follow_leader + monofuel (or Bot*) as
-   leader; expand coverage only after that is boringly stable.
+**Host networking gotchas (job is bridge, dockerd is host sock):**
 
-Until steps 3–6 exist, e2e stays local: `make start-server` + manual seat
-bring-up per `docs/control-plane.md` and coworld-playbook
-`games/vanilla-wow.md`.
+- Compose bind-mount sources must be **host** paths. Workflow resolves
+  `GITHUB_WORKSPACE` → host path via `docker inspect` on the job container;
+  falls back to named-volume + `docker cp` materialization.
+- Operator smoke / healthz / realmd use the job's default-route gateway IP
+  (usually the docker bridge gateway), not bare `127.0.0.1`.
+- After bootstrap, `realmlist` is patched to
+  `address=<host_gateway>, port=<VMANGOS_WORLD_HOST_PORT>` so the headless
+  client (also in the job) can reach the remapped world port.
+
+Timeouts and readiness polls live only in e2e; unit tier remains sleep-free.
+
+### (f) Remaining / follow-ups
+
+1. **First green nightly** on a real runner (secrets + 8GB data cache +
+   host-gateway reachability for published ports from the job bridge network).
+2. Optional `data.lock` SHA for wow-classic-data if the snapshot ever moves.
+3. Expand e2e to party/follow once navmesh + mutual visibility are available;
+   keep mechanism shape, not "reach level 2".
+4. Local still works: `make start-server` + manual seat per
+   `docs/control-plane.md` / coworld-playbook `games/vanilla-wow.md`.
