@@ -67,6 +67,24 @@ else
   printf 'SET gxApi "opengl"\nSET gxWindow "1"\n' > "$CONFIG"
 fi
 
+# Sound: force fmod (the client's bundled FMOD 3.x) onto the WINMM/waveOut
+# path instead of DirectSound. Wine's dsound mixing is a known-open bug
+# (winehq #9358) and the era-canonical vanilla-on-wine fix is
+# SoundOutputSystem "1" (FSOUND enum: 0=nosound 1=winmm 2=dsound).
+# Deployed 2026-07-25 for a reproducible crash on quest turn-in, right as
+# the iQuestComplete fanfare spins up a fresh one-shot stream. Values are
+# asserted (sed) rather than appended-once because the client rewrites
+# Config.wtf on exit and could persist a dsound value back.
+set_cvar() {
+  if grep -q "^SET $1 " "$CONFIG"; then
+    sed -i "s/^SET $1 .*/SET $1 \"$2\"/" "$CONFIG"
+  else
+    printf 'SET %s "%s"\n' "$1" "$2" >> "$CONFIG"
+  fi
+}
+set_cvar SoundOutputSystem 1
+set_cvar SoundBufferSize 100
+
 # --- wine prefix (idempotent) ----------------------------------------------
 if [ ! -d "$WINEPREFIX" ]; then
   echo "[play-classic] initializing wine prefix (first run only, ~1min)"
