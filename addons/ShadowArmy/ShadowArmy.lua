@@ -8,7 +8,7 @@ ShadowArmy = ShadowArmy or {}
 
 -- Bump on every edit. The System watches Chat.log for "<SA> loaded rev=..."
 -- after sending a reload — a new rev proves the edit actually loaded.
-local REV = "r9"
+local REV = "r10"
 
 local function say(msg)
   DEFAULT_CHAT_FRAME:AddMessage("|cFF9482C9[ShadowArmy]|r " .. tostring(msg))
@@ -140,6 +140,7 @@ local auto = {
   failUntil = 0,     -- backoff after SPELLCAST_FAILED (no machine-gun retry)
   shooting = false,  -- wand auto-repeat active (don't re-toggle it off!)
   melee = false,     -- auto-attack swing loop active
+  lastMeleeAt = 0,   -- AttackTarget re-fire guard (2nd call toggles OFF)
   known = {},        -- lowercase spell name -> true
 }
 
@@ -231,8 +232,11 @@ local function rotationStep()
     castNow("Corruption") -- instant: fine while moving
     return
   end
+  -- Mana reserve raised 30→45 (live traces: floor 30 drained to 10% and
+  -- left a wandless melee warlock — misery). The imp's autocast Firebolt
+  -- keeps dealing damage while we sit on the reserve; Corruption ticks too.
   if inCastRange and not move.moving
-      and auto.known["shadow bolt"] and manaPct > 30 then
+      and auto.known["shadow bolt"] and manaPct > 45 then
     castNow("Shadow Bolt")
     return
   end
@@ -245,8 +249,14 @@ local function rotationStep()
     CastSpellByName("Shoot")
     return
   end
-  if not auto.melee and CheckInteractDistance("target", 3) then
-    dtrace("melee AttackTarget")
+  -- Melee is a LAST resort for a warlock (the imp + DoTs are the plan):
+  -- only when the mob is already in our face. 3s re-fire guard — the live
+  -- traces showed back-to-back AttackTarget calls, and the second one
+  -- TOGGLES auto-attack off (that was the melee stutter).
+  if not auto.melee and CheckInteractDistance("target", 3)
+      and GetTime() - auto.lastMeleeAt > 3 then
+    auto.lastMeleeAt = GetTime()
+    dtrace("melee AttackTarget (last resort)")
     AttackTarget()
     return
   end
