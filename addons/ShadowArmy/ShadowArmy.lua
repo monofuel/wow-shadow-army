@@ -8,7 +8,7 @@ ShadowArmy = ShadowArmy or {}
 
 -- Bump on every edit. The System watches Chat.log for "<SA> loaded rev=..."
 -- after sending a reload — a new rev proves the edit actually loaded.
-local REV = "r16"
+local REV = "r17"
 
 -- Log window (r16): every say()/emit() line also lands here with a
 -- timestamp, so errors survive chat scroll-off and can be reviewed in-game.
@@ -140,7 +140,7 @@ end
 
 local panel = CreateFrame("Frame", "ShadowArmyPanel", UIParent)
 panel:SetWidth(210)
-panel:SetHeight(160)
+panel:SetHeight(184) -- +24: second button row (Log)
 panel:SetPoint("RIGHT", UIParent, "RIGHT", -40, 60)
 panel:SetBackdrop({
   bgFile = "Interface\\Tooltips\\UI-Tooltip-Background",
@@ -348,7 +348,7 @@ end
 local autoBtn = CreateFrame("Button", "ShadowArmyAutoBtn", panel, "UIPanelButtonTemplate")
 autoBtn:SetWidth(118)
 autoBtn:SetHeight(20)
-autoBtn:SetPoint("BOTTOMLEFT", panel, "BOTTOMLEFT", 8, 8)
+autoBtn:SetPoint("BOTTOMLEFT", panel, "BOTTOMLEFT", 8, 32) -- upper button row
 autoBtn:SetText("|cFF999999Auto Combat|r")
 autoBtn:SetScript("OnClick", function()
   setAuto(not auto.enabled)
@@ -369,7 +369,7 @@ end)
 local reloadBtn = CreateFrame("Button", "ShadowArmyReloadBtn", panel, "UIPanelButtonTemplate")
 reloadBtn:SetWidth(68) -- 118 + 8 gap + 68 = 194 = panel width minus insets
 reloadBtn:SetHeight(20)
-reloadBtn:SetPoint("BOTTOMRIGHT", panel, "BOTTOMRIGHT", -8, 8)
+reloadBtn:SetPoint("BOTTOMRIGHT", panel, "BOTTOMRIGHT", -8, 32) -- upper row, beside Auto Combat
 reloadBtn:SetText("|cFF44FF44Reload!|r")
 reloadBtn:Hide()
 reloadBtn:SetScript("OnClick", function()
@@ -473,11 +473,38 @@ local LOG_COLORS = {
   loaded = { 0.35, 1.0, 0.35 },
 }
 
+local logErrCount = 0 -- unseen errors since the window was last opened
+
 addLog = function(kind, text)
   local c = LOG_COLORS[kind] or { 0.8, 0.8, 0.8 }
   local tag = (kind == "say") and "" or ("[" .. kind .. "] ")
   logMsg:AddMessage(date("%H:%M:%S ") .. tag .. text, c[1], c[2], c[3])
+  if kind == "err" and not logFrame:IsVisible() then
+    logErrCount = logErrCount + 1
+    if ShadowArmyLogBtn then
+      -- badge the panel button so a silent error can't go unnoticed
+      ShadowArmyLogBtn:SetText(string.format("|cFFFF4444Log (%d)|r", logErrCount))
+    end
+  end
 end
+
+-- Panel button (r17): the log is a window, so it gets a button — /sa log
+-- stays as a fallback. Lives on its own row under Auto Combat / Reload.
+local logBtn = CreateFrame("Button", "ShadowArmyLogBtn", panel, "UIPanelButtonTemplate")
+logBtn:SetWidth(194) -- full inner width of the panel
+logBtn:SetHeight(20)
+logBtn:SetPoint("BOTTOM", panel, "BOTTOM", 0, 8)
+logBtn:SetText("Log")
+logBtn:SetScript("OnClick", function()
+  if logFrame:IsVisible() then
+    logFrame:Hide()
+  else
+    logFrame:Show()
+    logMsg:ScrollToBottom()
+    logErrCount = 0
+    logBtn:SetText("Log")
+  end
+end)
 
 --------------------------------------------------------------------------
 -- Live refresh: event-driven where possible, plus a 0.5s tick for the
