@@ -8,7 +8,7 @@ ShadowArmy = ShadowArmy or {}
 
 -- Bump on every edit. The System watches Chat.log for "<SA> loaded rev=..."
 -- after sending a reload — a new rev proves the edit actually loaded.
-local REV = "r7"
+local REV = "r8"
 
 local function say(msg)
   DEFAULT_CHAT_FRAME:AddMessage("|cFF9482C9[ShadowArmy]|r " .. tostring(msg))
@@ -135,11 +135,33 @@ local line5 = makeLine(line4, -6) -- buff watch / warnings
 local auto = {
   enabled = false,
   casting = false,   -- SPELLCAST_START..STOP window (cast-time spells)
+  castingSince = 0,  -- stuck-flag safety: clear if STOP never arrives
   gcdUntil = 0,      -- our own 1.6s guard after any cast request
+  failUntil = 0,     -- backoff after SPELLCAST_FAILED (no machine-gun retry)
   shooting = false,  -- wand auto-repeat active (don't re-toggle it off!)
   melee = false,     -- auto-attack swing loop active
   known = {},        -- lowercase spell name -> true
 }
+
+-- Movement detection (r8): Shadow Bolt while moving fails with "Can't do
+-- that while moving" and the rotation would retry forever instead of
+-- falling back to the wand ("breaks down if I'm moving" — monofuel, live).
+-- 1.12 exposes no IsMoving(); poll GetPlayerMapPosition deltas instead.
+local move = { x = 0, y = 0, at = 0, moving = false }
+local function updateMoving()
+  local x, y = GetPlayerMapPosition("player")
+  if x and (x ~= 0 or y ~= 0) then
+    if x ~= move.x or y ~= move.y then
+      move.moving = true
+      move.at = GetTime()
+    elseif GetTime() - move.at > 0.3 then
+      move.moving = false -- standing still for a beat
+    end
+    move.x, move.y = x, y
+  else
+    move.moving = false -- no map position (instance): assume stationary
+  end
+end
 
 local function scanSpellbook()
   auto.known = {}
@@ -175,8 +197,17 @@ local function rotationStep()
   if not auto.enabled then return end
   if not UnitExists("target") then return end
   if UnitIsDeadOrGhost("target") or not UnitCanAttack("player", "target") then return end
+  -- stuck-casting safety: a missed SPELLCAST_STOP would freeze the whole
+  -- rotation ("doesn't work" with no error). No 1.12 cast lasts 4s at our
+  -- level; clear and move on.
+  if auto.casting and GetTime() - auto.castingSince > 4 then
+    auto.casting = false
+    dtrace("casting flag stuck >4s — cleared")
+  end
   if auto.casting or GetTime() < auto.gcdUntil then return end
+  if GetTime() < auto.failUntil then return end
 
+  updateMoving()
   local manaPct = 0
   if UnitManaMax("player") > 0 then
     manaPct = UnitMana("player") / UnitManaMax("player") * 100
@@ -184,18 +215,24 @@ local function rotationStep()
   local inCastRange = CheckInteractDistance("target", 4)  -- ~28yd
 
   -- Priority: DoT up -> nuke while mana holds -> wand -> melee.
+  -- While MOVING only instants + wand are legal: Shadow Bolt would fail
+  -- "Can't do that while moving"; wand auto-repeat keeps firing on the run.
   if inCastRange and auto.known["corruption"] and manaPct > 25
       and not targetHasDebuff(CORRUPTION_TEX) then
-    castNow("Corruption")
+    castNow("Corruption") -- instant: fine while moving
     return
   end
-  if inCastRange and auto.known["shadow bolt"] and manaPct > 30 then
+  if inCastRange and not move.moving
+      and auto.known["shadow bolt"] and manaPct > 30 then
     castNow("Shadow Bolt")
     return
   end
-  if inCastRange and auto.known["shoot"] and not auto.shooting then
+  -- "Shoot" sits in the spellbook even with no wand equipped (live find);
+  -- gate on the ranged slot (18) actually holding something.
+  if inCastRange and auto.known["shoot"] and not auto.shooting
+      and GetInventoryItemLink("player", 18) then
     -- wand toggle: casting Shoot while already repeating would turn it OFF
-    dtrace("cast Shoot")
+    dtrace("cast Shoot" .. (move.moving and " (moving)" or ""))
     CastSpellByName("Shoot")
     return
   end
@@ -207,10 +244,10 @@ local function rotationStep()
   -- Nothing fired: say why, once per situation (dedupe handles repeats).
   local known = 0
   for _ in pairs(auto.known) do known = known + 1 end
-  dtrace(string.format("idle: known=%d mana=%d%% range28=%s range10=%s shooting=%s melee=%s",
+  dtrace(string.format("idle: known=%d mana=%d%% range28=%s range10=%s moving=%s shooting=%s melee=%s",
     known, manaPct, tostring(inCastRange),
     tostring(CheckInteractDistance("target", 3) and true or false),
-    tostring(auto.shooting), tostring(auto.melee)))
+    tostring(move.moving), tostring(auto.shooting), tostring(auto.melee)))
 end
 
 local function setAuto(on)
@@ -451,9 +488,15 @@ frame:SetScript("OnEvent", function()
     scanSpellbook()
   elseif event == "SPELLCAST_START" then
     auto.casting = true
-  elseif event == "SPELLCAST_STOP" or event == "SPELLCAST_FAILED"
-      or event == "SPELLCAST_INTERRUPTED" then
+    auto.castingSince = GetTime()
+  elseif event == "SPELLCAST_STOP" then
     auto.casting = false
+  elseif event == "SPELLCAST_FAILED" or event == "SPELLCAST_INTERRUPTED" then
+    auto.casting = false
+    -- brief backoff so a failing cast (moving/silenced/oom) can't retry
+    -- every frame and starve the wand fallback
+    auto.failUntil = GetTime() + 0.5
+    dtrace("cast failed/interrupted — 0.5s backoff")
   elseif event == "START_AUTOREPEAT_SPELL" then
     auto.shooting = true
   elseif event == "STOP_AUTOREPEAT_SPELL" then
