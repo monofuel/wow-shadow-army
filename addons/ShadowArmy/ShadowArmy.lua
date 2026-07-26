@@ -8,7 +8,7 @@ ShadowArmy = ShadowArmy or {}
 
 -- Bump on every edit. The System watches Chat.log for "<SA> loaded rev=..."
 -- after sending a reload — a new rev proves the edit actually loaded.
-local REV = "r13"
+local REV = "r14"
 
 local function say(msg)
   DEFAULT_CHAT_FRAME:AddMessage("|cFF9482C9[ShadowArmy]|r " .. tostring(msg))
@@ -367,6 +367,42 @@ reloadBtn:Hide()
 reloadBtn:SetScript("OnClick", function()
   ReloadUI()
 end)
+
+-- One-click loot vacuum (r14): 'loot gated' proved LootSlot is a no-op
+-- outside hardware-event context on this client (while sort's
+-- PickupContainerItem works from OnUpdate — the gate is per-function).
+-- So ride the player's first click on ANY loot item: from inside that
+-- click's context, loot every other slot too. One click per corpse.
+if LootButton_OnClick then
+  local origLootButtonClick = LootButton_OnClick
+  LootButton_OnClick = function(button)
+    local clicked = this and this:GetID() or 0
+    local i = GetNumLootItems()
+    while i >= 1 do
+      if i ~= clicked then
+        LootSlot(i)
+        pcall(ConfirmLootSlot, i)
+      end
+      i = i - 1
+    end
+    origLootButtonClick(button)
+  end
+end
+
+-- Auto-reload (r14): when a reload is pending, piggyback the player's own
+-- next action-bar press — that keypress IS a hardware event, so ReloadUI is
+-- legal inside the hook. Out-of-combat only (a surprise 2s UI freeze
+-- mid-fight could kill the character). The button stays as the visible
+-- fallback; whichever fires first wins.
+local reloadArmed = false
+local origUseAction = UseAction
+UseAction = function(slot, checkCursor, onSelf)
+  if reloadArmed and not UnitAffectingCombat("player") then
+    reloadArmed = false
+    ReloadUI() -- if somehow still gated, fall through and act normally
+  end
+  origUseAction(slot, checkCursor, onSelf)
+end
 
 --------------------------------------------------------------------------
 -- Live refresh: event-driven where possible, plus a 0.5s tick for the
@@ -1351,9 +1387,10 @@ driver:SetScript("OnUpdate", function()
       if not ok then emit("err", "ConsoleExec: " .. tostring(err)) end
     elseif pendingReload == 0 then
       emit("reload-click",
-        "#" .. reloadSeq .. " auto paths no-op; showing panel reload button")
+        "#" .. reloadSeq .. " auto paths no-op; button lit + next-press armed")
       panel:Show() -- the button lives in the panel; unhide if /sa'd away
       reloadBtn:Show()
+      reloadArmed = true -- next out-of-combat action press applies it
     end
     return
   end
@@ -1436,7 +1473,11 @@ frame:SetScript("OnEvent", function()
     grind.startXP = UnitXP("player")
     scanSpellbook()
     -- QoL defaults the advisor asserts on every login:
-    instantQuestText() -- no slow quest-text crawl (no CVar for this in 1.12)
+    -- instantQuestText() DISABLED (r14): prime remaining suspect for the
+    -- reproducible crash+lockup on Complete Quest (it nils the quest
+    -- panels' OnUpdate — exactly the surface involved in that click). The
+    -- fanfare mute didn't take (music still played), so this is the next
+    -- single-variable test. Re-enable only after turn-ins are proven safe.
     say("ARISE. Advisor online for " .. UnitName("player") .. " — /sa to toggle panel")
     emit("loaded", "rev=" .. REV)
   elseif event == "LEARNED_SPELL_IN_TAB" then
