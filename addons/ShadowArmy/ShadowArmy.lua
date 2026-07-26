@@ -8,7 +8,7 @@ ShadowArmy = ShadowArmy or {}
 
 -- Bump on every edit. The System watches Chat.log for "<SA> loaded rev=..."
 -- after sending a reload — a new rev proves the edit actually loaded.
-local REV = "r14"
+local REV = "r15"
 
 local function say(msg)
   DEFAULT_CHAT_FRAME:AddMessage("|cFF9482C9[ShadowArmy]|r " .. tostring(msg))
@@ -671,6 +671,26 @@ local bagsCount = bagsFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmal
 bagsCount:SetPoint("TOPRIGHT", bagsFrame, "TOPRIGHT", -36, -11) -- clear of the close button
 bagsCount:SetText("")
 
+-- Money footer (r15): currencies live with the bags, like every bag addon
+-- since the dawn of OneBag. Vanilla has exactly one currency — coin.
+local bagsMoney = bagsFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+bagsMoney:SetPoint("BOTTOMRIGHT", bagsFrame, "BOTTOMRIGHT", -10, 8)
+bagsMoney:SetJustifyH("RIGHT")
+bagsMoney:SetText("")
+
+local function moneyString()
+  local c = GetMoney() or 0
+  local gold = math.floor(c / 10000)
+  local silver = math.floor(math.mod(c, 10000) / 100)
+  local copper = math.mod(c, 100)
+  if gold > 0 then
+    return string.format("|cFFFFD700%dg|r |cFFC7C7CF%ds|r |cFFEDA55F%dc|r", gold, silver, copper)
+  elseif silver > 0 then
+    return string.format("|cFFC7C7CF%ds|r |cFFEDA55F%dc|r", silver, copper)
+  end
+  return string.format("|cFFEDA55F%dc|r", copper)
+end
+
 local bagsClose = CreateFrame("Button", nil, bagsFrame, "UIPanelCloseButton")
 bagsClose:SetPoint("TOPRIGHT", bagsFrame, "TOPRIGHT", -2, -2)
 -- The template's own OnClick calls HideParentFrame(); be explicit instead so
@@ -801,8 +821,10 @@ function bagsUpdate()
   end
   local rows = math.ceil(index / BAG_COLS)
   if rows < 1 then rows = 1 end
-  bagsFrame:SetHeight(BAG_HEADER + rows * (BAG_BTN_SIZE + BAG_BTN_PAD) + BAG_MARGIN - BAG_BTN_PAD)
+  -- +16: money footer row under the grid
+  bagsFrame:SetHeight(BAG_HEADER + rows * (BAG_BTN_SIZE + BAG_BTN_PAD) + BAG_MARGIN - BAG_BTN_PAD + 16)
   bagsCount:SetText(string.format("|cFFCCCCCC%d/%d used|r", used, index))
+  bagsMoney:SetText(moneyString())
 end
 
 local function bagsShow()
@@ -1191,6 +1213,7 @@ end)
 -- Contents change while the window is closed too — track dirt, refresh live.
 local bagsEvents = CreateFrame("Frame", "ShadowBagsEventFrame", UIParent)
 bagsEvents:RegisterEvent("BAG_UPDATE")
+bagsEvents:RegisterEvent("PLAYER_MONEY") -- money footer refresh
 bagsEvents:RegisterEvent("ITEM_LOCK_CHANGED")
 bagsEvents:RegisterEvent("BAG_UPDATE_COOLDOWN")
 bagsEvents:RegisterEvent("PLAYER_ENTERING_WORLD")
