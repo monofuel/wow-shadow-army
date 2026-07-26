@@ -8,7 +8,7 @@ ShadowArmy = ShadowArmy or {}
 
 -- Bump on every edit. The System watches Chat.log for "<SA> loaded rev=..."
 -- after sending a reload — a new rev proves the edit actually loaded.
-local REV = "r6"
+local REV = "r7"
 
 local function say(msg)
   DEFAULT_CHAT_FRAME:AddMessage("|cFF9482C9[ShadowArmy]|r " .. tostring(msg))
@@ -26,6 +26,17 @@ local function emit(kind, text)
   lastEmitMsg = msg
   lastEmitTime = now
   SendChatMessage(msg, "SAY")
+end
+
+-- Diagnosis mode (r7): auto-combat and auto-loot both silently no-op with
+-- zero err events — same signature as the gated ReloadUI. Trace every
+-- action attempt so the telemetry shows WHERE each path dies. Toggle with
+-- <SYS> debug off when the mystery is solved.
+local debugMode = true
+local function dtrace(text)
+  if debugMode then
+    emit("trace", text)
+  end
 end
 
 --------------------------------------------------------------------------
@@ -155,6 +166,7 @@ local function targetHasDebuff(texture)
 end
 
 local function castNow(spell)
+  dtrace("cast " .. spell)
   CastSpellByName(spell)
   auto.gcdUntil = GetTime() + 1.6
 end
@@ -183,12 +195,22 @@ local function rotationStep()
   end
   if inCastRange and auto.known["shoot"] and not auto.shooting then
     -- wand toggle: casting Shoot while already repeating would turn it OFF
+    dtrace("cast Shoot")
     CastSpellByName("Shoot")
     return
   end
   if not auto.melee and CheckInteractDistance("target", 3) then
+    dtrace("melee AttackTarget")
     AttackTarget()
+    return
   end
+  -- Nothing fired: say why, once per situation (dedupe handles repeats).
+  local known = 0
+  for _ in pairs(auto.known) do known = known + 1 end
+  dtrace(string.format("idle: known=%d mana=%d%% range28=%s range10=%s shooting=%s melee=%s",
+    known, manaPct, tostring(inCastRange),
+    tostring(CheckInteractDistance("target", 3) and true or false),
+    tostring(auto.shooting), tostring(auto.melee)))
 end
 
 local function setAuto(on)
@@ -209,6 +231,15 @@ autoBtn:SetPoint("BOTTOMLEFT", panel, "BOTTOMLEFT", 8, 8)
 autoBtn:SetText("Auto: OFF")
 autoBtn:SetScript("OnClick", function()
   setAuto(not auto.enabled)
+  -- Hardware-event probe: this click IS a hardware event. If a cast fires
+  -- here but never from OnUpdate, the client gates combat calls the same
+  -- way it gates ReloadUI. (Target something attackable, then click.)
+  if auto.enabled then
+    local ok, err = pcall(rotationStep)
+    if not ok then
+      emit("err", "rotation(click): " .. tostring(err))
+    end
+  end
 end)
 
 -- Remote-reload button: hidden until The System requests a reload. It must
@@ -434,6 +465,7 @@ frame:SetScript("OnEvent", function()
   elseif event == "LOOT_OPENED" then
     -- Backwards: LootSlot removes entries, so forward indexing skips slots.
     local n = GetNumLootItems()
+    dtrace("loot opened slots=" .. tostring(n))
     local i = n
     while i >= 1 do
       LootSlot(i)
@@ -458,6 +490,9 @@ frame:SetScript("OnEvent", function()
       pendingReload = 3 -- escalation ladder runs on the driver; see above
     elseif verb == "ping" then
       emit("pong", "rev=" .. REV)
+    elseif verb == "debug" then
+      debugMode = (rest ~= "off")
+      emit("debug", debugMode and "on" or "off")
     elseif verb == "status" then
       local xph = grindStats()
       emit("status", string.format("lvl=%d hp=%d/%d zone=%s xph=%d",
