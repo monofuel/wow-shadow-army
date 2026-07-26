@@ -31,10 +31,25 @@ command -v wine >/dev/null 2>&1 || {
 
 # --- one-time local client assembly (idempotent) ---------------------------
 mkdir -p "$CLIENT"
-if [ ! -e "$CLIENT/Data" ]; then
-  ln -s "$SNAPSHOT/Data" "$CLIENT/Data"
-  echo "[play-classic] symlinked Data/ from snapshot"
+# Data/ is a REAL dir of per-entry symlinks (not one symlink to the snapshot):
+# the 1.12 client checks loose files under Data/ before MPQs, and we need a
+# writable spot for sound-mute overrides without ever touching the snapshot.
+if [ -L "$CLIENT/Data" ]; then
+  rm "$CLIENT/Data"
+  echo "[play-classic] migrating Data/ symlink -> real dir with entry links"
 fi
+mkdir -p "$CLIENT/Data"
+for f in "$SNAPSHOT/Data"/*; do
+  base="$(basename "$f")"
+  [ -e "$CLIENT/Data/$base" ] || ln -s "$f" "$CLIENT/Data/$base"
+done
+# Mute ONLY the quest-complete fanfare: the client crashes reproducibly the
+# moment this one-shot stream spins up (2026-07-25, survived the WINMM
+# switch). A zero-length loose file shadows the MPQ copy and silences it —
+# doubles as the diagnostic: if turn-ins still crash with this in place,
+# the sound path is exonerated and the addon quest-panel hooks are next.
+mkdir -p "$CLIENT/Data/Sound/interface"
+: > "$CLIENT/Data/Sound/interface/iQuestComplete.wav"
 for item in WTF Interface WoW.exe dbghelp.dll fmod.dll ijl15.dll unicows.dll DivxDecoder.dll; do
   if [ ! -e "$CLIENT/$item" ] && [ -e "$SNAPSHOT/$item" ]; then
     cp -r "$SNAPSHOT/$item" "$CLIENT/$item"
@@ -67,23 +82,13 @@ else
   printf 'SET gxApi "opengl"\nSET gxWindow "1"\n' > "$CONFIG"
 fi
 
-# Sound: force fmod (the client's bundled FMOD 3.x) onto the WINMM/waveOut
-# path instead of DirectSound. Wine's dsound mixing is a known-open bug
-# (winehq #9358) and the era-canonical vanilla-on-wine fix is
-# SoundOutputSystem "1" (FSOUND enum: 0=nosound 1=winmm 2=dsound).
-# Deployed 2026-07-25 for a reproducible crash on quest turn-in, right as
-# the iQuestComplete fanfare spins up a fresh one-shot stream. Values are
-# asserted (sed) rather than appended-once because the client rewrites
-# Config.wtf on exit and could persist a dsound value back.
-set_cvar() {
-  if grep -q "^SET $1 " "$CONFIG"; then
-    sed -i "s/^SET $1 .*/SET $1 \"$2\"/" "$CONFIG"
-  else
-    printf 'SET %s "%s"\n' "$1" "$2" >> "$CONFIG"
-  fi
-}
-set_cvar SoundOutputSystem 1
-set_cvar SoundBufferSize 100
+# Sound: back on the default (dsound) path. The 2026-07-25 WINMM experiment
+# (SoundOutputSystem "1") did NOT fix the quest-turn-in crash and became the
+# prime suspect for periodic frame stutter — reverted; the crash is handled
+# by the loose-file fanfare mute above instead. Delete the experiment's
+# lines if a Config.wtf still carries them (the client persists CVars on
+# exit).
+sed -i '/^SET SoundOutputSystem /d;/^SET SoundBufferSize /d' "$CONFIG"
 
 # --- wine prefix (idempotent) ----------------------------------------------
 if [ ! -d "$WINEPREFIX" ]; then
