@@ -48,8 +48,10 @@ const
   SaPrefix = "<SA> "
   ## Older addon banner still seen in the wild.
   LegacyPrefix = "<ShadowArmy> "
-  ## How long reloadAddon waits for a fresh <SA> loaded event.
-  ReloadWaitMs = 6_000
+  ## How long reloadAddon waits for a fresh <SA> loaded event. The human
+  ## path is announce → panel button lights up → click, so this needs to
+  ## cover human reaction time, not just a programmatic reload.
+  ReloadWaitMs = 25_000
   ReloadStepMs = 200
 
 type
@@ -564,7 +566,7 @@ proc reloadAddon*(): JsonNode =
   result = %*{
     "ok": false,
     "timeout": true,
-    "hint": "no <SA> loaded seen in 6s — is the client logged in?"
+    "hint": "no <SA> loaded seen in 25s — client logged out, on a loading screen, or the panel button is still unclicked (check addon_events for reload-click)"
   }
 
 # ---------------------------------------------------------------------------

@@ -8,7 +8,7 @@ ShadowArmy = ShadowArmy or {}
 
 -- Bump on every edit. The System watches Chat.log for "<SA> loaded rev=..."
 -- after sending a reload — a new rev proves the edit actually loaded.
-local REV = "r8"
+local REV = "r9"
 
 local function say(msg)
   DEFAULT_CHAT_FRAME:AddMessage("|cFF9482C9[ShadowArmy]|r " .. tostring(msg))
@@ -213,6 +213,15 @@ local function rotationStep()
     manaPct = UnitMana("player") / UnitManaMax("player") * 100
   end
   local inCastRange = CheckInteractDistance("target", 4)  -- ~28yd
+
+  -- Pet first: sic the imp whenever it isn't on our target (Firebolt is on
+  -- autocast, so PetAttack is the only command it needs). No GCD cost.
+  -- UnitIsUnit handles both "no pet target" and "pet on the wrong mob".
+  if UnitExists("pet") and not UnitIsDead("pet")
+      and not UnitIsUnit("pettarget", "target") then
+    dtrace("pet attack")
+    PetAttack()
+  end
 
   -- Priority: DoT up -> nuke while mana holds -> wand -> melee.
   -- While MOVING only instants + wand are legal: Shadow Bolt would fail
