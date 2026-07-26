@@ -41,6 +41,14 @@ old-pin analysis below is kept for the record; see §"Resolution evidence".
 - The Detour mesh itself always covered the interiors: the navmesh helper
   routes crypt→Venya (69 waypoints) and outdoors→church (29, smooth)
   offline via `{"op":"route"}` — see docs/navmesh.md.
+- Walk 2, reverse (church → back INTO the crypt): re-entered the
+  underground WMO from terrain and settled at (1673.3, 1680.3, 139.2) —
+  4.2yd 2D from the spawn point but on the UPPER entrance chamber (spawn
+  chamber is z 121.7). 124 moves, 7 transient failures. Caveat: walkto's
+  arrival check is 2D-only, so it declared success one floor above the
+  target; WMO entry is proven, the full spiral descent was not exercised.
+  Add a z-band to `--arrive` before using walkto for multi-floor targets
+  (the two-story vendor building will need it).
 
 Practical consequences:
 
