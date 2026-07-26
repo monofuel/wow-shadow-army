@@ -62,6 +62,10 @@ def main() -> int:
     parser.add_argument("--to", choices=sorted(PRESETS), default=None)
     parser.add_argument("--dest", default=None, help="x,y,z overrides --to")
     parser.add_argument("--arrive", type=float, default=5.0)
+    # 0 disables the vertical check (2D-only). Multi-floor WMO targets (crypt
+    # spawn chamber under the entrance hall) need a band or the walk declares
+    # arrival one floor above the goal.
+    parser.add_argument("--arrive-z", type=float, default=0.0)
     parser.add_argument("--max-seconds", type=float, default=300.0)
     parser.add_argument("--settle-wait", type=float, default=2.0)
     parser.add_argument("--goal-id", default="walkto")
@@ -103,7 +107,8 @@ def main() -> int:
             obs = frame.observation
             here = (obs.location.x, obs.location.y, obs.location.z)
             gap = _dist2d(here[0], here[1], x, y)
-            if gap <= args.arrive:
+            z_ok = args.arrive_z <= 0 or abs(here[2] - z) <= args.arrive_z
+            if gap <= args.arrive and z_ok:
                 print(
                     f"[walkto] ARRIVED {label} gap={gap:.1f}yd "
                     f"pos=({here[0]:.1f},{here[1]:.1f},{here[2]:.1f}) "
