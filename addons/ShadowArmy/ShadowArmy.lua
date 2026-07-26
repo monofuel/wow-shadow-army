@@ -8,7 +8,7 @@ ShadowArmy = ShadowArmy or {}
 
 -- Bump on every edit. The System watches Chat.log for "<SA> loaded rev=..."
 -- after sending a reload — a new rev proves the edit actually loaded.
-local REV = "r11"
+local REV = "r12"
 
 local function say(msg)
   DEFAULT_CHAT_FRAME:AddMessage("|cFF9482C9[ShadowArmy]|r " .. tostring(msg))
@@ -387,6 +387,7 @@ local WATCHED_BUFFS = {
       "Interface\\Icons\\Spell_Shadow_SpectralSight", -- Demon Armor (lvl 20+)
     },
     warnBelow = 300, -- seconds; warn under 5 minutes
+    autoCast = true, -- r12: the advisor keeps this one up itself (see armorTick)
   },
 }
 
@@ -409,9 +410,102 @@ local function buffTimeLeftByTexture(textures)
   end
 end
 
+--------------------------------------------------------------------------
+-- r12: Demon Skin / Demon Armor AUTO-CAST — replaces the nag. It is an
+-- instant self-buff, legal while moving and out of combat, so the driver
+-- can simply keep it up instead of telling the human to.
+--
+-- SAFETY (this is the whole reason the code below is shaped like this): the
+-- textures in WATCHED_BUFFS are UNVERIFIED GUESSES. A wrong guess means the
+-- buff NEVER reads as present, and a naive "missing -> cast" loop would
+-- recast every 5s forever, burning mana for nothing, with no error anywhere
+-- (scriptErrors is off). So the first cast arms a verification window: if
+-- the buff still does not READ AT ALL 10s after we cast it, auto-cast
+-- switches itself off for the session and emits exactly ONE err line
+-- carrying the player's real buff textures. That line is how The System
+-- learns the correct texture — it is a diagnostic, not a complaint.
+--------------------------------------------------------------------------
+
+local ARMOR_RETRY_EVERY = 5    -- seconds between cast attempts
+local ARMOR_VERIFY_AFTER = 10  -- seconds a cast gets to make the buff READ
+local ARMOR_CHECK_EVERY = 1    -- buff scan cadence (driver ticks every frame)
+
+local armorNextCheck = 0
+
+-- Which spell to use. Demon Armor supersedes Demon Skin at 20+; auto.known
+-- is the spellbook scan, so we never CastSpellByName something untrained
+-- (that throws "you don't know that spell" red text at the human).
+local function armorSpell()
+  if auto.known["demon armor"] then return "Demon Armor" end
+  if auto.known["demon skin"] then return "Demon Skin" end
+  return nil
+end
+
+-- Comma-separated list of the player's current buff icons with the
+-- "Interface\Icons\" prefix stripped — the payload of the one diagnostic
+-- line. Hard-bounded: 1.12 buff indices are 0..31 and a runaway while-loop
+-- here would hang the client, not just the addon.
+local function playerBuffTextureList(maxN)
+  local out, n, i = nil, 0, 0
+  while n < maxN and i < 32 do
+    local buffIndex = GetPlayerBuff(i, "HELPFUL")
+    if not buffIndex or buffIndex < 0 then break end
+    local tex = GetPlayerBuffTexture(buffIndex)
+    if tex then
+      -- Lua patterns: backslash is NOT special (only % is), so the path
+      -- literal doubles as its own pattern.
+      tex = string.gsub(tex, "Interface\\Icons\\", "")
+      out = out and (out .. "," .. tex) or tex
+      n = n + 1
+    end
+    i = i + 1
+  end
+  return out or "none"
+end
+
+local function armorTick()
+  local now = GetTime()
+  if now < armorNextCheck then return end
+  armorNextCheck = now + ARMOR_CHECK_EVERY
+  for _, watch in ipairs(WATCHED_BUFFS) do
+    if watch.autoCast and not watch.acDisabled then
+      local left = buffTimeLeftByTexture(watch.textures)
+      if left then
+        -- Texture guess CONFIRMED the first time the buff reads at all. From
+        -- here the safety can never trip: a short timer is not a bad texture,
+        -- and warnBelow refreshes must not look like failed casts.
+        watch.acProven = true
+        watch.acVerifyAt = nil
+      elseif watch.acVerifyAt and now >= watch.acVerifyAt then
+        watch.acDisabled = true
+        emit("err", "demon-skin autocast: buff never detected after cast — "
+          .. "texture guess likely wrong; captured=" .. playerBuffTextureList(8))
+      end
+      -- Cast when the buff is missing entirely OR inside the refresh window.
+      if not watch.acDisabled and (not left or left < watch.warnBelow) then
+        local spell = armorSpell()
+        if spell and not auto.casting
+            and now >= auto.gcdUntil and now >= auto.failUntil
+            and now >= (watch.acNextTryAt or 0)
+            and not UnitIsDeadOrGhost("player") then
+          watch.acNextTryAt = now + ARMOR_RETRY_EVERY
+          -- Only the FIRST pending cast arms the verify window — re-arming on
+          -- every retry would push the deadline out forever and the safety
+          -- would never fire.
+          if not watch.acProven and not watch.acVerifyAt then
+            watch.acVerifyAt = now + ARMOR_VERIFY_AFTER
+          end
+          castNow(spell) -- shared GCD bookkeeping + dtrace
+        end
+      end
+    end
+  end
+end
+
 local lastNag = 0
 local function buffWatchLine()
   local warnings = nil
+  local nags = nil
   for _, watch in ipairs(WATCHED_BUFFS) do
     local left = buffTimeLeftByTexture(watch.textures)
     local warn
@@ -421,12 +515,24 @@ local function buffWatchLine()
       warn = string.format("|cFFFFAA00%s %dm left|r", watch.label, math.ceil(left / 60))
     end
     if warn then
+      local nag = warn
+      -- r12: when auto-cast owns this buff there is nothing for the human to
+      -- do — show the auto state and stay out of chat entirely. If the
+      -- texture-guess safety disabled auto-cast, we fall straight back to the
+      -- old warning text AND the old once-a-minute chat nag.
+      if watch.autoCast and not watch.acDisabled then
+        warn = string.format("|cFF44FF44armor: auto (%s)|r", armorSpell() or "untrained")
+        nag = nil
+      end
       warnings = warnings and (warnings .. "  " .. warn) or warn
+      if nag then
+        nags = nags and (nags .. "  " .. nag) or nag
+      end
     end
   end
-  if warnings and (GetTime() - lastNag) > 60 then
+  if nags and (GetTime() - lastNag) > 60 then
     lastNag = GetTime()
-    say("buff watch: " .. warnings) -- chat nag at most once a minute
+    say("buff watch: " .. nags) -- chat nag at most once a minute
   end
   return warnings or "|cFF44FF44buffs OK|r"
 end
@@ -452,6 +558,292 @@ local function targetSummary()
   return string.format("target: %s (lvl %s)%s", name, levelStr, hostile),
     string.format("  %d/%d hp, %s", hp, hpMax, range)
 end
+
+--------------------------------------------------------------------------
+-- ShadowBags (r12): ONE window for bags 0..4, OneBag-style. The five
+-- Blizzard ContainerFrames simply never open any more — every normal path
+-- to them (the B key, the bag-bar buttons, merchants, the bank) funnels
+-- through a handful of GLOBAL functions, so we save the originals and
+-- replace them. That is exactly how OneBag did it in 1.12; there is no
+-- hooksecurefunc in this client (that is a 2.0 API) and none is needed —
+-- nothing here is protected.
+--
+-- Item MOVEMENT (PickupContainerItem/UseContainerItem) is called only from a
+-- real mouse OnClick, which IS hardware-event context — the same context that
+-- makes the panel's Reload! button work where programmatic ReloadUI is a
+-- silent no-op on this build. Never move items from OnUpdate.
+--
+-- The buttons are PLAIN Buttons, NOT ContainerFrameItemButtonTemplate: that
+-- template carries OnClick/OnEnter logic bound to a ContainerFrame parent
+-- (it derives bag id from the parent frame's id), so reusing it outside one
+-- misbehaves. Icon texture + count fontstring + our own click routing is the
+-- whole widget.
+--------------------------------------------------------------------------
+
+local BAG_COLS = 8
+local BAG_BTN_SIZE = 37
+local BAG_BTN_PAD = 4
+local BAG_MARGIN = 12
+local BAG_HEADER = 30  -- vertical room for title + counts
+
+-- 1.12 has ITEM_QUALITY_COLORS in FrameXML, but relying on a Blizzard global
+-- that may or may not exist on a private-server build is a silent-nil risk;
+-- the six numbers are cheaper than the dependency.
+local BAG_QUALITY_COLOR = {
+  [2] = { 0.12, 1.00, 0.00 }, -- uncommon
+  [3] = { 0.00, 0.44, 0.87 }, -- rare
+  [4] = { 0.64, 0.21, 0.93 }, -- epic
+  [5] = { 1.00, 0.50, 0.00 }, -- legendary
+  [6] = { 0.90, 0.80, 0.50 }, -- artifact
+}
+
+local bags = { buttons = {}, dirty = true }
+-- Forward declaration: the button OnClick handlers (created below) close over
+-- the refresh function, so the local has to EXIST before they are defined.
+-- `function bagsUpdate()` later assigns into this local, not a new global.
+local bagsUpdate
+
+local bagsFrame = CreateFrame("Frame", "ShadowBagsFrame", UIParent)
+bagsFrame:SetWidth(BAG_MARGIN * 2 + BAG_COLS * BAG_BTN_SIZE + (BAG_COLS - 1) * BAG_BTN_PAD)
+bagsFrame:SetHeight(BAG_HEADER + 4 * (BAG_BTN_SIZE + BAG_BTN_PAD) + BAG_MARGIN)
+bagsFrame:SetPoint("CENTER", UIParent, "CENTER", 0, 0)
+bagsFrame:SetBackdrop({
+  bgFile = "Interface\\Tooltips\\UI-Tooltip-Background",
+  edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+  tile = true, tileSize = 16, edgeSize = 16,
+  insets = { left = 4, right = 4, top = 4, bottom = 4 },
+})
+bagsFrame:SetBackdropColor(0.05, 0.02, 0.10, 0.92) -- same purple as the panel
+bagsFrame:EnableMouse(true)
+bagsFrame:SetMovable(true)
+bagsFrame:SetFrameStrata("HIGH") -- above the world UI, below GameTooltip
+bagsFrame:RegisterForDrag("LeftButton")
+bagsFrame:SetScript("OnDragStart", function() bagsFrame:StartMoving() end)
+bagsFrame:SetScript("OnDragStop", function() bagsFrame:StopMovingOrSizing() end)
+bagsFrame:Hide()
+
+local bagsTitle = bagsFrame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+bagsTitle:SetPoint("TOPLEFT", bagsFrame, "TOPLEFT", BAG_MARGIN, -9)
+bagsTitle:SetText("|cFF9482C9Shadow Bags|r")
+
+local bagsCount = bagsFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+bagsCount:SetPoint("TOPRIGHT", bagsFrame, "TOPRIGHT", -36, -11) -- clear of the close button
+bagsCount:SetText("")
+
+local bagsClose = CreateFrame("Button", nil, bagsFrame, "UIPanelCloseButton")
+bagsClose:SetPoint("TOPRIGHT", bagsFrame, "TOPRIGHT", -2, -2)
+-- The template's own OnClick calls HideParentFrame(); be explicit instead so
+-- this does not depend on that helper existing on this build.
+bagsClose:SetScript("OnClick", function() bagsFrame:Hide() end)
+
+-- Buttons are created on demand and then REUSED forever (creating frames
+-- every refresh would leak — 1.12 frames cannot be destroyed).
+local function bagButton(index)
+  local btn = bags.buttons[index]
+  if btn then return btn end
+  btn = CreateFrame("Button", nil, bagsFrame)
+  btn:SetWidth(BAG_BTN_SIZE)
+  btn:SetHeight(BAG_BTN_SIZE)
+  btn:SetBackdrop({
+    bgFile = "Interface\\Tooltips\\UI-Tooltip-Background",
+    edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+    tile = true, tileSize = 16, edgeSize = 12,
+    insets = { left = 3, right = 3, top = 3, bottom = 3 },
+  })
+  btn.icon = btn:CreateTexture(nil, "ARTWORK")
+  btn.icon:SetPoint("TOPLEFT", btn, "TOPLEFT", 3, -3)
+  btn.icon:SetPoint("BOTTOMRIGHT", btn, "BOTTOMRIGHT", -3, 3)
+  btn.count = btn:CreateFontString(nil, "OVERLAY", "NumberFontNormal")
+  btn.count:SetPoint("BOTTOMRIGHT", btn, "BOTTOMRIGHT", -4, 4)
+  btn:SetHighlightTexture("Interface\\Buttons\\ButtonHilight-Square", "ADD")
+  -- Default is LeftButtonUp only; the right-click "use/equip/sell" path needs
+  -- to be registered explicitly or the handler simply never fires.
+  btn:RegisterForClicks("LeftButtonUp", "RightButtonUp")
+  btn:SetScript("OnEnter", function()
+    -- `this` is the button (1.12 passes script args as globals, no self).
+    if not this.saBag or this.saEmpty then return end
+    GameTooltip:SetOwner(this, "ANCHOR_RIGHT")
+    GameTooltip:SetBagItem(this.saBag, this.saSlot)
+    GameTooltip:Show()
+  end)
+  btn:SetScript("OnLeave", function()
+    GameTooltip:Hide()
+  end)
+  btn:SetScript("OnClick", function()
+    -- OnClick's `arg1` is the mouse button name.
+    if not this.saBag then return end
+    if arg1 == "RightButton" then
+      -- use / equip / sell-to-merchant — the default game logic decides which
+      UseContainerItem(this.saBag, this.saSlot)
+    else
+      -- pick up / drop / swap: whatever the cursor is holding, the client's
+      -- own container logic sorts out. Shift+Left stack-splitting is NOT
+      -- wired this rev (deliberate: SplitContainerItem with a bad count is a
+      -- good way to lose a stack, and the default UI is not there to catch it).
+      PickupContainerItem(this.saBag, this.saSlot)
+    end
+    -- ITEM_LOCK_CHANGED will refresh us anyway; refreshing now means the grid
+    -- never renders one click behind the cursor.
+    bagsUpdate()
+  end)
+  bags.buttons[index] = btn
+  return btn
+end
+
+function bagsUpdate()
+  -- OnUpdate/OnShow do not exist for a hidden frame's children either; skip
+  -- the work and remember to catch up when we are shown again.
+  if not bagsFrame:IsShown() then
+    bags.dirty = true
+    return
+  end
+  bags.dirty = false
+  local index, used = 0, 0
+  local bag = 0
+  while bag <= 4 do
+    local n = GetContainerNumSlots(bag)
+    if n and n > 0 then
+      local slot = 1
+      while slot <= n do
+        index = index + 1
+        local btn = bagButton(index)
+        -- 1.12 signature: texture, itemCount, locked, quality, readable
+        local texture, itemCount, locked, quality = GetContainerItemInfo(bag, slot)
+        btn.saBag, btn.saSlot = bag, slot
+        btn.saEmpty = not texture
+        if texture then
+          used = used + 1
+          btn.icon:SetTexture(texture)
+          -- Texture:SetDesaturated is a 2.0 API — fade the icon instead to
+          -- show "locked" (picked up / in flight).
+          btn.icon:SetAlpha(locked and 0.35 or 1.0)
+          btn.icon:Show()
+          if itemCount and itemCount > 1 then
+            btn.count:SetText(tostring(itemCount))
+            btn.count:Show()
+          else
+            btn.count:Hide()
+          end
+          local c = quality and BAG_QUALITY_COLOR[quality]
+          if c then
+            btn:SetBackdropBorderColor(c[1], c[2], c[3], 1)
+          else
+            btn:SetBackdropBorderColor(0.40, 0.35, 0.50, 1)
+          end
+          btn:SetBackdropColor(0.10, 0.08, 0.16, 0.90)
+        else
+          btn.icon:Hide()
+          btn.count:Hide()
+          btn:SetBackdropBorderColor(0.22, 0.20, 0.30, 1) -- empty = dark socket
+          btn:SetBackdropColor(0.02, 0.01, 0.05, 0.90)
+        end
+        -- ClearAllPoints first: SetPoint ACCUMULATES anchors in 1.12, so a
+        -- re-layout after a bag swap would fight its own old anchor.
+        local i0 = index - 1
+        local col = math.mod(i0, BAG_COLS)
+        local row = math.floor(i0 / BAG_COLS)
+        btn:ClearAllPoints()
+        btn:SetPoint("TOPLEFT", bagsFrame, "TOPLEFT",
+          BAG_MARGIN + col * (BAG_BTN_SIZE + BAG_BTN_PAD),
+          -(BAG_HEADER + row * (BAG_BTN_SIZE + BAG_BTN_PAD)))
+        btn:Show()
+        slot = slot + 1
+      end
+    end
+    bag = bag + 1
+  end
+  -- Bag swapped for a smaller one: park the now-surplus buttons.
+  local extra = index + 1
+  while bags.buttons[extra] do
+    bags.buttons[extra]:Hide()
+    extra = extra + 1
+  end
+  local rows = math.ceil(index / BAG_COLS)
+  if rows < 1 then rows = 1 end
+  bagsFrame:SetHeight(BAG_HEADER + rows * (BAG_BTN_SIZE + BAG_BTN_PAD) + BAG_MARGIN - BAG_BTN_PAD)
+  bagsCount:SetText(string.format("|cFFCCCCCC%d/%d used|r", used, index))
+end
+
+local function bagsShow()
+  bagsFrame:Show()
+  bagsUpdate()
+end
+
+local function bagsHide()
+  bagsFrame:Hide()
+end
+
+local function bagsToggle()
+  if bagsFrame:IsShown() then bagsHide() else bagsShow() end
+end
+
+bagsFrame:SetScript("OnShow", function()
+  if bags.dirty then bagsUpdate() end
+end)
+
+-- Contents change while the window is closed too — track dirt, refresh live.
+local bagsEvents = CreateFrame("Frame", "ShadowBagsEventFrame", UIParent)
+bagsEvents:RegisterEvent("BAG_UPDATE")
+bagsEvents:RegisterEvent("ITEM_LOCK_CHANGED")
+bagsEvents:RegisterEvent("BAG_UPDATE_COOLDOWN")
+bagsEvents:RegisterEvent("PLAYER_ENTERING_WORLD")
+bagsEvents:SetScript("OnEvent", function()
+  if bagsFrame:IsShown() then
+    bagsUpdate()
+  else
+    bags.dirty = true
+  end
+end)
+
+-- The takeover. B / the bag-bar buttons / merchants / the bank all reach the
+-- ContainerFrames through these globals, so replacing them is enough — the
+-- Blizzard frames are never asked to open. Originals are parked on the
+-- ShadowArmy root so a future rev (or a live /script) can put them back
+-- without a reload.
+ShadowArmy.origBagFuncs = {
+  ToggleBackpack = ToggleBackpack,
+  ToggleBag = ToggleBag,
+  OpenBackpack = OpenBackpack,
+  CloseBackpack = CloseBackpack,
+  OpenAllBags = OpenAllBags,
+  CloseAllBags = CloseAllBags,
+}
+
+function ToggleBackpack()
+  bagsToggle()
+end
+
+-- The bag id is irrelevant now: there is one window and it holds every bag.
+function ToggleBag(id)
+  bagsToggle()
+end
+
+function OpenBackpack()
+  bagsShow()
+end
+
+function CloseBackpack()
+  bagsHide()
+end
+
+-- Called with the requesting frame (merchant/bank/trade) in vanilla; we do not
+-- need it, but the parameter stays so the signature matches what callers pass.
+function OpenAllBags(frame)
+  bagsShow()
+end
+
+function CloseAllBags()
+  bagsHide()
+end
+
+-- ToggleKeyRing is deliberately NOT hooked: the keyring is bag -2 and is not
+-- in this grid, so it keeps using the Blizzard frame. Bank frames are likewise
+-- untouched this rev — opening the bank shows this window (via OpenAllBags),
+-- which is enough to click items across.
+
+-- Escape closes it, like every other UI panel. UISpecialFrames is a list of
+-- frame NAMES resolved with getglobal(), which is why the frame is named.
+tinsert(UISpecialFrames, "ShadowBagsFrame")
 
 -- Rotation driver lives on its OWN always-shown frame — NOT the panel.
 -- (OnUpdate only fires for visible frames; hiding the panel via /sa must
@@ -555,6 +947,12 @@ driver:SetScript("OnUpdate", function()
   -- as "moving" (which blocks Shadow Bolt). Two float compares, negligible.
   updateMoving()
   emitDrain() -- paced outbound chat; see EMIT_GAP
+  -- r12: keep Demon Skin/Armor up. Deliberately ABOVE the auto.enabled gate —
+  -- it is a self-buff, not a fight, so it works whether or not auto-combat is
+  -- on. pcall for the same reason as the rotation: a raw error here would
+  -- silently kill the rest of this OnUpdate (loot retries, reload ladder).
+  local aok, aerr = pcall(armorTick)
+  if not aok then emit("err", "armorTick: " .. tostring(aerr)) end
   if loot.active then lootTick() end
   if pendingReload > 0 then
     pendingReload = pendingReload - 1
@@ -759,6 +1157,13 @@ SLASH_SHADOWARMY1 = "/sa"
 SlashCmdList["SHADOWARMY"] = function(msg)
   if msg == "reload" then
     ReloadUI()
+    return
+  end
+  -- Manual valve for the bag window: if the global takeover ever fails to
+  -- take (another addon loading after us and re-replacing ToggleBackpack),
+  -- this still opens it.
+  if msg == "bags" then
+    bagsToggle()
     return
   end
   if msg == "status" then
