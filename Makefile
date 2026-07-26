@@ -26,7 +26,7 @@ COMPOSE_FILE := infra/compose.vmangos.yml
 ACCOUNT_USER := monofuel
 ACCOUNT_PASS := password
 
-.PHONY: test test-lua test-python test-nim system pin-check integration-test start-server stop-server server-logging logs account soap-account play play-classic shadow breadcrumbs
+.PHONY: test test-lua test-python test-nim system pin-check integration-test start-server stop-server server-logging logs account soap-account play play-classic shadow breadcrumbs warlock-account warlock-bot
 
 # Unit tier only. test-python is stdlib-only (projection + intent_mapping + optional
 # lua_runner smoke); it is wired into `make test` because it needs no venv/network.
@@ -258,6 +258,90 @@ soap-account:
 	docker exec "$$cid" mariadb -umangos -pmangos realmd -e \
 		"REPLACE INTO account_access (id, gmlevel, RealmID) SELECT id, 6, -1 FROM account WHERE username = UPPER('$(SOAP_USER)')"; \
 	echo "SOAP account ready: $(SOAP_USER) (gmlevel 6). Restart the realm if it was created just now."
+
+# ---------------------------------------------------------------------------
+# Shadowfel — headless UNDEAD WARLOCK seat (docs/warlock-seat.md).
+#
+# Undead is deliberately absent from the upstream seed scripts' race maps
+# (game/vmangos_character.py RACE_NAME_TO_ID is Horde-with-coverage only, and
+# upstream docs/leveling-character-selection.md says not to offer Undead as a
+# *hosted submission* option). That is a seeding/submission constraint, not a
+# server one — so this seat never touches the characters table. The reference
+# player creates the character over the wire with CMSG_CHAR_CREATE, exactly
+# like a human at the CharacterCreate screen: when
+# VANILLA_WOW_PLAYER_CHARACTER_NAME is not on the account,
+# connectBotControlSession creates it from the RACE/CLASS/GENDER env tuple
+# (nim_control_server.nim botControlCharacterSpec →
+#  control_session_packets.nim). Race/class validity comes from ChrRaces.dbc /
+# CharBaseInfo.dbc (client/character_identity.nim), so undead+warlock is legal.
+WARLOCK_ACCOUNT := shadow1
+WARLOCK_PASS := shadow1
+WARLOCK_CHARACTER := Shadowfel
+WARLOCK_RACE := undead
+WARLOCK_CLASS := warlock
+WARLOCK_GENDER := male
+# Slot map (docs/control-plane.md): 0=Botwarrior, 1=Botpriest, 2=Shadowfel.
+# The control socket is 41114 + slot, so this seat answers on 127.0.0.1:41116.
+# Leave WOW_SDK_NIM_CONTROL_PORT unset on BOTH sides — an explicit value is
+# used verbatim and is NOT offset by the slot (nim_control_server.nim:666-673).
+WARLOCK_SLOT := 2
+WARLOCK_RUNTIME_DIR := $(CURDIR)/local_data/nim-runtime-slot$(WARLOCK_SLOT)
+
+# Idempotently ensure the shadow1 account (same upstream SRP script as `account`).
+warlock-account:
+	@set -e; \
+	if [ ! -d "$(UPSTREAM)" ]; then \
+		echo "error: upstream checkout missing: $(UPSTREAM)" >&2; exit 1; \
+	fi; \
+	cd "$(UPSTREAM)"; \
+	cid=$$(docker compose -f "$(COMPOSE_FILE)" --profile coworld ps -q coworld-game); \
+	if [ -z "$$cid" ]; then \
+		echo "error: coworld-game is not running; make start-server first" >&2; exit 1; \
+	fi; \
+	uv run python server/scripts/manage_coworld_accounts.py \
+		--entrant "$(WARLOCK_ACCOUNT):$(WARLOCK_ACCOUNT):$(WARLOCK_PASS)" \
+		--mysql-container "$$cid" \
+		--host 127.0.0.1 \
+		--port 3306 \
+		--db-user mangos \
+		--db-password mangos \
+		--apply; \
+	echo "account ready: $(WARLOCK_ACCOUNT) / $(WARLOCK_PASS)"
+
+# Bring the Shadowfel seat online. First run also creates the character.
+#
+# AUTONOMOUS=0 is load-bearing: the upstream leveling planner needs the Detour
+# navmesh helper we have not built (docs/milestone-1-evidence.md, unresolved
+# #1), and a seat launched with AUTONOMOUS=1 exited shortly after listen. 0
+# parks the seat logged in and lets an external brain own the goal.
+#
+# Foreground like `make play` / `make shadow`. Detach with:
+#   nohup make warlock-bot > local_data/warlock-bot.log 2>&1 &
+# Stop with: kill <pid>  (SIGTERM; the seat logs out and characters.online→0)
+warlock-bot:
+	@set -e; \
+	if [ ! -d "$(UPSTREAM)" ]; then \
+		echo "error: upstream checkout missing: $(UPSTREAM)" >&2; exit 1; \
+	fi; \
+	if [ ! -f "$(WOW_ENV)" ]; then \
+		echo "error: missing $(WOW_ENV)" >&2; exit 1; \
+	fi; \
+	mkdir -p "$(WARLOCK_RUNTIME_DIR)"; \
+	cd "$(UPSTREAM)"; \
+	. "$(WOW_ENV)"; \
+	VANILLA_WOW_PLAYER_REALM_HOST=127.0.0.1 \
+	VANILLA_WOW_PLAYER_REALM_PORT=3724 \
+	VANILLA_WOW_PLAYER_USERNAME=$(WARLOCK_ACCOUNT) \
+	VANILLA_WOW_PLAYER_PASSWORD=$(WARLOCK_PASS) \
+	VANILLA_WOW_PLAYER_CHARACTER_NAME=$(WARLOCK_CHARACTER) \
+	VANILLA_WOW_PLAYER_CHARACTER_RACE=$(WARLOCK_RACE) \
+	VANILLA_WOW_PLAYER_CHARACTER_CLASS=$(WARLOCK_CLASS) \
+	VANILLA_WOW_PLAYER_CHARACTER_GENDER=$(WARLOCK_GENDER) \
+	VANILLA_WOW_PLAYER_AUTONOMOUS=0 \
+	WOW_SDK_NIM_RUNTIME_SLOT=$(WARLOCK_SLOT) \
+	WOW_SDK_NIM_RUNTIME_DIR=$(WARLOCK_RUNTIME_DIR) \
+	WOW_SDK_NIM_CONTROL_HOST=127.0.0.1 \
+	nim r player/reference_player/reference_player.nim --scenario=nim-control
 
 # Launch the native client for HUMAN play against the local realm.
 # --login-screen: land at GlueXML login (no auto world entry). Credentials are
