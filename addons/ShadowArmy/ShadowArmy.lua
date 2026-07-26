@@ -8,7 +8,7 @@ ShadowArmy = ShadowArmy or {}
 
 -- Bump on every edit. The System watches Chat.log for "<SA> loaded rev=..."
 -- after sending a reload — a new rev proves the edit actually loaded.
-local REV = "r17"
+local REV = "r18"
 
 -- Log window (r16): every say()/emit() line also lands here with a
 -- timestamp, so errors survive chat scroll-off and can be reviewed in-game.
@@ -140,7 +140,7 @@ end
 
 local panel = CreateFrame("Frame", "ShadowArmyPanel", UIParent)
 panel:SetWidth(210)
-panel:SetHeight(184) -- +24: second button row (Log)
+panel:SetHeight(192) -- +24 second button row, +8 the r18 quest line
 panel:SetPoint("RIGHT", UIParent, "RIGHT", -40, 60)
 panel:SetBackdrop({
   bgFile = "Interface\\Tooltips\\UI-Tooltip-Background",
@@ -175,6 +175,7 @@ local line2 = makeLine(line1)
 local line3 = makeLine(line2)
 local line4 = makeLine(line3)
 local line5 = makeLine(line4, -6) -- buff watch / warnings
+local line6 = makeLine(line5, -6) -- r18: nearest quest objective
 
 -- (v0.1 had Nearest-foe/Attack buttons; removed — they duplicated Tab and
 -- the T auto-attack keybind. Rule: a button earns its place only by doing
@@ -491,9 +492,10 @@ end
 -- Panel button (r17): the log is a window, so it gets a button — /sa log
 -- stays as a fallback. Lives on its own row under Auto Combat / Reload.
 local logBtn = CreateFrame("Button", "ShadowArmyLogBtn", panel, "UIPanelButtonTemplate")
-logBtn:SetWidth(194) -- full inner width of the panel
+-- r18: half the bottom row; the Quests toggle takes the other half.
+logBtn:SetWidth(93)
 logBtn:SetHeight(20)
-logBtn:SetPoint("BOTTOM", panel, "BOTTOM", 0, 8)
+logBtn:SetPoint("BOTTOMLEFT", panel, "BOTTOMLEFT", 8, 8)
 logBtn:SetText("Log")
 logBtn:SetScript("OnClick", function()
   if logFrame:IsVisible() then
@@ -1377,6 +1379,530 @@ end
 -- frame NAMES resolved with getglobal(), which is why the frame is named.
 tinsert(UISpecialFrames, "ShadowBagsFrame")
 
+--------------------------------------------------------------------------
+-- QUEST HELPER (r18): "where do I go next" — a nearest-objective line in the
+-- advisor panel, dots on the minimap, dots on the world map. Everything here
+-- is driven by QuestData.lua (global ShadowArmyQuestData, keyed by the EXACT
+-- quest title). 1.12 does not expose quest IDs to addons at all, so the title
+-- STRING is the only join between the live quest log and mined coordinates —
+-- that is why the data file is shaped the way it is, not a stylistic choice.
+--
+-- If the data file is absent the whole feature no-ops after exactly one
+-- `err quest data missing` line. Nothing below may ever depend on it existing.
+--
+-- ZONE IDENTITY IS THE HARD PART, and it is why this section looks paranoid.
+-- The data file speaks AreaTable ids (85 = Tirisfal Glades). The 1.12 client
+-- hands an addon zone NAMES (GetZoneText/GetRealZoneText) and world-map
+-- dropdown INDICES (GetCurrentMapZone) — never AreaTable ids, and there is no
+-- API that converts between them. A hand-written name->id table would be the
+-- only bridge, and one wrong row in it parks an arrow on a mob three zones
+-- over, which is worse than no arrow at all.
+--
+-- So we never convert. A waypoint is drawn only when BOTH hold:
+--   (1) the quest's own quest-log HEADER name equals the player's current
+--       zone name. The log groups quests by zone, and that grouping comes
+--       from the same server the coordinates were mined against — it is a
+--       string compare between two things the client itself produced.
+--   (2) the waypoint's `zone` id equals its quest's `zone` id. Both numbers
+--       come out of the data file, so the client is not involved in that
+--       comparison at all.
+-- Anything we cannot prove sits in the current zone is simply NOT DRAWN.
+-- Fails safe: a missing arrow costs a few seconds of reading the quest log,
+-- a wrong arrow costs a corpse run.
+--
+-- Deliberate consequence: an objective that lives in a neighbouring zone
+-- stays hidden until you walk into that zone. (2) is what makes multi-zone
+-- quests degrade quietly instead of pointing at the wrong patch of map.
+--
+-- Second, opportunistic path: every time (1) holds we LEARN `zone id -> zone
+-- name` from that quest, and afterwards a waypoint carrying a learned id is
+-- allowed through even when its quest headers somewhere else. Conflicting
+-- evidence for an id POISONS that id permanently (it goes back to unknown),
+-- because a learned mapping that is wrong is worse than no mapping. The table
+-- is rebuilt from scratch every reload; it is a cache, never a source.
+--------------------------------------------------------------------------
+
+local QUEST_TICK_EVERY = 0.5   -- recompute the nearest objective this often
+local QUEST_MARKER_EVERY = 0.2 -- WORLD_MAP_UPDATE repaint throttle
+local QUEST_MAX_CAND = 60      -- bound on waypoints considered per scan
+local QUEST_MAX_BLIPS = 8      -- minimap dots (created once, reused forever)
+local QUEST_MAX_MARKERS = 30   -- world map dots
+
+-- Zone dimensions are NOT exposed in 1.12 (no zone size API, and no world
+-- coordinates for anything but yourself), so a percentage delta cannot be
+-- turned into a real distance — only into an estimate against a nominal
+-- vanilla zone footprint. Hence every distance the UI prints carries a "~".
+-- Tunable: vanilla zone maps are ~3:2, and most Eastern Kingdoms leveling
+-- zones land within roughly 20% of these numbers.
+local QUEST_ZONE_YARDS_X = 3500
+local QUEST_ZONE_YARDS_Y = 2333
+
+-- Minimap view RADIUS in yards per Minimap:GetZoom() level (0..5). These are
+-- the outdoor numbers vanilla map addons converged on; approximate and
+-- deliberately tunable. 1.12 has no dependable IsIndoors(), so indoors the
+-- blips read slightly optimistic — they still point the right way, which is
+-- the entire job of a dot on a rim.
+local QUEST_MINIMAP_RADIUS = {
+  [0] = 233.3, [1] = 200.0, [2] = 166.6,
+  [3] = 133.3, [4] = 100.0, [5] = 66.6,
+}
+
+-- FRIZQT__.TTF (the 1.12 UI font) is not trusted to carry U+2192 / U+21A9;
+-- a missing glyph renders as an empty box and the line reads as broken. ASCII
+-- markers always render. Swap these two for "->" / "<-" arrows if you run a
+-- font pack that has them.
+local QUEST_MARK_GO = ">>"
+local QUEST_MARK_TURNIN = "<<"
+
+local COMPASS_TAN22 = 0.4142 -- tan(22.5 deg): the 8-point octant boundary
+
+local quest = {
+  enabled = true,
+  dataWarned = false,   -- the one-and-only "no data file" emit
+  nextTickAt = 0,
+  nextMarkerAt = 0,
+  nextMapFix = 0,
+  logSig = "",          -- change detector for the debug-only log trace
+  target = nil,         -- the waypoint the panel line is pointing at
+  spots = {},           -- every drawable waypoint, nearest first
+  learned = {},         -- zone id -> zone name, or false once poisoned
+  zoneName = "",
+  px = 0, py = 0, posOK = false,
+}
+
+local questBtn -- created below; questSetEnabled closes over this local
+
+local function questData()
+  if ShadowArmyQuestData then return ShadowArmyQuestData end
+  if not quest.dataWarned then
+    quest.dataWarned = true
+    emit("err", "quest data missing")
+  end
+  return nil
+end
+
+-- GetPlayerMapPosition answers for whatever zone the WORLD MAP is currently
+-- showing, so it reads 0,0 while the human browses another zone (and in
+-- instances, which have no player dot at all). When the map is CLOSED we can
+-- quietly put it back with SetMapToCurrentZone(); while it is OPEN we leave
+-- the human's browsing alone and stop drawing instead. A stale sample is
+-- never reused — that is how you end up with an arrow pointing at a spot in
+-- the zone you left twenty minutes ago.
+local function questPosition()
+  local x, y = GetPlayerMapPosition("player")
+  if (not x) or (x == 0 and y == 0) then
+    local now = GetTime()
+    if now >= quest.nextMapFix
+        and not (WorldMapFrame and WorldMapFrame:IsVisible()) then
+      quest.nextMapFix = now + 2
+      pcall(SetMapToCurrentZone)
+      x, y = GetPlayerMapPosition("player")
+    end
+  end
+  if (not x) or (x == 0 and y == 0) then
+    quest.posOK = false
+    return false
+  end
+  -- The data file is in percent; the API is in fractions.
+  quest.px, quest.py, quest.posOK = x * 100, y * 100, true
+  return true
+end
+
+local function questLearn(id, name)
+  if not id or not name or name == "" then return end
+  local known = quest.learned[id]
+  if known == nil then
+    quest.learned[id] = name
+  elseif known and known ~= name then
+    quest.learned[id] = false -- two names for one id: never trust it again
+  end
+end
+
+-- Rule (1) OR the learned-id fallback; see the section header.
+local function questSpotHere(q, spotZone, headerMatch, zone)
+  if headerMatch and (not spotZone or spotZone == q.zone) then return true end
+  local learned = spotZone and quest.learned[spotZone]
+  if learned and learned == zone then return true end
+  return false
+end
+
+-- Map space is +x east, +y SOUTH (screen down). The vanilla minimap is
+-- north-up by default and GetPlayerFacing is not something to lean on in
+-- 1.12, so no rotation enters any of this. Octants are decided by comparing
+-- the two legs against tan(22.5) rather than calling atan2 — one less 5.0
+-- math library assumption for the same answer.
+local function questBearing(dx, dy)
+  local ax = dx >= 0 and dx or -dx
+  local ay = dy >= 0 and dy or -dy
+  local ns = (dy < 0) and "N" or "S"
+  local ew = (dx >= 0) and "E" or "W"
+  if ax < ay * COMPASS_TAN22 then return ns end
+  if ay < ax * COMPASS_TAN22 then return ew end
+  return ns .. ew
+end
+
+local function questYards(dx, dy)
+  local ux = dx / 100 * QUEST_ZONE_YARDS_X
+  local uy = dy / 100 * QUEST_ZONE_YARDS_Y
+  return math.sqrt(ux * ux + uy * uy)
+end
+
+-- Live objective progress only exists as leaderboard STRINGS ("Mindless
+-- Zombie slain: 3/8"). SelectQuestLogEntry is global UI state — it moves the
+-- human's selection in an open quest log — so the caller restores the old
+-- selection once the whole scan is done, and the scan is skipped outright
+-- while the log is on screen.
+local function questBoards(i)
+  SelectQuestLogEntry(i)
+  local out = {}
+  local n = GetNumQuestLeaderBoards() or 0
+  local j = 1
+  while j <= n do
+    local text, _, done = GetQuestLogLeaderBoard(j)
+    local have, need
+    if text then
+      -- string.find returns start, stop, THEN the captures.
+      local _, _, a, b = string.find(text, "(%d+)%s*/%s*(%d+)")
+      have, need = tonumber(a), tonumber(b)
+    end
+    out[j] = {
+      text = text or "", done = done and true or false,
+      have = have, need = need,
+    }
+    j = j + 1
+  end
+  return out, n
+end
+
+-- Join a data objective to its live leaderboard line. Label substring first,
+-- with string.find's PLAIN flag so a label containing "-" or "(" cannot blow
+-- up as a Lua pattern. Positional fallback second: vanilla lists objectives
+-- in the same order the database stores them, so index N usually is index N,
+-- and a wrong count is better than no line at all here (the count is cosmetic
+-- — the coordinates come from the data file either way).
+local function questMatchBoard(boards, nb, label, idx)
+  if label then
+    local want = string.lower(label)
+    local j = 1
+    while j <= nb do
+      if string.find(string.lower(boards[j].text), want, 1, true) then
+        return boards[j]
+      end
+      j = j + 1
+    end
+  end
+  if idx and idx <= nb then return boards[idx] end
+  return nil
+end
+
+-- Strict TOTAL order: table.sort in 5.0 is unstable and raises "invalid order
+-- function" on a sloppy comparator (the same lesson the bag sort learned).
+local function questCandCmp(a, b)
+  if a.dist ~= b.dist then return a.dist < b.dist end
+  return a.idx < b.idx
+end
+
+local function questScan()
+  local data = questData()
+  local zone = GetRealZoneText() or ""
+  quest.zoneName = zone
+  if not data or not quest.posOK then
+    quest.spots = {}
+    quest.target = nil
+    return
+  end
+  -- Quest log open: keep the previous scan rather than reach into the
+  -- selection under the human's cursor. Blips stay honest anyway because
+  -- they are drawn against the live player position every tick.
+  if QuestLogFrame and QuestLogFrame:IsVisible() then return end
+
+  local sel = 0
+  if GetQuestLogSelection then sel = GetQuestLogSelection() or 0 end
+
+  -- Watched (tracked) quests own the panel line when there are any.
+  local watched = {}
+  local nw = GetNumQuestWatches and GetNumQuestWatches() or 0
+  local wi = 1
+  while wi <= nw do
+    local qi = GetQuestIndexForWatch(wi)
+    if qi then watched[qi] = true end
+    wi = wi + 1
+  end
+
+  local cand, nc = {}, 0
+  local sig = ""
+  local header = ""
+  local nEntries = GetNumQuestLogEntries()
+  local i = 1
+  while i <= nEntries and nc < QUEST_MAX_CAND do
+    -- 1.12: title, level, questTag, isHeader, isCollapsed, isComplete.
+    -- Headers carry the ZONE NAME as their title — that is rule (1)'s input.
+    local title, _, _, isHeader, _, isComplete = GetQuestLogTitle(i)
+    if isHeader then
+      header = title or ""
+    elseif title then
+      local q = data[title]
+      if q then
+        local headerMatch = (header == zone)
+        if headerMatch then questLearn(q.zone, zone) end
+        sig = sig .. title .. (isComplete and "!" or "-")
+        if isComplete then
+          -- Objectives are done: the only useful waypoint is the turn-in NPC.
+          local w = q.turnIn
+          if w and w.x and w.y and questSpotHere(q, w.zone, headerMatch, zone) then
+            nc = nc + 1
+            cand[nc] = {
+              label = w.label or title, x = w.x, y = w.y,
+              turnIn = true, tracked = watched[i] and true or false, idx = nc,
+            }
+          end
+        elseif q.objectives then
+          local boards, nb = questBoards(i)
+          local nObj = table.getn(q.objectives)
+          local oi = 1
+          while oi <= nObj and nc < QUEST_MAX_CAND do
+            local obj = q.objectives[oi]
+            local b = questMatchBoard(boards, nb, obj.label, oi)
+            local have = (b and b.have) or 0
+            local need = (b and b.need) or obj.count or 0
+            local done = b and (b.done or (need > 0 and have >= need))
+            if not done and obj.spots then
+              sig = sig .. ":" .. have
+              local nSpots = table.getn(obj.spots)
+              local si = 1
+              while si <= nSpots and nc < QUEST_MAX_CAND do
+                local s = obj.spots[si]
+                if s.x and s.y and questSpotHere(q, s.zone, headerMatch, zone) then
+                  nc = nc + 1
+                  cand[nc] = {
+                    label = obj.label or title, have = have, need = need,
+                    x = s.x, y = s.y,
+                    tracked = watched[i] and true or false, idx = nc,
+                  }
+                end
+                si = si + 1
+              end
+            end
+            oi = oi + 1
+          end
+        end
+      end
+    end
+    i = i + 1
+  end
+  -- Put the human's selection back before anything can redraw the log.
+  if sel > 0 then SelectQuestLogEntry(sel) end
+
+  local k = 1
+  while k <= nc do
+    local c = cand[k]
+    c.dx = c.x - quest.px
+    c.dy = c.y - quest.py
+    c.dist = questYards(c.dx, c.dy)
+    k = k + 1
+  end
+  table.sort(cand, questCandCmp)
+  quest.spots = cand
+
+  -- Tracked quests win the panel LINE outright; the blips still show
+  -- everything nearby, because the map is more useful than the line.
+  local pick = nil
+  k = 1
+  while k <= nc do
+    if cand[k].tracked then
+      pick = cand[k]
+      break
+    end
+    k = k + 1
+  end
+  if not pick then pick = cand[1] end
+  quest.target = pick
+
+  if sig ~= quest.logSig then
+    quest.logSig = sig
+    dtrace("quest " .. nc .. " waypoint(s) in " .. zone)
+  end
+end
+
+--------------------------------------------------------------------------
+-- Drawing. Textures are created once and parked (1.12 frames and their
+-- regions cannot be destroyed), and SetTexture is called with COLOR numbers
+-- rather than an art path — a solid dot cannot 404 on a private-server build
+-- the way a guessed Interface\\ path can.
+--------------------------------------------------------------------------
+
+local questBlips = {}
+local function questBlip(i)
+  local t = questBlips[i]
+  if t then return t end
+  t = Minimap:CreateTexture(nil, "OVERLAY")
+  t:SetWidth(7)
+  t:SetHeight(7)
+  t:Hide()
+  questBlips[i] = t
+  return t
+end
+
+local function questDrawBlips()
+  if not Minimap then return end
+  local radius = QUEST_MINIMAP_RADIUS[Minimap:GetZoom() or 0] or 200.0
+  local halfW = Minimap:GetWidth() / 2
+  local halfH = Minimap:GetHeight() / 2
+  local rim = halfW - 4
+  local show = quest.enabled and quest.posOK
+  local i = 1
+  while i <= QUEST_MAX_BLIPS do
+    local s = quest.spots[i]
+    local t = questBlip(i)
+    if show and s then
+      -- North-up: screen "up" is NEGATIVE map y, hence the sign flip.
+      local ox = (s.x - quest.px) / 100 * QUEST_ZONE_YARDS_X / radius * halfW
+      local oy = -((s.y - quest.py) / 100 * QUEST_ZONE_YARDS_Y) / radius * halfH
+      local m = math.sqrt(ox * ox + oy * oy)
+      if m > rim and m > 0 then
+        -- Out of minimap range: pin to the rim. A dot on the edge still says
+        -- "that way", which beats hiding it.
+        ox, oy = ox / m * rim, oy / m * rim
+      end
+      t:ClearAllPoints() -- SetPoint ACCUMULATES anchors in 1.12
+      t:SetPoint("CENTER", Minimap, "CENTER", ox, oy)
+      if s.turnIn then
+        t:SetTexture(0.20, 1.00, 0.20, 0.90)
+      else
+        t:SetTexture(1.00, 0.82, 0.00, 0.90)
+      end
+      t:Show()
+    else
+      t:Hide()
+    end
+    i = i + 1
+  end
+end
+
+local questMarkers = {}
+local function questMarker(i)
+  local t = questMarkers[i]
+  if t then return t end
+  t = WorldMapDetailFrame:CreateTexture(nil, "OVERLAY")
+  t:SetWidth(10)
+  t:SetHeight(10)
+  t:Hide()
+  questMarkers[i] = t
+  return t
+end
+
+-- The map is only ever marked when it is showing the PLAYER'S OWN zone, and
+-- the oracle for that is quest.posOK: GetPlayerMapPosition reads 0,0 the
+-- moment the map is pointed anywhere else. No zone id lookup, no dropdown
+-- index math, and it cannot be fooled into decorating the wrong continent.
+local function questDrawMarkers()
+  if not WorldMapDetailFrame then return end
+  local show = quest.enabled and quest.posOK
+    and WorldMapFrame and WorldMapFrame:IsVisible()
+  local w = WorldMapDetailFrame:GetWidth()
+  local h = WorldMapDetailFrame:GetHeight()
+  local i = 1
+  while i <= QUEST_MAX_MARKERS do
+    local s = quest.spots[i]
+    local t = questMarker(i)
+    if show and s then
+      t:ClearAllPoints()
+      t:SetPoint("CENTER", WorldMapDetailFrame, "TOPLEFT",
+        s.x / 100 * w, -(s.y / 100 * h))
+      if s.turnIn then
+        t:SetTexture(0.20, 1.00, 0.20, 0.95)
+      else
+        t:SetTexture(1.00, 0.82, 0.00, 0.95)
+      end
+      t:Show()
+    else
+      t:Hide()
+    end
+    i = i + 1
+  end
+end
+
+-- The advisor panel's quest line. Every state says WHY it has nothing to
+-- show; a blank line reads as a broken addon.
+local function questLineText()
+  if not quest.enabled then return "" end
+  if not ShadowArmyQuestData then return "|cFF777777quests: no data file|r" end
+  if not quest.posOK then return "|cFF777777quests: map is off-zone|r" end
+  local t = quest.target
+  if not t then return "|cFF777777quests: nothing mapped here|r" end
+  local dir = questBearing(t.dx, t.dy)
+  local yards = math.floor(t.dist + 0.5)
+  if t.turnIn then
+    return string.format("|cFF44FF44%s %s|r |cFFAAAAAA%s ~%dy %s|r",
+      QUEST_MARK_TURNIN, t.label, "\194\183", yards, dir)
+  end
+  local prog = ""
+  if t.need and t.need > 0 then
+    prog = string.format(" %d/%d", t.have or 0, t.need)
+  end
+  return string.format("|cFFFFD200%s %s%s|r |cFFAAAAAA%s ~%dy %s|r",
+    QUEST_MARK_GO, t.label, prog, "\194\183", yards, dir)
+end
+
+local function questTick()
+  if not quest.enabled then return end
+  local now = GetTime()
+  if now < quest.nextTickAt then return end
+  quest.nextTickAt = now + QUEST_TICK_EVERY
+  questPosition()
+  questScan()
+  questDrawBlips()
+  questDrawMarkers()
+end
+
+local function questSetEnabled(on)
+  quest.enabled = on and true or false
+  if questBtn then
+    -- Same convention as Auto Combat: the label never changes, the STATE is
+    -- the colour. Green on, grey off.
+    questBtn:SetText(quest.enabled and "|cFF44FF44Quests|r" or "|cFF999999Quests|r")
+  end
+  if quest.enabled then
+    quest.nextTickAt = 0
+  else
+    quest.spots = {}
+    quest.target = nil
+    pcall(questDrawBlips)
+    pcall(questDrawMarkers)
+  end
+end
+
+questBtn = CreateFrame("Button", "ShadowArmyQuestBtn", panel, "UIPanelButtonTemplate")
+questBtn:SetWidth(93) -- 8 + 93 + 8 + 93 + 8 = 210 = panel width
+questBtn:SetHeight(20)
+questBtn:SetPoint("BOTTOMRIGHT", panel, "BOTTOMRIGHT", -8, 8) -- bottom row, right of Log
+questBtn:SetText("|cFF44FF44Quests|r")
+questBtn:SetScript("OnClick", function()
+  questSetEnabled(not quest.enabled)
+end)
+
+-- WORLD_MAP_UPDATE fires on pan/zoom/zone-switch and can arrive every frame
+-- while the map is open, so the repaint is throttled; the 0.5s tick repaints
+-- anyway, this just keeps markers from lagging a zone change visibly.
+-- ZONE_CHANGED_NEW_AREA forces an immediate rescan because rule (1) is a
+-- comparison against the zone NAME, which just changed.
+local questEvents = CreateFrame("Frame", "ShadowArmyQuestEvents", UIParent)
+questEvents:RegisterEvent("WORLD_MAP_UPDATE")
+questEvents:RegisterEvent("ZONE_CHANGED_NEW_AREA")
+questEvents:SetScript("OnEvent", function()
+  if not quest.enabled then return end
+  if event == "ZONE_CHANGED_NEW_AREA" then
+    quest.nextTickAt = 0
+    return
+  end
+  local now = GetTime()
+  if now < quest.nextMarkerAt then return end
+  quest.nextMarkerAt = now + QUEST_MARKER_EVERY
+  local ok, err = pcall(questDrawMarkers)
+  if not ok then emit("err", "questMarkers: " .. tostring(err)) end
+end)
+
+
 -- Rotation driver lives on its OWN always-shown frame — NOT the panel.
 -- (OnUpdate only fires for visible frames; hiding the panel via /sa must
 -- not kill auto-combat.) pcall so a rotation bug reports instead of
@@ -1496,6 +2022,14 @@ driver:SetScript("OnUpdate", function()
       pcall(sortStop, "error")
     end
   end
+  -- r18: quest waypoints. Self-throttled to 0.5s internally, above the
+  -- auto.enabled gate (knowing where to walk has nothing to do with combat)
+  -- and pcall'd like every other tick body here — a bug in the quest data
+  -- must not be able to take loot retries or the reload ladder down with it.
+  if quest.enabled then
+    local qok, qerr = pcall(questTick)
+    if not qok then emit("err", "questTick: " .. tostring(qerr)) end
+  end
   if loot.active then lootTick() end
   if pendingReload > 0 then
     pendingReload = pendingReload - 1
@@ -1541,6 +2075,7 @@ panel:SetScript("OnUpdate", function()
   line3:SetText(t1)
   line4:SetText(t2)
   line5:SetText(buffWatchLine())
+  line6:SetText(questLineText())
 end)
 
 --------------------------------------------------------------------------
@@ -1712,6 +2247,11 @@ SlashCmdList["SHADOWARMY"] = function(msg)
   -- this still opens it.
   if msg == "bags" then
     bagsToggle()
+    return
+  end
+  if msg == "quests" then
+    questSetEnabled(not quest.enabled)
+    say("quest helper " .. (quest.enabled and "ON" or "OFF"))
     return
   end
   if msg == "log" then

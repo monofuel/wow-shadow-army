@@ -3,4 +3,5 @@
 ## Notes: Advisor HUD + command channel for the shadow army (hello world stage)
 ## Version: 0.1.0
 
+QuestData.lua
 ShadowArmy.lua
