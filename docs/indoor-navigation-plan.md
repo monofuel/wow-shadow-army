@@ -1,15 +1,72 @@
-# Indoor (WMO) navigation fix — plan
+# Indoor (WMO) navigation — plan and RESOLUTION
 
-Written 2026-07-26. Goal: fix the wow-coworld bug that stops bots from
+Written 2026-07-26. Goal was: fix the wow-coworld bug that stops bots from
 navigating inside WMOs (crypts, buildings, dungeon entrances), prove it on a
 fresh testbed warlock, and hand upstream a PR.
 
+**RESOLUTION (same day): no fix needed — upstream already fixed it.** At
+`033fa79c4` the testbed warlock Igris walked crypt-interior → outdoors →
+INTO the cathedral to the imp questgiver on the UNPATCHED build, driven by
+plain external `move` actions with a destination (`brain/walkto.py`). The
+old-pin analysis below is kept for the record; see §"Resolution evidence".
+
 | | |
 |---|---|
-| Fork branch | `indoor-wmo-navigation` (Gitea `Monolab/coworld-vanilla-wow`) |
+| Fork branch | `indoor-wmo-navigation` (Gitea `Monolab/coworld-vanilla-wow`) — **empty on purpose**, no carried delta |
 | Based on | upstream `main` @ `033fa79c4` ("Admit retained Orc quest discovery actions") |
-| Testbed | second fresh undead warlock (own account + slot; NOT Shadowfel's slot 2) |
-| Status | branch cut, plan agreed, **no code yet** |
+| Testbed | Igris — undead warlock, account `shadow2/shadow2`, slot 3 / socket 41117, seat runs from the FORK worktree (`make igris-bot`) |
+| Status | **resolved: works upstream**; fork doctrine says drop our fix when upstream fixed it their way |
+
+## Resolution evidence (2026-07-26)
+
+- Walk 1, crypt → Venya Marthand (quest 1470 giver, church interior):
+  `uv run --project ../coworld-vanilla-wow-fork` +
+  `WOW_SHADOW_UPSTREAM=<fork>` `python -m brain.walkto --slot 3
+  --character Igris --to venya`. Result: **ARRIVED gap=2.5yd**,
+  pos (1839.2, 1632.2, 96.9), 67 moves total across two runs, 2 transient
+  `graph movement made no progress into target polygon` failures that
+  self-recovered by replanning. Crypt spiral (z 121→134), tunnel exit
+  (z→101), church door, nave — all on graph-edge moves.
+- DB ground truth: `characters` row for Igris at (1839.2, 1632.2, 96.9),
+  online — the cathedral interior, next to Venya (1836.94, 1633.43, 97.02).
+- Why it works now: `planNavigationAction`
+  (`player/behavior/navigation.nim:574+`) converts every destination move
+  into native navmesh-graph-edge legs and stamps
+  `allowTerrainOverhead = true` (line 553, "a native adjacency is the floor
+  contract"), which skips the ADT terrain-divergence rejection in
+  `routeForwardFloorSafety` and keeps physics on the collision deck
+  (`client/simulation/physics.nim solidFloorAt`). Between our old pin
+  `98220fead` and `033fa79c4` upstream's navmesh-graph rework closed the
+  gap the plan below was written against.
+- The Detour mesh itself always covered the interiors: the navmesh helper
+  routes crypt→Venya (69 waypoints) and outdoors→church (29, smooth)
+  offline via `{"op":"route"}` — see docs/navmesh.md.
+
+Practical consequences:
+
+- Shadowfel-era DB repositioning is obsolete: bots can WALK out of the
+  Shadow Grave, and into the church/vendor buildings, today.
+- `brain/walkto.py` is the reusable walk driver + evidence logger
+  (presets: `outside`, `venya`, `crypt`).
+- No residual external-move gap: `resolvePolicyAction`
+  (`player/contract/environment_frame.nim:1019-1040`) lowers BOTH external
+  move forms — target-form (destination := target's observed location,
+  arrival 4yd) and destination-form — to `navigationMode = "goal"`, which is
+  not in `planNavigationAction`'s `manual/local/transport` bypass list
+  (`navigation.nim:584`), so every external move gets graph planning and the
+  terrain-overhead contract. The `manual`/`local` modes that skip the flag
+  are internal planner-authored actions only.
+- The transient `graph movement made no progress into target polygon`
+  failures are the corridor settlement classifier
+  (`player/contract/actions.nim:994`) reporting a stalled leg; walkto's next
+  submission replans and recovers — observed twice in 67 moves, both
+  self-healed.
+- If a future upstream pin ever regresses this, the analysis + ranked fix
+  options below become live again.
+
+---
+
+# Original plan (pre-resolution, kept for the record)
 
 ## Why this bug is the early-game blocker
 

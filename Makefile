@@ -493,6 +493,75 @@ play-classic:
 	@nix develop --command tools/play_classic.sh
 
 # ---------------------------------------------------------------------------
+# Igris — testbed UNDEAD WARLOCK for the indoor-navigation fix
+# (docs/indoor-navigation-plan.md). Identical seat pattern to warlock-bot,
+# except the reference player runs from OUR FORK worktree (branch
+# indoor-wmo-navigation) against the stock realm — so the patched client can
+# be A/B'd (fork main = baseline, fix branch = patched) without touching the
+# upstream checkout or the realm image. Character auto-creates over the wire
+# on first login (CMSG_CHAR_CREATE), spawning in the Shadow Grave crypt —
+# the indoor-nav reproduce case.
+IGRIS_ACCOUNT := shadow2
+IGRIS_PASS := shadow2
+IGRIS_CHARACTER := Igris
+IGRIS_RACE := undead
+IGRIS_CLASS := warlock
+IGRIS_GENDER := male
+# Slot map (docs/control-plane.md): 0=Botwarrior, 1=Botpriest, 2=Shadowfel,
+# 3=Igris. Control socket 41114 + slot = 127.0.0.1:41117.
+IGRIS_SLOT := 3
+IGRIS_RUNTIME_DIR := $(CURDIR)/local_data/nim-runtime-slot$(IGRIS_SLOT)
+
+.PHONY: igris-account igris-bot
+igris-account:
+	@set -e; \
+	if [ ! -d "$(UPSTREAM)" ]; then \
+		echo "error: upstream checkout missing: $(UPSTREAM)" >&2; exit 1; \
+	fi; \
+	cd "$(UPSTREAM)"; \
+	cid=$$(docker compose -f "$(COMPOSE_FILE)" --profile coworld ps -q coworld-game); \
+	if [ -z "$$cid" ]; then \
+		echo "error: coworld-game is not running; make start-server first" >&2; exit 1; \
+	fi; \
+	uv run python server/scripts/manage_coworld_accounts.py \
+		--entrant "$(IGRIS_ACCOUNT):$(IGRIS_ACCOUNT):$(IGRIS_PASS)" \
+		--mysql-container "$$cid" \
+		--host 127.0.0.1 \
+		--port 3306 \
+		--db-user mangos \
+		--db-password mangos \
+		--apply; \
+	echo "account ready: $(IGRIS_ACCOUNT) / $(IGRIS_PASS)"
+
+# Foreground. Detach with:
+#   nohup make igris-bot > local_data/igris-bot.log 2>&1 &
+# Ready at: "Nim binary control socket listening on 127.0.0.1:41117."
+igris-bot:
+	@set -e; \
+	if [ ! -d "$(FORK)" ]; then \
+		echo "error: fork checkout missing: $(FORK) (see docs/coworld-fork.md)" >&2; exit 1; \
+	fi; \
+	if [ ! -f "$(WOW_ENV)" ]; then \
+		echo "error: missing $(WOW_ENV)" >&2; exit 1; \
+	fi; \
+	mkdir -p "$(IGRIS_RUNTIME_DIR)"; \
+	cd "$(FORK)"; \
+	. "$(WOW_ENV)"; \
+	VANILLA_WOW_PLAYER_REALM_HOST=127.0.0.1 \
+	VANILLA_WOW_PLAYER_REALM_PORT=3724 \
+	VANILLA_WOW_PLAYER_USERNAME=$(IGRIS_ACCOUNT) \
+	VANILLA_WOW_PLAYER_PASSWORD=$(IGRIS_PASS) \
+	VANILLA_WOW_PLAYER_CHARACTER_NAME=$(IGRIS_CHARACTER) \
+	VANILLA_WOW_PLAYER_CHARACTER_RACE=$(IGRIS_RACE) \
+	VANILLA_WOW_PLAYER_CHARACTER_CLASS=$(IGRIS_CLASS) \
+	VANILLA_WOW_PLAYER_CHARACTER_GENDER=$(IGRIS_GENDER) \
+	VANILLA_WOW_PLAYER_AUTONOMOUS=0 \
+	WOW_SDK_NIM_RUNTIME_SLOT=$(IGRIS_SLOT) \
+	WOW_SDK_NIM_RUNTIME_DIR=$(IGRIS_RUNTIME_DIR) \
+	WOW_SDK_NIM_CONTROL_HOST=127.0.0.1 \
+	nim r player/reference_player/reference_player.nim --scenario=nim-control
+
+# ---------------------------------------------------------------------------
 # Our fork of coworld-vanilla-wow (docs/coworld-fork.md): thin rebase layer
 # carrying the SMSG_SET_FACTION_STANDING crash fix. Builds the three
 # shadow-army-tagged images serially (each can saturate the box). Never
