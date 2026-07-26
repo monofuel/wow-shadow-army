@@ -1,12 +1,32 @@
-"""Coerce live EnvironmentFrame quirks that strict upstream pydantic rejects.
+"""Coerce live wire quirks that strict upstream pydantic rejects.
 
-At pin 98220fead, headless frames can emit empty strings for
-``observation.movement_mode`` and ``observation.liquid_kind`` where the
-Python model requires the literal ``"unknown"``. This is an adapter-only
-normalization so we can consume live frames without forking upstream.
+Adapter-only normalization so we can consume live frames without forking
+upstream. Everything here is a documented divergence between what the Nim
+client actually puts on the wire at pin ``98220fead`` and what the Python
+contract models will accept.
 
-Also softens ActionSettled validation when success/reason_code disagree
-(seen once on the wire during milestone-1 bring-up).
+Three families, all observed live:
+
+1. **Empty enum strings.** ``observation.movement_mode`` /
+   ``observation.liquid_kind`` arrive as ``""`` where the model requires the
+   literal ``"unknown"`` (milestone-1 bring-up).
+
+2. **Empty ``min_length=1`` strings in ``leveling_context``.** An undead
+   warlock resolves ``profile_id=unsupported_profile``; the strategy reducer
+   then never picks a farm area, so ``farm_area_id`` / ``farm_area_label``
+   (and, defensively, the sibling profile/strategy labels) go out as ``""``
+   against ``Field(min_length=1)``. This blocked EVERY frame read on the
+   Shadowfel seat — see ``docs/warlock-seat.md``.
+
+3. **``ActionSettled`` success/reason_code disagreement.** The model asserts
+   ``success == (reason_code == "ok")``. The noop settlement produced by the
+   unsupported-profile path violates it. Reconciliation here is deliberately
+   **failure-preserving**: a disagreement never becomes a success, so no
+   coercion can make the brain believe an action worked when it did not.
+
+``ActionSettled`` reaches us on two different paths — embedded in the
+MessagePack environment frame as ``previous_transition``, and standalone as
+JSON from ``last_settlement()``. Both are patched.
 """
 
 from __future__ import annotations
@@ -14,14 +34,63 @@ from __future__ import annotations
 from typing import Any
 
 
+# Empty string -> contract default, matched by key name anywhere in the tree.
 _EMPTY_TO_UNKNOWN = {
     "movement_mode": "unknown",
     "liquid_kind": "unknown",
+    # leveling_context Field(min_length=1) slots, empty when no strategy ran.
+    "profile_id": "unknown",
+    "profile_label": "unknown",
+    "strategy_id": "unknown",
+    "strategy_label": "unknown",
+    "farm_area_id": "unknown",
+    "farm_area_label": "unknown",
+}
+
+# ActionSettled.reason_code Literal set (player/sdk/nim_control.py:934-941).
+_REASON_CODES = {
+    "ok",
+    "movement_blocked",
+    "unsafe_route",
+    "spell_rejected",
+    "unsupported_action",
+    "action_rejected",
 }
 
 
+def coerce_action_settled(obj: dict[str, Any]) -> dict[str, Any]:
+    """Make ``success`` and ``reason_code`` agree, never inventing a success.
+
+    Rules, in order:
+
+    * ``reason_code`` missing/empty/unknown -> ``"ok"`` when ``success`` is
+      true, else ``"action_rejected"``.
+    * ``success`` true but ``reason_code != "ok"`` -> ``success = False``
+      (trust the specific failure code).
+    * ``success`` false but ``reason_code == "ok"`` -> ``"action_rejected"``
+      (trust the boolean).
+
+    Both disagreement branches settle on failure by design.
+    """
+    out = dict(obj)
+    success = bool(out.get("success", False))
+    reason = out.get("reason_code")
+
+    if not isinstance(reason, str) or reason not in _REASON_CODES:
+        reason = "ok" if success else "action_rejected"
+
+    if success and reason != "ok":
+        success = False
+    elif not success and reason == "ok":
+        reason = "action_rejected"
+
+    out["success"] = success
+    out["reason_code"] = reason
+    return out
+
+
 def coerce_frame_payload(obj: Any) -> Any:
-    """Recursively replace known empty-string enums with contract defaults."""
+    """Recursively normalize a decoded wire payload in place-of-copy."""
     if isinstance(obj, dict):
         out: dict[str, Any] = {}
         for key, value in obj.items():
@@ -29,23 +98,63 @@ def coerce_frame_payload(obj: Any) -> Any:
                 out[key] = _EMPTY_TO_UNKNOWN[key]
             else:
                 out[key] = coerce_frame_payload(value)
+        if out.get("type") == "action_settled":
+            out = coerce_action_settled(out)
         return out
     if isinstance(obj, list):
         return [coerce_frame_payload(item) for item in obj]
     return obj
 
 
+def coerce_json_payload(payload: bytes) -> bytes:
+    """Normalize a JSON wire payload; returns the original bytes on any doubt."""
+    import json
+
+    try:
+        decoded = json.loads(payload)
+    except ValueError:
+        return payload
+    if not isinstance(decoded, dict):
+        return payload
+    return json.dumps(coerce_frame_payload(decoded)).encode()
+
+
 def patch_upstream_decode() -> None:
-    """Monkey-patch upstream msgpack decode once (import-time safe)."""
+    """Monkey-patch upstream decode paths once (import-time safe)."""
     import player.sdk.nim_control as nc
 
     if getattr(nc, "_shadow_coerce_patched", False):
         return
 
-    original = nc._decode_environment_frame_payload
+    # (a) MessagePack environment frames (includes previous_transition).
+    original_decode = nc._decode_environment_frame_payload
 
-    def _wrapped(payload: bytes) -> object:
-        return coerce_frame_payload(original(payload))
+    def _wrapped_decode(payload: bytes) -> object:
+        return coerce_frame_payload(original_decode(payload))
 
-    nc._decode_environment_frame_payload = _wrapped  # type: ignore[assignment]
+    nc._decode_environment_frame_payload = _wrapped_decode  # type: ignore[assignment]
+
+    # (b) Standalone JSON ActionSettled from last_settlement().
+    original_request = nc.NimControlClient._request
+
+    def _wrapped_request(self, frame_type, request, response_type, response_model):  # type: ignore[no-untyped-def]
+        if response_model is not nc.ActionSettled:
+            return original_request(self, frame_type, request, response_type, response_model)
+        # Re-run upstream's own framing, but coerce before validation by
+        # temporarily validating through a lenient shim.
+        original_validate = response_model.model_validate_json
+
+        def _lenient(payload, *args, **kwargs):  # type: ignore[no-untyped-def]
+            try:
+                return original_validate(payload, *args, **kwargs)
+            except Exception:  # noqa: BLE001 — pydantic ValidationError surface
+                return original_validate(coerce_json_payload(payload), *args, **kwargs)
+
+        response_model.model_validate_json = _lenient  # type: ignore[assignment]
+        try:
+            return original_request(self, frame_type, request, response_type, response_model)
+        finally:
+            response_model.model_validate_json = original_validate  # type: ignore[assignment]
+
+    nc.NimControlClient._request = _wrapped_request  # type: ignore[assignment]
     nc._shadow_coerce_patched = True  # type: ignore[attr-defined]

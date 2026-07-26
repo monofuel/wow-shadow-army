@@ -32,7 +32,7 @@ COMPOSE_FILE := infra/compose.vmangos.yml
 ACCOUNT_USER := monofuel
 ACCOUNT_PASS := password
 
-.PHONY: test test-lua test-python test-nim system pin-check integration-test start-server stop-server server-logging logs account soap-account play play-classic shadow party-form breadcrumbs warlock-account warlock-bot botwarrior-bot navmesh-helper navmesh-status
+.PHONY: test test-lua test-python test-nim system pin-check integration-test start-server stop-server server-logging logs account soap-account play play-classic shadow grind party-form breadcrumbs warlock-account warlock-bot botwarrior-bot navmesh-helper navmesh-status
 
 # Unit tier only. test-python is stdlib-only (projection + intent_mapping + optional
 # lua_runner smoke); it is wired into `make test` because it needs no venv/network.
@@ -112,6 +112,22 @@ EXTRA ?=
 shadow:
 	@cd "$(CURDIR)" && uv run --project "$(UPSTREAM)" python -m brain.shadow \
 		--slot $(SLOT) --leader-name $(LEADER) --party-members $(PARTY) $(EXTRA)
+
+# Mob-grinding brain (docs/warlock-seat.md). Drives a seat entirely from OUR
+# policy using the goal-independent generic action masks, so it works for
+# classes the upstream leveling planner refuses (an undead warlock resolves
+# `unsupported_profile` and the planner noops forever — that only silences
+# `recommended_action`, it does not close the masks).
+#
+#   make grind SLOT=2 CHARACTER=Shadowfel EXTRA='--max-seconds 600'
+#
+# Safety: `--avoid-names` defaults to Murist. Bots never address the human's
+# character. `--leash` keeps the bot near its anchor so a chase cannot walk it
+# into his play area.
+CHARACTER ?= Shadowfel
+grind:
+	@cd "$(CURDIR)" && uv run --project "$(UPSTREAM)" python -m brain.grind \
+		--slot $(SLOT) --character $(CHARACTER) $(EXTRA)
 
 # Form a real party across two or more of OUR headless seats (docs/party-formation.md).
 # `invite_party` is only unmasked while the leader seat holds a dungeon goal whose
