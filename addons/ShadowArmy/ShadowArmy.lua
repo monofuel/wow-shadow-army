@@ -8,10 +8,17 @@ ShadowArmy = ShadowArmy or {}
 
 -- Bump on every edit. The System watches Chat.log for "<SA> loaded rev=..."
 -- after sending a reload — a new rev proves the edit actually loaded.
-local REV = "r15"
+local REV = "r16"
+
+-- Log window (r16): every say()/emit() line also lands here with a
+-- timestamp, so errors survive chat scroll-off and can be reviewed in-game.
+-- ScrollingMessageFrame is the same widget chat frames are built on —
+-- free history, free scrolling. Forward-declared; UI built after the panel.
+local addLog -- (kind, text)
 
 local function say(msg)
   DEFAULT_CHAT_FRAME:AddMessage("|cFF9482C9[ShadowArmy]|r " .. tostring(msg))
+  if addLog then addLog("say", tostring(msg)) end
 end
 
 -- /say lands in the server's Chat.log; The System tails it. This is
@@ -39,6 +46,7 @@ local function emit(kind, text)
   end
   lastEmitMsg = msg
   lastEmitTime = now
+  if addLog then addLog(kind, text) end
   local droppable = DROPPABLE[kind] and true or false
   if table.getn(emitQueue) >= EMIT_QUEUE_MAX then
     -- Make room: evict the oldest droppable line first.
@@ -402,6 +410,73 @@ UseAction = function(slot, checkCursor, onSelf)
     ReloadUI() -- if somehow still gated, fall through and act normally
   end
   origUseAction(slot, checkCursor, onSelf)
+end
+
+--------------------------------------------------------------------------
+-- Log window (r16): scrollable history of everything the advisor said or
+-- emitted, timestamped. /sa log toggles. ScrollingMessageFrame gives us
+-- history + scrolling for free (it's what chat frames are made of).
+--------------------------------------------------------------------------
+
+local logFrame = CreateFrame("Frame", "ShadowArmyLogFrame", UIParent)
+logFrame:SetWidth(380)
+logFrame:SetHeight(220)
+logFrame:SetPoint("CENTER", UIParent, "CENTER", 0, -120)
+logFrame:SetBackdrop({
+  bgFile = "Interface\\Tooltips\\UI-Tooltip-Background",
+  edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+  tile = true, tileSize = 16, edgeSize = 16,
+  insets = { left = 4, right = 4, top = 4, bottom = 4 },
+})
+logFrame:SetBackdropColor(0.05, 0.02, 0.10, 0.9)
+logFrame:EnableMouse(true)
+logFrame:SetMovable(true)
+logFrame:RegisterForDrag("LeftButton")
+logFrame:SetScript("OnDragStart", function() logFrame:StartMoving() end)
+logFrame:SetScript("OnDragStop", function() logFrame:StopMovingOrSizing() end)
+logFrame:Hide()
+tinsert(UISpecialFrames, "ShadowArmyLogFrame")
+
+local logTitle = logFrame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+logTitle:SetPoint("TOP", logFrame, "TOP", 0, -8)
+logTitle:SetText("|cFF9482C9Advisor Log|r")
+
+local logClose = CreateFrame("Button", nil, logFrame, "UIPanelCloseButton")
+logClose:SetPoint("TOPRIGHT", logFrame, "TOPRIGHT", -2, -2)
+
+local logMsg = CreateFrame("ScrollingMessageFrame", "ShadowArmyLogMsg", logFrame)
+logMsg:SetPoint("TOPLEFT", logFrame, "TOPLEFT", 12, -28)
+logMsg:SetPoint("BOTTOMRIGHT", logFrame, "BOTTOMRIGHT", -12, 30)
+logMsg:SetFontObject(GameFontNormalSmall)
+logMsg:SetJustifyH("LEFT")
+logMsg:SetMaxLines(250)
+logMsg:SetFading(false)
+
+local function makeLogBtn(label, xOff, fn)
+  local b = CreateFrame("Button", nil, logFrame, "UIPanelButtonTemplate")
+  b:SetWidth(56)
+  b:SetHeight(18)
+  b:SetPoint("BOTTOMLEFT", logFrame, "BOTTOMLEFT", xOff, 7)
+  b:SetText(label)
+  b:SetScript("OnClick", fn)
+  return b
+end
+makeLogBtn("Up", 12, function() logMsg:ScrollUp() end)
+makeLogBtn("Down", 72, function() logMsg:ScrollDown() end)
+makeLogBtn("Latest", 132, function() logMsg:ScrollToBottom() end)
+
+-- kind -> color; errors pop, telemetry chatter stays muted
+local LOG_COLORS = {
+  err = { 1.0, 0.35, 0.35 },
+  say = { 0.72, 0.62, 0.9 },
+  trace = { 0.55, 0.55, 0.55 },
+  loaded = { 0.35, 1.0, 0.35 },
+}
+
+addLog = function(kind, text)
+  local c = LOG_COLORS[kind] or { 0.8, 0.8, 0.8 }
+  local tag = (kind == "say") and "" or ("[" .. kind .. "] ")
+  logMsg:AddMessage(date("%H:%M:%S ") .. tag .. text, c[1], c[2], c[3])
 end
 
 --------------------------------------------------------------------------
@@ -1610,6 +1685,10 @@ SlashCmdList["SHADOWARMY"] = function(msg)
   -- this still opens it.
   if msg == "bags" then
     bagsToggle()
+    return
+  end
+  if msg == "log" then
+    if logFrame:IsVisible() then logFrame:Hide() else logFrame:Show() end
     return
   end
   if msg == "status" then
