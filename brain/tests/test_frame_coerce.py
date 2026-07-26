@@ -24,6 +24,22 @@ class TestEmptyEnums(unittest.TestCase):
         self.assertEqual(out["observation"]["movement_mode"], "unknown")
         self.assertEqual(out["observation"]["liquid_kind"], "unknown")
 
+    def test_service_context_empty_destination_demoted(self):
+        """Live frames can flash kind=train with blank destinations."""
+        payload = {
+            "leveling_context": {
+                "service": {
+                    "kind": "train",
+                    "destination_id": "",
+                    "destination_label": "",
+                }
+            }
+        }
+        svc = coerce_frame_payload(payload)["leveling_context"]["service"]
+        self.assertEqual(svc["kind"], "none")
+        self.assertEqual(svc["destination_id"], "")
+        self.assertEqual(svc["destination_label"], "")
+
     def test_leveling_context_min_length_fields(self):
         """The blocker that stopped every Shadowfel frame read."""
         payload = {

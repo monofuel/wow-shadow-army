@@ -18,30 +18,22 @@ masked purely from what the bot can see — not from what the planner
 recommends. The unsupported profile only means ``recommended_action`` is
 ``None``. We supply the policy instead.
 
-The loop (one action per tick, upstream's own control-loop shape):
+The loop (one action per tick) is owned by ``brain.grind_policy.decide_action``:
 
     dead? -> release/reclaim
     loot pending? -> loot
     hurt & out of combat? -> eat/drink, then hold
-    pick nearest eligible hostile
-      cast masked (target, spell)?  -> cast it   (Shadow Bolt first)
-      out of melee range?           -> move (target form, 4 yd arrival)
-      not already auto-attacking?   -> attack ONCE
-      otherwise                     -> hold the settled auto-attack
-
-Auto-attack persists server-side; re-issuing ``attack`` every tick resends
-``CMSG_ATTACK_SWING`` and burns a packet-wait window, so we latch on
-``observation.auto_attack_guid`` (mask proxy: ``stop_attack`` enabled).
+    quest phases when surface allows (accept / skulls / turn-in)
+    pick nearest eligible hostile (entry allowlist — no critters)
+      cast masked (Shadow Bolt first)
+      out of cast range? -> destination-step move (unit-target move is flaky)
+      target / attack fallback
 
 Safety rails
 ------------
-* Only ``kind == "unit"`` entities with ``reaction == "hostile"`` are ever
-  targeted. Player entities (``self``/``party``) are never action targets.
-* ``--avoid-names`` (default ``Murist``) is a hard exclusion at every
-  selection site. The human plays on this realm; a bot must never address
-  his character. See ``docs/party-formation.md``.
-* ``--leash`` keeps the bot inside a radius of its anchor so a chase cannot
-  walk it across the zone into the human's play area.
+* Only hostiles on the Deathknell XP entry list are engaged (critters filtered).
+* ``--avoid-names`` (default ``Murist``) is a hard exclusion at every site.
+* ``--leash`` keeps the bot inside a radius of its anchor.
 
 Usage::
 
@@ -52,17 +44,28 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import signal
 import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Optional
 
+from brain.grind_policy import (
+    PolicyConfig,
+    PolicyState,
+    action_to_factorized,
+    decide_action,
+    has_spell,
+    inventory_count,
+    masked_kinds,
+    quest_in_log,
+    quest_rewarded,
+    quest_turnin_ready,
+    SUMMON_IMP_SPELL,
+)
 from brain.upstream import (
     ActionSelectionRequest,
-    ControlDirective,
     FactorizedAction,
     GoalRequest,
     NimControlClient,
@@ -70,22 +73,12 @@ from brain.upstream import (
 )
 from player.sdk.nim_control import POLICY_ACTION_KINDS
 
-_KIND_INDEX = {k: i for i, k in enumerate(POLICY_ACTION_KINDS)}
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _DEFAULT_LOG_DIR = _REPO_ROOT / "local_data" / "brain-logs"
-
-# Unit-target `move` settles on arrival within 4.0 yd
-# (player/contract/environment_frame.nim:1331-1334). Ask for melee a touch
-# tighter than the 5 yd swing range so we do not oscillate.
-MELEE_RANGE = 4.5
 
 
 def _utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
-
-
-def _dist(a: Any, b: Any) -> float:
-    return math.dist((a.x, a.y, a.z), (b.x, b.y, b.z))
 
 
 class _Jsonl:
@@ -104,79 +97,51 @@ class _Jsonl:
         self._fp.close()
 
 
-def masked_kinds(frame: Any) -> list[str]:
-    return [k for k, on in zip(POLICY_ACTION_KINDS, frame.action_mask.kind) if on]
-
-
-def cast_options(frame: Any) -> list[tuple[int, int]]:
-    """All legal ``(target_index, spell_index)`` cast pairs in this frame.
-
-    The spell mask is indexed ``[target][spell]``, not ``[kind][spell]``
-    (``player/contract/actions.nim:207-211``), and only the class rotation
-    tables ever set a cell — so this is the client telling us exactly which
-    spells it considers in range, in line of sight and off cooldown.
-    """
-    out: list[tuple[int, int]] = []
-    for target_index, row in enumerate(frame.action_mask.spell):
-        for spell_index, allowed in enumerate(row):
-            if allowed and spell_index > 0:
-                out.append((target_index, spell_index))
-    return out
-
-
 class GrindBrain:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
-        self.avoid = {n.strip().casefold() for n in args.avoid_names.split(",") if n.strip()}
-        self.anchor: Optional[Any] = None
-        self.blacklist: set[str] = set()
-        self.attempts: dict[str, int] = {}
+        avoid = frozenset(
+            n.strip().casefold() for n in args.avoid_names.split(",") if n.strip()
+        )
+        self.cfg = PolicyConfig(
+            rest_hp=args.rest_hp,
+            rest_mana=args.rest_mana,
+            engage_hp=args.engage_hp,
+            leash=args.leash,
+            max_level_above=args.max_level_above,
+            spell_priority=tuple(
+                w.strip() for w in args.spell_priority.split(",") if w.strip()
+            ),
+            self_buffs=args.self_buffs,
+            avoid_names=avoid,
+            seek_quest=not args.no_quest,
+        )
+        self.state = PolicyState(max_attempts=args.max_attempts)
         self.kills = 0
         self.loots = 0
         self.start_xp: Optional[int] = None
         self.start_level: Optional[int] = None
 
-    # -- selection helpers -------------------------------------------------
+    def decide(self, frame: Any) -> tuple[Optional[FactorizedAction], str]:
+        # Pydantic EnvironmentFrame forbids extra attrs; wrap for kind names.
+        class _FrameView:
+            def __init__(self, inner: Any) -> None:
+                object.__setattr__(self, "_inner", inner)
+                object.__setattr__(self, "policy_kind_names", POLICY_ACTION_KINDS)
 
-    def eligible_targets(self, frame: Any) -> list[tuple[Any, Any, float]]:
-        """(entity, unit_observation, distance) for hostiles we may engage."""
-        me = frame.observation.location
-        units = {u.guid: u for u in frame.observation.units}
-        out: list[tuple[Any, Any, float]] = []
-        attack_row = frame.action_mask.target[_KIND_INDEX["attack"]]
-        for e in frame.bindings.entities:
-            if e.kind != "unit" or e.reaction != "hostile" or not e.alive:
-                continue
-            if (e.name or "").strip().casefold() in self.avoid:
-                continue
-            if e.guid in self.blacklist:
-                continue
-            if e.index >= len(attack_row) or not attack_row[e.index]:
-                continue
-            unit = units.get(e.guid)
-            if unit is not None:
-                if unit.level > frame.observation.level + self.args.max_level_above:
-                    continue
-                if unit.line_of_sight_blocked and self.args.skip_los_blocked:
-                    continue
-            dist = _dist(e.location, me)
-            if self.anchor is not None:
-                if _dist(e.location, self.anchor) > self.args.leash:
-                    continue
-            out.append((e, unit, dist))
-        out.sort(key=lambda t: t[2])
-        return out
+            def __getattr__(self, name: str) -> Any:
+                return getattr(object.__getattribute__(self, "_inner"), name)
 
-    def lootables(self, frame: Any) -> list[Any]:
-        return [
-            e
-            for e in frame.bindings.entities
-            if e.lootable and (e.name or "").strip().casefold() not in self.avoid
-        ]
-
-    # -- action plumbing ---------------------------------------------------
-
-    def select(self, client: Any, frame: Any, action: FactorizedAction, note: str) -> Optional[Any]:
+        raw, why = decide_action(_FrameView(frame), self.cfg, self.state)
+        if raw is None:
+            return None, why
+        try:
+            return action_to_factorized(raw), why
+        except Exception as exc:  # noqa: BLE001
+            return None, f"factorize_error:{exc}:{why}"
+    def select(
+        self, client: Any, frame: Any, action: FactorizedAction, note: str
+    ) -> Optional[Any]:
         if not frame.allows_action(action):
             return {"masked_out": note}
         try:
@@ -191,124 +156,18 @@ class GrindBrain:
             )
         except NimControlRequestError as exc:
             return {"select_error": str(exc)}
-        time.sleep(self.args.settle_wait)
+        # Destination moves often need longer than a cast settle.
+        wait = self.args.settle_wait
+        if action.kind == "move":
+            wait = max(wait, 1.8)
+        elif action.kind in ("cast", "accept_quest", "turn_in_quest", "interact"):
+            wait = max(wait, 1.0)
+        time.sleep(wait)
         try:
             settled = client.last_settlement()
-        except Exception as exc:  # noqa: BLE001 — keep the loop alive
+        except Exception as exc:  # noqa: BLE001
             return {"settle_error": str(exc)}
         return settled
-
-    # -- the policy --------------------------------------------------------
-
-    def decide(self, frame: Any) -> tuple[Optional[FactorizedAction], str]:
-        obs = frame.observation
-        kinds = set(masked_kinds(frame))
-
-        # 1. Death recovery.
-        if obs.is_ghost and obs.can_reclaim_corpse and "reclaim_corpse" in kinds:
-            return FactorizedAction(kind="reclaim_corpse"), "reclaim_corpse"
-        if obs.is_dead and "release_spirit" in kinds:
-            return FactorizedAction(kind="release_spirit"), "release_spirit"
-        if obs.is_dead or obs.is_ghost:
-            return None, "dead_waiting"
-
-        # 2. Loot anything the client says is lootable (it only flags corpses
-        #    within 5.5 yd that we have not already looted).
-        for corpse in self.lootables(frame):
-            if "loot" in kinds:
-                return FactorizedAction(kind="loot", target=corpse.index), "loot"
-
-        hp_pct = 100.0 * obs.health / max(obs.max_health, 1)
-        # Only MANA is worth resting for. Rage (1) and energy (3) regenerate in
-        # combat and read 0 at rest, so treating them as "empty" parks a warrior
-        # or rogue in a permanent drink loop.
-        uses_mana = obs.active_power_type_known and obs.active_power_type == 0
-        mana_pct = (
-            100.0 * obs.active_power / max(obs.active_max_power, 1)
-            if uses_mana and obs.active_power_known and obs.active_max_power
-            else 100.0
-        )
-
-        # 3. Rest out of combat. Eating/drinking is a stock item use; while the
-        #    buff ticks we simply hold so regen is not interrupted.
-        if not obs.in_combat and (hp_pct < self.args.rest_hp or mana_pct < self.args.rest_mana):
-            if obs.eating or obs.drinking:
-                return None, f"resting hp={hp_pct:.0f}% mana={mana_pct:.0f}%"
-            item_row = frame.action_mask.item[_KIND_INDEX["use_item"]]
-            want = "drink" if mana_pct < self.args.rest_mana else "food"
-            for item in frame.bindings.items:
-                if item.purpose != want:
-                    continue
-                if item.index < len(item_row) and item_row[item.index]:
-                    return (
-                        FactorizedAction(kind="use_item", item=item.index),
-                        f"consume_{want}",
-                    )
-            return None, f"rest_wait hp={hp_pct:.0f}% mana={mana_pct:.0f}%"
-
-        # Do not open a NEW fight while badly hurt; hold and let regen work.
-        targets = self.eligible_targets(frame)
-        if not obs.in_combat and hp_pct < self.args.engage_hp:
-            return None, f"regen_before_engage hp={hp_pct:.0f}%"
-        if not targets:
-            return None, "no_eligible_target"
-
-        entity, unit, dist = targets[0]
-
-        # 4. Cast whatever the rotation mask offers for this target. The client
-        #    already checked range / LoS / cooldown / resource for us.
-        options = [(t, s) for t, s in cast_options(frame) if t in (entity.index, 0)]
-        if options and "cast" in kinds:
-            preferred = self._preferred_spell(frame, options)
-            if preferred is not None:
-                t_idx, s_idx = preferred
-                spell = frame.bindings.spells[s_idx - 1]
-                return (
-                    FactorizedAction(kind="cast", target=t_idx, spell=s_idx),
-                    f"cast {spell.name} -> e{entity.index} @{dist:.1f}yd",
-                )
-
-        # 5. Close to melee. Unit-target move settles at 4 yd.
-        if dist > MELEE_RANGE and "move" in kinds:
-            move_row = frame.action_mask.target[_KIND_INDEX["move"]]
-            if entity.index < len(move_row) and move_row[entity.index]:
-                return (
-                    FactorizedAction(kind="move", target=entity.index),
-                    f"approach e{entity.index} @{dist:.1f}yd",
-                )
-
-        # 6. Start auto-attack exactly once per target.
-        if obs.auto_attack_guid != entity.guid and "attack" in kinds:
-            return (
-                FactorizedAction(kind="attack", target=entity.index),
-                f"attack e{entity.index} @{dist:.1f}yd",
-            )
-
-        return None, f"hold auto-attack on e{entity.index} @{dist:.1f}yd"
-
-    def _preferred_spell(
-        self, frame: Any, options: Iterable[tuple[int, int]]
-    ) -> Optional[tuple[int, int]]:
-        """Prefer explicitly named nukes, then any other offered spell.
-
-        Self-buffs (target 0) are only taken when nothing else is offered and
-        we are out of combat, so we never trade a nuke GCD for Demon Skin
-        mid-fight.
-        """
-        wanted = [w.strip().casefold() for w in self.args.spell_priority.split(",") if w.strip()]
-        opts = list(options)
-        for want in wanted:
-            for t_idx, s_idx in opts:
-                if frame.bindings.spells[s_idx - 1].name.casefold() == want:
-                    return t_idx, s_idx
-        offensive = [(t, s) for t, s in opts if t != 0]
-        if offensive:
-            return offensive[0]
-        if not frame.observation.in_combat and self.args.self_buffs:
-            return opts[0] if opts else None
-        return None
-
-    # -- main loop ---------------------------------------------------------
 
     def run(self) -> int:
         args = self.args
@@ -325,7 +184,10 @@ class GrindBrain:
         started = time.monotonic()
         try:
             with NimControlClient(
-                host=args.host, port=args.port, slot=args.slot, timeout_seconds=args.timeout
+                host=args.host,
+                port=args.port,
+                slot=args.slot,
+                timeout_seconds=args.timeout,
             ) as client:
                 status = client.status()
                 print(
@@ -334,8 +196,6 @@ class GrindBrain:
                     flush=True,
                 )
 
-                # Any goal unlocks frames; the leveling profile is unsupported
-                # for this race/class, which only silences `recommended_action`.
                 goal = GoalRequest(
                     goal_id=args.goal_id,
                     goal_kind="leveling",
@@ -358,6 +218,9 @@ class GrindBrain:
                     if args.max_seconds > 0 and time.monotonic() - started >= args.max_seconds:
                         print("[grind] max-seconds reached", flush=True)
                         break
+                    if args.stop_level and self.start_level is not None:
+                        # checked after frame read below
+                        pass
                     tick += 1
                     row: dict[str, Any] = {"ts": _utc_iso(), "tick": tick}
                     try:
@@ -369,8 +232,12 @@ class GrindBrain:
                         continue
 
                     obs = frame.observation
-                    if self.anchor is None and obs.location.x:
-                        self.anchor = obs.location
+                    if self.state.anchor is None and obs.location.x:
+                        self.state.anchor = (
+                            obs.location.x,
+                            obs.location.y,
+                            obs.location.z,
+                        )
                         print(
                             f"[grind] anchor {obs.location.x:.1f},{obs.location.y:.1f} "
                             f"leash={args.leash}yd",
@@ -378,6 +245,16 @@ class GrindBrain:
                         )
                     if self.start_xp is None and obs.xp_known:
                         self.start_xp, self.start_level = obs.xp, obs.level
+
+                    if args.stop_level and obs.level >= args.stop_level:
+                        print(
+                            f"[grind] stop-level {args.stop_level} reached "
+                            f"(lvl={obs.level})",
+                            flush=True,
+                        )
+                        row["event"] = "stop_level"
+                        log.write(row)
+                        break
 
                     if not frame.action_ready:
                         row["skip"] = f"not_ready phase={frame.phase}"
@@ -399,7 +276,13 @@ class GrindBrain:
                             "in_combat": obs.in_combat,
                             "pos": [obs.location.x, obs.location.y, obs.location.z],
                             "why": why,
-                            "mask": masked_kinds(frame),
+                            "mask": masked_kinds(frame)
+                            if hasattr(frame, "action_mask")
+                            else [],
+                            "quest_log": list(obs.quest_log_quest_ids or []),
+                            "skulls": inventory_count(frame, self.cfg.quest_item_id),
+                            "accept_blocked": self.state.quest_accept_blocked,
+                            "turnin_blocked": self.state.quest_turnin_blocked,
                         }
                     )
 
@@ -419,40 +302,81 @@ class GrindBrain:
                     row["action"] = action.model_dump(exclude_none=True)
                     if hasattr(settled, "model_dump"):
                         row["settlement"] = settled.model_dump()
-                        ok, reason, msg = settled.success, settled.reason_code, settled.message
+                        ok = settled.success
+                        reason = settled.reason_code
+                        msg = settled.message
                         if action.kind == "loot" and ok:
                             self.loots += 1
-                        if "finished attack" in (msg or ""):
-                            self.kills += 1
+                        if ok and (
+                            "finished attack" in (msg or "")
+                            or "target gone" in (msg or "")
+                            or "(landed)" in (msg or "")
+                        ):
+                            if action.kind in ("cast", "attack"):
+                                self.kills += 1
                         print(
                             f"[grind] t{tick} lvl{obs.level} xp={obs.xp}/{obs.next_level_xp} "
                             f"hp={obs.health}/{obs.max_health} :: {why} -> "
                             f"{action.kind} ok={ok} {reason} {msg!r}",
                             flush=True,
                         )
-                        # A target the client cannot reach or resolve gets one
-                        # more chance, then a blacklist entry so we rotate on.
+                        if action.kind == "move":
+                            if ok:
+                                self.state.approach_fails = 0
+                            else:
+                                self.state.approach_fails += 1
                         if not ok and action.target:
-                            guid = frame.bindings.entities[action.target - 1].guid
-                            self.attempts[guid] = self.attempts.get(guid, 0) + 1
-                            if self.attempts[guid] >= args.max_attempts:
-                                self.blacklist.add(guid)
-                                row["blacklisted"] = guid
-                                print(f"[grind]   blacklist {guid}", flush=True)
+                            try:
+                                guid = frame.bindings.entities[action.target - 1].guid
+                                self.state.attempts[guid] = (
+                                    self.state.attempts.get(guid, 0) + 1
+                                )
+                                if self.state.attempts[guid] >= args.max_attempts:
+                                    self.state.blacklist.add(guid)
+                                    row["blacklisted"] = guid
+                                    print(f"[grind]   blacklist {guid}", flush=True)
+                            except Exception:  # noqa: BLE001
+                                pass
+                        # Destination-form moves have no target index — still
+                        # rotate if we thrash the same approach guid.
+                        if (
+                            not ok
+                            and action.kind == "move"
+                            and self.state.last_approach_guid
+                            and self.state.approach_fails >= args.max_attempts
+                        ):
+                            self.state.blacklist.add(self.state.last_approach_guid)
+                            row["blacklisted"] = self.state.last_approach_guid
+                            self.state.approach_fails = 0
+                            print(
+                                f"[grind]   blacklist approach "
+                                f"{self.state.last_approach_guid}",
+                                flush=True,
+                            )
                     else:
                         row["settlement"] = settled
-                        print(f"[grind] t{tick} :: {why} -> {action.kind} {settled}", flush=True)
+                        print(
+                            f"[grind] t{tick} :: {why} -> {action.kind} {settled}",
+                            flush=True,
+                        )
 
                     last_report = time.monotonic()
                     log.write(row)
                     time.sleep(args.cadence)
 
-                # Final read for the report.
                 try:
-                    final = client.status(include_environment_frame=True).observation
+                    final = client.status(include_environment_frame=True)
+                    fobs = final.observation
                     print(
-                        f"[grind] DONE level {self.start_level}->{final.level} "
-                        f"xp {self.start_xp}->{final.xp} loots={self.loots} kills~{self.kills}",
+                        f"[grind] DONE level {self.start_level}->{fobs.level} "
+                        f"xp {self.start_xp}->{fobs.xp} loots={self.loots} "
+                        f"kills~{self.kills} "
+                        f"quest_in_log={quest_in_log(final, self.cfg.quest_id)} "
+                        f"turnin_ready={quest_turnin_ready(final, self.cfg.quest_id)} "
+                        f"rewarded={quest_rewarded(final, self.cfg.quest_id)} "
+                        f"imp={has_spell(final, SUMMON_IMP_SPELL)} "
+                        f"accept_blocked={self.state.quest_accept_blocked} "
+                        f"turnin_blocked={self.state.quest_turnin_blocked}",
                         flush=True,
                     )
                     log.write(
@@ -460,10 +384,15 @@ class GrindBrain:
                             "ts": _utc_iso(),
                             "event": "summary",
                             "start_level": self.start_level,
-                            "end_level": final.level,
+                            "end_level": fobs.level,
                             "start_xp": self.start_xp,
-                            "end_xp": final.xp,
+                            "end_xp": fobs.xp,
                             "loots": self.loots,
+                            "kills": self.kills,
+                            "quest_in_log": quest_in_log(final, self.cfg.quest_id),
+                            "imp_known": has_spell(final, SUMMON_IMP_SPELL),
+                            "accept_blocked": self.state.quest_accept_blocked,
+                            "turnin_blocked": self.state.quest_turnin_blocked,
                         }
                     )
                 except Exception:  # noqa: BLE001
@@ -481,27 +410,37 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     p.add_argument("--port", type=int, default=None)
     p.add_argument("--character", default="Shadowfel")
     p.add_argument("--goal-id", default="shadow-grind")
-    p.add_argument("--cadence", type=float, default=0.6, help="loop seconds")
-    p.add_argument("--settle-wait", type=float, default=0.35)
+    p.add_argument("--cadence", type=float, default=0.55, help="loop seconds")
+    p.add_argument("--settle-wait", type=float, default=0.5)
     p.add_argument("--timeout", type=float, default=15.0)
     p.add_argument("--max-seconds", type=float, default=300.0)
+    p.add_argument(
+        "--stop-level",
+        type=int,
+        default=0,
+        help="stop when observation.level >= N (0=disabled)",
+    )
     p.add_argument("--log-dir", type=Path, default=_DEFAULT_LOG_DIR)
-    p.add_argument("--leash", type=float, default=150.0, help="yards from anchor")
+    p.add_argument("--leash", type=float, default=220.0, help="yards from anchor")
     p.add_argument("--anchor-x", type=float, default=None)
     p.add_argument("--anchor-y", type=float, default=None)
     p.add_argument("--anchor-z", type=float, default=None)
-    p.add_argument("--max-level-above", type=int, default=2)
-    p.add_argument("--max-attempts", type=int, default=6)
-    p.add_argument("--rest-hp", type=float, default=45.0)
-    p.add_argument("--rest-mana", type=float, default=25.0)
-    p.add_argument("--engage-hp", type=float, default=60.0)
+    p.add_argument("--max-level-above", type=int, default=3)
+    p.add_argument("--max-attempts", type=int, default=5)
+    p.add_argument("--rest-hp", type=float, default=40.0)
+    p.add_argument("--rest-mana", type=float, default=20.0)
+    p.add_argument("--engage-hp", type=float, default=55.0)
     p.add_argument("--spell-priority", default="Shadow Bolt")
-    p.add_argument("--self-buffs", action="store_true", help="allow out-of-combat self buffs")
-    p.add_argument("--skip-los-blocked", action="store_true", default=True)
+    p.add_argument("--self-buffs", action="store_true")
+    p.add_argument(
+        "--no-quest",
+        action="store_true",
+        help="skip Venya seek / quest phases (pure XP grind)",
+    )
     p.add_argument(
         "--avoid-names",
         default="Murist",
-        help="NEVER target or address these characters (the human plays here)",
+        help="NEVER target these characters (human on realm)",
     )
     return p.parse_args(argv)
 
@@ -510,10 +449,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     args = _parse_args(argv)
     brain = GrindBrain(args)
     if args.anchor_x is not None and args.anchor_y is not None:
-        from brain.upstream import WorldPoint
-
-        brain.anchor = WorldPoint(
-            map_id=0, x=args.anchor_x, y=args.anchor_y, z=args.anchor_z or 0.0
+        brain.state.anchor = (
+            args.anchor_x,
+            args.anchor_y,
+            args.anchor_z or 0.0,
         )
     return brain.run()
 

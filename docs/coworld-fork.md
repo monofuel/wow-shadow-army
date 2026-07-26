@@ -1,16 +1,27 @@
-# coworld-vanilla-wow-fork — thin local rebase layer
+# coworld-vanilla-wow-fork — thin rebase layer on Gitea
 
-Local-only fork of the coworld-vanilla-wow upstream checkout so we can carry
-fixes the running realm needs without ever writing to upstream
-(`../coworld-vanilla-wow` is READ-ONLY per `AGENTS.md`).
+Our private fork of Metta-AI `coworld-vanilla-wow`. Carries realm/client fixes
+we need without writing to Softmax GitHub. Upstream checkout
+`../coworld-vanilla-wow` stays READ-ONLY per `AGENTS.md`.
 
 | | |
 |---|---|
-| Fork | `/home/monofuel/Documents/Projects/Softmax/coworld-vanilla-wow-fork` |
-| Branch | `shadow-army-fixes` |
-| Forked from | upstream `main` @ `98220fead107070b0999549e3074056668d34bb7` ("Refresh Coworld image set after supporting slim") |
-| Remote `upstream` | `/home/monofuel/Documents/Projects/Softmax/coworld-vanilla-wow` (local path, fetch-only in practice) |
-| Pushed anywhere | **No.** Local-only. Whether Softmax code may go to the personal gitea is monofuel's call — open question, do not push meanwhile. |
+| Worktree | `/home/monofuel/Documents/Projects/Softmax/coworld-vanilla-wow-fork` |
+| Gitea | `ssh://git@10.11.4.11:222/Monolab/coworld-vanilla-wow.git` |
+| Web | https://gitea.solution-nine.monofuel.dev/Monolab/coworld-vanilla-wow |
+| Branch `main` | mirrors Metta-AI `main` (stock upstream, no local delta) |
+| Branch `shadow-army-fixes` | our carried commits, rebased on `main` |
+| Last synced upstream | `5068c8ffa` ("Track player runtime in browser builds") |
+
+## Remotes (on the fork worktree)
+
+| Remote | URL | Push |
+|---|---|---|
+| `origin` | Gitea `Monolab/coworld-vanilla-wow` | **yes** — our home |
+| `upstream` | `git@github.com:Metta-AI/coworld-vanilla-wow.git` | **DISABLED** |
+| `local-upstream` | path to `../coworld-vanilla-wow` (offline fetch) | **DISABLED** |
+
+Never push to GitHub from this worktree. All writes go to Gitea via `origin`.
 
 ## Strategy: upstream is always right
 
@@ -20,11 +31,10 @@ fork is a **thin rebase layer, never a divergent branch**:
 1. **Minimum possible delta.** One commit per fix, each self-contained and
    upstreamable as-is (message carries the why + evidence citation). No
    refactors, no cleanups, no reformatting.
-2. **Upstream wins on conflict.** Routine sync is
-   `git fetch upstream && git rebase upstream/main`. If one of our commits
+2. **Upstream wins on conflict.** Routine sync is below. If one of our commits
    conflicts with an upstream change: **drop ours, take theirs**
-   (`git rebase --skip`), then re-evaluate whether the fix is still needed at
-   all — upstream may have fixed it their own way.
+   (`git rebase --skip`), then re-evaluate whether the fix is still needed —
+   upstream may have fixed it their own way.
 3. **Every carried fix is a pending upstream submission**, not a permanent
    local divergence. Track status in the table below.
 4. **Tournament rule: never tune bot behavior against our patched build.**
@@ -37,22 +47,37 @@ fork is a **thin rebase layer, never a divergent branch**:
    it accepts upstream's framing unchanged, so bots behave identically on the
    stock stack.
 
-## Carried fixes
-
-| Commit | What | Why | Upstream status |
-|---|---|---|---|
-| `9dead5d46` | cowpatch `FACTION_STANDING_PACKET_WRITER`: emit `uint32(1)` row-count prefix in `SMSG_SET_FACTION_STANDING` | Count-less body deterministically crashes the build 5875 client (NULL `Faction.dbc` row 0 deref at WoW.exe RVA `0x000D4BEE`) on every reputation-granting quest turn-in. Full disassembly evidence: [`quest-crash-forensics.md`](quest-crash-forensics.md). | **Not reported yet** — evidence package ready for monofuel to submit |
-| `dfbccfb47` | `client/packets/quest_progression.nim` `parseFactionStanding` + proof: accept both the count-prefixed 5875 stock framing and the count-less 8-byte coworld framing | Bot must work against both the tournament stack (count-less) and our patched realm (stock framing). Shapes cannot collide (no count makes `4 + 8*count == 8`). | **Not reported yet** — same evidence package |
-
-## Rebase on upstream
+## Sync upstream → Gitea
 
 ```bash
 cd /home/monofuel/Documents/Projects/Softmax/coworld-vanilla-wow-fork
+
 git fetch upstream
-git rebase upstream/main        # conflicts: git rebase --skip (drop ours), then re-evaluate
+git checkout main
+git merge --ff-only upstream/main
+git push origin main
+
+git checkout shadow-army-fixes
+git rebase upstream/main          # conflicts: git rebase --skip (drop ours), re-evaluate
+git push --force-with-lease origin shadow-army-fixes
 ```
 
-After any rebase, re-run the validation below before rebuilding images.
+`--force-with-lease` is expected after rebase (history rewrites). Do **not**
+force-push `main`. After any rebase, re-run the validation below before
+rebuilding images.
+
+Offline alternative: `git fetch local-upstream` after updating the sibling
+checkout (`cd ../coworld-vanilla-wow && git pull`), then merge/rebase onto
+`local-upstream/main` instead of `upstream/main`.
+
+## Carried fixes
+
+SHAs rewrite on every rebase; identify by message / path.
+
+| Tip SHA (as of last sync) | What | Why | Upstream status |
+|---|---|---|---|
+| `c62f46a1b` | cowpatch `FACTION_STANDING_PACKET_WRITER`: emit `uint32(1)` row-count prefix in `SMSG_SET_FACTION_STANDING` | Count-less body deterministically crashes the build 5875 client (NULL `Faction.dbc` row 0 deref at WoW.exe RVA `0x000D4BEE`) on every reputation-granting quest turn-in. Full disassembly evidence: [`quest-crash-forensics.md`](quest-crash-forensics.md). | **Not reported yet** — evidence package ready for monofuel to submit |
+| `3c121b946` | `client/packets/quest_progression.nim` `parseFactionStanding` + proof: accept both the count-prefixed 5875 stock framing and the count-less 8-byte coworld framing | Bot must work against both the tournament stack (count-less) and our patched realm (stock framing). Shapes cannot collide (no count makes `4 + 8*count == 8`). | **Not reported yet** — same evidence package |
 
 ## Validate the cowpatch still applies (no docker needed)
 
@@ -170,7 +195,5 @@ re-run step 1 afterwards, or re-check which build `:local` points at with
 
 ## Open questions
 
-- **Remote hosting**: fork is local-only. Pushing Softmax-derived code to
-  monofuel's personal gitea (or anywhere) is HIS call — not decided.
 - **Upstream report**: forensics + fix are ready to hand to Softmax; not yet
   reported.

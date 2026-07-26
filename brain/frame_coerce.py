@@ -24,6 +24,11 @@ Three families, all observed live:
    **failure-preserving**: a disagreement never becomes a success, so no
    coercion can make the brain believe an action worked when it did not.
 
+4. **``leveling_context.service`` with kind != "none" but empty destination.**
+   Live frames after a train/vendor proximity flash can emit
+   ``{"kind":"train","destination_id":"","destination_label":""}``, which the
+   pydantic model rejects. Coerce empty destinations to ``kind="none"``.
+
 ``ActionSettled`` reaches us on two different paths — embedded in the
 MessagePack environment frame as ``previous_transition``, and standalone as
 JSON from ``last_settlement()``. Both are patched.
@@ -89,6 +94,34 @@ def coerce_action_settled(obj: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def coerce_service_context(obj: dict[str, Any]) -> dict[str, Any]:
+    """Normalize leveling_context.service so empty destinations never validate.
+
+    Empty strings may already have been rewritten to ``"unknown"`` by the
+    generic empty-string map — treat that placeholder as missing too, so we
+    demote to ``kind="none"`` rather than invent a trainer name.
+    """
+    out = dict(obj)
+    kind = out.get("kind") or "none"
+    dest_id = out.get("destination_id") or ""
+    dest_label = out.get("destination_label") or ""
+    missing = (
+        not dest_id
+        or not dest_label
+        or dest_id == "unknown"
+        or dest_label == "unknown"
+    )
+    if kind != "none" and missing:
+        out["kind"] = "none"
+        out["destination_id"] = ""
+        out["destination_label"] = ""
+    elif kind == "none":
+        # none must not carry destination names (including "unknown" fillers).
+        out["destination_id"] = ""
+        out["destination_label"] = ""
+    return out
+
+
 def coerce_frame_payload(obj: Any) -> Any:
     """Recursively normalize a decoded wire payload in place-of-copy."""
     if isinstance(obj, dict):
@@ -100,6 +133,15 @@ def coerce_frame_payload(obj: Any) -> Any:
                 out[key] = coerce_frame_payload(value)
         if out.get("type") == "action_settled":
             out = coerce_action_settled(out)
+        # leveling_context.service shape: kind + destination_id + destination_label.
+        if (
+            "kind" in out
+            and "destination_id" in out
+            and "destination_label" in out
+            and out.get("kind")
+            in {"none", "train", "sell", "repair"}
+        ):
+            out = coerce_service_context(out)
         return out
     if isinstance(obj, list):
         return [coerce_frame_payload(item) for item in obj]
