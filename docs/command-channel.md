@@ -86,15 +86,33 @@ fixture chat lines, no realm needed).
 
 ## Open questions before building
 
-1. Do chat messages (party + whisper) appear in EnvironmentFrame? Which
-   kinds, and with sender identity? `(verify against live frames)`
-2. Can a shadow *send* chat via nim_control — is there an action for it,
-   or is speaking masked off? `(verify action masks)`
-3. Do raid target icon assignments appear in frames? `(verify)`
-4. Does the leader's target show on party-member frame data? `(verify)`
-5. Party formation itself is still blocked (invite_party masked while solo
-   — see docs/control-plane.md); the command channel is moot until shadows
-   can actually join the party.
+Answers landed 2026-07-25 — full evidence and citations in
+[docs/party-formation.md](party-formation.md).
+
+1. **Do chat messages appear in EnvironmentFrame? — No, but chat IS
+   perceived.** The frame contract has no chat surface at all. `SMSG_MESSAGECHAT`
+   lands in the session's `chatInbox` and is published as `chat_inbox` in the
+   runtime dir's `state.json`, with sender name, sender GUID, `message_type`,
+   `channel_name` and an ordering tick. So the parser reads `state.json`, not
+   the frame — perception only, never a control path.
+2. **Can a shadow *send* chat? — Not with words we choose.** No mask ever
+   admits `chat_say`/`chat_whisper` with a policy-supplied string. The runtime
+   *does* narrate every decision in `/say` (observed live), but the text is the
+   controller's rationale, and for external selections it is the fixed string
+   `"external factorized policy action"`. Bot-authored command text is an
+   upstream ask.
+3. Do raid target icon assignments appear in frames? `(unverified)` — the
+   `groups` table carries `icon1..icon8`, so the server state exists.
+4. Does the leader's target show on party-member frame data? `(unverified)` —
+   `BotPartyMember` carries no target GUID field, so this looks like "no" from
+   the contract alone.
+5. **Party formation is UNBLOCKED** — two bots formed a real server-side party
+   with no upstream patch. `invite_party` needs a dungeon goal with a declared
+   roster; `accept_party` needs only a pending invite. See
+   [docs/party-formation.md](party-formation.md) and `make party-form`.
+
+**Hard rule learned the hard way:** bots never address the human's character —
+no invites, no whispers, nothing. A test invite interrupted monofuel's session.
 
 First concrete step when we build: capture live frames while a human types
 in party chat, whispers a bot, sets a raid mark, and changes target — then
