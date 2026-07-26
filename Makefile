@@ -32,7 +32,7 @@ COMPOSE_FILE := infra/compose.vmangos.yml
 ACCOUNT_USER := monofuel
 ACCOUNT_PASS := password
 
-.PHONY: test test-lua test-python test-nim system pin-check integration-test start-server stop-server server-logging logs account soap-account play play-classic shadow grind party-form breadcrumbs warlock-account warlock-bot botwarrior-bot navmesh-helper navmesh-status
+.PHONY: test test-lua test-python test-nim system pin-check integration-test start-server stop-server server-logging logs account soap-account play play-classic shadow grind party-form breadcrumbs quest-data warlock-account warlock-bot botwarrior-bot navmesh-helper navmesh-status
 
 # Unit tier only. test-python is stdlib-only (projection + intent_mapping + optional
 # lua_runner smoke); it is wired into `make test` because it needs no venv/network.
@@ -177,6 +177,16 @@ navmesh-status:
 CHARACTER ?= Murist
 breadcrumbs:
 	@python3 breadcrumbs/poller.py --character "$(CHARACTER)"
+
+# Regenerate addons/ShadowArmy/QuestData.lua from the world DB + WorldMapArea.dbc
+# (docs/quest-data.md). Read-only DB access; requires the realm up. Deterministic,
+# so a no-op rerun leaves the file byte-identical. Scope with:
+#   make quest-data QUEST_DATA_ARGS="--max-level 20"
+#   make quest-data QUEST_DATA_ARGS="--zones 85,130,12"
+QUEST_DATA_ARGS ?=
+quest-data:
+	@python3 tools/gen_quest_data.py \
+		--dbc-dir "$(VANILLA_WOW_EXTRACTED_DATA_DIR)/dbc" $(QUEST_DATA_ARGS)
 
 # Bring up the local VMaNGOS/Coworld realm, then attach to container logs.
 # Operator `up` is detached (compose up -d). Ctrl-C only detaches from logs;
@@ -481,3 +491,31 @@ play:
 # prefix. Login monofuel / password. Do not run unattended (opens a GUI).
 play-classic:
 	@nix develop --command tools/play_classic.sh
+
+# ---------------------------------------------------------------------------
+# Our fork of coworld-vanilla-wow (docs/coworld-fork.md): thin rebase layer
+# carrying the SMSG_SET_FACTION_STANDING crash fix. Builds the three
+# shadow-army-tagged images serially (each can saturate the box). Never
+# touches the stock :local tags or the running realm — switch-over is a
+# human-run retag, see docs/coworld-fork.md.
+FORK := $(abspath ../coworld-vanilla-wow-fork)
+.PHONY: fork-images
+fork-images:
+	@set -e; \
+	if [ ! -d "$(FORK)" ]; then \
+		echo "error: fork checkout missing: $(FORK) (see docs/coworld-fork.md)" >&2; exit 1; \
+	fi; \
+	cd "$(FORK)"; \
+	docker build -f infra/docker/vmangos/Dockerfile.native \
+		--target vmangos_native_runtime \
+		-t coworld-vmangos-native-runtime:shadow-army .; \
+	docker build -f player/Dockerfile --ssh default \
+		--target reference_player_runtime_artifact \
+		-t coworld-reference-player-runtime:shadow-army .; \
+	docker build -f infra/docker/vmangos/Dockerfile --ssh default \
+		--build-arg COWORLD_NIM_PARALLEL_BUILD=8 \
+		--build-context vmangos_native_runtime=docker-image://coworld-vmangos-native-runtime:shadow-army \
+		--build-context reference_player_runtime=docker-image://coworld-reference-player-runtime:shadow-army \
+		-t coworld-vmangos:shadow-army .; \
+	echo ""; \
+	echo "shadow-army images built. Switch-over is human-run: docs/coworld-fork.md"

@@ -149,3 +149,18 @@ before overwriting a live file.
 First concrete step when we build: same frame-capture session as
 command-channel.md (chat, marks, targeting) plus quest pickup/turn-in and
 a loot event — one session answers both docs' perception questions.
+
+## Built: quest waypoint data (2026-07-25)
+
+First piece of the "ground truth in mariadb" thesis shipped as an artifact:
+`tools/gen_quest_data.py` joins `quest_template` against creature/gameobject
+spawns and loot tables, converts world coords to the zone-normalized percent
+space `GetPlayerMapPosition` uses, and writes
+`addons/ShadowArmy/QuestData.lua` — 3050 quests with locatable turn-ins,
+questgivers and objective spots, 1.1 MiB, whole game, regenerated with
+`make quest-data`.
+
+This is advice *generation* only, per the transfer hedge above: the file is a
+structured recommendation source with no rendering opinion, so the addon HUD
+and a future bot route policy consume the same waypoints. Details, the verified
+coordinate derivation, and known gaps: `docs/quest-data.md`.
