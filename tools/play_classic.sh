@@ -71,15 +71,19 @@ for addon in "$REPO_ROOT"/addons/*/; do
   fi
 done
 
-# OpenGL renderer (runs better under wine than the d3d path) + windowed.
+# Graphics API: Direct3D under wine (gxApi d3d, no -opengl flag).
+# Was hard-forced to OpenGL; monofuel 2026-07-26 A/B — GL + weather particles
+# hitch hard on this host; trying d3d instead. Flip back to opengl + `-opengl`
+# if d3d is worse.
 CONFIG="$CLIENT/WTF/Config.wtf"
+GX_API="${WOW_GX_API:-d3d}"
 if [ -f "$CONFIG" ]; then
-  sed -i 's/^SET gxApi .*/SET gxApi "opengl"/' "$CONFIG"
-  grep -q '^SET gxApi' "$CONFIG" || printf 'SET gxApi "opengl"\n' >> "$CONFIG"
+  sed -i "s/^SET gxApi .*/SET gxApi \"$GX_API\"/" "$CONFIG"
+  grep -q '^SET gxApi' "$CONFIG" || printf 'SET gxApi "%s"\n' "$GX_API" >> "$CONFIG"
   grep -q '^SET gxWindow' "$CONFIG" || printf 'SET gxWindow "1"\n' >> "$CONFIG"
 else
   mkdir -p "$CLIENT/WTF"
-  printf 'SET gxApi "opengl"\nSET gxWindow "1"\n' > "$CONFIG"
+  printf 'SET gxApi "%s"\nSET gxWindow "1"\n' "$GX_API" > "$CONFIG"
 fi
 
 # Sound: back on the default (dsound) path. The 2026-07-25 WINMM experiment
@@ -96,6 +100,12 @@ if [ ! -d "$WINEPREFIX" ]; then
   wineboot --init
 fi
 
-echo "[play-classic] launching WoW.exe -opengl (realm 127.0.0.1, login monofuel/password)"
+# -opengl forces the GL path and overrides Config gxApi. For d3d, launch bare.
 cd "$CLIENT"
-exec wine WoW.exe -opengl
+if [ "$GX_API" = "opengl" ]; then
+  echo "[play-classic] launching WoW.exe -opengl (gxApi=$GX_API, realm 127.0.0.1)"
+  exec wine WoW.exe -opengl
+else
+  echo "[play-classic] launching WoW.exe (gxApi=$GX_API, realm 127.0.0.1)"
+  exec wine WoW.exe
+fi

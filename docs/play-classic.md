@@ -23,10 +23,10 @@ clients either way.
   - `wineprefix/` — dedicated WINEPREFIX; nothing touches `~/.wine`.
 - `realmlist.wtf` is rewritten to `set realmlist 127.0.0.1` on every
   launch (the snapshot's copy points at the old tailnet host).
-- `WTF/Config.wtf` gets `SET gxApi "opengl"` (1.12's native GL renderer —
-  historically the well-behaved path under wine) and keeps the snapshot's
-  `gxWindow "1"` (windowed) + 1024x768. Resolution/fullscreen are yours to
-  change in the video options once it's known-good.
+- `WTF/Config.wtf` gets `SET gxApi "d3d"` by default (Direct3D via wine;
+  launch without `-opengl`). Override with `WOW_GX_API=opengl make play-classic`
+  for the old GL path. Windowed + 1024x768 from the snapshot until you
+  change video options.
 - Login at the door: `monofuel` / `password` (`make account` if missing).
 
 ## Addons

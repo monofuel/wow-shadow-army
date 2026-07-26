@@ -10,7 +10,7 @@ Live session notes for the human-in-the-loop cast: **Murist** (you) +
 | **P0 Crypt follow** | Multi-floor: dest move. Same-floor: stock follow (dest freezes old point → chase lag) | **0** |
 | Party formation | Working; Murist+Shadowfel+Igris | done |
 | Caster-first DPS (no random rats / no dagger-with-mana) | In Lua; free-fire paths removed | 1 |
-| Client stutter | Suspect: dual escort 4Hz + lua subprocess + bot chat spam + SA OnUpdate — not fully proven | 2 |
+| Client stutter | Ranked: (1) bot /say replan spam (2) navmesh-helper CPU spikes (3) wine+GL baseline ~70% (4) SA residual OnUpdate minor when quests off | 2 |
 | Auto-loot on escort | Not implemented | later |
 | Advisor panel / `/sa help` | r20; TOC load order fix | done |
 
