@@ -8,7 +8,7 @@ ShadowArmy = ShadowArmy or {}
 
 -- Bump on every edit. The System watches Chat.log for "<SA> loaded rev=..."
 -- after sending a reload — a new rev proves the edit actually loaded.
-local REV = "r12"
+local REV = "r13"
 
 local function say(msg)
   DEFAULT_CHAT_FRAME:AddMessage("|cFF9482C9[ShadowArmy]|r " .. tostring(msg))
@@ -568,10 +568,15 @@ end
 -- hooksecurefunc in this client (that is a 2.0 API) and none is needed —
 -- nothing here is protected.
 --
--- Item MOVEMENT (PickupContainerItem/UseContainerItem) is called only from a
--- real mouse OnClick, which IS hardware-event context — the same context that
--- makes the panel's Reload! button work where programmatic ReloadUI is a
--- silent no-op on this build. Never move items from OnUpdate.
+-- Item MOVEMENT (PickupContainerItem/UseContainerItem) is called from a real
+-- mouse OnClick, which IS hardware-event context — the same context that makes
+-- the panel's Reload! button work where programmatic ReloadUI is a silent
+-- no-op on this build.
+-- r13 amends "never move items from OnUpdate" to "never move items from
+-- OnUpdate UNMEASURED": the autosort engine below does exactly that, but it
+-- fires its first swap from the click and then watches whether the OnUpdate
+-- ones have any effect at all, so a gate shows up as telemetry instead of as a
+-- button that mysteriously does nothing.
 --
 -- The buttons are PLAIN Buttons, NOT ContainerFrameItemButtonTemplate: that
 -- template carries OnClick/OnEnter logic bound to a ContainerFrame parent
@@ -781,6 +786,372 @@ bagsFrame:SetScript("OnShow", function()
   if bags.dirty then bagsUpdate() end
 end)
 
+--------------------------------------------------------------------------
+-- AUTOSORT (r13): a "Sort" button in the ShadowBags header that packs every
+-- item in bags 0..4 to the front of the grid, grouped by type.
+--
+-- THE PLAN IS NEVER REPLAYED. Every step recomputes the next needed swap
+-- from the CURRENT bag contents, because a swap moves two items at once and
+-- any precomputed move list is stale the instant the first one lands. The
+-- loop is: scan -> sort a copy -> find the first position whose occupant is
+-- wrong -> swap the right item into it -> wait for the server -> repeat.
+-- That converges (each completed swap fixes at least position i) and it is
+-- immune to the human clicking things mid-sort: the next scan just sees the
+-- new reality.
+--
+-- ASYNC IS THE WHOLE PROBLEM. PickupContainerItem does not move anything by
+-- itself; it puts the item on the cursor, the second call asks the server to
+-- place it, and BOTH slots read `locked` until the server answers. Firing the
+-- next swap before that answer arrives moves phantoms. So exactly one swap is
+-- in flight at a time and the driver polls for the locks to clear.
+--
+-- GATING PROBE (the reason the first swap is fired from the OnClick): this
+-- client silently ignores ReloadUI outside hardware-event context (see the
+-- driver notes) and the r11 loot work suggests LootSlot may be gated the same
+-- way. If PickupContainerItem is also gated, OnUpdate swaps will produce no
+-- lock and no content change at all. The engine measures exactly that: the
+-- FIRST swap goes out inside the button's OnClick (hardware event, known-good
+-- path), the rest from OnUpdate. Two consecutive no-effect OnUpdate swaps
+-- after a click swap provably worked = gated, and we say so once and stop.
+-- The fix for that world is a click-stepper button; NOT implemented here on
+-- purpose — no point building it before the telemetry says we need it.
+--------------------------------------------------------------------------
+
+local SORT_TIMEOUT   = 3.0   -- seconds with no completed move -> abort
+local SORT_SETTLE    = 0.35  -- seconds a fired swap gets to show ANY effect
+local SORT_MAX_MOVES = 200   -- runaway guard; a full 5-bag sort is well under
+
+local sort = {
+  active = false,
+  moves = 0,
+  seq = 0,          -- like reloadSeq: keeps two identical results from being
+                    -- swallowed by emit()'s 30s dedupe
+  lastMoveAt = 0,
+  pend = nil,       -- the single in-flight swap, or nil
+  clickWorked = false,
+  ctxFail = 0,      -- consecutive no-effect swaps fired from OnUpdate
+  skipBag = {},     -- bags that rejected a placement (soul bag / quiver)
+}
+
+-- GetItemInfo is NOT reliably populated in 1.12: it answers nil until the
+-- client has actually seen the item this session. Cache the answers we do get
+-- and never cache the misses, so a later pass can still learn the type.
+local sortTypeCache = {}
+
+local function cursorBusy()
+  local ok, has = pcall(CursorHasItem)
+  if not ok then return false end
+  return has and true or false
+end
+
+-- ClearCursor RETURNS a held bag item to where it came from (it does not
+-- destroy it). pcall because a missing global here would kill the driver.
+local function cursorDrop()
+  pcall(ClearCursor)
+end
+
+-- "type/subtype", or "zz-unknown" so unidentified items sort to the end
+-- instead of scattering through the grid.
+local function itemTypeKey(id)
+  if not id then return "zz-unknown" end
+  local cached = sortTypeCache[id]
+  if cached then return cached end
+  local ok, r1, r2, r3, r4, r5, r6, r7 = pcall(GetItemInfo, id)
+  if not ok or not r1 then return "zz-unknown" end
+  -- Return-order skepticism: 1.12 is
+  --   name, link, quality, iLevel, TYPE, SUBTYPE, stack, equipLoc, texture
+  -- while 2.0+ wedged itemMinLevel in at 5. Rather than trust either doc,
+  -- discriminate on what is actually there: slot 5 is a string only in the
+  -- 1.12 layout (it is a number in the newer one).
+  local typ, sub
+  if type(r5) == "string" then
+    typ, sub = r5, r6
+  else
+    typ, sub = r6, r7
+  end
+  if type(typ) ~= "string" then return "zz-unknown" end
+  local key = string.lower(typ) .. "/"
+  if type(sub) == "string" then key = key .. string.lower(sub) end
+  sortTypeCache[id] = key
+  return key
+end
+
+-- Specialty containers (soul bag, quiver, ammo pouch) refuse ordinary items.
+-- Dropping one in produces NO lock and NO content change — indistinguishable
+-- from the gating we are probing for — so keep them out of the grid entirely.
+-- 1.12's second return here is not something to bet on, hence the guard AND
+-- the empirical fallback in the tick (a bag that rejects a placement gets
+-- added to sort.skipBag for the rest of the run).
+local function bagIsNormal(bag)
+  if sort.skipBag[bag] then return false end
+  if bag == 0 then return true end -- backpack is never a specialty bag
+  local ok, free, btype = pcall(GetContainerNumFreeSlots, bag)
+  if not ok then return true end
+  if type(btype) == "number" and btype ~= 0 then return false end
+  return true
+end
+
+local function slotLocked(bag, slot)
+  local _, _, locked = GetContainerItemInfo(bag, slot)
+  return locked and true or false
+end
+
+-- Content fingerprint of one slot. `locked` is deliberately NOT in here:
+-- the lock flag is tracked separately as proof the client accepted the call,
+-- and folding it in would make a lock flicker look like a completed move.
+local function slotSig(bag, slot)
+  local tex, count = GetContainerItemInfo(bag, slot)
+  return tostring(tex) .. "#" .. tostring(count)
+end
+
+-- Flat scan of every sortable slot, in bag/slot order. Index in this list IS
+-- the position the sort reasons about; entry.tex nil = empty socket.
+local function sortScan()
+  local list, n = {}, 0
+  local bag = 0
+  while bag <= 4 do -- NEVER -1/5+ (bank) and never -2 (keyring)
+    if bagIsNormal(bag) then
+      local slots = GetContainerNumSlots(bag)
+      if slots and slots > 0 then
+        local slot = 1
+        while slot <= slots do
+          n = n + 1
+          local tex, count, locked, quality = GetContainerItemInfo(bag, slot)
+          local e = {
+            bag = bag, slot = slot, idx = n,
+            locked = locked and true or false,
+          }
+          if tex then
+            e.tex = tex
+            e.count = count or 1
+            e.quality = quality or 1
+            -- GetContainerItemLink gives "|cff...|Hitem:2589:0:0:0|h[..]|h|r".
+            -- string.find returns start, stop, THEN the captures.
+            local okl, link = pcall(GetContainerItemLink, bag, slot)
+            if okl and link then
+              local _, _, idStr = string.find(link, "item:(%d+)")
+              if idStr then e.id = tonumber(idStr) end
+            end
+            e.tkey = itemTypeKey(e.id)
+          end
+          list[n] = e
+          slot = slot + 1
+        end
+      end
+    end
+    bag = bag + 1
+  end
+  return list, n
+end
+
+-- Strict TOTAL order — table.sort in 5.0 is not stable and will happily raise
+-- "invalid order function" on a sloppy comparator. The trailing idx tiebreak
+-- does double duty: it makes the order total, and it means items that compare
+-- equal keep their current positions, so equal items never generate a swap.
+local function sortCmp(a, b)
+  if a.tkey ~= b.tkey then return a.tkey < b.tkey end
+  if a.quality ~= b.quality then return a.quality > b.quality end
+  local ai, bi = a.id or 0, b.id or 0
+  if ai ~= bi then return ai < bi end
+  if a.count ~= b.count then return a.count > b.count end
+  return a.idx < b.idx
+end
+
+-- Returns destinationIndex, sourceEntry for the next swap, or nil when the
+-- grid already matches the desired arrangement.
+local function sortNextSwap(list, n)
+  local occ, m = {}, 0
+  local i = 1
+  while i <= n do
+    if list[i].tex then
+      m = m + 1
+      occ[m] = list[i]
+    end
+    i = i + 1
+  end
+  table.sort(occ, sortCmp)
+  -- occ[i] is the entry that BELONGS at position i; entries are the very same
+  -- tables the scan produced, so identity comparison is the whole test.
+  i = 1
+  while i <= n do
+    local want = occ[i] -- nil past the packed run: position i should be empty
+    if want then
+      if list[i] ~= want then
+        return i, want
+      end
+    end
+    -- The mirror case (want nil but the slot is occupied) cannot be reached:
+    -- there are exactly m items, so an item sitting past position m implies an
+    -- empty slot at or before m, which mismatches at a LOWER i than this one.
+    i = i + 1
+  end
+  return nil, nil
+end
+
+-- Created below; the label helper closes over the local, so it must exist
+-- first (and the creation must ASSIGN, not re-declare).
+local sortBtn
+
+local function sortSetLabel(active)
+  if not sortBtn then return end
+  sortBtn:SetText(active and "|cFFFFAA00Sorting...|r" or "|cFFCCCCCCSort|r")
+end
+
+local function sortStop(reason)
+  sort.active = false
+  sort.pend = nil
+  if cursorBusy() then cursorDrop() end
+  sortSetLabel(false)
+  dtrace("sort stop " .. tostring(reason) .. " moves=" .. sort.moves)
+  bagsUpdate()
+end
+
+local function sortFinish()
+  local n = sort.moves
+  sortStop("done")
+  emit("sort", "done moves=" .. n .. " #" .. sort.seq)
+end
+
+local function sortAbort(why)
+  local n = sort.moves
+  sortStop(why)
+  if why == "stalled" then
+    emit("err", "sort stalled at " .. n .. " moves #" .. sort.seq)
+  elseif why == "runaway" then
+    emit("err", "sort runaway at " .. n .. " moves #" .. sort.seq)
+  end
+end
+
+-- Fire at most ONE swap. ctx is "click" (hardware event) or "onupdate".
+local function sortIssue(ctx)
+  if sort.pend then return end
+  if cursorBusy() then return end -- the human is carrying something; wait
+  local list, n = sortScan()
+  local dstIdx, src = sortNextSwap(list, n)
+  if not dstIdx then
+    sortFinish()
+    return
+  end
+  local dst = list[dstIdx]
+  -- Locked = a move we (or the human) already asked for is still in flight.
+  -- Skip gracefully: no plan to invalidate, the next tick just re-scans.
+  if src.locked or dst.locked then return end
+  if sort.moves >= SORT_MAX_MOVES then
+    sortAbort("runaway")
+    return
+  end
+  local sig = slotSig(src.bag, src.slot) .. "|" .. slotSig(dst.bag, dst.slot)
+  -- SOURCE FIRST, ALWAYS. The destination may be an empty socket, and
+  -- picking up an empty slot is a no-op — doing it in the other order would
+  -- leave the item stranded on the cursor.
+  PickupContainerItem(src.bag, src.slot)
+  PickupContainerItem(dst.bag, dst.slot)
+  -- Same-item landmine: dropping a stack onto a PARTIAL stack of the same item
+  -- tops it up and leaves the remainder on the cursor instead of swapping.
+  -- Put the remainder back where it came from; the recompute then sees two
+  -- re-balanced stacks (and this quietly consolidates stacks as a bonus).
+  if cursorBusy() then
+    PickupContainerItem(src.bag, src.slot)
+  end
+  sort.pend = {
+    sbag = src.bag, sslot = src.slot,
+    dbag = dst.bag, dslot = dst.slot,
+    sig = sig, at = GetTime(), ctx = ctx, sawLock = false,
+  }
+  bagsUpdate() -- shared refresh path: the grid shows the locked (faded) icons
+end
+
+-- Driven from the driver's OnUpdate (see below). Never sends chat directly.
+local function sortTick()
+  if not sort.active then return end
+  local now = GetTime()
+  local p = sort.pend
+  if p then
+    if slotLocked(p.sbag, p.sslot) or slotLocked(p.dbag, p.dslot) then
+      p.sawLock = true -- the client ACCEPTED the call; this path is not gated
+      return
+    end
+    local sigNow = slotSig(p.sbag, p.sslot) .. "|" .. slotSig(p.dbag, p.dslot)
+    if sigNow ~= p.sig then
+      sort.moves = sort.moves + 1
+      sort.lastMoveAt = now
+      sort.ctxFail = 0
+      if p.ctx == "click" then sort.clickWorked = true end
+      sort.pend = nil
+      bagsUpdate()
+    elseif (now - p.at) > SORT_SETTLE then
+      -- No lock, no content change: that call did literally nothing.
+      sort.pend = nil
+      if cursorBusy() then cursorDrop() end
+      if not p.sawLock and p.ctx == "onupdate" then
+        sort.ctxFail = sort.ctxFail + 1
+        if sort.ctxFail >= 2 then
+          if sort.clickWorked then
+            -- The one line that settles it: clicks move items, OnUpdate does
+            -- not. Next rev = click-stepper.
+            emit("sort", "gated ctx=onupdate")
+          else
+            -- No click swap ever landed either, so this is not proof of a
+            -- context gate — say so rather than blame the wrong thing.
+            emit("sort", "noeffect ctx=onupdate click=untested")
+          end
+          sortStop("gated")
+          return
+        end
+      end
+      -- Empirical specialty-bag detection: that destination bag refused the
+      -- item. Drop it from the grid and carry on with the rest.
+      if not sort.skipBag[p.dbag] then
+        sort.skipBag[p.dbag] = true
+        dtrace("sort skipping bag " .. p.dbag .. " (placement refused)")
+      end
+    else
+      return -- still inside the settle window
+    end
+  end
+  if not sort.active then return end
+  if (now - sort.lastMoveAt) > SORT_TIMEOUT then
+    sortAbort("stalled")
+    return
+  end
+  sortIssue("onupdate")
+end
+
+local function sortStart()
+  sort.seq = sort.seq + 1
+  sort.active = true
+  sort.moves = 0
+  sort.pend = nil
+  sort.ctxFail = 0
+  sort.clickWorked = false
+  sort.skipBag = {}
+  sort.lastMoveAt = GetTime()
+  sortSetLabel(true)
+  dtrace("sort start #" .. sort.seq)
+  -- The first swap goes out RIGHT HERE, still inside the mouse click, so the
+  -- known-good hardware-event path is exercised before OnUpdate is trusted.
+  sortIssue("click")
+end
+
+sortBtn = CreateFrame("Button", "ShadowBagsSortBtn", bagsFrame, "UIPanelButtonTemplate")
+sortBtn:SetWidth(64)
+sortBtn:SetHeight(20)
+sortBtn:SetPoint("LEFT", bagsTitle, "RIGHT", 14, 0)
+sortBtn:SetText("|cFFCCCCCCSort|r")
+sortBtn:SetScript("OnClick", function()
+  if sort.active then
+    sortStop("cancel") -- re-click = cancel, and the label snaps back
+    return
+  end
+  -- pcall: an error in here would die silently (scriptErrors is off) and the
+  -- button would just look broken.
+  local ok, err = pcall(sortStart)
+  if not ok then
+    emit("err", "sort start: " .. tostring(err))
+    sortStop("error")
+  end
+end)
+
 -- Contents change while the window is closed too — track dirt, refresh live.
 local bagsEvents = CreateFrame("Frame", "ShadowBagsEventFrame", UIParent)
 bagsEvents:RegisterEvent("BAG_UPDATE")
@@ -953,6 +1324,17 @@ driver:SetScript("OnUpdate", function()
   -- silently kill the rest of this OnUpdate (loot retries, reload ladder).
   local aok, aerr = pcall(armorTick)
   if not aok then emit("err", "armorTick: " .. tostring(aerr)) end
+  -- r13: bag autosort steps here (one swap in flight, lock-polled). Above the
+  -- auto.enabled gate on purpose — sorting has nothing to do with combat — and
+  -- pcall'd for the same reason armorTick is: a raw error would take the rest
+  -- of this OnUpdate down with it, silently.
+  if sort.active then
+    local sok, serr = pcall(sortTick)
+    if not sok then
+      emit("err", "sortTick: " .. tostring(serr))
+      pcall(sortStop, "error")
+    end
+  end
   if loot.active then lootTick() end
   if pendingReload > 0 then
     pendingReload = pendingReload - 1
