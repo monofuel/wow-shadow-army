@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from brain import frame_projection, intent_mapping, lua_runner
+from brain.accept_invite import should_accept_invite
 from brain.upstream import (
     ActionSelectionRequest,
     ActionSettled,
@@ -96,7 +97,14 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     p.add_argument(
         "--tool",
         default="follow_leader",
-        help="Lua tool name (default follow_leader)",
+        help="Lua tool name (default follow_leader; use escort_leader for follow+assist)",
+    )
+    p.add_argument(
+        "--accept-from",
+        default="",
+        help="comma-separated inviter allowlist; when set, accept_party from "
+        "those names is preferred over escort intents (default empty; "
+        "make escort sets Murist)",
     )
     return p.parse_args(argv)
 
@@ -106,6 +114,10 @@ def _party_list(raw: str) -> list[str]:
     if not members:
         raise SystemExit("party-members must list at least one name")
     return members
+
+
+def _accept_allowlist(raw: str) -> list[str]:
+    return [n.strip() for n in raw.split(",") if n.strip()]
 
 
 class _JsonlLogger:
@@ -298,7 +310,10 @@ def run(args: argparse.Namespace) -> int:
                     except Exception as exc:  # noqa: BLE001
                         print(f"[shadow] fixture capture failed: {exc}", flush=True)
 
-                projection = frame_projection.project_for_follow_leader(frame)
+                if args.tool == "escort_leader":
+                    projection = frame_projection.project_for_escort_leader(frame)
+                else:
+                    projection = frame_projection.project_for_follow_leader(frame)
                 self_loc = frame_projection.project_self_location(frame)
                 row["frame_id"] = frame.frame_id
                 row["observed_tick"] = frame.observed_tick
@@ -316,6 +331,78 @@ def run(args: argparse.Namespace) -> int:
                     }
                 if self_loc:
                     last_pos = dict(self_loc)
+
+                # Invite accept beats escort: one standing process per seat
+                # (no separate party_butler fighting the same socket).
+                allowlist = _accept_allowlist(args.accept_from)
+                party_obs = frame.observation.party
+                if should_accept_invite(
+                    bool(party_obs.invite_pending),
+                    str(party_obs.invite_from or ""),
+                    allowlist,
+                ):
+                    intent = {
+                        "kind": "accept_party",
+                        "reason": f"invite_from:{party_obs.invite_from}",
+                    }
+                    row["intent"] = intent
+                    row["auto_accept"] = True
+                    prefer_dest = None
+                    mapped = intent_mapping.map_intent(intent)
+                    row["mapped"] = {
+                        "kind": mapped.kind,
+                        "target": mapped.target,
+                        "destination": mapped.destination,
+                        "skip": mapped.skip,
+                        "reason": mapped.reason,
+                    }
+                    settlement = None
+                    if (
+                        not mapped.skip
+                        and mapped.kind is not None
+                        and frame.action_ready
+                    ):
+                        kwargs = intent_mapping.mapped_to_factorized_kwargs(mapped)
+                        assert kwargs is not None
+                        action = FactorizedAction(**kwargs)
+                        if not frame.allows_action(action):
+                            row["select_skipped"] = "mask_rejects"
+                            print(
+                                f"[shadow] #{loop_i} accept_party mask rejects",
+                                flush=True,
+                            )
+                        else:
+                            try:
+                                client.select(
+                                    ActionSelectionRequest(
+                                        action=action,
+                                        frame_id=frame.frame_id,
+                                        observed_tick=frame.observed_tick,
+                                        expected_slot=args.slot,
+                                        expected_revision=frame.revision,
+                                    )
+                                )
+                                settlement = _safe_last_settlement(client)
+                                if isinstance(settlement, ActionSettled):
+                                    row["settlement"] = settlement.model_dump()
+                                    print(
+                                        f"[shadow] #{loop_i} ACCEPT "
+                                        f"ok={settlement.success} "
+                                        f"msg={settlement.message!r}",
+                                        flush=True,
+                                    )
+                                else:
+                                    row["settlement"] = settlement
+                                    print(
+                                        f"[shadow] #{loop_i} ACCEPT settled={settlement}",
+                                        flush=True,
+                                    )
+                            except NimControlRequestError as exc:
+                                row["select_error"] = str(exc)
+                                print(f"[shadow] accept error: {exc}", flush=True)
+                    logger.write(row)
+                    time.sleep(args.cadence)
+                    continue
 
                 try:
                     intent = lua_runner.decide(args.tool, projection)
@@ -371,6 +458,7 @@ def run(args: argparse.Namespace) -> int:
                 row["mapped"] = {
                     "kind": mapped.kind,
                     "target": mapped.target,
+                    "spell": mapped.spell,
                     "destination": mapped.destination,
                     "skip": mapped.skip,
                     "reason": mapped.reason,

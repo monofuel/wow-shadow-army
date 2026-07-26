@@ -32,7 +32,7 @@ COMPOSE_FILE := infra/compose.vmangos.yml
 ACCOUNT_USER := monofuel
 ACCOUNT_PASS := password
 
-.PHONY: test test-lua test-python test-nim system pin-check integration-test start-server stop-server server-logging logs account soap-account play play-classic shadow grind party-form breadcrumbs quest-data warlock-account warlock-bot botwarrior-bot navmesh-helper navmesh-status
+.PHONY: test test-lua test-python test-nim system pin-check integration-test start-server stop-server server-logging logs account soap-account play play-classic shadow escort escort-army grind party-form breadcrumbs quest-data warlock-account warlock-bot botwarrior-bot navmesh-helper navmesh-status
 
 # Unit tier only. test-python is stdlib-only (projection + intent_mapping + optional
 # lua_runner smoke); it is wired into `make test` because it needs no venv/network.
@@ -112,6 +112,44 @@ EXTRA ?=
 shadow:
 	@cd "$(CURDIR)" && uv run --project "$(UPSTREAM)" python -m brain.shadow \
 		--slot $(SLOT) --leader-name $(LEADER) --party-members $(PARTY) $(EXTRA)
+
+# Escort Murist: one standing brain per seat — accept Murist invites + Lua
+# escort_leader (follow formation + assist/attack his target). Do NOT also run
+# party_butler on the same slot (one client per control socket).
+# Docs: docs/rolling-issues-2026-07-26.md
+#
+#   make escort SLOT=2 EXTRA='--max-seconds 120'
+#   make escort-army          # both Shadowfel + Igris in background (auto)
+#
+# Uses fork uv project when WOW_SHADOW_UPSTREAM points at the fork (Igris path).
+ESCORT_LEADER ?= Murist
+ESCORT_PARTY ?= Murist,Shadowfel,Igris
+ESCORT_ACCEPT_FROM ?= Murist
+# Prefer fork SDK when the fork checkout exists (matches igris/warlock-bot-fork seats).
+ESCORT_UPSTREAM ?= $(shell if [ -d "$(abspath ../coworld-vanilla-wow-fork)" ]; then echo $(abspath ../coworld-vanilla-wow-fork); else echo $(UPSTREAM); fi)
+escort:
+	@cd "$(CURDIR)" && \
+	UP=$${WOW_SHADOW_UPSTREAM:-$(ESCORT_UPSTREAM)}; \
+	uv run --project "$$UP" env WOW_SHADOW_UPSTREAM="$$UP" python -m brain.shadow \
+		--slot $(SLOT) --leader-name $(ESCORT_LEADER) --party-members $(ESCORT_PARTY) \
+		--tool escort_leader --accept-from $(ESCORT_ACCEPT_FROM) \
+		--goal-id escort-slot-$(SLOT) $(EXTRA)
+
+# Standing army escorts: slots 2 (Shadowfel) + 3 (Igris). Background, no
+# max-seconds — kill the logged PIDs to stop. Logs under local_data/brain-logs/.
+# One brain per seat (accept + escort); do not also run party_butler on these slots.
+escort-army:
+	@mkdir -p "$(CURDIR)/local_data/brain-logs"
+	@cd "$(CURDIR)" && \
+	UP=$${WOW_SHADOW_UPSTREAM:-$(ESCORT_UPSTREAM)}; \
+	echo "starting escort slot 2 (Shadowfel) + slot 3 (Igris) via $$UP"; \
+	nohup env WOW_SHADOW_UPSTREAM="$$UP" $(MAKE) escort SLOT=2 EXTRA='--cadence 0.25' \
+		> local_data/brain-logs/escort-slot2.log 2>&1 & echo $$! > local_data/brain-logs/escort-slot2.pid; \
+	nohup env WOW_SHADOW_UPSTREAM="$$UP" $(MAKE) escort SLOT=3 EXTRA='--cadence 0.25' \
+		> local_data/brain-logs/escort-slot3.log 2>&1 & echo $$! > local_data/brain-logs/escort-slot3.pid; \
+	sleep 1; \
+	echo "pids: $$(cat local_data/brain-logs/escort-slot2.pid) $$(cat local_data/brain-logs/escort-slot3.pid)"; \
+	echo "logs: local_data/brain-logs/escort-slot2.log local_data/brain-logs/escort-slot3.log"
 
 # Mob-grinding brain (docs/warlock-seat.md). Drives a seat entirely from OUR
 # policy using the goal-independent generic action masks, so it works for
@@ -558,6 +596,32 @@ igris-bot:
 	VANILLA_WOW_PLAYER_AUTONOMOUS=0 \
 	WOW_SDK_NIM_RUNTIME_SLOT=$(IGRIS_SLOT) \
 	WOW_SDK_NIM_RUNTIME_DIR=$(IGRIS_RUNTIME_DIR) \
+	WOW_SDK_NIM_CONTROL_HOST=127.0.0.1 \
+	nim r player/reference_player/reference_player.nim --scenario=nim-control
+
+# Shadowfel on the FORK build (same env tuple as warlock-bot, cd FORK) —
+# for play sessions that need fork-carried client fixes on both seats
+# (e.g. party-invite-observation). Stock target remains `warlock-bot`.
+.PHONY: warlock-bot-fork
+warlock-bot-fork:
+	@set -e; \
+	if [ ! -d "$(FORK)" ]; then \
+		echo "error: fork checkout missing: $(FORK)" >&2; exit 1; \
+	fi; \
+	mkdir -p "$(WARLOCK_RUNTIME_DIR)"; \
+	cd "$(FORK)"; \
+	. "$(WOW_ENV)"; \
+	VANILLA_WOW_PLAYER_REALM_HOST=127.0.0.1 \
+	VANILLA_WOW_PLAYER_REALM_PORT=3724 \
+	VANILLA_WOW_PLAYER_USERNAME=$(WARLOCK_ACCOUNT) \
+	VANILLA_WOW_PLAYER_PASSWORD=$(WARLOCK_PASS) \
+	VANILLA_WOW_PLAYER_CHARACTER_NAME=$(WARLOCK_CHARACTER) \
+	VANILLA_WOW_PLAYER_CHARACTER_RACE=$(WARLOCK_RACE) \
+	VANILLA_WOW_PLAYER_CHARACTER_CLASS=$(WARLOCK_CLASS) \
+	VANILLA_WOW_PLAYER_CHARACTER_GENDER=$(WARLOCK_GENDER) \
+	VANILLA_WOW_PLAYER_AUTONOMOUS=0 \
+	WOW_SDK_NIM_RUNTIME_SLOT=$(WARLOCK_SLOT) \
+	WOW_SDK_NIM_RUNTIME_DIR=$(WARLOCK_RUNTIME_DIR) \
 	WOW_SDK_NIM_CONTROL_HOST=127.0.0.1 \
 	nim r player/reference_player/reference_player.nim --scenario=nim-control
 

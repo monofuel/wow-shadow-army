@@ -39,13 +39,7 @@ from player.sdk.nim_control import (  # noqa: E402
 print = functools.partial(print, flush=True)  # noqa: A001
 
 
-def should_accept(
-    invite_pending: bool, invite_from: str, allowlist: list[str]
-) -> bool:
-    """Pure decision: accept only a pending invite from an allowlisted name."""
-    if not invite_pending:
-        return False
-    return invite_from.strip().lower() in [n.strip().lower() for n in allowlist]
+from brain.accept_invite import should_accept_invite as should_accept
 
 
 def main() -> int:
@@ -70,7 +64,8 @@ def main() -> int:
             f"goal={status.goal.id if status.goal else None} "
             f"accept-from={allowlist}"
         )
-        if status.goal is None:
+        # A fresh seat reports a zero-value goal (empty id), not None.
+        if status.goal is None or not getattr(status.goal, "id", ""):
             # accept_party needs any installed goal; install a passive one.
             try:
                 status = client.submit_goal(

@@ -24,6 +24,9 @@ from typing import Any, Mapping, MutableMapping, Optional
 
 
 FOLLOW_KIND = "follow"
+ASSIST_KIND = "assist"
+ATTACK_KIND = "attack"
+CAST_KIND = "cast"
 
 
 def _get(obj: Any, *names: str, default: Any = None) -> Any:
@@ -47,7 +50,14 @@ def _xy(location: Any) -> Optional[dict[str, float]]:
     y = _get(location, "y")
     if x is None or y is None:
         return None
-    return {"x": float(x), "y": float(y)}
+    out: dict[str, float] = {"x": float(x), "y": float(y)}
+    z = _get(location, "z")
+    if z is not None:
+        out["z"] = float(z)
+    map_id = _get(location, "map_id")
+    if map_id is not None:
+        out["map_id"] = float(map_id)
+    return out
 
 
 def _kind_index(action_space: Any, kind: str) -> Optional[int]:
@@ -70,12 +80,12 @@ def _kind_index(action_space: Any, kind: str) -> Optional[int]:
         return None
 
 
-def _follow_mask_allows(frame: Any, entity_index: int) -> bool:
-    """True when action_mask.target[follow][entity_index] is admitted."""
+def _mask_allows(frame: Any, kind: str, entity_index: int) -> bool:
+    """True when action_mask.target[kind][entity_index] is admitted."""
     mask = _get(frame, "action_mask")
     if mask is None:
         return False
-    kind_i = _kind_index(_get(frame, "action_space"), FOLLOW_KIND)
+    kind_i = _kind_index(_get(frame, "action_space"), kind)
     if kind_i is None:
         return False
     kind_row = _get(mask, "kind")
@@ -88,6 +98,11 @@ def _follow_mask_allows(frame: Any, entity_index: int) -> bool:
     if entity_index < 0 or entity_index >= len(row):
         return False
     return bool(row[entity_index])
+
+
+def _follow_mask_allows(frame: Any, entity_index: int) -> bool:
+    """True when action_mask.target[follow][entity_index] is admitted."""
+    return _mask_allows(frame, FOLLOW_KIND, entity_index)
 
 
 def _party_entities(bindings: Any) -> list[Any]:
@@ -120,30 +135,60 @@ def _leader_position(
     entity: Any,
     observation: Any,
 ) -> Optional[dict[str, float]]:
-    """Prefer binding location, then party member location / last_visible."""
-    xy = _xy(_get(entity, "location")) if entity is not None else None
-    if xy is not None:
-        return xy
+    """Prefer binding location, then party member location / last_visible.
+
+    Party frames often set ``location_known`` with ``z=0`` and
+    ``elevation_known=false`` while ``last_visible_location`` still has a real
+    floor (crypt multi-floor). Prefer last_visible z when elevation is unknown.
+    """
+    if entity is not None:
+        xy = _xy(_get(entity, "location"))
+        if xy is not None and "z" in xy and xy["z"] != 0.0:
+            return xy
     members = _get(party, "members") or []
     leader_guid = _get(party, "leader_guid")
     leader_name = _get(party, "leader_name")
     for m in members:
-        if _get(m, "leader") or (
-            leader_guid and str(_get(m, "guid", default="")) == str(leader_guid)
-        ) or (
-            leader_name
-            and str(_get(m, "name", default="") or "").strip().casefold()
-            == str(leader_name).strip().casefold()
+        if not (
+            _get(m, "leader")
+            or (
+                leader_guid
+                and str(_get(m, "guid", default="")) == str(leader_guid)
+            )
+            or (
+                leader_name
+                and str(_get(m, "name", default="") or "").strip().casefold()
+                == str(leader_name).strip().casefold()
+            )
         ):
-            if _get(m, "location_known"):
-                xy = _xy(_get(m, "location"))
-                if xy is not None:
-                    return xy
-            if _get(m, "last_visible_location_known"):
-                xy = _xy(_get(m, "last_visible_location"))
-                if xy is not None:
-                    return xy
-    # Last resort: observation.location is self, not leader — skip.
+            continue
+        live = _xy(_get(m, "location")) if _get(m, "location_known") else None
+        last = (
+            _xy(_get(m, "last_visible_location"))
+            if _get(m, "last_visible_location_known")
+            else None
+        )
+        elev_ok = bool(_get(m, "elevation_known"))
+        if live is not None:
+            live_z = live.get("z")
+            live_has_floor = live_z is not None and float(live_z) != 0.0
+            # Prefer full live when elevation is known, or live already has a floor.
+            # Never overwrite a good live z with last_visible — that freezes the
+            # leader on an old floor and destination moves chase a ghost.
+            if elev_ok or live_has_floor:
+                return live
+            # xy known, z missing/0: graft last_visible floor only.
+            if last is not None and "z" in last and last["z"] != 0.0:
+                out = dict(live)
+                out["z"] = last["z"]
+                if "map_id" in last:
+                    out["map_id"] = last["map_id"]
+                return out
+            return live
+        if last is not None:
+            return last
+    if entity is not None:
+        return _xy(_get(entity, "location"))
     return None
 
 
@@ -179,6 +224,10 @@ def project_for_follow_leader(frame: Any) -> dict[str, Any]:
                 "y": pos["y"],
                 "visible": visible,
             }
+            if "z" in pos:
+                leader_unit["z"] = pos["z"]
+            if "map_id" in pos:
+                leader_unit["map_id"] = pos["map_id"]
         elif leader_name or leader_guid:
             # In party but leader not in bindings → remembered only → not visible.
             pos = _leader_position(party, None, observation) or {"x": 0.0, "y": 0.0}
@@ -188,11 +237,179 @@ def project_for_follow_leader(frame: Any) -> dict[str, Any]:
                 "y": pos["y"],
                 "visible": False,
             }
+            if "z" in pos:
+                leader_unit["z"] = pos["z"]
+            if "map_id" in pos:
+                leader_unit["map_id"] = pos["map_id"]
+
+    # Self gets z/map when available (destination rejoin / multi-floor).
+    if self_unit is not None and loc is not None:
+        z = _get(loc, "z")
+        if z is not None:
+            self_unit = dict(self_unit)
+            self_unit["z"] = float(z)
+            mid = _get(loc, "map_id")
+            if mid is not None:
+                self_unit["map_id"] = float(mid)
 
     return {
         "self_unit": self_unit,
         "party": {"leader_unit": leader_unit},
     }
+
+
+def _mana_percent(observation: Any) -> float:
+    """Mana fraction 0–100; prefer power pool 0 (mana) over active_power latch."""
+    if observation is None:
+        return 100.0
+    powers = _get(observation, "powers")
+    max_powers = _get(observation, "max_powers")
+    if (
+        isinstance(powers, (list, tuple))
+        and isinstance(max_powers, (list, tuple))
+        and len(max_powers) > 0
+        and float(max_powers[0] or 0) > 0
+    ):
+        return 100.0 * float(powers[0] or 0) / float(max_powers[0])
+    if bool(_get(observation, "active_power_type_known")) and int(
+        _get(observation, "active_power_type", -1) or -1
+    ) == 0 and _get(observation, "active_power_known"):
+        return 100.0 * float(_get(observation, "active_power", 0) or 0) / max(
+            float(_get(observation, "active_max_power", 1) or 1), 1.0
+        )
+    return 100.0
+
+
+def _health_percent(observation: Any) -> float:
+    if observation is None or not _get(observation, "health_known"):
+        return 100.0
+    mx = float(_get(observation, "max_health", 0) or 0)
+    if mx <= 0:
+        return 100.0
+    return 100.0 * float(_get(observation, "health", 0) or 0) / mx
+
+
+def _cast_options(frame: Any) -> list[dict[str, Any]]:
+    """List masked cast options as plain tables for Lua.
+
+    Each entry: ``{ target, spell, name, spell_id }`` where ``spell`` is the
+    policy spell index (1-based binding index used by FactorizedAction).
+    """
+    mask = _get(frame, "action_mask")
+    if mask is None:
+        return []
+    kind_i = _kind_index(_get(frame, "action_space"), CAST_KIND)
+    if kind_i is None:
+        return []
+    kind_row = _get(mask, "kind")
+    if kind_row is not None and kind_i < len(kind_row) and not kind_row[kind_i]:
+        return []
+    spell_mask = _get(mask, "spell") or []
+    spells = _get(_get(frame, "bindings"), "spells") or []
+    out: list[dict[str, Any]] = []
+    # spell_mask is target_index → list[bool] over spell indices.
+    for target_index, row in enumerate(spell_mask):
+        if not isinstance(row, (list, tuple)):
+            continue
+        for spell_index, allowed in enumerate(row):
+            if not allowed or spell_index <= 0:
+                continue
+            name = ""
+            spell_id = 0
+            if 0 <= spell_index - 1 < len(spells):
+                sp = spells[spell_index - 1]
+                name = str(_get(sp, "name", default="") or "")
+                spell_id = int(_get(sp, "spell_id", default=0) or 0)
+            out.append(
+                {
+                    "target": int(target_index),
+                    "spell": int(spell_index),
+                    "name": name,
+                    "spell_id": spell_id,
+                }
+            )
+    return out
+
+
+def project_for_escort_leader(frame: Any) -> dict[str, Any]:
+    """Map EnvironmentFrame → escort_leader table (follow + assist + cast/attack).
+
+    Shape::
+
+        {
+          self_unit = { x, y } | nil,
+          party = {
+            leader_unit = { id, x, y, visible, assistable } | nil
+          },
+          combat = {
+            in_combat = bool,
+            mana_pct = number,
+            health_pct = number,
+            focus_guid = string,
+            auto_attack_guid = string,
+            attackable = [ { id, guid, x?, y? }, ... ],
+            casts = [ { target, spell, name, spell_id }, ... ]
+          }
+        }
+    """
+    base = project_for_follow_leader(frame)
+    observation = _get(frame, "observation")
+    leader = (base.get("party") or {}).get("leader_unit")
+    if leader is not None and leader.get("id"):
+        idx = int(leader["id"])
+        leader["assistable"] = bool(leader.get("visible")) and _mask_allows(
+            frame, ASSIST_KIND, idx
+        )
+    elif leader is not None:
+        leader["assistable"] = False
+
+    focus_guid = (
+        str(_get(observation, "combat_focus_guid", default="") or "")
+        if observation is not None
+        else ""
+    )
+    auto_guid = (
+        str(_get(observation, "auto_attack_guid", default="") or "")
+        if observation is not None
+        else ""
+    )
+    combat: dict[str, Any] = {
+        "in_combat": bool(_get(observation, "in_combat", default=False))
+        if observation is not None
+        else False,
+        "mana_pct": _mana_percent(observation),
+        "health_pct": _health_percent(observation),
+        "focus_guid": focus_guid,
+        "auto_attack_guid": auto_guid,
+        "focus_id": 0,
+        "attackable": [],
+        "casts": _cast_options(frame),
+    }
+    bindings = _get(frame, "bindings")
+    entities = _get(bindings, "entities") or []
+    prefer_guids = {g for g in (focus_guid, auto_guid) if g and g != "0"}
+    for e in entities:
+        idx = int(_get(e, "index", default=0) or 0)
+        if idx <= 0:
+            continue
+        eg = str(_get(e, "guid", default="") or "")
+        if eg in prefer_guids:
+            combat["focus_id"] = idx
+        if not _mask_allows(frame, ATTACK_KIND, idx):
+            continue
+        loc = _get(e, "location")
+        xy = _xy(loc)
+        entry: dict[str, Any] = {
+            "id": idx,
+            "guid": eg,
+        }
+        if xy is not None:
+            entry["x"] = xy["x"]
+            entry["y"] = xy["y"]
+        combat["attackable"].append(entry)
+
+    base["combat"] = combat
+    return base
 
 
 def project_self_location(frame: Any) -> Optional[dict[str, float]]:

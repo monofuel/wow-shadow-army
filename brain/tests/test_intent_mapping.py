@@ -56,6 +56,73 @@ class TestMapIntent(unittest.TestCase):
         self.assertTrue(m.skip)
         self.assertIn("unknown_intent", m.reason)
 
+    def test_assist_unit(self):
+        m = map_intent({"kind": "assist_unit", "unit_id": 2, "reason": "mirror_leader_target"})
+        self.assertFalse(m.skip)
+        self.assertEqual(m.kind, "assist")
+        self.assertEqual(m.target, 2)
+        self.assertEqual(
+            mapped_to_factorized_kwargs(m),
+            {"kind": "assist", "target": 2},
+        )
+
+    def test_attack_unit(self):
+        m = map_intent({"kind": "attack_unit", "unit_id": 5})
+        self.assertFalse(m.skip)
+        self.assertEqual(m.kind, "attack")
+        self.assertEqual(m.target, 5)
+        self.assertEqual(
+            mapped_to_factorized_kwargs(m),
+            {"kind": "attack", "target": 5},
+        )
+
+    def test_assist_invalid_id_skips(self):
+        m = map_intent({"kind": "assist_unit", "unit_id": 0})
+        self.assertTrue(m.skip)
+
+    def test_accept_party(self):
+        m = map_intent({"kind": "accept_party", "reason": "invite_from:Murist"})
+        self.assertFalse(m.skip)
+        self.assertEqual(m.kind, "accept_party")
+        self.assertEqual(mapped_to_factorized_kwargs(m), {"kind": "accept_party"})
+
+    def test_cast_spell(self):
+        m = map_intent(
+            {
+                "kind": "cast_spell",
+                "unit_id": 5,
+                "spell": 22,
+                "reason": "shadow_bolt:shadow bolt",
+            }
+        )
+        self.assertFalse(m.skip)
+        self.assertEqual(m.kind, "cast")
+        self.assertEqual(m.target, 5)
+        self.assertEqual(m.spell, 22)
+        self.assertEqual(
+            mapped_to_factorized_kwargs(m),
+            {"kind": "cast", "target": 5, "spell": 22},
+        )
+
+    def test_move_to_unit_with_xyz_is_destination(self):
+        m = map_intent(
+            {
+                "kind": "move_to_unit",
+                "unit_id": 2,
+                "x": 1644.0,
+                "y": 1662.0,
+                "z": 132.0,
+                "map_id": 0,
+                "reason": "rejoin_formation_vertical",
+            }
+        )
+        self.assertFalse(m.skip)
+        self.assertEqual(m.kind, "move")
+        self.assertEqual(m.destination["z"], 132.0)
+        kwargs = mapped_to_factorized_kwargs(m)
+        self.assertEqual(kwargs["kind"], "move")
+        self.assertEqual(kwargs["destination"]["z"], 132.0)
+
 
 if __name__ == "__main__":
     unittest.main()

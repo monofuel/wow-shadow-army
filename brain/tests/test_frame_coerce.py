@@ -15,6 +15,8 @@ from brain.frame_coerce import (  # noqa: E402
     coerce_action_settled,
     coerce_frame_payload,
     coerce_json_payload,
+    coerce_leveling_lifecycle,
+    coerce_navigation,
 )
 
 
@@ -137,6 +139,56 @@ class TestJsonPayload(unittest.TestCase):
 
     def test_non_dict_json_untouched(self):
         self.assertEqual(coerce_json_payload(b"[1,2]"), b"[1,2]")
+
+
+class TestNavigationAndLifecycle(unittest.TestCase):
+    def test_navigation_matches_loaded_sdk(self):
+        """Upstream wants steep; fork wants empty exclude_flags (live 2026-07-26)."""
+        from brain.frame_coerce import sdk_has_quest_discovery_lifecycle
+
+        raw = {
+            "owner": "vmangos_detour",
+            "profile": "vmangos_player_ground_water",
+            "include_flags": ["ground", "water"],
+            "exclude_flags": [],
+            "action_contract": "semantic_destination",
+        }
+        out = coerce_navigation(raw)
+        self.assertEqual(out["include_flags"], ["ground", "water"])
+        if sdk_has_quest_discovery_lifecycle():
+            self.assertEqual(out["exclude_flags"], [])
+        else:
+            self.assertEqual(out["exclude_flags"], ["steep"])
+        nested = coerce_frame_payload({"navigation": raw})
+        self.assertEqual(
+            nested["navigation"]["exclude_flags"], out["exclude_flags"]
+        )
+
+    def test_leveling_lifecycle_sdk_shape(self):
+        from brain.frame_coerce import sdk_has_quest_discovery_lifecycle
+
+        raw = {
+            "active_strategy_key": "generic",
+            "no_progress_seconds": 1.5,
+            "quest_discovery_state": "unstarted",
+            "quest_discovery_terminal_reason": "none",
+            "quest_discovery_target_guid": "0",
+            "quest_discovery_frames": 0,
+            "quest_discovery_attempts": 0,
+            "strategy_failures": [],
+            "attention": {"kind": "none", "message": ""},
+        }
+        out = coerce_leveling_lifecycle(raw)
+        self.assertEqual(out["active_strategy_key"], "generic")
+        self.assertEqual(out["attention"]["kind"], "none")
+        if sdk_has_quest_discovery_lifecycle():
+            self.assertEqual(out["quest_discovery_state"], "unstarted")
+        else:
+            self.assertNotIn("quest_discovery_state", out)
+            self.assertEqual(
+                set(out.keys()),
+                {"active_strategy_key", "no_progress_seconds", "attention"},
+            )
 
 
 if __name__ == "__main__":

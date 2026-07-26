@@ -8,7 +8,7 @@ ShadowArmy = ShadowArmy or {}
 
 -- Bump on every edit. The System watches Chat.log for "<SA> loaded rev=..."
 -- after sending a reload — a new rev proves the edit actually loaded.
-local REV = "r18"
+local REV = "r20"
 
 -- Log window (r16): every say()/emit() line also lands here with a
 -- timestamp, so errors survive chat scroll-off and can be reviewed in-game.
@@ -142,6 +142,7 @@ local panel = CreateFrame("Frame", "ShadowArmyPanel", UIParent)
 panel:SetWidth(210)
 panel:SetHeight(192) -- +24 second button row, +8 the r18 quest line
 panel:SetPoint("RIGHT", UIParent, "RIGHT", -40, 60)
+panel:SetFrameStrata("HIGH")
 panel:SetBackdrop({
   bgFile = "Interface\\Tooltips\\UI-Tooltip-Background",
   edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
@@ -154,6 +155,16 @@ panel:SetMovable(true)
 panel:RegisterForDrag("LeftButton")
 panel:SetScript("OnDragStart", function() panel:StartMoving() end)
 panel:SetScript("OnDragStop", function() panel:StopMovingOrSizing() end)
+-- Start visible; /sa toggles. CreateFrame defaults are fine, but an explicit
+-- Show() after strata/backdrop avoids "loaded but nowhere" on some clients.
+panel:Show()
+
+local function panelShowReset()
+  -- Recover from off-screen drag or a hide that left no way back.
+  panel:ClearAllPoints()
+  panel:SetPoint("RIGHT", UIParent, "RIGHT", -40, 60)
+  panel:Show()
+end
 
 local title = panel:CreateFontString(nil, "OVERLAY", "GameFontNormal")
 title:SetPoint("TOP", panel, "TOP", 0, -8)
@@ -2138,8 +2149,12 @@ frame:SetScript("OnEvent", function()
     -- panels' OnUpdate — exactly the surface involved in that click). The
     -- fanfare mute didn't take (music still played), so this is the next
     -- single-variable test. Re-enable only after turn-ins are proven safe.
-    say("ARISE. Advisor online for " .. UnitName("player") .. " — /sa to toggle panel")
+    panelShowReset()
+    say("ARISE. Advisor online for " .. UnitName("player") .. " — /sa help (rev=" .. REV .. ")")
     emit("loaded", "rev=" .. REV)
+    if not ShadowArmyQuestData then
+      say("quest data missing (QuestData.lua failed to load) — panel still works")
+    end
   elseif event == "LEARNED_SPELL_IN_TAB" then
     scanSpellbook()
   elseif event == "SPELLCAST_START" then
@@ -2233,11 +2248,36 @@ frame:SetScript("OnEvent", function()
 end)
 
 --------------------------------------------------------------------------
--- /sa — toggle panel; /sa reload — live iteration; /sa status — chat dump.
+-- /sa — toggle panel; /sa help — command list; /sa reload, status, …
 --------------------------------------------------------------------------
+
+local function saHelp()
+  -- Keep this list next to the slash handler so they cannot drift.
+  say("ShadowArmy " .. REV .. " — commands:")
+  say("  /sa            toggle advisor panel")
+  say("  /sa show       show panel (reset position if off-screen)")
+  say("  /sa help       this list")
+  say("  /sa status     level, HP, zone, XP/h")
+  say("  /sa log        toggle advisor log window")
+  say("  /sa bags       open ShadowBags")
+  say("  /sa quests     toggle quest helper (map blips / objectives)")
+  say("  /sa reload     ReloadUI() — pick up disk edits")
+end
 
 SLASH_SHADOWARMY1 = "/sa"
 SlashCmdList["SHADOWARMY"] = function(msg)
+  msg = string.gsub(msg or "", "^%s+", "")
+  msg = string.gsub(msg, "%s+$", "")
+  msg = string.lower(msg)
+  if msg == "help" or msg == "?" then
+    saHelp()
+    return
+  end
+  if msg == "show" then
+    panelShowReset()
+    say("panel shown (position reset)")
+    return
+  end
   if msg == "reload" then
     ReloadUI()
     return
@@ -2266,9 +2306,14 @@ SlashCmdList["SHADOWARMY"] = function(msg)
       UnitName("player"), UnitLevel("player"), hp, hpMax, GetZoneText(), xph, tta))
     return
   end
-  if panel:IsVisible() then
+  if msg ~= "" then
+    say("unknown /sa command — try /sa help")
+    return
+  end
+  -- Toggle: prefer IsShown (local flag) over IsVisible (parent chain).
+  if panel:IsShown() then
     panel:Hide()
   else
-    panel:Show()
+    panelShowReset()
   end
 end
