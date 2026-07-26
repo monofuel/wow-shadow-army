@@ -19,6 +19,12 @@ export VANILLA_WOW_EXTRACTED_DATA_DIR := $(UPSTREAM)/local_data/vmangos-5875-dat
 export VMANGOS_MYSQL_DUMPS_DIR := $(UPSTREAM)/local_data/vmangos-db/mysql-dump
 export COWORLD_CONFIG_DIR := $(UPSTREAM)/local_data/coworld-config
 export COWORLD_RUN_DIR := $(UPSTREAM)/local_data/coworld-run
+# Detour pathfinding helper (docs/navmesh.md). Without it every move settles
+# `movement_blocked`. Build once with `make navmesh-helper`; the mmaps it reads
+# come from VANILLA_WOW_EXTRACTED_DATA_DIR/mmaps above.
+export VANILLA_WOW_NAVMESH_HELPER := $(UPSTREAM)/tmp/vmangos-navmesh-helper
+# Sparse vmangos/core checkout supplying dep/recastnavigation + dep/include.
+VMANGOS_CORE_DIR := $(UPSTREAM)/local_data/reference/vmangos-core
 
 OPERATOR := uv run python server/scripts/docker_vmangos_server.py
 COMPOSE_FILE := infra/compose.vmangos.yml
@@ -26,7 +32,7 @@ COMPOSE_FILE := infra/compose.vmangos.yml
 ACCOUNT_USER := monofuel
 ACCOUNT_PASS := password
 
-.PHONY: test test-lua test-python test-nim system pin-check integration-test start-server stop-server server-logging logs account soap-account play play-classic shadow breadcrumbs warlock-account warlock-bot
+.PHONY: test test-lua test-python test-nim system pin-check integration-test start-server stop-server server-logging logs account soap-account play play-classic shadow party-form breadcrumbs warlock-account warlock-bot botwarrior-bot navmesh-helper navmesh-status
 
 # Unit tier only. test-python is stdlib-only (projection + intent_mapping + optional
 # lua_runner smoke); it is wired into `make test` because it needs no venv/network.
@@ -106,6 +112,48 @@ EXTRA ?=
 shadow:
 	@cd "$(CURDIR)" && uv run --project "$(UPSTREAM)" python -m brain.shadow \
 		--slot $(SLOT) --leader-name $(LEADER) --party-members $(PARTY) $(EXTRA)
+
+# Form a real party across two or more of OUR headless seats (docs/party-formation.md).
+# `invite_party` is only unmasked while the leader seat holds a dungeon goal whose
+# declared roster is incomplete (upstream environment_frame.nim:1230 is the only
+# enabler); `accept_party` needs nothing but a pending invite plus any goal.
+# Requires: realm up + one running reference player per slot below.
+#
+#   make party-form LEADER_SLOT=0 LEADER=Botwarrior MEMBERS=Botwarrior,Botpriest MEMBER_SLOTS=1
+#
+# MEMBER_SLOTS lists only the seats WE drive; leave it empty for members we do
+# not control. NEVER put a human character in MEMBERS — bots do not address the
+# human's character (see docs/party-formation.md).
+# PARTY_LEADER is separate from `shadow`'s LEADER on purpose: it must name the
+# character logged in on LEADER_SLOT, or the reducer stays at noop.
+LEADER_SLOT ?= 0
+PARTY_LEADER ?= Botwarrior
+MEMBERS ?= Botwarrior,Botpriest
+MEMBER_SLOTS ?= 1
+party-form:
+	@cd "$(CURDIR)" && uv run --project "$(UPSTREAM)" python -m brain.party \
+		--leader-slot $(LEADER_SLOT) --leader $(PARTY_LEADER) \
+		--members $(MEMBERS) --member-slots $(MEMBER_SLOTS) $(EXTRA)
+
+# Build the Detour navmesh helper (docs/navmesh.md). Compile-only: it links
+# VMaNGOS's vendored Detour against the mmaps we already extracted — no mmap
+# generation, no server build. Idempotent; ~30s. Needs the sparse vmangos/core
+# checkout in $(VMANGOS_CORE_DIR) (see docs/navmesh.md for the clone recipe).
+navmesh-helper:
+	@set -e; \
+	if [ ! -d "$(VMANGOS_CORE_DIR)/dep/recastnavigation/Detour" ]; then \
+		echo "error: Detour sources missing: $(VMANGOS_CORE_DIR)/dep/recastnavigation/Detour" >&2; \
+		echo "see docs/navmesh.md for the sparse vmangos/core clone recipe" >&2; \
+		exit 1; \
+	fi; \
+	cd "$(UPSTREAM)"; \
+	VMANGOS_CORE_DIR="$(VMANGOS_CORE_DIR)" \
+	nim r player/sdk/helpers/build_vmangos_navmesh.nim -- "$(VANILLA_WOW_NAVMESH_HELPER)"
+
+# One-shot readiness probe: helper binary + mmap inventory, no realm needed.
+navmesh-status:
+	@printf '{"op":"status","mmaps_dir":"%s/mmaps"}' "$(VANILLA_WOW_EXTRACTED_DATA_DIR)" \
+		| "$(VANILLA_WOW_NAVMESH_HELPER)"
 
 # DB breadcrumb poller: JSONL session stream from characters MariaDB while a
 # human plays. Requires realm up (docker exec → mariadb). Not unit tier.
@@ -260,6 +308,47 @@ soap-account:
 	echo "SOAP account ready: $(SOAP_USER) (gmlevel 6). Restart the realm if it was created just now."
 
 # ---------------------------------------------------------------------------
+# Botwarrior — the seat that PROVES MOVEMENT (docs/navmesh.md).
+#
+# Orc warrior, level 30, map 1 (Durotar), slot 0 / socket 127.0.0.1:41114, on
+# upstream's playtest account bot1/bot1. Unlike Shadowfel it resolves a real
+# leveling profile (durotar_troll_shaman), so the planner actually offers move
+# options. Inherits VANILLA_WOW_NAVMESH_HELPER from the export at the top.
+#
+# Foreground. Detach with:
+#   nohup make botwarrior-bot > local_data/botwarrior-bot.log 2>&1 &
+# Ready at: "Nim binary control socket listening on 127.0.0.1:41114."
+# Then drive it:
+#   make shadow SLOT=0 LEADER=Botwarrior PARTY=Botwarrior \
+#     EXTRA='--move-fallback --max-seconds 75'
+BOTWARRIOR_RUNTIME_DIR := $(CURDIR)/local_data/nim-runtime-slot0
+botwarrior-bot:
+	@set -e; \
+	if [ ! -d "$(UPSTREAM)" ]; then \
+		echo "error: upstream checkout missing: $(UPSTREAM)" >&2; exit 1; \
+	fi; \
+	if [ ! -f "$(WOW_ENV)" ]; then \
+		echo "error: missing $(WOW_ENV)" >&2; exit 1; \
+	fi; \
+	if [ ! -x "$(VANILLA_WOW_NAVMESH_HELPER)" ]; then \
+		echo "error: navmesh helper missing; run: make navmesh-helper" >&2; exit 1; \
+	fi; \
+	mkdir -p "$(BOTWARRIOR_RUNTIME_DIR)"; \
+	cd "$(UPSTREAM)"; \
+	. "$(WOW_ENV)"; \
+	VANILLA_WOW_PLAYER_REALM_HOST=127.0.0.1 \
+	VANILLA_WOW_PLAYER_REALM_PORT=3724 \
+	VANILLA_WOW_PLAYER_USERNAME=bot1 \
+	VANILLA_WOW_PLAYER_PASSWORD=bot1 \
+	VANILLA_WOW_PLAYER_CHARACTER_NAME=Botwarrior \
+	VANILLA_WOW_PLAYER_AUTONOMOUS=0 \
+	WOW_SDK_NIM_RUNTIME_SLOT=0 \
+	WOW_SDK_NIM_RUNTIME_DIR=$(BOTWARRIOR_RUNTIME_DIR) \
+	WOW_SDK_NIM_CONTROL_HOST=127.0.0.1 \
+	WOW_SDK_NIM_CONTROL_PORT=41114 \
+	nim r player/reference_player/reference_player.nim --scenario=nim-control
+
+# ---------------------------------------------------------------------------
 # Shadowfel — headless UNDEAD WARLOCK seat (docs/warlock-seat.md).
 #
 # Undead is deliberately absent from the upstream seed scripts' race maps
@@ -310,10 +399,15 @@ warlock-account:
 
 # Bring the Shadowfel seat online. First run also creates the character.
 #
-# AUTONOMOUS=0 is load-bearing: the upstream leveling planner needs the Detour
-# navmesh helper we have not built (docs/milestone-1-evidence.md, unresolved
-# #1), and a seat launched with AUTONOMOUS=1 exited shortly after listen. 0
-# parks the seat logged in and lets an external brain own the goal.
+# AUTONOMOUS=0 is load-bearing: a seat launched with AUTONOMOUS=1 was observed
+# exiting shortly after listen. 0 parks the seat logged in and lets an external
+# brain own the goal.
+#
+# The Detour navmesh helper IS built now (docs/navmesh.md) and this target
+# inherits VANILLA_WOW_NAVMESH_HELPER from the export above, so movement is no
+# longer blocked on it. Shadowfel specifically still cannot walk under a
+# `leveling` goal — an undead warlock resolves `unsupported_profile`. Use
+# `botwarrior-bot` for movement work until that is fixed.
 #
 # Foreground like `make play` / `make shadow`. Detach with:
 #   nohup make warlock-bot > local_data/warlock-bot.log 2>&1 &
