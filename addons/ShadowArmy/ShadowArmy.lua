@@ -8,7 +8,7 @@ ShadowArmy = ShadowArmy or {}
 
 -- Bump on every edit. The System watches Chat.log for "<SA> loaded rev=..."
 -- after sending a reload — a new rev proves the edit actually loaded.
-local REV = "r10"
+local REV = "r11"
 
 local function say(msg)
   DEFAULT_CHAT_FRAME:AddMessage("|cFF9482C9[ShadowArmy]|r " .. tostring(msg))
@@ -16,7 +16,21 @@ end
 
 -- /say lands in the server's Chat.log; The System tails it. This is
 -- the addon's only outbound channel.
-local lastEmitMsg, lastEmitTime = nil, 0
+-- r11 flood control (live incident): the trace firehose tripped the server's
+-- chat throttle — "you must wait 4s before speaking again" — which blocked
+-- the HUMAN's own chat too. So nothing is sent straight from the call site
+-- any more. emit() queues; the driver's OnUpdate drains at most one line per
+-- EMIT_GAP seconds. The queue is deliberately tiny and priority-aware: under
+-- pressure we throw away chatter (traces) and never the lines The System
+-- actually reads (loaded / reloading / reload-click / err / pong / status).
+local EMIT_GAP = 2.0        -- seconds between ANY two sends
+local EMIT_QUEUE_MAX = 5
+local DROPPABLE = { trace = true }
+
+local emitQueue = {}        -- FIFO of { msg = string, drop = bool }
+local lastSendAt = 0
+local lastEmitMsg, lastEmitTime = nil, 0 -- 30s identical-message dedupe
+
 local function emit(kind, text)
   local msg = "<SA> " .. kind .. " " .. text
   local now = GetTime()
@@ -25,14 +39,48 @@ local function emit(kind, text)
   end
   lastEmitMsg = msg
   lastEmitTime = now
-  SendChatMessage(msg, "SAY")
+  local droppable = DROPPABLE[kind] and true or false
+  if table.getn(emitQueue) >= EMIT_QUEUE_MAX then
+    -- Make room: evict the oldest droppable line first.
+    local victim = nil
+    local i = 1
+    while i <= table.getn(emitQueue) do
+      if emitQueue[i].drop then
+        victim = i
+        break
+      end
+      i = i + 1
+    end
+    if victim then
+      table.remove(emitQueue, victim)
+    elseif droppable then
+      return -- queue is all must-send lines; this trace is what gives way
+    else
+      table.remove(emitQueue, 1) -- all must-send: sacrifice the stalest
+    end
+  end
+  table.insert(emitQueue, { msg = msg, drop = droppable })
 end
 
--- Diagnosis mode (r7): auto-combat and auto-loot both silently no-op with
--- zero err events — same signature as the gated ReloadUI. Trace every
--- action attempt so the telemetry shows WHERE each path dies. Toggle with
--- <SYS> debug off when the mystery is solved.
-local debugMode = true
+-- Called every frame by the driver; sends at most one queued line.
+local function emitDrain()
+  if table.getn(emitQueue) == 0 then
+    return
+  end
+  local now = GetTime()
+  if now - lastSendAt < EMIT_GAP then
+    return
+  end
+  lastSendAt = now
+  local item = table.remove(emitQueue, 1)
+  SendChatMessage(item.msg, "SAY")
+end
+
+-- Diagnosis mode (r7): trace every action attempt so the telemetry shows
+-- WHERE each path dies. OFF by default since r11 — left on, the traces
+-- tripped the server chat throttle and locked the human out of their own
+-- /say. Opt in with `<SYS> debug on`, off again with `<SYS> debug off`.
+local debugMode = false
 local function dtrace(text)
   if debugMode then
     emit("trace", text)
@@ -148,6 +196,11 @@ local auto = {
 -- that while moving" and the rotation would retry forever instead of
 -- falling back to the wand ("breaks down if I'm moving" — monofuel, live).
 -- 1.12 exposes no IsMoving(); poll GetPlayerMapPosition deltas instead.
+-- r11: sampled from the DRIVER's OnUpdate (every frame), not from
+-- rotationStep — rotationStep is skipped during GCD/backoff windows, so
+-- move.at went stale and a player who had stopped still read as moving for
+-- a whole extra cycle, starving Shadow Bolt. rotationStep now only READS
+-- move.moving.
 local move = { x = 0, y = 0, at = 0, moving = false }
 local function updateMoving()
   local x, y = GetPlayerMapPosition("player")
@@ -208,7 +261,7 @@ local function rotationStep()
   if auto.casting or GetTime() < auto.gcdUntil then return end
   if GetTime() < auto.failUntil then return end
 
-  updateMoving()
+  -- move.moving is sampled by the driver every frame (see updateMoving).
   local manaPct = 0
   if UnitManaMax("player") > 0 then
     manaPct = UnitMana("player") / UnitManaMax("player") * 100
@@ -232,11 +285,13 @@ local function rotationStep()
     castNow("Corruption") -- instant: fine while moving
     return
   end
-  -- Mana reserve raised 30→45 (live traces: floor 30 drained to 10% and
-  -- left a wandless melee warlock — misery). The imp's autocast Firebolt
-  -- keeps dealing damage while we sit on the reserve; Corruption ticks too.
+  -- Mana reserve: 30→45 (r10) was too greedy — "shadow bolt still not
+  -- working" (monofuel, live): with Corruption + the imp burning mana the
+  -- pool sits under 45% most of a fight, so the nuke never fired. r11 puts
+  -- the floor at 35: still leaves a wand/Corruption reserve, but lets the
+  -- bolt actually cast.
   if inCastRange and not move.moving
-      and auto.known["shadow bolt"] and manaPct > 45 then
+      and auto.known["shadow bolt"] and manaPct > 35 then
     castNow("Shadow Bolt")
     return
   end
@@ -271,7 +326,9 @@ end
 
 local function setAuto(on)
   auto.enabled = on
-  local label = on and "|cFF44FF44Auto: ON|r" or "Auto: OFF"
+  -- r11: label always reads "Auto Combat" (the old "Auto: ON/OFF" was
+  -- unclear); the STATE lives in the colour — green on, grey off.
+  local label = on and "|cFF44FF44Auto Combat|r" or "|cFF999999Auto Combat|r"
   ShadowArmyAutoBtn:SetText(label)
   say(on and "auto-combat ON — target something and watch"
         or "auto-combat OFF — back to manual")
@@ -281,10 +338,10 @@ local function setAuto(on)
 end
 
 local autoBtn = CreateFrame("Button", "ShadowArmyAutoBtn", panel, "UIPanelButtonTemplate")
-autoBtn:SetWidth(96)
+autoBtn:SetWidth(118)
 autoBtn:SetHeight(20)
 autoBtn:SetPoint("BOTTOMLEFT", panel, "BOTTOMLEFT", 8, 8)
-autoBtn:SetText("Auto: OFF")
+autoBtn:SetText("|cFF999999Auto Combat|r")
 autoBtn:SetScript("OnClick", function()
   setAuto(not auto.enabled)
   -- Hardware-event probe: this click IS a hardware event. If a cast fires
@@ -302,7 +359,7 @@ end)
 -- be a click because this build ignores programmatic ReloadUI (see the
 -- driver notes) — a mouse click is the hardware event that makes it legal.
 local reloadBtn = CreateFrame("Button", "ShadowArmyReloadBtn", panel, "UIPanelButtonTemplate")
-reloadBtn:SetWidth(96)
+reloadBtn:SetWidth(68) -- 118 + 8 gap + 68 = 194 = panel width minus insets
 reloadBtn:SetHeight(20)
 reloadBtn:SetPoint("BOTTOMRIGHT", panel, "BOTTOMRIGHT", -8, 8)
 reloadBtn:SetText("|cFF44FF44Reload!|r")
@@ -407,18 +464,114 @@ end
 -- programmatic UI reload on hardware-event context (the slash path starts
 -- from a keypress). So: try the free paths, then light up the panel's
 -- Reload! button — a mouse click IS a hardware event, so its OnClick works.
+--------------------------------------------------------------------------
+-- Auto-loot (r11): single-shot LootSlot() at LOOT_OPENED provably did not
+-- empty the window (live: `trace loot opened slots=N`, items still there).
+-- Three candidate causes, and this code is built to tell them apart:
+--   (a) the client gates LootSlot the way it gates ReloadUI -> retries can
+--       never work, and `loot gated` says so out loud;
+--   (b) the first call races the server's loot packet -> retries fix it;
+--   (c) BoP/quest items want ConfirmLootSlot -> the confirm pass fixes it.
+-- GetNumLootItems() counts SLOTS, which do not disappear as they are
+-- looted, so "how much is left" is measured by how many slots still carry
+-- an item (GetLootSlotInfo returns nil texture for a cleared slot).
+--------------------------------------------------------------------------
+
+local LOOT_RETRY_EVERY = 0.25
+local LOOT_RETRY_FOR = 2.0
+
+local loot = {
+  active = false,
+  openedAt = 0,
+  startSlots = 0,   -- item-bearing slots when the window opened
+  lastSeen = 0,     -- item-bearing slots at the most recent observation
+  nextTryAt = 0,
+  gatedReported = false, -- one `loot gated` per session is the whole signal
+}
+
+local function lootSlotsLeft()
+  local n = GetNumLootItems()
+  if not n then return 0 end
+  local left = 0
+  local i = 1
+  while i <= n do
+    if GetLootSlotInfo(i) then -- first return is the texture; nil = cleared
+      left = left + 1
+    end
+    i = i + 1
+  end
+  return left
+end
+
+local function lootSweep()
+  local n = GetNumLootItems()
+  if not n then return end
+  -- Backwards: LootSlot removes entries, so forward indexing skips slots.
+  local i = n
+  while i >= 1 do
+    LootSlot(i)
+    -- BoP/quest items raise a confirmation prompt; on clients with nothing
+    -- pending this call errors, and an unguarded error here would kill the
+    -- rest of the sweep silently (scriptErrors is off).
+    pcall(ConfirmLootSlot, i)
+    i = i - 1
+  end
+  loot.lastSeen = lootSlotsLeft()
+end
+
+local function lootTick()
+  local now = GetTime()
+  if now < loot.nextTryAt then return end
+  loot.nextTryAt = now + LOOT_RETRY_EVERY
+  loot.lastSeen = lootSlotsLeft()
+  if loot.lastSeen <= 0 then
+    loot.active = false -- window is empty; summary lands on LOOT_CLOSED
+    return
+  end
+  if (now - loot.openedAt) > LOOT_RETRY_FOR then
+    loot.active = false -- retry budget spent
+    if loot.lastSeen >= loot.startSlots and not loot.gatedReported then
+      -- Two seconds of retries moved exactly nothing: these calls are being
+      -- ignored, not raced. More retries are wasted; the next rev needs a
+      -- hardware-event piggyback (same shape as the reload button).
+      loot.gatedReported = true
+      emit("loot", "gated")
+    end
+    return
+  end
+  lootSweep()
+end
+
 local pendingReload = 0 -- countdown of escalation steps; 0 = idle
+-- r11: every request gets a number so the ladder is traceable end to end, and
+-- two reloads within emit()'s 30s identical-message window can never collapse
+-- into one line.
+local reloadSeq = 0
 
 local driver = CreateFrame("Frame", "ShadowArmyDriver", UIParent)
 driver:SetScript("OnUpdate", function()
+  -- Sample position EVERY frame: rotationStep is skipped during GCD and
+  -- failure-backoff windows, and a stale sample made a standing player read
+  -- as "moving" (which blocks Shadow Bolt). Two float compares, negligible.
+  updateMoving()
+  emitDrain() -- paced outbound chat; see EMIT_GAP
+  if loot.active then lootTick() end
   if pendingReload > 0 then
     pendingReload = pendingReload - 1
     if pendingReload == 2 then
-      ReloadUI() -- if this works we never reach the next step
+      -- pcall: if this build has no ReloadUI/ConsoleExec global, a raw call
+      -- would raise and (scriptErrors off) silently kill the whole OnUpdate
+      -- for that frame with zero telemetry. Report instead.
+      dtrace("reload #" .. reloadSeq .. " step 1/3 ReloadUI()")
+      local ok, err = pcall(ReloadUI) -- if this works we never reach step 2
+      if not ok then emit("err", "ReloadUI: " .. tostring(err)) end
     elseif pendingReload == 1 then
-      ConsoleExec("reloadui")
+      dtrace("reload #" .. reloadSeq .. " step 2/3 ConsoleExec(reloadui)")
+      local ok, err = pcall(ConsoleExec, "reloadui")
+      if not ok then emit("err", "ConsoleExec: " .. tostring(err)) end
     elseif pendingReload == 0 then
-      emit("reload-click", "auto paths no-op; showing panel reload button")
+      emit("reload-click",
+        "#" .. reloadSeq .. " auto paths no-op; showing panel reload button")
       panel:Show() -- the button lives in the panel; unhide if /sa'd away
       reloadBtn:Show()
     end
@@ -491,8 +644,11 @@ frame:RegisterEvent("PLAYER_LEAVE_COMBAT")
 -- The System inbound: GM announce arrives as CHAT_MSG_SYSTEM
 frame:RegisterEvent("CHAT_MSG_SYSTEM")
 -- auto-loot: vanilla has no always-auto-loot option (that's a TBC setting),
--- and LootSlot isn't protected in 1.12 — vacuum the window on open
+-- and LootSlot isn't protected in 1.12 — vacuum the window on open, then
+-- retry from the driver (r11) and report the result on close
 frame:RegisterEvent("LOOT_OPENED")
+frame:RegisterEvent("LOOT_SLOT_CLEARED")
+frame:RegisterEvent("LOOT_CLOSED")
 
 frame:SetScript("OnEvent", function()
   if event == "PLAYER_ENTERING_WORLD" then
@@ -525,13 +681,25 @@ frame:SetScript("OnEvent", function()
   elseif event == "PLAYER_LEAVE_COMBAT" then
     auto.melee = false
   elseif event == "LOOT_OPENED" then
-    -- Backwards: LootSlot removes entries, so forward indexing skips slots.
-    local n = GetNumLootItems()
-    dtrace("loot opened slots=" .. tostring(n))
-    local i = n
-    while i >= 1 do
-      LootSlot(i)
-      i = i - 1
+    loot.active = true
+    loot.openedAt = GetTime()
+    loot.startSlots = lootSlotsLeft()
+    loot.lastSeen = loot.startSlots
+    loot.nextTryAt = GetTime() + LOOT_RETRY_EVERY
+    dtrace("loot opened slots=" .. tostring(GetNumLootItems())
+      .. " items=" .. loot.startSlots)
+    lootSweep() -- first attempt now; the driver retries for ~2s after this
+  elseif event == "LOOT_SLOT_CLEARED" then
+    -- Keeps lastSeen honest when the window empties and auto-closes inside
+    -- a single retry interval.
+    loot.lastSeen = lootSlotsLeft()
+  elseif event == "LOOT_CLOSED" then
+    loot.active = false
+    if loot.startSlots > 0 then
+      -- The one line that settles "do these calls do anything at all".
+      emit("loot", "result took=" .. (loot.startSlots - loot.lastSeen)
+        .. " left=" .. loot.lastSeen)
+      loot.startSlots = 0
     end
   elseif event == "CHAT_MSG_SYSTEM" then
     -- The System speaks via GM `announce`, which arrives as CHAT_MSG_SYSTEM:
@@ -543,12 +711,27 @@ frame:SetScript("OnEvent", function()
     local _, _, cmd = string.find(msg, "<SYS>%s*(.+)$")
     if not cmd then return end
     cmd = string.gsub(cmd, "%s+$", "")
+    -- r11: marker matched. Trace it BEFORE the verb parse so a future
+    -- "the addon ignored my command" can be told apart from "the announce
+    -- never arrived" without guessing.
+    dtrace("sys rx [" .. cmd .. "]")
     local _, _, verb, rest = string.find(cmd, "^(%S+)%s*(.*)$")
-    if not verb then return end
+    if not verb then
+      emit("err", "sys unparsed: [" .. cmd .. "]")
+      return
+    end
     verb = string.lower(verb)
     if verb == "reload" then
-      -- "reloading" without a following "loaded" = the reload never ran.
-      emit("reloading", "rev=" .. REV)
+      -- NOTE for whoever reads this in Chat.log: rev= here is the rev that is
+      -- CURRENTLY RUNNING — the one being replaced — because the addon cannot
+      -- know what is on disk. The rev you pushed only ever appears on the
+      -- following `loaded` line. Never grep `reloading rev=<the rev I just
+      -- pushed>`; it can never match, and reading its absence as "reload is
+      -- broken" is exactly the wrong turn taken on 2026-07-25.
+      -- #N makes each request unique so emit()'s 30s dedupe can't swallow a
+      -- retry, and pairs this line with its reload-click.
+      reloadSeq = reloadSeq + 1
+      emit("reloading", "#" .. reloadSeq .. " from-rev=" .. REV)
       pendingReload = 3 -- escalation ladder runs on the driver; see above
     elseif verb == "ping" then
       emit("pong", "rev=" .. REV)
