@@ -543,6 +543,10 @@ play-classic:
 # libuuid + vulkan-loader ride along on LD_LIBRARY_PATH because the OpenXR
 # loader dlopens SteamVR's vrclient.so, which needs both (verified via ldd;
 # same set as the xr repo flake's shellHook).
+# --http-port/--ws-port are pinned below the kernel ephemeral range
+# (32768-60999): the launcher default 44590 lives inside it, so any outgoing
+# TCP connection can transiently squat the port and fail the launch with
+# "already in use by a process this checkout does not own".
 # Do not run unattended (opens a GUI).
 XR_FORK := $(abspath ../coworld-vanilla-wow-xr)
 play-xr:
@@ -575,6 +579,8 @@ play-xr:
 			--realm-host=127.0.0.1 \
 			--realm-port=3724 \
 			--world-port=8085 \
+			--http-port=18590 \
+			--ws-port=18591 \
 			--xr'
 
 # ---------------------------------------------------------------------------
