@@ -154,7 +154,20 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         "those names is preferred over escort intents (default empty; "
         "make escort sets Murist)",
     )
+    p.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="log every loop tick. Default is quiet: startup + failures only. "
+        "JSONL is always full.",
+    )
     return p.parse_args(argv)
+
+
+def _say(verbose: bool, msg: str, *, force: bool = False) -> None:
+    """Stdout logger. Quiet by default; force for failures / lifecycle."""
+    if force or verbose:
+        print(msg, flush=True)
 
 
 def _party_list(raw: str) -> list[str]:
@@ -174,7 +187,6 @@ class _JsonlLogger:
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         self.path = log_dir / f"shadow-{stamp}.jsonl"
         self._fp = self.path.open("a", encoding="utf-8")
-        print(f"[shadow] jsonl -> {self.path}", flush=True)
 
     def write(self, row: dict[str, Any]) -> None:
         self._fp.write(json.dumps(row, default=str) + "\n")
@@ -225,7 +237,10 @@ def run(args: argparse.Namespace) -> int:
         raise SystemExit("leader-name must appear in party-members")
 
     logger = _JsonlLogger(args.log_dir)
+    verbose = bool(args.verbose)
     stop = {"flag": False}
+    # Throttle: only re-print SELECT lines when kind/reason changes.
+    last_select_sig = {"s": ""}
 
     def _handle_sig(_signum: int, _frame: Any) -> None:
         stop["flag"] = True
@@ -233,16 +248,18 @@ def run(args: argparse.Namespace) -> int:
 
     signal.signal(signal.SIGINT, _handle_sig)
     signal.signal(signal.SIGTERM, _handle_sig)
-
     fixtures_dir = _REPO_ROOT / "tests" / "fixtures" / "frames"
     frames_captured = 0
     started = time.monotonic()
     last_pos: Optional[dict[str, float]] = None
+    # Throttle identical failure lines (assist-reject spam was drowning logs).
+    last_fail_sig = {"s": "", "n": 0}
 
-    print(
-        f"[shadow] connect slot={args.slot} host={args.host} port={args.port} "
-        f"leader={args.leader_name} party={members}",
-        flush=True,
+    _say(
+        verbose,
+        f"[shadow] slot={args.slot} leader={args.leader_name} tool={args.tool} "
+        f"jsonl={logger.path.name}",
+        force=True,
     )
 
     try:
@@ -253,7 +270,7 @@ def run(args: argparse.Namespace) -> int:
             timeout_seconds=args.timeout,
         ) as client:
             status = client.status()
-            print(f"[shadow] status:\n{format_control_status(status)}", flush=True)
+            _say(verbose, f"[shadow] status:\n{format_control_status(status)}")
             logger.write(
                 {
                     "ts": _utc_iso(),
@@ -276,7 +293,11 @@ def run(args: argparse.Namespace) -> int:
             )
             try:
                 status = client.submit_goal(goal_req)
-                print(f"[shadow] goal accepted:\n{format_control_status(status)}", flush=True)
+                _say(
+                    verbose,
+                    f"[shadow] goal accepted rev={status.revision} phase={status.phase}",
+                    force=True,
+                )
                 logger.write(
                     {
                         "ts": _utc_iso(),
@@ -287,7 +308,7 @@ def run(args: argparse.Namespace) -> int:
                     }
                 )
             except NimControlRequestError as exc:
-                print(f"[shadow] goal rejected: {exc}", flush=True)
+                _say(verbose, f"[shadow] goal rejected: {exc}", force=True)
                 logger.write(
                     {
                         "ts": _utc_iso(),
@@ -311,7 +332,7 @@ def run(args: argparse.Namespace) -> int:
             }
             while not stop["flag"]:
                 if args.max_seconds > 0 and (time.monotonic() - started) >= args.max_seconds:
-                    print("[shadow] max-seconds reached", flush=True)
+                    _say(verbose, "[shadow] max-seconds reached", force=True)
                     break
 
                 loop_i += 1
@@ -320,7 +341,7 @@ def run(args: argparse.Namespace) -> int:
                 try:
                     frame = client.status(include_environment_frame=True)
                 except Exception as exc:  # noqa: BLE001 — log and keep looping
-                    print(f"[shadow] frame error: {exc}", flush=True)
+                    _say(verbose, f"[shadow] frame error: {exc}", force=True)
                     row["error"] = str(exc)
                     logger.write(row)
                     time.sleep(args.cadence)
@@ -365,9 +386,9 @@ def run(args: argparse.Namespace) -> int:
                             encoding="utf-8",
                         )
                         frames_captured += 1
-                        print(f"[shadow] captured fixture {out}", flush=True)
+                        _say(verbose, f"[shadow] captured fixture {out}", force=True)
                     except Exception as exc:  # noqa: BLE001
-                        print(f"[shadow] fixture capture failed: {exc}", flush=True)
+                        _say(verbose, f"[shadow] fixture capture failed: {exc}", force=True)
 
                 if args.tool == "escort_leader":
                     projection = frame_projection.project_for_escort_leader(frame)
@@ -450,10 +471,11 @@ def run(args: argparse.Namespace) -> int:
                                 if isinstance(settlement, ActionSettled)
                                 else settlement
                             )
-                            print(
+                            _say(
+                                verbose,
                                 f"[shadow] #{loop_i} DEATH-REC {rec.kind} "
                                 f"settlement={row.get('settlement')} pos={self_loc}",
-                                flush=True,
+                                force=True,
                             )
                             if isinstance(settlement, ActionSettled) and rec.kind == "move":
                                 import math
@@ -504,12 +526,13 @@ def run(args: argparse.Namespace) -> int:
                                     ) % 4
                                     # Next ticks: skip stock, force hop/detour path.
                                     death_nav["skip_stock_rec"] = 12
-                                    print(
+                                    _say(
+                                        verbose,
                                         f"[shadow] #{loop_i} death-rec stuck "
                                         f"fails={death_nav['fails']} "
                                         f"phase={death_nav['phase']} "
                                         f"gap={gap} best={best} ok={ok}",
-                                        flush=True,
+                                        force=True,
                                     )
                                 if cur_xy is not None:
                                     death_nav["last_xy"] = cur_xy
@@ -517,7 +540,7 @@ def run(args: argparse.Namespace) -> int:
                                 death_nav["fails"] = 0
                         except NimControlRequestError as exc:
                             row["select_error"] = str(exc)
-                            print(f"[shadow] #{loop_i} death-rec error: {exc}", flush=True)
+                            _say(verbose, f"[shadow] #{loop_i} death-rec error: {exc}", force=True)
                             death_nav["skip_stock_rec"] = 4
                         logger.write(row)
                         time.sleep(args.cadence)
@@ -559,9 +582,10 @@ def run(args: argparse.Namespace) -> int:
                         action = FactorizedAction(**kwargs)
                         if not frame.allows_action(action):
                             row["select_skipped"] = "mask_rejects"
-                            print(
+                            _say(
+                                verbose,
                                 f"[shadow] #{loop_i} accept_party mask rejects",
-                                flush=True,
+                                force=True,
                             )
                         else:
                             try:
@@ -577,21 +601,23 @@ def run(args: argparse.Namespace) -> int:
                                 settlement = _safe_last_settlement(client)
                                 if isinstance(settlement, ActionSettled):
                                     row["settlement"] = settlement.model_dump()
-                                    print(
+                                    _say(
+                                        verbose,
                                         f"[shadow] #{loop_i} ACCEPT "
                                         f"ok={settlement.success} "
                                         f"msg={settlement.message!r}",
-                                        flush=True,
+                                        force=True,
                                     )
                                 else:
                                     row["settlement"] = settlement
-                                    print(
+                                    _say(
+                                        verbose,
                                         f"[shadow] #{loop_i} ACCEPT settled={settlement}",
-                                        flush=True,
+                                        force=True,
                                     )
                             except NimControlRequestError as exc:
                                 row["select_error"] = str(exc)
-                                print(f"[shadow] accept error: {exc}", flush=True)
+                                _say(verbose, f"[shadow] accept error: {exc}", force=True)
                     logger.write(row)
                     time.sleep(args.cadence)
                     continue
@@ -599,7 +625,7 @@ def run(args: argparse.Namespace) -> int:
                 try:
                     intent = lua_runner.decide(args.tool, projection)
                 except Exception as exc:  # noqa: BLE001
-                    print(f"[shadow] lua error: {exc}", flush=True)
+                    _say(verbose, f"[shadow] lua error: {exc}", force=True)
                     row["lua_error"] = str(exc)
                     logger.write(row)
                     time.sleep(args.cadence)
@@ -735,10 +761,10 @@ def run(args: argparse.Namespace) -> int:
                     action = FactorizedAction(**kwargs)
                     if not frame.allows_action(action):
                         row["select_skipped"] = "mask_rejects"
-                        print(
+                        _say(
+                            verbose,
                             f"[shadow] #{loop_i} intent={intent} mapped={mapped.kind} "
                             f"mask rejects action",
-                            flush=True,
                         )
                     else:
                         try:
@@ -754,12 +780,52 @@ def run(args: argparse.Namespace) -> int:
                             settlement = _safe_last_settlement(client)
                             if isinstance(settlement, ActionSettled):
                                 row["settlement"] = settlement.model_dump()
-                                print(
-                                    f"[shadow] #{loop_i} SELECT {mapped.kind} "
-                                    f"ok={settlement.success} reason={settlement.reason_code} "
-                                    f"msg={settlement.message!r} pos={self_loc}",
-                                    flush=True,
+                                sig = (
+                                    f"{mapped.kind}:{settlement.success}:"
+                                    f"{settlement.reason_code}"
                                 )
+                                last_select_sig["s"] = sig
+                                # Quiet default: only failures, and throttle
+                                # identical reject spam (assist no-target).
+                                if not settlement.success:
+                                    fail_sig = (
+                                        f"{mapped.kind}:{settlement.reason_code}:"
+                                        f"{settlement.message}"
+                                    )
+                                    if fail_sig == last_fail_sig["s"]:
+                                        last_fail_sig["n"] += 1
+                                        if last_fail_sig["n"] in (1, 10, 50) or (
+                                            last_fail_sig["n"] % 100 == 0
+                                        ):
+                                            _say(
+                                                verbose,
+                                                f"[shadow] #{loop_i} SELECT "
+                                                f"{mapped.kind} FAIL "
+                                                f"x{last_fail_sig['n']} "
+                                                f"reason={settlement.reason_code} "
+                                                f"msg={settlement.message!r}",
+                                                force=True,
+                                            )
+                                    else:
+                                        last_fail_sig["s"] = fail_sig
+                                        last_fail_sig["n"] = 1
+                                        _say(
+                                            verbose,
+                                            f"[shadow] #{loop_i} SELECT "
+                                            f"{mapped.kind} FAIL "
+                                            f"reason={settlement.reason_code} "
+                                            f"msg={settlement.message!r}",
+                                            force=True,
+                                        )
+                                else:
+                                    last_fail_sig["s"] = ""
+                                    last_fail_sig["n"] = 0
+                                    _say(
+                                        verbose,
+                                        f"[shadow] #{loop_i} SELECT {mapped.kind} "
+                                        f"ok reason={settlement.reason_code} "
+                                        f"msg={settlement.message!r}",
+                                    )
                                 if is_casualty and mapped.kind == "move":
                                     import math
 
@@ -798,36 +864,38 @@ def run(args: argparse.Namespace) -> int:
                                             int(death_nav.get("phase") or 0) + 1
                                         ) % 4
                                         death_nav["skip_stock_rec"] = 12
-                                        print(
+                                        _say(
+                                            verbose,
                                             f"[shadow] #{loop_i} corpse-nav "
                                             f"fails={death_nav['fails']} "
                                             f"phase={death_nav['phase']} "
                                             f"gap={gap_now}",
-                                            flush=True,
+                                            force=True,
                                         )
                             elif isinstance(settlement, dict):
                                 row["settlement"] = settlement
-                                print(
+                                _say(
+                                    verbose,
                                     f"[shadow] #{loop_i} SELECT {mapped.kind} "
-                                    f"settlement={settlement} pos={self_loc}",
-                                    flush=True,
+                                    f"settlement={settlement}",
                                 )
                             else:
-                                print(
+                                _say(
+                                    verbose,
                                     f"[shadow] #{loop_i} SELECT {mapped.kind} "
-                                    f"(no settlement yet) pos={self_loc}",
-                                    flush=True,
+                                    f"(no settlement yet)",
                                 )
                         except NimControlRequestError as exc:
                             row["select_error"] = str(exc)
-                            print(f"[shadow] #{loop_i} select error: {exc}", flush=True)
+                            _say(verbose, f"[shadow] #{loop_i} select error: {exc}", force=True)
                 else:
                     why = mapped.reason if mapped.skip else "action_not_ready"
-                    print(
+                    # Quiet: drop routine skip/action_not_ready spam entirely.
+                    _say(
+                        verbose,
                         f"[shadow] #{loop_i} skip select ({why}) intent={intent} "
                         f"ready={frame.action_ready} pos={self_loc} "
                         f"party={frame.observation.party.in_group}",
-                        flush=True,
                     )
 
                 # Optional settled poll (does not request env frame in same call).
@@ -842,9 +910,9 @@ def run(args: argparse.Namespace) -> int:
                 time.sleep(args.cadence)
 
     except KeyboardInterrupt:
-        print("[shadow] interrupted", flush=True)
+        _say(verbose, "[shadow] interrupted", force=True)
     except Exception as exc:  # noqa: BLE001
-        print(f"[shadow] fatal: {exc}", flush=True)
+        _say(True, f"[shadow] fatal: {exc}", force=True)
         traceback.print_exc()
         logger.write({"ts": _utc_iso(), "event": "fatal", "error": str(exc)})
         logger.close()
@@ -852,7 +920,7 @@ def run(args: argparse.Namespace) -> int:
     finally:
         logger.close()
 
-    print(f"[shadow] done; log at {logger.path}", flush=True)
+    _say(verbose, f"[shadow] done; log at {logger.path}", force=True)
     return 0
 
 

@@ -238,7 +238,9 @@ class TestProjectForFollowLeader(unittest.TestCase):
         ]
         out = project_for_follow_leader(frame)
         leader = out["party"]["leader_unit"]
-        self.assertEqual(leader["x"], 1670.0)
+        # elev unknown + live z=0 → prefer last_visible xy+z (stale party xy).
+        self.assertEqual(leader["x"], 1650.0)
+        self.assertEqual(leader["y"], 1650.0)
         self.assertEqual(leader["z"], 132.0)
 
     def test_project_self_location(self):

@@ -188,13 +188,10 @@ def _leader_position(
             # leader on an old floor and destination moves chase a ghost.
             if elev_ok or live_has_floor:
                 return live
-            # xy known, z missing/0: graft last_visible floor only.
-            if last is not None and "z" in last and last["z"] != 0.0:
-                out = dict(live)
-                out["z"] = last["z"]
-                if "map_id" in last:
-                    out["map_id"] = last["map_id"]
-                return out
+            # Party unit xy is often low-res/stale while last_visible tracks the
+            # human better (live z=0, elev unknown). Prefer last_visible whole.
+            if last is not None and "z" in last and float(last["z"]) != 0.0:
+                return last
             return live
         if last is not None:
             return last
@@ -262,6 +259,18 @@ def project_for_follow_leader(frame: Any) -> dict[str, Any]:
             mid = _get(loc, "map_id")
             if mid is not None:
                 self_unit["map_id"] = float(mid)
+
+    # Class id for role-aware escort (warrior tank / priest healer / warlock dps).
+    if self_unit is not None and observation is not None:
+        cid = _get(observation, "class_id")
+        if cid is None:
+            cid = _get(observation, "class")
+        if cid is not None:
+            try:
+                self_unit = dict(self_unit)
+                self_unit["class_id"] = int(cid)
+            except (TypeError, ValueError):
+                pass
 
     return {
         "self_unit": self_unit,
@@ -439,6 +448,11 @@ def project_for_escort_leader(frame: Any) -> dict[str, Any]:
         if xy is not None:
             entry["x"] = xy["x"]
             entry["y"] = xy["y"]
+            # z/map for approach-cast-range destination moves (casters OOR).
+            if "z" in xy:
+                entry["z"] = xy["z"]
+            if "map_id" in xy:
+                entry["map_id"] = xy["map_id"]
         combat["attackable"].append(entry)
 
     base["combat"] = combat

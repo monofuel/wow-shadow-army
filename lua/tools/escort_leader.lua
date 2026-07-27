@@ -1,32 +1,38 @@
--- escort_leader: stay near the party leader and aid combat as a *caster*.
+-- escort_leader: stay near the party leader and fight with the cast.
 --
--- Warlocks: ranged DPS (DoTs → Shadow Bolt → wand). Dagger auto-attack is
--- last resort only when truly out of mana and Shoot is not offered.
+-- Role is derived from observation class_id (projected on self_unit):
+--   warrior (1)  → tank: threat/melee casts, then attack_unit
+--   priest  (5)  → healer: heal/shield when offered, else smite/wand
+--   warlock (9) / default → DPS: DoTs → Shadow Bolt → wand
 --
 -- Priority (each decide):
---   0. Death recovery (release / hop-to-corpse / reclaim) — never combat while dead.
---   1. Life Tap when mana is critical and HP allows.
---   2. Cast warlock rotation on a *hostile* focus (never self/party).
---      Defensive: if in combat with no focus, pick nearest attackable.
---   3. Rejoin formation when out of near band (destination when z known).
---   4. Assist leader ONLY when in combat and we lack a hostile focus.
---      Never spam assist OOC (was freezing follow + chat spam).
---   5. OOM: Shoot, then dagger only if still no ranged option.
---   6. OOC: Demon Skin / Demon Armor, else hold.
+--   0. Death recovery
+--   1. Life Tap when dry
+--   2. FORMATION leash/far rejoin (beats combat — stay on the human)
+--   3. Soft rejoin outside near band when not on a real focus
+--   4. Combat on focus / join casts near LEADER only / defend if in_combat
+--   5. Buff / hold — never OOC assist-spam, never free-fire zone
 --
--- Cast list from projection combat.casts (masked only). Coupling isolation:
--- field names owned by brain/frame_projection.py.
+-- Cast list from projection combat.casts (masked only).
 
 local registry = require("registry")
 
 local DEFAULT_NEAR = 8.0
-local DEFAULT_FAR = 30.0
--- Stay looser while fighting so we don't walk instead of bolting.
-local COMBAT_REJOIN = 28.0
+-- Beyond this: always rejoin (even mid-combat). Tight escort leash.
+local DEFAULT_FAR = 18.0
+-- Outside near but inside far while fighting: stay on target.
+local COMBAT_LEASH = 12.0
 local LIFE_TAP_MANA = 18.0
 local LIFE_TAP_MIN_HP = 40.0
 -- Below this: prefer wand/dagger over spending for SB.
 local OOM_MANA = 8.0
+-- Casters approach this far before falling back to melee (vanilla SB/Smite ~30).
+local CAST_APPROACH = 22.0
+-- Inside this, casters may dagger/wand-swing if the cast mask is empty.
+local MELEE_RANGE = 5.5
+-- OOC: only open on cast targets within this of the LEADER (join his pull,
+-- not free-fire the zone).
+local JOIN_LEADER_BAND = 16.0
 -- Corpse runs: never emit a single long direct move to the body (mountain /
 -- cave deaths). Brain/shadow rewrites destinations onto a multi-leg
 -- Detour/anchor corridor; Lua only names the body so reclaim/hop reasons stay.
@@ -47,6 +53,49 @@ local BUFF_PRIORITY = {
   "demon skin",
   "demon armor",
 }
+-- Warrior threat / melee options (masked names only; never invent spells).
+local TANK_THREAT_PRIORITY = {
+  "sunder armor",
+  "revenge",
+  "heroic strike",
+  "thunder clap",
+  "shield bash",
+  "taunt",
+  "demoralizing shout",
+  "battle shout",
+}
+-- Priest heals / shields (prefer cast mask targets as offered).
+local HEAL_PRIORITY = {
+  "flash heal",
+  "lesser heal",
+  "heal",
+  "renew",
+  "power word: shield",
+  "power word shield",
+}
+local PRIEST_DAMAGE_PRIORITY = {
+  "smite",
+  "shadow word: pain",
+  "mind blast",
+  "shoot",
+}
+local PRIEST_BUFF_PRIORITY = {
+  "power word: fortitude",
+  "inner fire",
+}
+
+-- Classic class ids (ChrClasses).
+local CLASS_WARRIOR = 1
+local CLASS_PRIEST = 5
+local CLASS_WARLOCK = 9
+
+local function role_for_class(class_id)
+  local c = tonumber(class_id) or 0
+  if c == CLASS_WARRIOR then return "tank" end
+  if c == CLASS_PRIEST then return "healer" end
+  if c == CLASS_WARLOCK then return "dps" end
+  return "dps"
+end
 
 local function dist2(a, b)
   local dx, dy = a.x - b.x, a.y - b.y
@@ -157,6 +206,13 @@ local function is_offensive_cast(c)
   if name_matches(n, "shoot") then return true end
   if name_matches(n, "drain") then return true end
   if name_matches(n, "searing pain") then return true end
+  if name_matches(n, "smite") then return true end
+  if name_matches(n, "mind blast") then return true end
+  if name_matches(n, "shadow word: pain") then return true end
+  if name_matches(n, "heroic strike") then return true end
+  if name_matches(n, "sunder") then return true end
+  if name_matches(n, "revenge") then return true end
+  if name_matches(n, "thunder clap") then return true end
   return false
 end
 
@@ -194,6 +250,74 @@ local function any_offensive_on_target(casts, target_id)
   return nil
 end
 
+local function tank_rotation(casts, target_id)
+  local threat = pick_cast(casts, target_id, TANK_THREAT_PRIORITY)
+  if threat then return threat, "tank_threat" end
+  -- Battle Shout is often self-target (0).
+  local shout = pick_self_cast(casts, { "battle shout" })
+  if shout then return shout, "tank_buff" end
+  return nil, nil
+end
+
+local function healer_rotation(casts, target_id, mana_pct, hp_pct)
+  -- Prefer heals/shields on any cast-mask target (self=0 or party indices).
+  for pi = 1, #HEAL_PRIORITY do
+    local want = HEAL_PRIORITY[pi]
+    for i = 1, #casts do
+      local c = casts[i]
+      if c and name_matches(c.name, want) then
+        -- Skip expensive heals when full health and cast is self-only.
+        if (hp_pct or 100) >= 95 and (c.target or 0) == 0
+            and not name_matches(c.name, "shield") then
+          -- fall through
+        else
+          return c, "heal"
+        end
+      end
+    end
+  end
+  if target_id and target_id > 0 and (mana_pct or 100) >= OOM_MANA then
+    local dmg = pick_cast(casts, target_id, PRIEST_DAMAGE_PRIORITY)
+    if dmg then return dmg, "priest_dmg" end
+  end
+  return nil, nil
+end
+
+local function role_combat_intent(role, casts, target_id, mana_pct, hp_pct, focused)
+  if not target_id or target_id <= 0 then
+    return nil
+  end
+  if role == "tank" then
+    local cast, why = tank_rotation(casts, target_id)
+    if cast then return cast_intent(cast, why) end
+    if focused then
+      return {
+        kind = "attack_unit",
+        unit_id = focused.id,
+        reason = "tank_melee",
+      }
+    end
+    return {
+      kind = "attack_unit",
+      unit_id = target_id,
+      reason = "tank_melee",
+    }
+  end
+  if role == "healer" then
+    local cast, why = healer_rotation(casts, target_id, mana_pct, hp_pct)
+    if cast then return cast_intent(cast, why) end
+    local any = any_offensive_on_target(casts, target_id)
+    if any then return cast_intent(any, "cast_any") end
+    return nil
+  end
+  -- dps (warlock / default)
+  local cast, why = warlock_rotation(casts, target_id, mana_pct)
+  if cast then return cast_intent(cast, why) end
+  local any = any_offensive_on_target(casts, target_id)
+  if any then return cast_intent(any, "cast_any") end
+  return nil
+end
+
 local function any_shadow_bolt(casts)
   for i = 1, #casts do
     local c = casts[i]
@@ -212,6 +336,17 @@ local function any_offensive(casts)
     end
   end
   return nil
+end
+
+local function has_cast_on(casts, target_id)
+  if not casts or not target_id or target_id <= 0 then return false end
+  for i = 1, #casts do
+    local c = casts[i]
+    if c and c.target == target_id then
+      return true
+    end
+  end
+  return false
 end
 
 -- Ghost corpse run: hop toward the body instead of one long blocked move.
@@ -271,9 +406,70 @@ local function nearest_attackable(me, attackable)
   return best
 end
 
+local function unit_range(me, u)
+  if not me or not u or me.x == nil or u.x == nil or me.y == nil or u.y == nil then
+    return nil
+  end
+  return math.sqrt(dist2(me, u))
+end
+
+-- Walk into cast range of a hostile. Prefer destination move when xy known
+-- (stock follow on mobs is flaky); graft self z when unit z missing.
+local function approach_unit(me, u, reason)
+  local intent = {
+    kind = "move_to_unit",
+    unit_id = u.id,
+    stop_range = CAST_APPROACH * 0.55,
+    urgent = true,
+    reason = reason or "approach_cast_range",
+  }
+  if u.x ~= nil and u.y ~= nil then
+    intent.x = u.x
+    intent.y = u.y
+    intent.z = u.z
+    if intent.z == nil and me and me.z ~= nil then
+      intent.z = me.z
+    end
+    if intent.z == nil then
+      intent.z = 0
+    end
+    intent.map_id = u.map_id or (me and me.map_id) or 0
+  end
+  return intent
+end
+
+local function find_attackable_by_id(attackable, id)
+  if not attackable or not id then return nil end
+  for i = 1, #attackable do
+    local u = attackable[i]
+    if u and u.id == id then return u end
+  end
+  return nil
+end
+
+-- Cast on a masked target that sits near the leader (join his pull only).
+local function join_leader_cast(casts, attackable, leader)
+  if not casts or not leader or leader.x == nil then return nil end
+  local band2 = JOIN_LEADER_BAND * JOIN_LEADER_BAND
+  local best, best_d2 = nil, nil
+  for i = 1, #casts do
+    local c = casts[i]
+    if is_offensive_cast(c) and c.target and c.target > 0 then
+      local u = find_attackable_by_id(attackable, c.target)
+      if u and u.x ~= nil and u.y ~= nil then
+        local d2 = dist2(leader, u)
+        if d2 <= band2 and (best_d2 == nil or d2 < best_d2) then
+          best, best_d2 = c, d2
+        end
+      end
+    end
+  end
+  return best
+end
+
 return registry.register({
   name = "escort_leader",
-  when = "In party with a human leader: keep formation and ranged-DPS their target.",
+  when = "In party with a human leader: formation + role combat (tank/healer/dps).",
   decide = function(frame, args)
     args = args or {}
     local near = args.near or DEFAULT_NEAR
@@ -285,6 +481,7 @@ return registry.register({
     local mana = combat.mana_pct or 100
     local hp = combat.health_pct or 100
     local death = frame.death or {}
+    local role = args.role or role_for_class(me and me.class_id or args.class_id)
 
     -- Death recovery FIRST (fair-play only). Never assist/cast while dead/ghost.
     if death.is_dead and not death.is_ghost then
@@ -334,9 +531,12 @@ return registry.register({
       end
     end
 
-    -- Basic defensive combat: if we are in combat with no usable focus, take
-    -- the nearest attackable hostile so DoTs/bolts fire without waiting on
-    -- assist packet churn.
+    -- Engaged = we are in combat or already swinging. OOC focus is kept only
+    -- when it resolves to an attackable (client target) — not wiped, so assist
+    -- handoff and sticky targets work; we never free-fire non-focus casts OOC.
+    local engaged = combat.in_combat or guid_nonzero(combat.auto_attack_guid)
+
+    -- Defensive: in combat with no usable focus → nearest attackable.
     if (not target_id or target_id == 0) and combat.in_combat then
       local near_h = nearest_attackable(me, combat.attackable)
       if near_h then
@@ -351,69 +551,139 @@ return registry.register({
       dz = leader.z - me.z
       if dz < 0 then dz = -dz end
     end
-    local fighting = combat.in_combat or (target_id and target_id > 0)
-    local rejoin_limit = fighting and COMBAT_REJOIN or near
-    local need_rejoin = (d2 > rejoin_limit * rejoin_limit) or (dz > 2.5)
-        or (d2 > near * near and not fighting)
+    local out_of_near = (d2 > near * near) or (dz > 2.5)
+    local out_of_leash = (d2 > COMBAT_LEASH * COMBAT_LEASH) or (dz > 4.0)
+    local out_of_far = (d2 > far * far) or (dz > 8.0)
 
-    -- Life Tap before everything else when dry (not a dagger problem).
-    if mana < LIFE_TAP_MANA and hp >= LIFE_TAP_MIN_HP then
+    -- Life Tap when dry (casters only) — still beats combat spam.
+    if role ~= "tank" and mana < LIFE_TAP_MANA and hp >= LIFE_TAP_MIN_HP then
       local tap = pick_self_cast(casts, { "life tap" })
       if tap then
         return cast_intent(tap, "life_tap")
       end
     end
 
-    -- === Ranged DPS first (this is the warlock job) ===
-    if target_id and target_id > 0 then
-      local cast, why = warlock_rotation(casts, target_id, mana)
-      if cast then
-        return cast_intent(cast, why)
-      end
-      local any = any_offensive_on_target(casts, target_id)
-      if any then
-        return cast_intent(any, "cast_any")
-      end
+    -- FORMATION FIRST: lost the human → rejoin. Beats combat thrash while
+    -- Murist runs ahead (live: tank 80yd behind still swinging).
+    if out_of_far or (out_of_leash and not engaged) then
+      return rejoin_intent(leader, me, near, far, d2, "rejoin_far")
+    end
+    if out_of_leash and engaged then
+      return rejoin_intent(leader, me, near, far, d2, "rejoin_leash")
     end
 
-    -- Rejoin BEFORE assist. Assist spam was freezing bots in place and
-    -- flooding /say with "external factorized policy action".
-    if need_rejoin then
+    -- Soft rejoin when outside near band (OOC or not on a real focus).
+    if out_of_near and (not engaged or not target_id or target_id == 0) then
       return rejoin_intent(leader, me, near, far, d2, "rejoin_formation")
     end
 
-    -- === Truly OOM while on a hostile: wand then dagger ===
-    if mana < OOM_MANA and target_id and target_id > 0 then
+    -- === Combat on a real focus (in combat / AA / client focus on attackable) ===
+    if target_id and target_id > 0 and (engaged or has_cast_on(casts, target_id)) then
+      local combat_intent = role_combat_intent(
+        role, casts, target_id, mana, hp, focused
+      )
+      if combat_intent then
+        return combat_intent
+      end
+      if role ~= "tank" then
+        local on_focus = any_offensive_on_target(casts, target_id)
+        if on_focus then
+          return cast_intent(on_focus, "cast_focus")
+        end
+        local rng = focused and unit_range(me, focused) or nil
+        if focused and (rng == nil or rng > MELEE_RANGE) then
+          return approach_unit(me, focused, "approach_cast_range")
+        end
+        if focused and engaged then
+          local wand = pick_cast(casts, target_id, WAND_PRIORITY)
+          if wand then
+            return cast_intent(wand, "wand_melee_band")
+          end
+          return {
+            kind = "attack_unit",
+            unit_id = target_id,
+            reason = "caster_melee_band",
+          }
+        end
+      end
+      if role == "tank" and engaged then
+        return {
+          kind = "attack_unit",
+          unit_id = target_id,
+          reason = "defend_melee_fallback",
+        }
+      end
+    end
+
+    -- In formation: join leader's pull via cast targets near HIM (not zone
+    -- free-fire). Assist only when WE are already in_combat (upstream rejects
+    -- OOC assist with "no mirrored target" and freezes the seat).
+    if not out_of_near then
+      local join = join_leader_cast(casts, combat.attackable, leader)
+      if join then
+        return cast_intent(join, "join_leader_band")
+      end
+      if combat.in_combat
+          and (not target_id or target_id == 0)
+          and leader.assistable then
+        return {
+          kind = "assist_unit",
+          unit_id = leader.id,
+          reason = "mirror_leader_target",
+        }
+      end
+    end
+
+    -- In combat, no focus: defend nearest (only while engaged).
+    if combat.in_combat and (not target_id or target_id == 0) then
+      local near_h = nearest_attackable(me, combat.attackable)
+      if near_h then
+        local cast = any_offensive_on_target(casts, near_h.id)
+        if cast then
+          return cast_intent(cast, "defend_cast_nearest")
+        end
+        if role ~= "tank" then
+          local rng = unit_range(me, near_h)
+          if rng == nil or rng > MELEE_RANGE then
+            return approach_unit(me, near_h, "approach_cast_range")
+          end
+        end
+        return {
+          kind = "attack_unit",
+          unit_id = near_h.id,
+          reason = "defend_nearest_hostile",
+        }
+      end
+      return { kind = "hold", reason = "in_combat_no_hostile" }
+    end
+
+    -- OOM on engaged focus only.
+    if role == "dps" and engaged and mana < OOM_MANA and target_id and target_id > 0 then
       local wand = pick_cast(casts, target_id, WAND_PRIORITY)
       if wand then
         return cast_intent(wand, "wand_oom")
       end
-      if focused then
+      local rng = focused and unit_range(me, focused) or nil
+      if focused and (rng ~= nil and rng <= MELEE_RANGE) then
         return {
           kind = "attack_unit",
           unit_id = focused.id,
           reason = "dagger_oom_only",
         }
       end
-    end
-
-    -- Mirror leader target when we lack a hostile focus.
-    -- - in_combat: always try assist
-    -- - OOC but cast mask offers offensive spells: leader likely has/had a
-    --   pull in range — assist to acquire (not free-fire cast).
-    -- Brain throttles OOC assist so we don't chat-spam on empty target.
-    if (not target_id or target_id == 0) and leader.assistable then
-      if combat.in_combat or any_offensive(casts) ~= nil then
-        return {
-          kind = "assist_unit",
-          unit_id = leader.id,
-          reason = combat.in_combat and "mirror_leader_target" or "mirror_leader_ooc",
-        }
+      if focused then
+        return approach_unit(me, focused, "approach_cast_range")
       end
     end
 
-    if not combat.in_combat then
-      local buff = pick_self_cast(casts, BUFF_PRIORITY)
+    if not engaged then
+      local buffs = BUFF_PRIORITY
+      if role == "healer" then
+        buffs = PRIEST_BUFF_PRIORITY
+      elseif role == "tank" then
+        buffs = { "battle shout" }
+      end
+      local buff = pick_self_cast(casts, buffs)
       if buff then
         return cast_intent(buff, "self_buff")
       end

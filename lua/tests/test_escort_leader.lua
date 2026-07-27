@@ -209,7 +209,7 @@ r = tool.decide(frame(me, leader_near, {
 }))
 check(r.spell == 32, "curse of agony first")
 
--- Mana remaining, no cast mask: refresh target / follow — do NOT dagger.
+-- In combat, focus, no cast mask, no xy: casters approach (not free-fire).
 r = tool.decide(frame(me, leader_near, {
   in_combat = true,
   mana_pct = 50,
@@ -219,8 +219,25 @@ r = tool.decide(frame(me, leader_near, {
   attackable = { { id = 5, guid = "99" } },
   casts = {},
 }))
-check(r.kind ~= "attack_unit", "no dagger with mana")
-check(r.kind == "assist_unit" or r.kind == "move_to_unit" or r.kind == "hold", "stay mobile or refresh")
+check(r.kind == "move_to_unit" and r.unit_id == 5, "caster approaches focus when no cast")
+check(r.reason == "approach_cast_range", "approach_cast_range reason")
+
+-- Tank in combat, focus, no cast: melee fallback.
+r = tool.decide({
+  self_unit = { x = 0, y = 0, class_id = 1 },
+  party = { leader_unit = leader_near },
+  combat = {
+    in_combat = true,
+    mana_pct = 0,
+    health_pct = 90,
+    focus_guid = "99",
+    auto_attack_guid = "0",
+    attackable = { { id = 5, guid = "99", x = 2, y = 0 } },
+    casts = {},
+  },
+})
+check(r.kind == "attack_unit" and r.unit_id == 5, "tank melees when engaged")
+check(r.reason == "defend_melee_fallback" or r.reason == "tank_melee", "tank melee reason")
 
 -- Stale focus_id (not attackable, no casts, not in combat): follow when leader far.
 r = tool.decide(frame(me, leader_far, {
@@ -332,17 +349,35 @@ r = tool.decide(frame(me, leader_near, {
 }))
 check(r.spell == 13 and tostring(r.reason):find("wand", 1, true) ~= nil, "wand when oom")
 
--- OOM, no shoot: dagger allowed.
+-- OOM, no shoot, focus in melee band: swing.
 r = tool.decide(frame(me, leader_near, {
   in_combat = true,
   mana_pct = 3,
   health_pct = 90,
   focus_guid = "99",
   auto_attack_guid = "0",
-  attackable = { { id = 5, guid = "99" } },
+  attackable = { { id = 5, guid = "99", x = 2, y = 0 } },
   casts = {},
 }))
-check(r.kind == "attack_unit" and r.reason == "dagger_oom_only", "dagger only when oom")
+check(r.kind == "attack_unit" and r.unit_id == 5, "attack when oom with no wand")
+check(
+  r.reason == "dagger_oom_only"
+    or r.reason == "defend_melee_fallback"
+    or r.reason == "caster_melee_band",
+  "oom attack reason"
+)
+
+-- OOM, no shoot, focus far: approach cast range (not OOR melee thrash).
+r = tool.decide(frame(me, leader_near, {
+  in_combat = true,
+  mana_pct = 3,
+  health_pct = 90,
+  focus_guid = "99",
+  auto_attack_guid = "0",
+  attackable = { { id = 5, guid = "99", x = 20, y = 0 } },
+  casts = {},
+}))
+check(r.kind == "move_to_unit" and r.unit_id == 5, "oom far focus approaches")
 
 -- In combat, no focus: assist once when attackable empty.
 r = tool.decide(frame(me, leader_near, {
@@ -416,3 +451,194 @@ r = tool.decide(frame(me, leader_near, {
 check(r.kind == "cast_spell" and r.spell == 25, "demon skin ooc")
 
 print("test_escort_leader: " .. passed .. " checks passed")
+
+-- === Role-aware combat (tank / healer / dps) ===
+
+-- Warlock DPS still bolts with class_id=9.
+r = tool.decide({
+  self_unit = { x = 0, y = 0, class_id = 9 },
+  party = { leader_unit = leader_near },
+  combat = {
+    in_combat = true,
+    mana_pct = 80,
+    health_pct = 90,
+    focus_guid = "99",
+    auto_attack_guid = "0",
+    attackable = { { id = 5, guid = "99" } },
+    casts = {
+      { target = 5, spell = 22, name = "Shadow Bolt", spell_id = 686 },
+    },
+  },
+})
+check(r.kind == "cast_spell" and r.spell == 22, "warlock dps bolts")
+check(r.reason and tostring(r.reason):find("shadow", 1, true), "warlock reason")
+
+-- Warrior tank: attack_unit when threat casts absent.
+r = tool.decide({
+  self_unit = { x = 0, y = 0, class_id = 1 },
+  party = { leader_unit = leader_near },
+  combat = {
+    in_combat = true,
+    mana_pct = 0,
+    health_pct = 90,
+    focus_guid = "99",
+    auto_attack_guid = "0",
+    attackable = { { id = 5, guid = "99", x = 2, y = 0 } },
+    casts = {},
+  },
+})
+check(r.kind == "attack_unit" and r.unit_id == 5, "tank melees focus")
+check(r.reason == "tank_melee", "tank_melee reason")
+
+-- Warrior tank: heroic strike when offered.
+r = tool.decide({
+  self_unit = { x = 0, y = 0, class_id = 1 },
+  party = { leader_unit = leader_near },
+  combat = {
+    in_combat = true,
+    mana_pct = 0,
+    health_pct = 90,
+    focus_guid = "99",
+    auto_attack_guid = "0",
+    attackable = { { id = 5, guid = "99" } },
+    casts = {
+      { target = 5, spell = 11, name = "Heroic Strike", spell_id = 78 },
+    },
+  },
+})
+check(r.kind == "cast_spell" and r.spell == 11, "tank heroic strike")
+check(r.reason and tostring(r.reason):find("tank_threat", 1, true), "tank threat reason")
+
+-- Priest healer: lesser heal when offered.
+r = tool.decide({
+  self_unit = { x = 0, y = 0, class_id = 5 },
+  party = { leader_unit = leader_near },
+  combat = {
+    in_combat = true,
+    mana_pct = 80,
+    health_pct = 40,
+    focus_guid = "99",
+    auto_attack_guid = "0",
+    attackable = { { id = 5, guid = "99" } },
+    casts = {
+      { target = 0, spell = 7, name = "Lesser Heal", spell_id = 2050 },
+      { target = 5, spell = 22, name = "Smite", spell_id = 585 },
+    },
+  },
+})
+check(r.kind == "cast_spell" and r.spell == 7, "healer heals first")
+check(r.reason and tostring(r.reason):find("heal", 1, true), "heal reason")
+
+-- OOC: assist leader only — never open on ambient hostiles.
+r = tool.decide({
+  self_unit = { x = 0, y = 0, class_id = 1 },
+  party = { leader_unit = leader_near },
+  combat = {
+    in_combat = false,
+    mana_pct = 0,
+    health_pct = 100,
+    focus_guid = "0",
+    auto_attack_guid = "0",
+    attackable = { { id = 5, guid = "99", x = 3, y = 0 } },
+    casts = {},
+  },
+})
+check(r.kind == "assist_unit", "OOC assists leader only")
+check(r.reason == "mirror_leader_ooc", "mirror_leader_ooc reason")
+
+-- Death still beats tank combat.
+r = tool.decide({
+  self_unit = { x = 0, y = 0, class_id = 1 },
+  party = { leader_unit = leader_near },
+  combat = {
+    in_combat = true,
+    attackable = { { id = 5, guid = "99" } },
+    casts = {},
+  },
+  death = {
+    is_dead = true,
+    is_ghost = false,
+    can_release_spirit = true,
+  },
+})
+check(r.kind == "release_spirit", "death beats tank combat")
+
+-- OOC stale focus + SB on random target: MUST NOT free-fire (assist or hold).
+r = tool.decide({
+  self_unit = { x = 0, y = 0, class_id = 9 },
+  party = { leader_unit = leader_near },
+  combat = {
+    in_combat = false,
+    mana_pct = 100,
+    health_pct = 100,
+    focus_guid = "56",
+    focus_id = 56,
+    auto_attack_guid = "0",
+    attackable = {
+      { id = 56, guid = "56", x = 40, y = 0 },
+      { id = 27, guid = "27", x = 5, y = 0 },
+    },
+    casts = {
+      { target = 27, spell = 22, name = "Shadow Bolt", spell_id = 686 },
+    },
+  },
+})
+check(r.kind ~= "cast_spell", "OOC never free-fires cast masks")
+check(r.kind == "assist_unit" or r.kind == "hold", "OOC assist or hold only")
+
+-- Tank 40yd from leader while in combat: HARD rejoin beats melee thrash.
+r = tool.decide({
+  self_unit = { x = 0, y = 0, class_id = 1 },
+  party = { leader_unit = leader_far },
+  combat = {
+    in_combat = true,
+    mana_pct = 0,
+    health_pct = 100,
+    focus_guid = "99",
+    auto_attack_guid = "99",
+    attackable = { { id = 5, guid = "99", x = 2, y = 0 } },
+    casts = {},
+  },
+})
+check(r.kind == "move_to_unit", "far tank rejoins leader over melee")
+check(r.reason and tostring(r.reason):find("rejoin_far", 1, true), "rejoin_far reason")
+
+-- Priest OOC with Smite offered on ambient: do NOT open fire.
+r = tool.decide({
+  self_unit = { x = 0, y = 0, class_id = 5 },
+  party = { leader_unit = leader_near },
+  combat = {
+    in_combat = false,
+    mana_pct = 100,
+    health_pct = 100,
+    focus_guid = "0",
+    auto_attack_guid = "0",
+    attackable = { { id = 9, guid = "9", x = 6, y = 0 } },
+    casts = {
+      { target = 9, spell = 18, name = "Smite", spell_id = 585 },
+    },
+  },
+})
+check(r.kind ~= "cast_spell" or r.unit_id ~= 9, "priest OOC does not smite neutrals")
+check(r.kind == "assist_unit" or r.kind == "hold" or (r.kind == "cast_spell" and r.unit_id == 0),
+  "priest OOC assist/buff/hold only")
+
+-- Engaged warlock with SB on focus: bolt, do not melee thrash.
+r = tool.decide({
+  self_unit = { x = 0, y = 0, class_id = 9 },
+  party = { leader_unit = leader_near },
+  combat = {
+    in_combat = true,
+    mana_pct = 80,
+    health_pct = 90,
+    focus_guid = "99",
+    auto_attack_guid = "0",
+    attackable = { { id = 5, guid = "99", x = 18, y = 0 } },
+    casts = {
+      { target = 5, spell = 22, name = "Shadow Bolt", spell_id = 686 },
+    },
+  },
+})
+check(r.kind == "cast_spell" and r.spell == 22, "engaged warlock bolts focus")
+
+print("OK " .. passed .. " checks")
