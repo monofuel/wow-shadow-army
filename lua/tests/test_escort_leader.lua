@@ -151,22 +151,35 @@ r = tool.decide({
 })
 check(r.kind == "release_spirit", "release without leader/self")
 
--- Focused + bolt: cast even when slightly far of "near" if within combat rejoin
--- (40yd is still rejoin — cast only when we don't rejoin first). At 40yd with
--- bolt: still rejoin (beyond COMBAT_REJOIN 28). At 20yd with bolt: cast.
-r = tool.decide(frame(me, { id = 2, x = 20, y = 0, visible = true, assistable = true }, {
+-- Focused + bolt inside combat leash (< COMBAT_LEASH 12): cast, not rejoin.
+-- Beyond DEFAULT_FAR (18): rejoin even while engaged (formation first).
+r = tool.decide(frame(me, { id = 2, x = 10, y = 0, visible = true, assistable = true }, {
   in_combat = true,
   mana_pct = 80,
   health_pct = 90,
   focus_guid = "99",
   focus_id = 5,
   auto_attack_guid = "0",
-  attackable = { { id = 5, guid = "99" } },
+  attackable = { { id = 5, guid = "99", x = 2, y = 0 } },
   casts = {
     { target = 5, spell = 22, name = "Shadow Bolt", spell_id = 686 },
   },
 }))
 check(r.kind == "cast_spell" and r.spell == 22, "cast bolt before rejoin when in range band")
+
+r = tool.decide(frame(me, { id = 2, x = 40, y = 0, visible = true, assistable = true }, {
+  in_combat = true,
+  mana_pct = 80,
+  health_pct = 90,
+  focus_guid = "99",
+  focus_id = 5,
+  auto_attack_guid = "0",
+  attackable = { { id = 5, guid = "99", x = 2, y = 0 } },
+  casts = {
+    { target = 5, spell = 22, name = "Shadow Bolt", spell_id = 686 },
+  },
+}))
+check(r.kind == "move_to_unit", "far rejoin beats combat cast")
 
 r = tool.decide(frame(me, leader_far, {
   in_combat = false,
@@ -409,7 +422,7 @@ r = tool.decide(frame(me, leader_near, {
 }))
 check(r.kind == "cast_spell" and r.unit_id == 5, "defensive picks nearest attackable")
 
--- OOC in formation: HOLD — never spam assist (was freezing follow + chat).
+-- OOC in formation, leader idle full HP: HOLD — never spam assist.
 r = tool.decide(frame(me, leader_near, {
   in_combat = false,
   mana_pct = 80,
@@ -420,6 +433,73 @@ r = tool.decide(frame(me, leader_near, {
   casts = {},
 }))
 check(r.kind == "hold" or r.kind == "cast_spell", "OOC in formation does not assist-spam")
+
+-- OOC: leader damaged (real fight signal) + empty attackable → assist hand-off.
+local leader_fight = {
+  id = 2, x = 0, y = 0, z = 0, visible = true, assistable = true,
+  health_pct = 55, in_combat = true,
+}
+r = tool.decide(frame(me, leader_fight, {
+  in_combat = false,
+  mana_pct = 80,
+  health_pct = 100,
+  focus_guid = "0",
+  auto_attack_guid = "0",
+  attackable = {},
+  casts = {},
+}))
+check(r.kind == "assist_unit" and r.unit_id == 2, "OOC join_leader_assist when leader damaged")
+check(r.reason == "join_leader_assist", "join_leader_assist reason")
+
+-- Sticky false combat: full-HP + in_combat alone must NOT assist (AA theater).
+local leader_sticky = {
+  id = 2, x = 0, y = 0, z = 0, visible = true, assistable = true,
+  health_pct = 100, in_combat = true,
+}
+r = tool.decide(frame(me, leader_sticky, {
+  in_combat = false,
+  mana_pct = 80,
+  health_pct = 100,
+  focus_guid = "0",
+  auto_attack_guid = "0",
+  attackable = {},
+  casts = {},
+}))
+check(r.kind ~= "assist_unit", "full-HP in_combat leader does not assist-spam")
+
+-- Leader fighting + near-band hostile → attack/approach, not assist.
+local leader_pull = {
+  id = 2, x = 0, y = 0, z = 0, visible = true, assistable = true,
+  health_pct = 70, in_combat = true,
+}
+r = tool.decide(frame(me, leader_pull, {
+  in_combat = false,
+  mana_pct = 80,
+  health_pct = 100,
+  focus_guid = "0",
+  auto_attack_guid = "0",
+  attackable = { { id = 5, guid = "99", x = 3, y = 0 } },
+  casts = {},
+}))
+check(r.kind == "attack_unit" or r.kind == "move_to_unit",
+  "near-band hostile prefers attack/approach over assist")
+check(r.kind ~= "assist_unit", "near-band hostile does not assist")
+
+-- OOC: leader full health, not in_combat → still no assist spam.
+local leader_idle = {
+  id = 2, x = 0, y = 0, z = 0, visible = true, assistable = true,
+  health_pct = 100, in_combat = false,
+}
+r = tool.decide(frame(me, leader_idle, {
+  in_combat = false,
+  mana_pct = 80,
+  health_pct = 100,
+  focus_guid = "0",
+  auto_attack_guid = "0",
+  attackable = {},
+  casts = {},
+}))
+check(r.kind ~= "assist_unit", "OOC idle full-HP leader does not assist")
 
 -- Life Tap when dry.
 r = tool.decide(frame(me, leader_near, {
@@ -529,7 +609,7 @@ r = tool.decide({
 check(r.kind == "cast_spell" and r.spell == 7, "healer heals first")
 check(r.reason and tostring(r.reason):find("heal", 1, true), "heal reason")
 
--- OOC: assist leader only — never open on ambient hostiles.
+-- OOC with hostiles near leader: join pull (not free-fire zone).
 r = tool.decide({
   self_unit = { x = 0, y = 0, class_id = 1 },
   party = { leader_unit = leader_near },
@@ -543,8 +623,8 @@ r = tool.decide({
     casts = {},
   },
 })
-check(r.kind == "assist_unit", "OOC assists leader only")
-check(r.reason == "mirror_leader_ooc", "mirror_leader_ooc reason")
+check(r.kind == "attack_unit" and r.unit_id == 5, "OOC joins hostile near leader")
+check(r.reason == "join_leader_attack", "join_leader_attack reason")
 
 -- Death still beats tank combat.
 r = tool.decide({
@@ -563,7 +643,7 @@ r = tool.decide({
 })
 check(r.kind == "release_spirit", "death beats tank combat")
 
--- OOC stale focus + SB on random target: MUST NOT free-fire (assist or hold).
+-- OOC: SB only on a mob far from the leader → no free-fire (hold/buff).
 r = tool.decide({
   self_unit = { x = 0, y = 0, class_id = 9 },
   party = { leader_unit = leader_near },
@@ -571,20 +651,38 @@ r = tool.decide({
     in_combat = false,
     mana_pct = 100,
     health_pct = 100,
-    focus_guid = "56",
-    focus_id = 56,
+    focus_guid = "0",
     auto_attack_guid = "0",
     attackable = {
-      { id = 56, guid = "56", x = 40, y = 0 },
-      { id = 27, guid = "27", x = 5, y = 0 },
+      { id = 56, guid = "56", x = 80, y = 0 },
+    },
+    casts = {
+      { target = 56, spell = 22, name = "Shadow Bolt", spell_id = 686 },
+    },
+  },
+})
+check(r.kind ~= "cast_spell" or r.unit_id ~= 56, "OOC never free-fires far from leader")
+
+-- OOC: SB on mob near leader → join_leader_band (legitimate pull join).
+r = tool.decide({
+  self_unit = { x = 0, y = 0, class_id = 9 },
+  party = { leader_unit = leader_near },
+  combat = {
+    in_combat = false,
+    mana_pct = 100,
+    health_pct = 100,
+    focus_guid = "0",
+    auto_attack_guid = "0",
+    attackable = {
+      { id = 27, guid = "27", x = 4, y = 0 },
     },
     casts = {
       { target = 27, spell = 22, name = "Shadow Bolt", spell_id = 686 },
     },
   },
 })
-check(r.kind ~= "cast_spell", "OOC never free-fires cast masks")
-check(r.kind == "assist_unit" or r.kind == "hold", "OOC assist or hold only")
+check(r.kind == "cast_spell" and r.unit_id == 27, "join cast near leader")
+check(r.reason and tostring(r.reason):find("join_leader", 1, true), "join_leader_band reason")
 
 -- Tank 40yd from leader while in combat: HARD rejoin beats melee thrash.
 r = tool.decide({
@@ -603,7 +701,7 @@ r = tool.decide({
 check(r.kind == "move_to_unit", "far tank rejoins leader over melee")
 check(r.reason and tostring(r.reason):find("rejoin_far", 1, true), "rejoin_far reason")
 
--- Priest OOC with Smite offered on ambient: do NOT open fire.
+-- Priest OOC: Smite only on mob far from leader → no free-fire.
 r = tool.decide({
   self_unit = { x = 0, y = 0, class_id = 5 },
   party = { leader_unit = leader_near },
@@ -613,15 +711,13 @@ r = tool.decide({
     health_pct = 100,
     focus_guid = "0",
     auto_attack_guid = "0",
-    attackable = { { id = 9, guid = "9", x = 6, y = 0 } },
+    attackable = { { id = 9, guid = "9", x = 80, y = 0 } },
     casts = {
       { target = 9, spell = 18, name = "Smite", spell_id = 585 },
     },
   },
 })
-check(r.kind ~= "cast_spell" or r.unit_id ~= 9, "priest OOC does not smite neutrals")
-check(r.kind == "assist_unit" or r.kind == "hold" or (r.kind == "cast_spell" and r.unit_id == 0),
-  "priest OOC assist/buff/hold only")
+check(r.kind ~= "cast_spell" or r.unit_id ~= 9, "priest OOC does not smite far neutrals")
 
 -- Engaged warlock with SB on focus: bolt, do not melee thrash.
 r = tool.decide({
@@ -640,5 +736,21 @@ r = tool.decide({
   },
 })
 check(r.kind == "cast_spell" and r.spell == 22, "engaged warlock bolts focus")
+
+-- OOC far-only hostiles: never free-fire.
+r = tool.decide({
+  self_unit = { x = 0, y = 0, class_id = 9 },
+  party = { leader_unit = leader_near },
+  combat = {
+    in_combat = false,
+    mana_pct = 80,
+    health_pct = 90,
+    attackable = { { id = 12, x = 80, y = 0, z = 0 } },
+    casts = {},
+    focus_id = 0,
+  },
+  death = { is_dead = false, is_ghost = false },
+})
+check(r.kind ~= "attack_unit" or r.unit_id ~= 12, "no free-fire far hostile")
 
 print("OK " .. passed .. " checks")

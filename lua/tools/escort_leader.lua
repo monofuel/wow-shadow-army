@@ -103,7 +103,9 @@ local function dist2(a, b)
 end
 
 local function has_z(u)
-  return u and u.z ~= nil
+  -- Party bindings often ship z=0 when elevation is unknown. Treat that as
+  -- "no z" so we do not thrash vertical rejoin and skip combat join.
+  return u and u.z ~= nil and u.z ~= 0
 end
 
 -- Prefer destination `move` whenever we have leader z. Stock `follow` settles
@@ -467,6 +469,23 @@ local function join_leader_cast(casts, attackable, leader)
   return best
 end
 
+-- Nearest attackable within band of the leader (join pull, not free-fire zone).
+local function nearest_near_leader(leader, attackable, band)
+  if not leader or leader.x == nil or not attackable then return nil end
+  local band2 = (band or JOIN_LEADER_BAND) * (band or JOIN_LEADER_BAND)
+  local best, best_d2 = nil, nil
+  for i = 1, #attackable do
+    local u = attackable[i]
+    if u and u.id and u.id > 0 and u.x ~= nil and not u.lootable then
+      local d2 = dist2(leader, u)
+      if d2 ~= nil and d2 <= band2 and (best_d2 == nil or d2 < best_d2) then
+        best, best_d2 = u, d2
+      end
+    end
+  end
+  return best
+end
+
 return registry.register({
   name = "escort_leader",
   when = "In party with a human leader: formation + role combat (tank/healer/dps).",
@@ -572,6 +591,53 @@ return registry.register({
       return rejoin_intent(leader, me, near, far, d2, "rejoin_leash")
     end
 
+    -- OOC: join hostiles near the leader BEFORE soft rejoin. Soft rejoin used
+    -- to monopolize 8–18y formation gaps and starve combat join forever.
+    -- When already engaged, fall through to focus/defend combat paths.
+    -- Live OOC: attack kind is often FALSE (empty attackable); assist on the
+    -- leader remains masked. Join via assist when leader is fighting — never
+    -- when he is full-health idle (that freezes seats with assist-spam).
+    if not engaged then
+      local join = join_leader_cast(casts, combat.attackable, leader)
+      if join then
+        return cast_intent(join, "join_leader_band")
+      end
+      local near_l = nearest_near_leader(leader, combat.attackable, JOIN_LEADER_BAND)
+      if near_l then
+        local on = any_offensive_on_target(casts, near_l.id)
+        if on then
+          return cast_intent(on, "join_leader_hostile")
+        end
+        local rng = unit_range(me, near_l)
+        if rng == nil or rng > MELEE_RANGE then
+          return approach_unit(me, near_l, "join_leader_approach")
+        end
+        return {
+          kind = "attack_unit",
+          unit_id = near_l.id,
+          reason = "join_leader_attack",
+        }
+      end
+      -- Assist is a hand-off into leader combat, not a steady state.
+      -- Prefer near-leader cast/attack/approach (above). Require real damage
+      -- on the leader (health_pct < 99.5). Full-HP in_combat is sticky AA
+      -- theater and must not spam assist every ready frame.
+      -- Also skip assist when we already have a client focus/AA guid even if
+      -- not yet marked engaged (hand-off already started).
+      local leader_hp = tonumber(leader.health_pct)
+      local leader_damaged = leader_hp ~= nil and leader_hp < 99.5
+      local has_focus = guid_nonzero(combat.focus_guid) or
+        guid_nonzero(combat.auto_attack_guid)
+      if leader_damaged and leader.assistable and leader.id and leader.id > 0
+          and not has_focus then
+        return {
+          kind = "assist_unit",
+          unit_id = leader.id,
+          reason = "join_leader_assist",
+        }
+      end
+    end
+
     -- Soft rejoin when outside near band (OOC or not on a real focus).
     if out_of_near and (not engaged or not target_id or target_id == 0) then
       return rejoin_intent(leader, me, near, far, d2, "rejoin_formation")
@@ -615,23 +681,15 @@ return registry.register({
       end
     end
 
-    -- In formation: join leader's pull via cast targets near HIM (not zone
-    -- free-fire). Assist only when WE are already in_combat (upstream rejects
-    -- OOC assist with "no mirrored target" and freezes the seat).
-    if not out_of_near then
-      local join = join_leader_cast(casts, combat.attackable, leader)
-      if join then
-        return cast_intent(join, "join_leader_band")
-      end
-      if combat.in_combat
-          and (not target_id or target_id == 0)
-          and leader.assistable then
-        return {
-          kind = "assist_unit",
-          unit_id = leader.id,
-          reason = "mirror_leader_target",
-        }
-      end
+    -- Mirror leader target only while already engaged (OOC assist freezes seats).
+    if combat.in_combat
+        and (not target_id or target_id == 0)
+        and leader.assistable then
+      return {
+        kind = "assist_unit",
+        unit_id = leader.id,
+        reason = "mirror_leader_target",
+      }
     end
 
     -- In combat, no focus: defend nearest (only while engaged).

@@ -29,6 +29,15 @@ upstream controller already owns.
   capabilities over home-grown action FSMs. If upstream is missing a
   capability, document the gap and tell monofuel — do not paper over it with
   a local Python (or other) policy brain.
+- **DO NOT CHEAT.** We need to do things properly so we can win in the
+  tournament. If you cheat, you only make things harder: you mask real
+  issues in pathing, combat, quests, party, and recovery that we would
+  otherwise find and fix. Forbidden as progress or “just this once”
+  shortcuts: GM level/XP/gold/items, force-complete quests, DB progress
+  pokes, memory cheats, out-of-band collusion between seats, or any other
+  path that a stranger client on the live realm cannot take. When something
+  is hard or stuck, **document the gap** and fix the real pipeline — do not
+  paper over it with admin power.
 - **FAIR PLAY — NO COLLUSION.** Seats play as strangers. In-party
   cooperation is legitimate ONLY through the game's own typed contracts
   (party membership, `VANILLA_WOW_RFC_ASSIGNMENT`) and live observations.
@@ -40,8 +49,10 @@ upstream controller already owns.
   and tell monofuel — he decides whether to report it.
 - **Respect the client/bot boundary.** Our layer sees typed frames and
   sends typed goals/actions. No database pokes for progress, no GM-command
-  gameplay, no memory reads. (Local GM usage for *observation/testing
-  setup* is fine; never as a policy action.)
+  gameplay, no memory reads. Local GM is allowed only for **observation /
+  testing setup** (e.g. revive after a stuck corpse, tele to a known start
+  so you can re-test). Never for levels, XP, quest completion, loot, or
+  any outcome that should come from play. When in doubt, do not use GM.
 - **Tests stay green and instant.** `make test` before every commit; unit
   tier has no network, no docker, no sleeps (testing doctrine:
   racha_notes `Programming/testing.md`). Integration tier may use the

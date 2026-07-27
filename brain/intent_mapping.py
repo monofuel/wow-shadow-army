@@ -5,6 +5,8 @@
 ``attack_unit`` → attack entity index.
 ``cast_spell`` → cast spell index on target index.
 ``accept_party`` → accept pending group invite (no target).
+``accept_quest`` / ``turn_in_quest`` → quest kinds with optional entity target.
+``interact_unit`` → interact entity index.
 ``hold`` / nil → no action this frame (skip select()).
 
 Move fallback (party not formed): when ``prefer_move_destination`` is set,
@@ -202,6 +204,39 @@ def map_intent(
             reason=str(intent.get("reason") or "move_to_corpse"),
         )
 
+    # Thin wire for Lua quest tools (not policy — only kind translation).
+    if kind == "accept_quest":
+        unit_id = intent.get("unit_id", intent.get("target", 0)) or 0
+        return MappedAction(
+            kind="accept_quest",
+            target=int(unit_id),
+            skip=False,
+            reason=str(intent.get("reason") or "accept_quest"),
+        )
+
+    if kind == "turn_in_quest":
+        unit_id = intent.get("unit_id", intent.get("target", 0)) or 0
+        return MappedAction(
+            kind="turn_in_quest",
+            target=int(unit_id),
+            skip=False,
+            reason=str(intent.get("reason") or "turn_in_quest"),
+        )
+
+    if kind == "interact_unit":
+        unit_id = intent.get("unit_id", intent.get("target"))
+        if unit_id is None:
+            return MappedAction(kind=None, skip=True, reason="interact_unit_missing_id")
+        idx = int(unit_id)
+        if idx <= 0:
+            return MappedAction(kind=None, skip=True, reason="interact_unit_invalid_id")
+        return MappedAction(
+            kind="interact",
+            target=idx,
+            skip=False,
+            reason=str(intent.get("reason") or "interact"),
+        )
+
     return MappedAction(kind=None, skip=True, reason=f"unknown_intent:{kind}")
 
 
@@ -209,7 +244,9 @@ def mapped_to_factorized_kwargs(mapped: MappedAction) -> Optional[dict[str, Any]
     """Build kwargs for FactorizedAction(**kwargs), or None if skip."""
     if mapped.skip or mapped.kind is None:
         return None
-    if mapped.kind in ("follow", "assist", "attack"):
+    if mapped.kind in ("follow", "assist", "attack", "interact"):
+        return {"kind": mapped.kind, "target": mapped.target}
+    if mapped.kind in ("accept_quest", "turn_in_quest"):
         return {"kind": mapped.kind, "target": mapped.target}
     if mapped.kind == "cast":
         return {

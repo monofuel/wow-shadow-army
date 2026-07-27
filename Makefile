@@ -113,22 +113,40 @@ shadow:
 	@cd "$(CURDIR)" && uv run --project "$(UPSTREAM)" python -m brain.shadow \
 		--slot $(SLOT) --leader-name $(LEADER) --party-members $(PARTY) $(EXTRA)
 
-# Escort Murist: one standing brain per seat — accept Murist invites + Lua
-# escort_leader (follow formation + assist/attack his target). Do NOT also run
-# party_butler on the same slot (one client per control socket).
+# Escort army: Nim host + Lua escort_leader (NO PYTHON decide path).
+# Accept invites + follow formation + assist/attack leader target.
+# Do NOT also run party_butler on the same slot.
 # Docs: docs/rolling-issues-2026-07-26.md
 #
 #   make escort SLOT=2 EXTRA='--max-seconds 120'
-#   make escort-army          # both Shadowfel + Igris in background (auto)
+#   make escort-army
 #
-# Uses fork uv project when WOW_SHADOW_UPSTREAM points at the fork (Igris path).
+# Legacy Python host (brain.shadow) kept as escort-python for one-off debug only.
 ESCORT_LEADER ?= Murist
 # Full 5-man cast: human + 2 locks + warrior tank + priest healer.
 ESCORT_PARTY ?= Murist,Shadowfel,Igris,Tusk,Beru
 ESCORT_ACCEPT_FROM ?= Murist
 # Prefer fork SDK when the fork checkout exists (matches igris/warlock-bot-fork seats).
 ESCORT_UPSTREAM ?= $(shell if [ -d "$(abspath ../coworld-vanilla-wow-fork)" ]; then echo $(abspath ../coworld-vanilla-wow-fork); else echo $(UPSTREAM); fi)
-escort:
+
+# Nim army host (no Python decide loop). Binary: tools/army_host
+.PHONY: army-host army-host-build escort-army-nim grind-army-nim escort escort-army escort-python
+army-host-build:
+	@nim c --hints:off -o:tools/army_host tools/army_host.nim
+
+army-host: army-host-build
+	@./tools/army_host --slot=$(SLOT) --tool=$(or $(TOOL),escort_leader) --leader=$(or $(ESCORT_LEADER),Murist) \
+		--party=$(or $(ESCORT_PARTY),Murist,Shadowfel,Igris,Tusk,Beru) --goal-id=army-slot-$(SLOT) \
+		--cadence=$(or $(CADENCE),0.35) --accept-from=$(or $(ESCORT_ACCEPT_FROM),Murist) $(EXTRA)
+
+# Single-seat escort (default standing path: Nim + Lua).
+escort: army-host-build
+	@./tools/army_host --slot=$(SLOT) --tool=escort_leader --leader=$(or $(ESCORT_LEADER),Murist) \
+		--party=$(or $(ESCORT_PARTY),Murist,Shadowfel,Igris,Tusk,Beru) --goal-id=army-slot-$(SLOT) \
+		--cadence=$(or $(CADENCE),0.35) --accept-from=$(or $(ESCORT_ACCEPT_FROM),Murist) $(EXTRA)
+
+# Legacy Python escort (debug only — not the standing army path).
+escort-python:
 	@cd "$(CURDIR)" && \
 	UP=$${WOW_SHADOW_UPSTREAM:-$(ESCORT_UPSTREAM)}; \
 	uv run --project "$$UP" env WOW_SHADOW_UPSTREAM="$$UP" python -m brain.shadow \
@@ -136,22 +154,36 @@ escort:
 		--tool escort_leader --accept-from $(ESCORT_ACCEPT_FROM) \
 		--goal-id escort-slot-$(SLOT) $(EXTRA)
 
-# Standing army escorts: slots 2–5 (Shadowfel, Igris, Tusk, Beru). Background,
-# no max-seconds — kill the logged PIDs to stop. Logs under local_data/brain-logs/.
-# One brain per seat (accept + escort); do not also run party_butler on these slots.
-# Seats must already be online (warlock-bot / igris-bot / tusk-bot / beru-bot).
-escort-army:
-	@mkdir -p "$(CURDIR)/local_data/brain-logs"
-	@cd "$(CURDIR)" && \
-	UP=$${WOW_SHADOW_UPSTREAM:-$(ESCORT_UPSTREAM)}; \
-	echo "starting escort slots 2–5 (Shadowfel,Igris,Tusk,Beru) via $$UP"; \
-	for s in 2 3 4 5; do \
-		nohup env WOW_SHADOW_UPSTREAM="$$UP" $(MAKE) escort SLOT=$$s EXTRA='--cadence 0.25' \
-			> local_data/brain-logs/escort-slot$$s.log 2>&1 & echo $$! > local_data/brain-logs/escort-slot$$s.pid; \
+# Standing army on Nim host (kills legacy python shadows first).
+escort-army-nim: army-host-build
+	@mkdir -p local_data/brain-logs
+	@-pkill -f 'brain.shadow --slot [2345]' 2>/dev/null || true
+	@-pkill -f 'tools/army_host --slot' 2>/dev/null || true
+	@sleep 1
+	@for s in 2 3 4 5; do \
+		nohup ./tools/army_host --slot=$$s --tool=escort_leader --leader=$(or $(ESCORT_LEADER),Murist) \
+			--party=Murist,Shadowfel,Igris,Tusk,Beru --goal-id=army-slot-$$s --cadence=0.35 \
+			--accept-from=$(or $(ESCORT_ACCEPT_FROM),Murist) > local_data/brain-logs/army-slot$$s.log 2>&1 & \
+		echo $$! > local_data/brain-logs/army-slot$$s.pid; \
 	done; \
-	sleep 1; \
-	echo "pids: $$(cat local_data/brain-logs/escort-slot2.pid) $$(cat local_data/brain-logs/escort-slot3.pid) $$(cat local_data/brain-logs/escort-slot4.pid) $$(cat local_data/brain-logs/escort-slot5.pid)"; \
-	echo "logs: local_data/brain-logs/escort-slot{2,3,4,5}.log"
+	echo "army_host pids: $$(cat local_data/brain-logs/army-slot{2,3,4,5}.pid 2>/dev/null)"; \
+	echo "logs: local_data/brain-logs/army-slot{2,3,4,5}.log"
+
+# Default standing-army launch = Nim (alias of escort-army-nim).
+escort-army: escort-army-nim
+
+grind-army-nim: army-host-build
+	@mkdir -p local_data/brain-logs
+	@-pkill -f 'tools/army_host --slot' 2>/dev/null || true
+	@-pkill -f 'brain.shadow --slot [2345]' 2>/dev/null || true
+	@sleep 1
+	@for s in 2 3 4 5; do \
+		nohup ./tools/army_host --slot=$$s --tool=grind_nearest --leader=$(or $(ESCORT_LEADER),Murist) \
+			--party=Murist,Shadowfel,Igris,Tusk,Beru --goal-id=grind-slot-$$s --cadence=0.3 \
+			> local_data/brain-logs/grind-slot$$s.log 2>&1 & \
+		echo $$! > local_data/brain-logs/grind-slot$$s.pid; \
+	done; \
+	echo "grind army started"
 
 # Mob-grinding brain (docs/warlock-seat.md). Drives a seat entirely from OUR
 # policy using the goal-independent generic action masks, so it works for
