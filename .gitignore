@@ -7,5 +7,16 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 *.o
+*.so
+*.a
 nimcache/
 local_classic/
+
+# Built binaries (compile with `make army-host-build` / nim c)
+tools/army_host
+tools/player_bin
+**/player_bin
+
+# Accidental local clones — army_host uses tools/msgpack_json.nim (stdlib only),
+# not a vendored msgpack4nim tree.
+tools/vendor/
