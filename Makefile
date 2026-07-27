@@ -32,7 +32,7 @@ COMPOSE_FILE := infra/compose.vmangos.yml
 ACCOUNT_USER := monofuel
 ACCOUNT_PASS := password
 
-.PHONY: test test-lua test-breadcrumbs test-nim system pin-check start-server stop-server server-logging logs account soap-account play play-classic escort escort-army grind breadcrumbs quest-data warlock-account warlock-bot botwarrior-bot tusk-account tusk-bot beru-account beru-bot party-army navmesh-helper navmesh-status
+.PHONY: test test-lua test-breadcrumbs test-nim system pin-check start-server stop-server server-logging logs account soap-account play play-classic play-xr escort escort-army grind breadcrumbs quest-data warlock-account warlock-bot botwarrior-bot tusk-account tusk-bot beru-account beru-bot party-army navmesh-helper navmesh-status
 
 # Unit tier: Lua tools + Nim host/system tests only (v2 DoD: no Python required
 # for bot correctness). If nim is missing, test-nim-soft skips rather than
@@ -532,6 +532,29 @@ play:
 # prefix. Login monofuel / password. Do not run unattended (opens a GUI).
 play-classic:
 	@nix develop --command tools/play_classic.sh
+
+# Launch the native client from the XR fork checkout in VR (OpenXR PoC,
+# branch monofuel/xr). Quick play on purpose: no --login-screen, so the
+# launcher drops straight into the world with the local-realm credentials.
+# --xr passes through to the player and enables the stereo OpenXR path
+# (SteamVR must be running; without it the client falls back to flat).
+# Do not run unattended (opens a GUI).
+XR_FORK := $(abspath ../coworld-vanilla-wow-xr)
+play-xr:
+	@set -e; \
+	if [ ! -d "$(XR_FORK)" ]; then \
+		echo "error: xr fork checkout missing: $(XR_FORK)" >&2; exit 1; \
+	fi; \
+	if [ ! -f "$(WOW_ENV)" ]; then \
+		echo "error: missing $(WOW_ENV)" >&2; exit 1; \
+	fi; \
+	cd "$(XR_FORK)"; \
+	nix shell nixpkgs\#nginx --command sh -c \
+		'. "$(WOW_ENV)"; nim r tools/launch_nim_player.nim -- \
+			--realm-host=127.0.0.1 \
+			--realm-port=3724 \
+			--world-port=8085 \
+			--xr'
 
 # ---------------------------------------------------------------------------
 # Igris — testbed UNDEAD WARLOCK for the indoor-navigation fix
