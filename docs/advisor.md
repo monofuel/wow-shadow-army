@@ -1,14 +1,19 @@
 # The advisor — human augmentation as a ramp to full AI guidance
 
-Design brainstorm (2026-07-25), no implementation yet. This is the
-shadow-army application of the racha_notes hypothesis
+Design brainstorm (2026-07-25). Early pieces shipped in `addons/ShadowArmy/`;
+this file is still the hypothesis + advice-class notes. **Product framing
+for the gradual autopilot ladder (L0–L5), two-client split, and sandbox
+honesty lives in `docs/advisor-autopilot.md`.**
+
+This is the shadow-army application of the racha_notes hypothesis
 `AI/game_bots/hypotheses.md` → "Human augmentation as a ramp to full AI
 guidance" (monofuel, 2026-07-24): build tools that advise a *human* player
 first — the human is the training wheels, and the handoff to a fully
 autonomous policy is gradual instead of a day-0 leap.
 
-Companion doc: `command-channel.md` — same chat bus, opposite direction.
-Commands flow human→shadows; advice flows shadows→human.
+Companion docs: `advisor-autopilot.md` (ladder + tournament relationship);
+`command-channel.md` — same chat bus, opposite direction. Commands flow
+human→shadows; advice flows shadows→human.
 
 ## The unfair advantage: ground truth in mariadb
 

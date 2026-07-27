@@ -1,25 +1,26 @@
-## Nim army host — external-policy loop without Python.
+## Nim army host — goal installer + fair-play audit for nim_control.v2.
 ##
-## Connects to nim_control (JSON requests, msgpack env frames), projects a
-## small table for Lua tools, runs `decide` via lua5.3, maps intents, selects.
+## Upstream v2 runs policy **in-process** (step(observation)). External hosts
+## install leveling goals with leader/party (escort) and observe frames; they
+## do **not** select factorized actions.
 ##
-##   nim r tools/army_host.nim --slot:2 --tool:escort_leader --leader:Murist
+##   nim r tools/army_host.nim --slot:2 --leader:Murist
 ##
-## Cadence defaults 0.35s; only selects when action_ready.
+## Cadence defaults 1.0s (status/audit only). Audit: --audit-path / --no-audit.
 
 import
   std/[
     endians, json, math, options, os, osproc, parseopt, sets, strformat, strutils,
     streams, net, times
   ],
-  msgpack_json, party_promote
+  msgpack_json, party_promote, fair_play_audit
 
 const
-  Protocol = "vanilla_wow.nim_control.v1"
+  Protocol = "vanilla_wow.nim_control.v2"
   Magic = 0x44524E4Bu32
   Version = 2'u16
   FrameGoal = 1'u16
-  FrameSelect = 3'u16
+  FrameDirective = 2'u16
   FrameStatusReq = 4'u16
   FrameControlStatus = 5'u16
   FrameEnv = 6'u16
@@ -40,6 +41,8 @@ type
     acceptFrom: string
     maxSeconds: float
     quiet: bool
+    ## Append-only fair-play milestone log (empty = disabled).
+    auditPath: string
 
 proc jget(n: JsonNode; keys: varargs[string]): JsonNode =
   result = n
@@ -161,8 +164,7 @@ proc statusJson(c: ControlClient): JsonNode =
     "protocol": Protocol,
     "type": "status_request",
     "expected_slot": c.slot,
-    "include_environment_frame": false,
-    "include_action_settled": false
+    "include_environment_frame": false
   }
   let (ft, node, _) = c.request(FrameStatusReq, body)
   if ft != FrameControlStatus:
@@ -174,8 +176,7 @@ proc envFrame(c: ControlClient): JsonNode =
     "protocol": Protocol,
     "type": "status_request",
     "expected_slot": c.slot,
-    "include_environment_frame": true,
-    "include_action_settled": false
+    "include_environment_frame": true
   }
   let (ft, node, _) = c.request(FrameStatusReq, body)
   if ft != FrameEnv:
@@ -183,48 +184,30 @@ proc envFrame(c: ControlClient): JsonNode =
   node
 
 proc submitGoal(c: ControlClient; goalId, leader: string; party: seq[string];
-    revision: int) =
+    revision: int; botId = "relh-roam"; stopLevel = 0) =
+  ## Install an in-process leveling goal. Escort uses leader_name + party_members;
+  ## the client policy steps follow/assist/grind autonomously (nim_control.v2).
   let body = %*{
     "protocol": Protocol,
     "type": "goal_request",
     "goal_id": goalId,
     "goal_kind": "leveling",
-    "bot_id": "relh-roam",
+    "bot_id": botId,
     "profile_id": "",
     "task_id": "",
     "role": "",
     "leader_name": leader,
     "party_members": party,
-    "stop_level": 0,
-    "deadline_unix_seconds": 0.0,
+    "stop_level": stopLevel,
     "expected_slot": c.slot,
     "expected_revision": revision,
-    "selection_mode": "external",
     "practice_reset": false,
     "rfc_launch": false
   }
   discard c.request(FrameGoal, body)
 
-proc selectAction(c: ControlClient; action: JsonNode; frameId, tick, rev: int) =
-  # Wire always requires destination key (null for non-move, object for move).
-  var act = copy(action)
-  if act.kind == JObject:
-    if jstr(jget(act, "kind")) == "move":
-      let dest = jget(act, "destination")
-      if dest.isNil or dest.kind != JObject:
-        raise newException(ValueError, "move without destination")
-    else:
-      act["destination"] = newJNull()
-  let body = %*{
-    "protocol": Protocol,
-    "type": "action_selection",
-    "action": act,
-    "frame_id": frameId,
-    "observed_tick": tick,
-    "expected_slot": c.slot,
-    "expected_revision": rev
-  }
-  discard c.request(FrameSelect, body)
+proc isStaleRevisionError(msg: string): bool =
+  msg.contains("stale controller revision") or msg.contains("stale revision")
 
 # ---------- projection (subset of brain/frame_projection.py) ----------
 
@@ -341,6 +324,10 @@ proc projectEscort(frame: JsonNode; preferLeaderName = ""): JsonNode =
       var visible = true
       var leaderHpPct = 100.0
       var leaderInCombat = false
+      # Party bindings freeze leader xy while the human runs (play-classic has
+      # no control socket for overlay). Only trust coords from live units obs,
+      # elevation-known party packets, or leader-slot overlay.
+      var positionReliable = false
       # Prefer live observation.units row for the leader guid — party binding
       # locations are often stale/zero-z and can equal the follower's own
       # square, which falsely kills rejoin.
@@ -350,16 +337,21 @@ proc projectEscort(frame: JsonNode; preferLeaderName = ""): JsonNode =
           if jstr(jget(u, "guid")) == leaderGuid:
             let uloc = jget(u, "location")
             if not uloc.isNil:
-              x = jnum(jget(uloc, "x"), x)
-              y = jnum(jget(uloc, "y"), y)
-              z = jnum(jget(uloc, "z"), z)
-              mapId = jnum(jget(uloc, "map_id"), mapId)
-              visible = true
+              let ux = jnum(jget(uloc, "x"))
+              let uy = jnum(jget(uloc, "y"))
+              if not (ux == 0.0 and uy == 0.0):
+                x = ux
+                y = uy
+                z = jnum(jget(uloc, "z"), z)
+                mapId = jnum(jget(uloc, "map_id"), mapId)
+                visible = true
+                positionReliable = true
             if jget(u, "in_combat") != nil:
               leaderInCombat = jbool(jget(u, "in_combat"))
             break
-      # last_visible: fill missing z only. Party xy can be correct while z=0;
-      # overwriting xy with last_visible collapses rejoin onto the follower.
+      # last_visible: only fill a FULL missing location (xy zero). Never glue
+      # last_visible z onto party xy — that made dest rejoin walk to a frozen
+      # square and look "in formation" while Murist is 50yd away.
       # Also project leader health (party members) so OOC join can assist when
       # the human is fighting — attack kind is false OOC, assist is not.
       let members = jget(party, "members")
@@ -369,6 +361,7 @@ proc projectEscort(frame: JsonNode; preferLeaderName = ""): JsonNode =
               jstr(jget(m, "name")).toLowerAscii == leaderName:
             let last = jget(m, "last_visible_location")
             let locKnown = jbool(jget(m, "location_known"))
+            let elevKnown = jbool(jget(m, "elevation_known"))
             if not last.isNil:
               let lz = jnum(jget(last, "z"))
               let lx = jnum(jget(last, "x"))
@@ -378,8 +371,9 @@ proc projectEscort(frame: JsonNode; preferLeaderName = ""): JsonNode =
                 y = ly
                 z = lz
                 mapId = jnum(jget(last, "map_id"), mapId)
-              elif z == 0.0 and lz != 0.0:
-                z = lz
+                # last_visible alone is still often frozen; not reliable.
+            if locKnown and elevKnown and not (x == 0.0 and y == 0.0):
+              positionReliable = true
             if jbool(jget(m, "health_known")):
               let mh = max(1.0, jnum(jget(m, "max_health"), 1.0))
               let hh = jnum(jget(m, "health"), mh)
@@ -399,7 +393,8 @@ proc projectEscort(frame: JsonNode; preferLeaderName = ""): JsonNode =
         "visible": visible,
         "assistable": targetAllows(frame, "assist", idx),
         "health_pct": leaderHpPct,
-        "in_combat": leaderInCombat
+        "in_combat": leaderInCombat,
+        "position_reliable": positionReliable
       }
 
   # combat casts from spell mask
@@ -919,6 +914,7 @@ proc mapIntent(intent: JsonNode): Option[JsonNode] =
 proc overlayLeaderLive(proj: JsonNode; leaderFrame: JsonNode) =
   ## Party bindings often freeze leader xy / omit in_combat. Overlay the
   ## leader seat's own observation (same control plane, not in-game collusion).
+  ## play-classic has no socket on slot 0 — callers must tolerate connect fail.
   if proj.isNil or leaderFrame.isNil: return
   let obs = jget(leaderFrame, "observation")
   if obs.isNil: return
@@ -935,6 +931,7 @@ proc overlayLeaderLive(proj: JsonNode; leaderFrame: JsonNode) =
       lu["z"] = %jnum(jget(loc, "z"))
       lu["map_id"] = %jnum(jget(loc, "map_id"))
       lu["visible"] = %true
+      lu["position_reliable"] = %true
   let maxHp = max(1.0, jnum(jget(obs, "max_health"), 1.0))
   let hp = jnum(jget(obs, "health"), maxHp)
   lu["health_pct"] = %(hp / maxHp * 100.0)
@@ -953,10 +950,11 @@ proc parseConfig(): HostConfig =
     leaderSlot: 0,
     party: @["Murist", "Shadowfel", "Igris", "Tusk", "Beru"],
     goalId: "army-slot-2",
-    cadence: 0.35,
+    cadence: 1.0,
     acceptFrom: "Murist",
     maxSeconds: 0.0,
-    quiet: true
+    quiet: true,
+    auditPath: DefaultAuditPath
   )
   for kind, key, val in getopt():
     case kind
@@ -972,6 +970,8 @@ proc parseConfig(): HostConfig =
       of "accept-from": result.acceptFrom = val
       of "max-seconds": result.maxSeconds = parseFloat(val)
       of "verbose": result.quiet = false
+      of "audit-path": result.auditPath = val
+      of "no-audit": result.auditPath = ""
       else: discard
     else: discard
   if result.goalId == "army-slot-2":
@@ -987,141 +987,89 @@ proc log(c: HostConfig; msg: string) =
 
 proc main() =
   let cfg = parseConfig()
-  echo &"[army_host] nim slot={cfg.slot} tool={cfg.tool} leader={cfg.leader} leaderSlot={cfg.leaderSlot}"
+  echo &"[army_host] v2 goal-host slot={cfg.slot} leader={cfg.leader} party={cfg.party}"
+  if cfg.auditPath.len > 0:
+    echo &"[army_host] fair-play audit → {cfg.auditPath}"
+  var audit = AuditState(
+    path: cfg.auditPath,
+    slot: cfg.slot,
+    tool: cfg.tool
+  )
   var client = connectClient(cfg.slot)
   defer: client.close()
-  # Optional live overlay from the human leader's control seat.
-  var leaderClient: ControlClient = nil
-  if cfg.leaderSlot >= 0 and cfg.leaderSlot != cfg.slot:
-    try:
-      leaderClient = connectClient(cfg.leaderSlot)
-      echo &"[army_host] leader overlay slot={cfg.leaderSlot}"
-    except:
-      echo "[army_host] leader overlay unavailable: ", getCurrentExceptionMsg()
-  defer:
-    if leaderClient != nil: leaderClient.close()
-  let st = client.statusJson()
-  let rev = jint(jget(st, "revision"))
-  client.submitGoal(cfg.goalId, cfg.leader, cfg.party, rev)
-  echo &"[army_host] goal {cfg.goalId} submitted"
+  proc installEscortGoal() =
+    let st = client.statusJson()
+    let rev = jint(jget(st, "revision"))
+    let phase = jstr(jget(st, "phase"))
+    client.submitGoal(cfg.goalId, cfg.leader, cfg.party, rev)
+    echo &"[army_host] goal {cfg.goalId} submitted (was phase={phase} rev={rev})"
+  installEscortGoal()
   let t0 = epochTime()
   var i = 0
-  var lastPromoteAt = 0.0
-  const PromoteRateLimitSec = 5.0
+  var lastHeartbeatAt = 0.0
+  var lastGoalRefreshAt = epochTime()
+  const HeartbeatSec = 15.0
+  const GoalRefreshSec = 30.0
   while true:
     if cfg.maxSeconds > 0 and epochTime() - t0 > cfg.maxSeconds:
       echo "[army_host] max-seconds"
       break
     inc i
     try:
-      let frame = client.envFrame()
-      let ready = jbool(jget(frame, "action_ready"))
-      let phase = jstr(jget(frame, "phase"))
-      let rev2 = jint(jget(frame, "revision"))
-      let fid = jint(jget(frame, "frame_id"))
-      let tick = jint(jget(frame, "observed_tick"))
-      # invite accept
-      let party = jget(frame, "observation", "party")
-      if jbool(jget(party, "invite_pending")) and ready:
-        let invFrom = jstr(jget(party, "invite_from")).toLowerAscii
-        if cfg.acceptFrom.len == 0 or invFrom == cfg.acceptFrom.toLowerAscii:
-          let act = %*{
-            "kind": "accept_party", "target": 0, "spell": 0, "item": 0,
-            "equipment_slot": 0, "quest": 0, "choice": 0, "recipient": 0,
-            "text": 0, "trigger": 0, "dialog": 0
-          }
-          client.selectAction(act, fid, tick, rev2)
-          sleep(int(cfg.cadence * 1000))
-          continue
-      # Auto hand leadership to preferred human (Murist) when this seat is
-      # the current party leader and Murist is online in the group.
-      if ready and jbool(jget(party, "in_group")) and
-          epochTime() - lastPromoteAt >= PromoteRateLimitSec:
-        let selfName = jstr(jget(frame, "observation", "name"))
-        let partyLeaderName = jstr(jget(party, "leader_name"))
-        var members: seq[PromoteMember] = @[]
-        let memArr = jget(party, "members")
-        let entsP = jget(frame, "bindings", "entities")
-        if not memArr.isNil and memArr.kind == JArray:
-          for m in memArr:
-            let mn = jstr(jget(m, "name"))
-            var eidx = 0
-            let mg = jstr(jget(m, "guid"))
-            if not entsP.isNil and entsP.kind == JArray:
-              for e in entsP:
-                let kind = jstr(jget(e, "kind")).toLowerAscii
-                if kind notin ["party", "player"]: continue
-                if jstr(jget(e, "guid")) == mg or
-                    jstr(jget(e, "name")).cmpIgnoreCase(mn) == 0:
-                  eidx = jint(jget(e, "index"))
-                  break
-            members.add PromoteMember(name: mn, entityIndex: eidx)
-        var preferIdx = 0
-        for m in members:
-          if m.name.cmpIgnoreCase(cfg.leader) == 0:
-            preferIdx = m.entityIndex
-            break
-        let dec = decidePromote(
-          selfName,
-          partyLeaderName,
-          cfg.leader,
-          members,
-          kindAllows(frame, "promote_party"),
-          preferIdx > 0 and targetAllows(frame, "promote_party", preferIdx)
-        )
-        if dec.shouldPromote:
-          let intent = %*{
-            "kind": "promote_party",
-            "unit_id": dec.targetIndex,
-            "reason": dec.reason
-          }
-          let mapped = mapIntent(intent)
-          if mapped.isSome:
-            try:
-              client.selectAction(mapped.get, fid, tick, rev2)
-              lastPromoteAt = epochTime()
-              echo "[army_host] #", i, " SELECT promote_party -> ", dec.targetName,
-                " (", dec.reason, ")"
-              sleep(int(cfg.cadence * 1000))
-              continue
-            except:
-              echo "[army_host] #", i, " SELECT FAIL promote_party ",
-                getCurrentExceptionMsg()
-      let proj = projectEscort(frame, preferLeaderName = cfg.leader)
-      if leaderClient != nil:
+      let st = client.statusJson()
+      let phase = jstr(jget(st, "phase"))
+      let rev = jint(jget(st, "revision"))
+      # Re-install if idle/failed/complete so escort keeps running.
+      if phase in ["idle", "failed", "complete"] or
+          epochTime() - lastGoalRefreshAt >= GoalRefreshSec:
         try:
-          let lf = leaderClient.envFrame()
-          overlayLeaderLive(proj, lf)
+          client.submitGoal(cfg.goalId, cfg.leader, cfg.party, rev)
+          lastGoalRefreshAt = epochTime()
+          if phase != "running":
+            echo &"[army_host] re-installed goal (phase was {phase})"
         except:
-          discard
-      let intent = runDecide(cfg.tool, proj)
-      if not cfg.quiet:
-        var atkSample = "[]"
-        let atk = proj{"combat"}{"attackable"}
-        if not atk.isNil and atk.kind == JArray and atk.len > 0:
-          atkSample = $atk[0]
-        let lead = proj{"party"}{"leader_unit"}
-        echo "[army_host] #", i, " ready=", ready, " intent=", intent,
-          " leader=", lead, " attackable0=", atkSample
-      if not ready:
-        sleep(int(cfg.cadence * 1000))
-        continue
-      let mapped = mapIntent(intent)
-      if mapped.isNone:
-        sleep(int(cfg.cadence * 1000))
-        continue
+          let msg = getCurrentExceptionMsg()
+          if isStaleRevisionError(msg):
+            let st2 = client.statusJson()
+            client.submitGoal(
+              cfg.goalId, cfg.leader, cfg.party, jint(jget(st2, "revision"))
+            )
+            lastGoalRefreshAt = epochTime()
+          else:
+            raise
       try:
-        if not cfg.quiet:
-          echo "[army_host] #", i, " action=", mapped.get, " intent=", intent
-        client.selectAction(mapped.get, fid, tick, rev2)
-        if not cfg.quiet:
-          let ak = jstr(jget(mapped.get, "kind"))
-          echo "[army_host] #", i, " SELECT ", ak
+        let frame = client.envFrame()
+        discard processFrame(audit, frame)
+        let name = jstr(jget(frame, "observation", "name"))
+        let loc = jget(frame, "observation", "location")
+        let party = jget(frame, "observation", "party")
+        if epochTime() - lastHeartbeatAt >= HeartbeatSec or not cfg.quiet:
+          lastHeartbeatAt = epochTime()
+          echo "[army_host] heartbeat #", i,
+            " name=", name,
+            " phase=", phase,
+            " pos=(",
+            jnum(jget(loc, "x")).formatFloat(ffDecimal, 0), ",",
+            jnum(jget(loc, "y")).formatFloat(ffDecimal, 0), ")",
+            " party=", jbool(jget(party, "in_group")),
+            " leader=", jstr(jget(party, "leader_name"))
       except:
-        echo "[army_host] #", i, " SELECT FAIL ", getCurrentExceptionMsg(),
-          " action=", mapped.get
+        # Frame optional if only status works
+        if not cfg.quiet:
+          echo "[army_host] frame skip: ", getCurrentExceptionMsg()
     except:
-      echo "[army_host] loop error: ", getCurrentExceptionMsg()
+      let msg = getCurrentExceptionMsg()
+      echo "[army_host] loop error: ", msg
+      if msg.contains("socket") or msg.contains("closed") or msg.contains("send failed"):
+        try: client.close()
+        except: discard
+        sleep(1000)
+        try:
+          client = connectClient(cfg.slot)
+          installEscortGoal()
+          echo "[army_host] reconnected slot=", cfg.slot
+        except:
+          echo "[army_host] reconnect failed: ", getCurrentExceptionMsg()
     sleep(int(cfg.cadence * 1000))
 
 when isMainModule:

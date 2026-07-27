@@ -21,7 +21,8 @@ import
   mummy, mummy/routers,
   webby/httpheaders as mummyheaders,
   jsony,
-  mcport/mcp_core
+  mcport/mcp_core,
+  ../tools/fair_play_audit
 
 const
   Version = "0.6.0"
@@ -883,6 +884,11 @@ proc respawnShadowArmy*(): AdminActionResult =
   ## corpse runs stall (ghost masks, elevated death pockets, etc.). Policy
   ## brains must never call this; only the System dashboard/MCP admin face.
   result = AdminActionResult(ok: true, action: "respawn_shadow_army", steps: @[])
+  recordAdmin(
+    DefaultAuditPath,
+    kind = "respawn_shadow_army_begin",
+    detail = "revive+tele+repair for cast seats"
+  )
   for name in ShadowArmyCast:
     for cmd in respawnCommandsFor(name):
       var step = AdminStepResult(name: name, command: cmd, ok: true, detail: "")
@@ -899,6 +905,18 @@ proc respawnShadowArmy*(): AdminActionResult =
         step.detail = e.msg
         result.ok = false
       result.steps.add(step)
+      # Fair-play audit: mark each SOAP step as admin_setup (not policy).
+      let kind =
+        if cmd.startsWith("tele "): "teleport"
+        elif cmd.startsWith("repairitems"): "repair"
+        elif cmd.startsWith("revive"): "revive"
+        else: "soap"
+      recordAdmin(
+        DefaultAuditPath,
+        kind = kind,
+        character = name,
+        detail = cmd & (if step.ok: " ok" else: " FAIL " & step.detail)
+      )
   try:
     discard announceInGame(
       "<SYS> admin respawned shadow army (revive+tele " &

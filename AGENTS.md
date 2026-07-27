@@ -67,8 +67,26 @@ upstream controller already owns.
   labels, thresholds tied to the upstream pin) live in one config module,
   not scattered through tools.
 
+## Operator surface (human vs agent)
+
+- **Human operator only interacts with play clients:** `make play` or
+  `make play-classic` (and in-game play / bug reports). That is the
+  intended human surface.
+- **Do not instruct the user to run commands.** Agents must not say
+  “please run `make escort-army`”, “restart the bots”, “check the log
+  with …”, or hand off shell steps. Execute those yourself.
+- **Agents own everything else automatically:** realm/server bring-up,
+  logging config, accounts, headless bot seats, `army_host` / escort /
+  grind brains, SOAP/admin recovery when used for **setup only**, log
+  greps, rebuilds, tests, upstream pulls/rebases (fork), pin updates,
+  and postmortems. Prefer Makefile targets already in-repo.
+- If something needs a human decision (force-push, report upstream bug,
+  irreversible data loss, tournament-risking cheat), **state the decision
+  and options** — do not dump a command list for the operator to type.
+
 ## Session protocol with monofuel
 
 He plays alongside the bots and reports issues in plain language; those
 land in `kb/postmortems/` or the playbook queue. Every play session opens
-by re-testing the previous session's complaints.
+by re-testing the previous session's complaints. Agents keep the bot/server
+stack healthy without asking him to run ops commands.

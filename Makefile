@@ -36,7 +36,18 @@ ACCOUNT_PASS := password
 
 # Unit tier only. test-python is stdlib-only (projection + intent_mapping + optional
 # lua_runner smoke); it is wired into `make test` because it needs no venv/network.
-test: test-lua test-python
+# Unit tier: Lua + Python + Nim pure tests (fair_play_audit, party_promote when nim on PATH).
+# If nim is missing, test-nim-soft skips rather than failing bare CI hosts.
+test: test-lua test-python test-nim-soft
+
+# Like test-nim but no-op when nim is unavailable (wired into `make test`).
+.PHONY: test-nim-soft
+test-nim-soft:
+	@if command -v nim >/dev/null 2>&1; then \
+		$(MAKE) test-nim; \
+	else \
+		echo "test-nim-soft: nim not on PATH — skip"; \
+	fi
 
 test-lua:
 	@rc=0; for t in lua/tests/test_*.lua; do \
@@ -57,14 +68,16 @@ test-python:
 test-nim:
 	@if command -v nim >/dev/null 2>&1; then \
 		rc=0; \
-		for t in system/tests/test_*.nim; do \
+		for t in system/tests/test_*.nim tools/tests/test_*.nim; do \
+			[ -f "$$t" ] || continue; \
 			echo "== $$t =="; \
 			nim r --hints:off --warnings:off "$$t" || rc=1; \
 		done; \
 		exit $$rc; \
 	elif [ -f flake.nix ] || [ -f shell.nix ]; then \
 		rc=0; \
-		for t in system/tests/test_*.nim; do \
+		for t in system/tests/test_*.nim tools/tests/test_*.nim; do \
+			[ -f "$$t" ] || continue; \
 			echo "== $$t =="; \
 			nix develop --command nim r --hints:off --warnings:off "$$t" || rc=1; \
 		done; \
@@ -155,35 +168,40 @@ escort-python:
 		--goal-id escort-slot-$(SLOT) $(EXTRA)
 
 # Standing army on Nim host (kills legacy python shadows first).
+# Writes fair-play milestones to local_data/audit/fair-play.jsonl (all seats).
 escort-army-nim: army-host-build
-	@mkdir -p local_data/brain-logs
+	@mkdir -p local_data/brain-logs local_data/audit
 	@-pkill -f 'brain.shadow --slot [2345]' 2>/dev/null || true
 	@-pkill -f 'tools/army_host --slot' 2>/dev/null || true
 	@sleep 1
 	@for s in 2 3 4 5; do \
 		nohup ./tools/army_host --slot=$$s --tool=escort_leader --leader=$(or $(ESCORT_LEADER),Murist) \
 			--party=Murist,Shadowfel,Igris,Tusk,Beru --goal-id=army-slot-$$s --cadence=0.35 \
-			--accept-from=$(or $(ESCORT_ACCEPT_FROM),Murist) > local_data/brain-logs/army-slot$$s.log 2>&1 & \
+			--accept-from=$(or $(ESCORT_ACCEPT_FROM),Murist) \
+			--audit-path=local_data/audit/fair-play.jsonl \
+			> local_data/brain-logs/army-slot$$s.log 2>&1 & \
 		echo $$! > local_data/brain-logs/army-slot$$s.pid; \
 	done; \
 	echo "army_host pids: $$(cat local_data/brain-logs/army-slot{2,3,4,5}.pid 2>/dev/null)"; \
-	echo "logs: local_data/brain-logs/army-slot{2,3,4,5}.log"
+	echo "logs: local_data/brain-logs/army-slot{2,3,4,5}.log"; \
+	echo "fair-play audit: local_data/audit/fair-play.jsonl"
 
 # Default standing-army launch = Nim (alias of escort-army-nim).
 escort-army: escort-army-nim
 
 grind-army-nim: army-host-build
-	@mkdir -p local_data/brain-logs
+	@mkdir -p local_data/brain-logs local_data/audit
 	@-pkill -f 'tools/army_host --slot' 2>/dev/null || true
 	@-pkill -f 'brain.shadow --slot [2345]' 2>/dev/null || true
 	@sleep 1
 	@for s in 2 3 4 5; do \
 		nohup ./tools/army_host --slot=$$s --tool=grind_nearest --leader=$(or $(ESCORT_LEADER),Murist) \
 			--party=Murist,Shadowfel,Igris,Tusk,Beru --goal-id=grind-slot-$$s --cadence=0.3 \
+			--audit-path=local_data/audit/fair-play.jsonl \
 			> local_data/brain-logs/grind-slot$$s.log 2>&1 & \
 		echo $$! > local_data/brain-logs/grind-slot$$s.pid; \
 	done; \
-	echo "grind army started"
+	echo "grind army started (audit: local_data/audit/fair-play.jsonl)"
 
 # Mob-grinding brain (docs/warlock-seat.md). Drives a seat entirely from OUR
 # policy using the goal-independent generic action masks, so it works for
@@ -779,14 +797,30 @@ beru-bot:
 	WOW_SDK_NIM_CONTROL_HOST=127.0.0.1 \
 	nim r player/reference_player/reference_player.nim --scenario=nim-control
 
+# Rotate non-empty client/brain logs so restarts never clobber fair-play proof.
+# Creates local_data/audit/ for army_host fair-play JSONL.
+.PHONY: rotate-client-logs
+rotate-client-logs:
+	@mkdir -p "$(CURDIR)/local_data" "$(CURDIR)/local_data/brain-logs" "$(CURDIR)/local_data/audit"
+	@ts=$$(date -u +%Y%m%dT%H%M%SZ); \
+	for f in warlock-bot igris-bot tusk-bot beru-bot murist-bot botwarrior-bot; do \
+		p="$(CURDIR)/local_data/$$f.log"; \
+		if [ -s "$$p" ]; then mv "$$p" "$$p.$$ts"; echo "rotated $$f.log → $$f.log.$$ts"; fi; \
+	done; \
+	for p in "$(CURDIR)"/local_data/brain-logs/army-slot{2,3,4,5}.log \
+	         "$(CURDIR)"/local_data/brain-logs/grind-slot{2,3,4,5}.log; do \
+		if [ -s "$$p" ]; then mv "$$p" "$$p.$$ts"; echo "rotated $$(basename $$p)"; fi; \
+	done
+
 # Bring the full 5-man bot side online (accounts if needed + 4 headless seats).
 # Human (Murist) is still classic client. Does NOT start escort brains —
 # run `make escort-army` after seats print "listening".
-party-army:
+# Client logs are rotated first (append-only history for fair-play greps).
+party-army: rotate-client-logs
 	@set -e; \
 	$(MAKE) tusk-account; \
 	$(MAKE) beru-account; \
-	mkdir -p "$(CURDIR)/local_data/brain-logs"; \
+	mkdir -p "$(CURDIR)/local_data/brain-logs" "$(CURDIR)/local_data/audit"; \
 	echo "starting headless seats (fork): Shadowfel:2 Igris:3 Tusk:4 Beru:5"; \
 	nohup $(MAKE) warlock-bot-fork > local_data/warlock-bot.log 2>&1 & echo $$! > local_data/brain-logs/warlock-bot.pid; \
 	nohup $(MAKE) igris-bot > local_data/igris-bot.log 2>&1 & echo $$! > local_data/brain-logs/igris-bot.pid; \
@@ -794,6 +828,7 @@ party-army:
 	nohup $(MAKE) beru-bot > local_data/beru-bot.log 2>&1 & echo $$! > local_data/brain-logs/beru-bot.pid; \
 	echo "bot pids: $$(cat local_data/brain-logs/warlock-bot.pid) $$(cat local_data/brain-logs/igris-bot.pid) $$(cat local_data/brain-logs/tusk-bot.pid) $$(cat local_data/brain-logs/beru-bot.pid)"; \
 	echo "wait for :41116–:41119 listening, then: make escort-army"; \
+	echo "fair-play audit: local_data/audit/fair-play.jsonl (written by army_host)"; \
 	echo "invite order in-game (Murist): Shadowfel, Igris, Tusk, Beru"
 
 # ---------------------------------------------------------------------------

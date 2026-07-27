@@ -114,6 +114,14 @@ end
 -- Stock follow only if leader has no z (fallback).
 local VERTICAL_DEST_DZ = 2.5
 
+local function leader_pos_reliable(leader)
+  -- Host sets false when only stale party packets exist (no units obs,
+  -- no elevation, no leader-slot overlay). Missing field = tests / trusted.
+  if leader == nil then return false end
+  if leader.position_reliable == false then return false end
+  return true
+end
+
 local function rejoin_intent(leader, me, near, far, d2, reason)
   local urgent = d2 > far * far
   local intent = {
@@ -123,7 +131,14 @@ local function rejoin_intent(leader, me, near, far, d2, reason)
     urgent = urgent,
     reason = reason or "rejoin_formation",
   }
-  if not has_z(leader) then
+  -- Stale party xy+fake z must not become destination moves: they walk to a
+  -- frozen square and then hold:in_formation while the human is far away.
+  -- Stock follow tracks the live party unit in the client.
+  if not leader_pos_reliable(leader) or not has_z(leader) then
+    if not leader_pos_reliable(leader) then
+      intent.urgent = true
+      intent.reason = (reason or "rejoin_formation") .. "_stale_follow"
+    end
     return intent
   end
   intent.x = leader.x
@@ -525,6 +540,16 @@ return registry.register({
       return { kind = "hold", reason = "leader_not_visible" }
     end
 
+    -- Party packets freeze leader xy (classic human has no control overlay).
+    -- Do not trust dist/hold while position_reliable is false — stock follow.
+    local pos_ok = leader_pos_reliable(leader)
+    if not pos_ok then
+      local engaged_early = combat.in_combat or guid_nonzero(combat.auto_attack_guid)
+      if not engaged_early then
+        return rejoin_intent(leader, me, near, far, far * far + 1, "rejoin_stale")
+      end
+    end
+
     -- Hostile focus only (projection should strip self; double-check via attackable).
     local prefer = combat.auto_attack_guid
     if not guid_nonzero(prefer) then
@@ -745,6 +770,11 @@ return registry.register({
       if buff then
         return cast_intent(buff, "self_buff")
       end
+    end
+
+    -- Never idle-hold on untrusted leader coords (live failure mode).
+    if not pos_ok then
+      return rejoin_intent(leader, me, near, far, far * far + 1, "rejoin_stale")
     end
 
     return { kind = "hold", reason = "in_formation" }

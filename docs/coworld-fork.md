@@ -11,7 +11,7 @@ we need without writing to Softmax GitHub. Upstream checkout
 | Web | https://gitea.solution-nine.monofuel.dev/Monolab/coworld-vanilla-wow |
 | Branch `main` | mirrors Metta-AI `main` (stock upstream, no local delta) |
 | Branch `shadow-army-fixes` | our carried commits, rebased on `main` |
-| Last synced upstream | `5068c8ffa` ("Track player runtime in browser builds") |
+| Last synced upstream | `ec5bd2f9d` ("Probe another direction after observed movement stalls") — 2026-07-27 |
 
 ## Remotes (on the fork worktree)
 
@@ -76,8 +76,10 @@ SHAs rewrite on every rebase; identify by message / path.
 
 | Tip SHA (as of last sync) | What | Why | Upstream status |
 |---|---|---|---|
-| `c62f46a1b` | cowpatch `FACTION_STANDING_PACKET_WRITER`: emit `uint32(1)` row-count prefix in `SMSG_SET_FACTION_STANDING` | Count-less body deterministically crashes the build 5875 client (NULL `Faction.dbc` row 0 deref at WoW.exe RVA `0x000D4BEE`) on every reputation-granting quest turn-in. Full disassembly evidence: [`quest-crash-forensics.md`](quest-crash-forensics.md). | **Not reported yet** — evidence package ready for monofuel to submit |
-| `3c121b946` | `client/packets/quest_progression.nim` `parseFactionStanding` + proof: accept both the count-prefixed 5875 stock framing and the count-less 8-byte coworld framing | Bot must work against both the tournament stack (count-less) and our patched realm (stock framing). Shapes cannot collide (no count makes `4 + 8*count == 8`). | **Not reported yet** — same evidence package |
+| `2816b7e33` (`shadow-army-fixes`) | cowpatch `FACTION_STANDING_PACKET_WRITER`: emit `uint32(1)` row-count prefix in `SMSG_SET_FACTION_STANDING` | Count-less body deterministically crashes the build 5875 client (NULL `Faction.dbc` row 0 deref at WoW.exe RVA `0x000D4BEE`) on every reputation-granting quest turn-in. Full disassembly evidence: [`quest-crash-forensics.md`](quest-crash-forensics.md). | **Not reported yet** — evidence package ready for monofuel to submit |
+| `065853773` (`shadow-army-fixes`) | `client/packets/quest_progression.nim` `parseFactionStanding` + proof: accept both the count-prefixed 5875 stock framing and the count-less 8-byte coworld framing | Bot must work against both the tournament stack (count-less) and our patched realm (stock framing). Shapes cannot collide (no count makes `4 + 8*count == 8`). | **Not reported yet** — same evidence package |
+| `62685254c` (`party-invite-observation`) | client: apply social-party packet models to retained party state | Party roster / invite observation for escort | Keep; rebased 2026-07-27 |
+| `cb092b666` (`party-invite-observation`) | `bakPromoteParty` + execute path (masks **dropped** — upstream removed factorized external masks in `nim_control.v2`) | Hand leadership to Murist; death/quest external masks no longer apply on v2 | **Adapt needed** — see `kb/upstream-nim-control-v2.md` |
 
 ## Validate the cowpatch still applies (no docker needed)
 

@@ -348,6 +348,58 @@ r = tool.decide(frame(
 ))
 check(r.kind == "move_to_unit" and r.z == nil, "no-z rejoin is stock follow")
 
+-- Stale party coords look "near" (frozen xy) but position_reliable=false:
+-- must stock-follow, never hold:in_formation (live army stuck mode).
+r = tool.decide(frame(
+  { x = 1884.8, y = 1590.7, z = 89.5, map_id = 0 },
+  {
+    id = 2,
+    x = 1891.0,
+    y = 1588.0,
+    z = 88.4,
+    map_id = 0,
+    visible = true,
+    assistable = true,
+    position_reliable = false,
+  },
+  {
+    in_combat = false,
+    mana_pct = 100,
+    health_pct = 100,
+    focus_guid = "0",
+    auto_attack_guid = "0",
+    attackable = {},
+    casts = {},
+  }
+))
+check(r.kind == "move_to_unit", "stale leader forces rejoin not hold")
+check(r.z == nil, "stale leader rejoin is stock follow (no dest)")
+check(r.reason and tostring(r.reason):find("stale", 1, true), "stale reason tag")
+
+-- Reliable near leader: still hold when truly in formation.
+r = tool.decide(frame(
+  { x = 0, y = 0, z = 10 },
+  {
+    id = 2,
+    x = 3,
+    y = 0,
+    z = 10,
+    visible = true,
+    assistable = true,
+    position_reliable = true,
+  },
+  {
+    in_combat = false,
+    mana_pct = 100,
+    health_pct = 100,
+    focus_guid = "0",
+    auto_attack_guid = "0",
+    attackable = {},
+    casts = {},
+  }
+))
+check(r.kind == "hold" and r.reason == "in_formation", "reliable near still holds")
+
 -- OOM: Shoot over dagger.
 r = tool.decide(frame(me, leader_near, {
   in_combat = true,
