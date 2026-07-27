@@ -32,13 +32,13 @@ COMPOSE_FILE := infra/compose.vmangos.yml
 ACCOUNT_USER := monofuel
 ACCOUNT_PASS := password
 
-.PHONY: test test-lua test-python test-nim system pin-check integration-test start-server stop-server server-logging logs account soap-account play play-classic shadow escort escort-army grind party-form breadcrumbs quest-data warlock-account warlock-bot botwarrior-bot tusk-account tusk-bot beru-account beru-bot party-army navmesh-helper navmesh-status
+.PHONY: test test-lua test-breadcrumbs test-nim system pin-check start-server stop-server server-logging logs account soap-account play play-classic escort escort-army grind breadcrumbs quest-data warlock-account warlock-bot botwarrior-bot tusk-account tusk-bot beru-account beru-bot party-army navmesh-helper navmesh-status
 
-# Unit tier only. test-python is stdlib-only (projection + intent_mapping + optional
-# lua_runner smoke); it is wired into `make test` because it needs no venv/network.
-# Unit tier: Lua + Python + Nim pure tests (fair_play_audit, party_promote when nim on PATH).
-# If nim is missing, test-nim-soft skips rather than failing bare CI hosts.
-test: test-lua test-python test-nim-soft
+# Unit tier: Lua tools + Nim host/system tests only (v2 DoD: no Python required
+# for bot correctness). If nim is missing, test-nim-soft skips rather than
+# failing bare CI hosts. Breadcrumbs (non-bot ops poller) tests are optional:
+# `make test-breadcrumbs`.
+test: test-lua test-nim-soft
 
 # Like test-nim but no-op when nim is unavailable (wired into `make test`).
 .PHONY: test-nim-soft
@@ -54,12 +54,9 @@ test-lua:
 		echo "== $$t"; LUA_PATH="lua/?.lua;lua/tools/?.lua;;" $(RUN_LUA) $$t || rc=1; \
 	done; exit $$rc
 
-# Python unit tier: plain dicts + stdlib unittest. No pydantic/msgpack required.
-# Runtime brain (brain.shadow) needs upstream deps — use:
-#   uv run --project $(UPSTREAM) python -m brain.shadow ...
-# breadcrumbs: DB poller diff logic (fixture dicts only; no mariadb in unit tier).
-test-python:
-	@python3 -m unittest discover -s brain/tests -p 'test_*.py' -v
+# breadcrumbs: DB poller diff logic (fixture dicts only; no mariadb in unit
+# tier). Ops tooling, not the bot — kept out of default `make test`.
+test-breadcrumbs:
 	@python3 -m unittest discover -s breadcrumbs/tests -p 'test_*.py' -v
 
 # Optional Nim unit tier (enum maps / pure parsers). Not part of `make test`
@@ -98,43 +95,28 @@ system:
 	fi
 
 # Pin-drift only: HEAD of ../coworld-vanilla-wow must match upstream.lock.
-# Also checks files brain/upstream.py imports still exist.
+# Pure shell — no Python. Format of upstream.lock: "<name> <sha>".
 pin-check:
-	@if [ ! -d "$(UPSTREAM)" ]; then \
+	@set -e; \
+	if [ ! -d "$(UPSTREAM)" ]; then \
 		echo "error: upstream checkout missing: $(UPSTREAM)" >&2; exit 1; \
-	fi
-	@cd "$(CURDIR)" && uv run --project "$(UPSTREAM)" python -m unittest \
-		tests.integration.test_pin_drift -v
-
-# Integration tier: pin-check + recorded wire_*.bin replay through real
-# EnvironmentFrame (upstream client) → frame_projection → lua tools → intent_mapping.
-# No live services, no docker, no realm. Needs uv + upstream project deps + lua5.3.
-# Never wired into `make test` (unit stays instant / stdlib-only).
-integration-test: pin-check
-	@cd "$(CURDIR)" && uv run --project "$(UPSTREAM)" python -m unittest discover \
-		-s tests/integration -p 'test_*.py' -v
-
-# Live shadow brain against a running nim_control socket (not unit tier).
-# Requires: realm up, headless reference player, uv + upstream project deps.
-# Example:
-#   make shadow SLOT=0 LEADER=Botpriest PARTY=Botpriest,Botwarrior EXTRA='--move-fallback --max-seconds 60'
-SLOT ?= 0
-LEADER ?= Botpriest
-PARTY ?= Botpriest,Botwarrior
-EXTRA ?=
-shadow:
-	@cd "$(CURDIR)" && uv run --project "$(UPSTREAM)" python -m brain.shadow \
-		--slot $(SLOT) --leader-name $(LEADER) --party-members $(PARTY) $(EXTRA)
+	fi; \
+	want=$$(awk '{print $$2}' upstream.lock); \
+	have=$$(git -C "$(UPSTREAM)" rev-parse HEAD); \
+	if [ -z "$$want" ]; then echo "error: bad upstream.lock" >&2; exit 1; fi; \
+	if [ "$$want" != "$$have" ]; then \
+		echo "pin drift: upstream HEAD $$have != upstream.lock $$want" >&2; exit 1; \
+	fi; \
+	echo "pin ok: $$want"
 
 # Escort army: Nim host + Lua escort_leader (NO PYTHON decide path).
 # Accept invites + follow formation + assist/attack leader target.
-# Do NOT also run party_butler on the same slot.
 # Docs: docs/rolling-issues-2026-07-26.md
 #
 #   make escort SLOT=2 EXTRA='--max-seconds 120'
 #   make escort-army
-#
-# Legacy Python host (brain.shadow) kept as escort-python for one-off debug only.
+SLOT ?= 0
+EXTRA ?=
 ESCORT_LEADER ?= Murist
 # Full 5-man cast: human + 2 locks + warrior tank + priest healer.
 ESCORT_PARTY ?= Murist,Shadowfel,Igris,Tusk,Beru
@@ -143,7 +125,7 @@ ESCORT_ACCEPT_FROM ?= Murist
 ESCORT_UPSTREAM ?= $(shell if [ -d "$(abspath ../coworld-vanilla-wow-fork)" ]; then echo $(abspath ../coworld-vanilla-wow-fork); else echo $(UPSTREAM); fi)
 
 # Nim army host (no Python decide loop). Binary: tools/army_host
-.PHONY: army-host army-host-build escort-army-nim grind-army-nim escort escort-army escort-python
+.PHONY: army-host army-host-build escort-army-nim grind-army-nim escort escort-army
 army-host-build:
 	@nim c --hints:off -o:tools/army_host tools/army_host.nim
 
@@ -157,15 +139,6 @@ escort: army-host-build
 	@./tools/army_host --slot=$(SLOT) --tool=escort_leader --leader=$(or $(ESCORT_LEADER),Murist) \
 		--party=$(or $(ESCORT_PARTY),Murist,Shadowfel,Igris,Tusk,Beru) --goal-id=army-slot-$(SLOT) \
 		--cadence=$(or $(CADENCE),0.35) --accept-from=$(or $(ESCORT_ACCEPT_FROM),Murist) $(EXTRA)
-
-# Legacy Python escort (debug only — not the standing army path).
-escort-python:
-	@cd "$(CURDIR)" && \
-	UP=$${WOW_SHADOW_UPSTREAM:-$(ESCORT_UPSTREAM)}; \
-	uv run --project "$$UP" env WOW_SHADOW_UPSTREAM="$$UP" python -m brain.shadow \
-		--slot $(SLOT) --leader-name $(ESCORT_LEADER) --party-members $(ESCORT_PARTY) \
-		--tool escort_leader --accept-from $(ESCORT_ACCEPT_FROM) \
-		--goal-id escort-slot-$(SLOT) $(EXTRA)
 
 # Standing army on Nim host (kills legacy python shadows first).
 # Writes fair-play milestones to local_data/audit/fair-play.jsonl (all seats).
@@ -203,43 +176,21 @@ grind-army-nim: army-host-build
 	done; \
 	echo "grind army started (audit: local_data/audit/fair-play.jsonl)"
 
-# Mob-grinding brain (docs/warlock-seat.md). Drives a seat entirely from OUR
-# policy using the goal-independent generic action masks, so it works for
-# classes the upstream leveling planner refuses (an undead warlock resolves
-# `unsupported_profile` and the planner noops forever — that only silences
-# `recommended_action`, it does not close the masks).
+# Single-seat mob grind on the Nim host (docs/warlock-seat.md). Uses the
+# goal-independent generic action masks, so it works for classes the upstream
+# leveling planner refuses (an undead warlock resolves `unsupported_profile`
+# and the planner noops forever — that only silences `recommended_action`, it
+# does not close the masks).
 #
-#   make grind SLOT=2 CHARACTER=Shadowfel EXTRA='--max-seconds 600'
-#
-# Safety: `--avoid-names` defaults to Murist. Bots never address the human's
-# character. `--leash` keeps the bot near its anchor so a chase cannot walk it
-# into his play area.
-CHARACTER ?= Shadowfel
-grind:
-	@cd "$(CURDIR)" && uv run --project "$(UPSTREAM)" python -m brain.grind \
-		--slot $(SLOT) --character $(CHARACTER) $(EXTRA)
+#   make grind SLOT=2 EXTRA='--max-seconds=600'
+grind: army-host-build
+	@./tools/army_host --slot=$(SLOT) --tool=grind_nearest --leader=$(or $(ESCORT_LEADER),Murist) \
+		--party=$(or $(ESCORT_PARTY),Murist,Shadowfel,Igris,Tusk,Beru) --goal-id=grind-slot-$(SLOT) \
+		--cadence=$(or $(CADENCE),0.3) --audit-path=local_data/audit/fair-play.jsonl $(EXTRA)
 
-# Form a real party across two or more of OUR headless seats (docs/party-formation.md).
-# `invite_party` is only unmasked while the leader seat holds a dungeon goal whose
-# declared roster is incomplete (upstream environment_frame.nim:1230 is the only
-# enabler); `accept_party` needs nothing but a pending invite plus any goal.
-# Requires: realm up + one running reference player per slot below.
-#
-#   make party-form LEADER_SLOT=0 LEADER=Botwarrior MEMBERS=Botwarrior,Botpriest MEMBER_SLOTS=1
-#
-# MEMBER_SLOTS lists only the seats WE drive; leave it empty for members we do
-# not control. NEVER put a human character in MEMBERS — bots do not address the
-# human's character (see docs/party-formation.md).
-# PARTY_LEADER is separate from `shadow`'s LEADER on purpose: it must name the
-# character logged in on LEADER_SLOT, or the reducer stays at noop.
-LEADER_SLOT ?= 0
-PARTY_LEADER ?= Botwarrior
-MEMBERS ?= Botwarrior,Botpriest
-MEMBER_SLOTS ?= 1
-party-form:
-	@cd "$(CURDIR)" && uv run --project "$(UPSTREAM)" python -m brain.party \
-		--leader-slot $(LEADER_SLOT) --leader $(PARTY_LEADER) \
-		--members $(MEMBERS) --member-slots $(MEMBER_SLOTS) $(EXTRA)
+# Party formation across our headless seats: human (or bot leader) invites,
+# seats accept via escort_leader; promote with tools/party_promote
+# (docs/party-formation.md). The old Python butler (brain.party) is gone.
 
 # Build the Detour navmesh helper (docs/navmesh.md). Compile-only: it links
 # VMaNGOS's vendored Detour against the mmaps we already extracted — no mmap
