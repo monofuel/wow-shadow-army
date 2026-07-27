@@ -1007,9 +1007,7 @@ proc main() =
   let t0 = epochTime()
   var i = 0
   var lastHeartbeatAt = 0.0
-  var lastGoalRefreshAt = epochTime()
   const HeartbeatSec = 15.0
-  const GoalRefreshSec = 30.0
   while true:
     if cfg.maxSeconds > 0 and epochTime() - t0 > cfg.maxSeconds:
       echo "[army_host] max-seconds"
@@ -1019,14 +1017,12 @@ proc main() =
       let st = client.statusJson()
       let phase = jstr(jget(st, "phase"))
       let rev = jint(jget(st, "revision"))
-      # Re-install if idle/failed/complete so escort keeps running.
-      if phase in ["idle", "failed", "complete"] or
-          epochTime() - lastGoalRefreshAt >= GoalRefreshSec:
+      # Re-install only when the controller dropped the goal. Periodic re-submit
+      # resets policy memory and thrash-glitches movement.
+      if phase in ["idle", "failed", "complete"]:
         try:
           client.submitGoal(cfg.goalId, cfg.leader, cfg.party, rev)
-          lastGoalRefreshAt = epochTime()
-          if phase != "running":
-            echo &"[army_host] re-installed goal (phase was {phase})"
+          echo &"[army_host] re-installed goal (phase was {phase})"
         except:
           let msg = getCurrentExceptionMsg()
           if isStaleRevisionError(msg):
@@ -1034,7 +1030,6 @@ proc main() =
             client.submitGoal(
               cfg.goalId, cfg.leader, cfg.party, jint(jget(st2, "revision"))
             )
-            lastGoalRefreshAt = epochTime()
           else:
             raise
       try:
