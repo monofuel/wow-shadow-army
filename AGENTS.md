@@ -38,6 +38,13 @@ upstream controller already owns.
   path that a stranger client on the live realm cannot take. When something
   is hard or stuck, **document the gap** and fix the real pipeline — do not
   paper over it with admin power.
+- **NO TELEPORT unless monofuel directly orders it.** Do not SOAP/GM/DB
+  teleport bots or the human player (Murist or any other seat), including
+  “just recovery,” “just setup,” mass army teles, or `UPDATE characters`
+  position writes. Stuck pathing, skybox glitches, wrong zones — fix code,
+  restart seats, or ask. **Only** tele when he explicitly says to tele
+  (named character(s) and destination). Same for summon/appear/goname and
+  equivalent.
 - **FAIR PLAY — NO COLLUSION.** Seats play as strangers. In-party
   cooperation is legitimate ONLY through the game's own typed contracts
   (party membership, `VANILLA_WOW_RFC_ASSIGNMENT`) and live observations.
@@ -83,6 +90,84 @@ upstream controller already owns.
 - If something needs a human decision (force-push, report upstream bug,
   irreversible data loss, tournament-risking cheat), **state the decision
   and options** — do not dump a command list for the operator to type.
+
+## Shadow Advisor — make monofuel's job easy
+
+The vanilla-client **ShadowArmy advisor** (`addons/ShadowArmy/`) is the
+human seat. Its job is to reduce cognitive load while monofuel plays and
+reports bugs — not to invent a second control language he has to memorize.
+
+- **UI or fully automated. Period.** Any capability monofuel is expected to
+  use mid-play must be either (a) a clear control on the advisor panel /
+  windows / map UI, or (b) automatic with a sensible default and an easy
+  off-switch. Prefer automation when the decision is obvious; prefer a
+  button/toggle when judgment is still his.
+- **Do not ship “remember `/sa …`” as the product.** Slash commands are a
+  **dev/power-user escape hatch** (reload, debug, off-screen recovery), not
+  the primary operator path. If a feature only exists as `/sa foo`, it is
+  unfinished — add UI or auto it before calling the work done.
+- **Do not tell him to type slash commands in play.** Agents and docs aimed
+  at the human seat should point at what is on screen or what already runs
+  itself. Never hand him a `/sa` cheat sheet as the way to use the advisor.
+- **Make the job easier, not harder.** New advisor surface area that
+  demands memory, setup rituals, or extra mid-fight keystrokes is a
+  regression. When in doubt: fewer things to remember, more things that
+  Just Work, overrides available without a manual.
+
+See also: `docs/advisor-autopilot.md` (L0–L5 ladder) and `docs/advisor.md`.
+
+## Shadow Advisor — live update / reload path
+
+When monofuel is in `make play-classic`, agents push addon changes **without
+making him restart the client or type slash commands.** Detail lives in
+`docs/the-system-loop.md` and `system/README.md`; the agent protocol is:
+
+### Layout (source of truth)
+
+- Edit **`addons/ShadowArmy/`** in the repo (Lua + `.toc`). That tree is the
+  only place agents write advisor code.
+- `tools/play_classic.sh` **symlinks** each `addons/*` into
+  `local_classic/client/Interface/AddOns/` on launch (wine follows host
+  symlinks). Disk edits are what the client reloads — no separate copy step.
+- **New addon folder or `.toc` name change** needs a **full client restart
+  once** (TOC scan at launch). Pure `.lua` edits do not.
+
+### After every advisor edit (agent owns this)
+
+1. **Bump `REV`** in `addons/ShadowArmy/ShadowArmy.lua` (string like `"r24"`).
+   The System proves a reload by seeing a fresh `<SA> loaded rev=…` line.
+2. **Parse-check** with `luac -p` on touched Lua (Lua 5.0-safe syntax).
+3. Ensure **`make system`** is up (http://127.0.0.1:7777) and the realm is
+   running (`make start-server`) so SOAP + Chat.log tail work.
+4. Call MCP **`reload_addon`** (or dashboard **Reload addon** → `POST /reload`).
+   That SOAP-announces `<SYS> reload` to every client.
+5. Confirm success via **`addon_events`** / dashboard: a new `loaded` event
+   with the **new** rev. Timeout (~6s) with no `loaded` usually means a
+   file-scope Lua error or the human seat is not logged in — check events
+   and fix; do not dump a `/sa` checklist on monofuel.
+
+### What monofuel sees (and why he rarely does anything)
+
+This 1.12/wine build often **gates** programmatic `ReloadUI()` outside a
+hardware event. The addon already handles that:
+
+1. Tries free paths (`ReloadUI` / `ConsoleExec("reloadui")`).
+2. If those no-op: shows a green **Reload!** button on the panel and arms
+   the **next out-of-combat action-bar press** so a normal keypress applies
+   the reload.
+
+Monofuel’s job at most: notice Reload! / press a bar key when safe. Agents
+**must not** tell him to type `/sa reload` or `/console reloadui` as the
+happy path — that is the escape hatch, not the product.
+
+### Do / don’t
+
+| Do | Don’t |
+|---|---|
+| Edit repo `addons/ShadowArmy/`, bump `REV`, `luac -p`, `reload_addon` | Ask monofuel to restart wine for every Lua tweak |
+| Confirm `loaded rev=<new>` before claiming the fix is live | Treat `reloading from-rev=…` as the new rev (that line is the *old* rev) |
+| Keep The System running during play sessions that iterate the advisor | Hand him slash-command reload recipes mid-fight |
+| Full client restart only for new AddOn folders / TOC changes | Copy files into `local_classic/…` by hand (symlink is already the path) |
 
 ## Session protocol with monofuel
 
