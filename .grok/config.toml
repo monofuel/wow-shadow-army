@@ -1,0 +1,6 @@
+# Project-scoped Grok Build config for wow-shadow-army.
+# Management server dashboard + MCP on :7777 (make system).
+
+[mcp_servers.shadow-army]
+url = "http://127.0.0.1:7777/mcp"
+enabled = true

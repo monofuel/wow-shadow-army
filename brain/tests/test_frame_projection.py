@@ -346,6 +346,154 @@ class TestProjectForEscortLeader(unittest.TestCase):
         self.assertEqual(bolt["target"], 5)
         self.assertEqual(bolt["spell"], 22)
 
+    def test_death_projection_release_masked(self):
+        """Dead frame projects death block with can_release_spirit from mask."""
+        RELEASE_I = 10  # matches fallback list in frame_projection
+        kind = [False] * 30
+        kind[RELEASE_I] = True
+        frame = {
+            "observation": {
+                "name": "Shadowfel",
+                "player_guid": "1000008",
+                "location": {"map_id": 0, "x": 10.0, "y": 20.0, "z": 30.0},
+                "is_dead": True,
+                "is_ghost": False,
+                "can_reclaim_corpse": False,
+                "corpse_known": False,
+                "corpse_location": {"map_id": 0, "x": 0.0, "y": 0.0, "z": 0.0},
+                "in_combat": False,
+                "combat_focus_guid": "0",
+                "auto_attack_guid": "0",
+                "powers": [0, 0, 0, 0, 0],
+                "max_powers": [200, 0, 0, 0, 0],
+                "health_known": True,
+                "health": 0,
+                "max_health": 100,
+                "party": {
+                    "in_group": True,
+                    "leader_guid": "100",
+                    "leader_name": "Murist",
+                    "invite_pending": False,
+                    "invite_from": "",
+                    "members": [],
+                },
+            },
+            "bindings": {"entities": [], "spells": []},
+            "action_mask": {"kind": kind, "target": [_empty_target_row() for _ in range(30)]},
+            "action_space": None,
+        }
+        out = project_for_escort_leader(frame)
+        death = out["death"]
+        self.assertTrue(death["is_dead"])
+        self.assertFalse(death["is_ghost"])
+        self.assertTrue(death["can_release_spirit"])
+        self.assertFalse(death["can_reclaim_action"])
+
+    def test_death_projection_ghost_corpse_point(self):
+        RECLAIM_I = 11
+        MOVE_I = 1
+        kind = [False] * 30
+        kind[RECLAIM_I] = True
+        kind[MOVE_I] = True
+        frame = {
+            "observation": {
+                "name": "Igris",
+                "player_guid": "1000009",
+                "location": {"map_id": 0, "x": 1.0, "y": 2.0, "z": 3.0},
+                "is_dead": False,
+                "is_ghost": True,
+                "can_reclaim_corpse": True,
+                "corpse_known": True,
+                "corpse_location": {"map_id": 0, "x": 2040.0, "y": 1840.0, "z": 106.0},
+                "in_combat": False,
+                "combat_focus_guid": "0",
+                "auto_attack_guid": "0",
+                "powers": [0, 0, 0, 0, 0],
+                "max_powers": [100, 0, 0, 0, 0],
+                "health_known": True,
+                "health": 0,
+                "max_health": 63,
+                "party": {
+                    "in_group": False,
+                    "leader_guid": "",
+                    "leader_name": "",
+                    "invite_pending": False,
+                    "invite_from": "",
+                    "members": [],
+                },
+            },
+            "bindings": {"entities": [], "spells": []},
+            "action_mask": {"kind": kind, "target": [_empty_target_row() for _ in range(30)]},
+            "action_space": None,
+        }
+        out = project_for_escort_leader(frame)
+        death = out["death"]
+        self.assertTrue(death["is_ghost"])
+        self.assertTrue(death["can_reclaim_corpse"])
+        self.assertTrue(death["can_reclaim_action"])
+        self.assertTrue(death["can_move"])
+        self.assertEqual(death["corpse"]["x"], 2040.0)
+        self.assertEqual(death["corpse"]["z"], 106.0)
+
+    def test_self_focus_guid_ignored(self):
+        leader = {
+            "index": 2,
+            "kind": "party",
+            "guid": "100",
+            "name": "Murist",
+            "location": {"map_id": 0, "x": 40.0, "y": 50.0, "z": 30.0},
+            "alive": True,
+        }
+        frame = {
+            "observation": {
+                "name": "Shadowfel",
+                "player_guid": "1000008",
+                "location": {"map_id": 0, "x": 10.0, "y": 20.0, "z": 30.0},
+                "in_combat": False,
+                "combat_focus_guid": "1000008",  # self — must not be a combat target
+                "auto_attack_guid": "0",
+                "powers": [100, 0, 0, 0, 0],
+                "max_powers": [200, 0, 0, 0, 0],
+                "health_known": True,
+                "health": 80,
+                "max_health": 100,
+                "party": {
+                    "in_group": True,
+                    "leader_guid": "100",
+                    "leader_name": "Murist",
+                    "invite_pending": False,
+                    "invite_from": "",
+                    "members": [],
+                },
+            },
+            "bindings": {
+                "entities": [
+                    {
+                        "index": 1,
+                        "kind": "self",
+                        "guid": "1000008",
+                        "name": "Shadowfel",
+                        "location": {"map_id": 0, "x": 10.0, "y": 20.0, "z": 30.0},
+                        "alive": True,
+                    },
+                    leader,
+                ],
+                "spells": [],
+            },
+            "action_mask": {
+                "kind": [False] * 50,
+                "target": [_empty_target_row() for _ in range(50)],
+            },
+            "action_space": None,
+        }
+        frame["action_mask"]["kind"][FOLLOW_KIND_I] = True
+        frame["action_mask"]["kind"][ASSIST_KIND_I] = True
+        frame["action_mask"]["target"][FOLLOW_KIND_I][2] = True
+        frame["action_mask"]["target"][ASSIST_KIND_I][2] = True
+        out = project_for_escort_leader(frame)
+        self.assertEqual(out["combat"]["focus_guid"], "")
+        self.assertEqual(out["combat"]["focus_id"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

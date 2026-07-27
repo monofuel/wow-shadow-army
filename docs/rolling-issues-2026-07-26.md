@@ -12,17 +12,26 @@ Live session notes for the human-in-the-loop cast: **Murist** (you) +
 | Caster-first DPS (no random rats / no dagger-with-mana) | In Lua; free-fire paths removed | 1 |
 | Client stutter | Ranked: (1) bot /say replan spam (2) navmesh-helper CPU spikes (3) wine+GL baseline ~70% (4) SA residual OnUpdate minor when quests off | 2 |
 | Auto-loot on escort | Not implemented | later |
-| Advisor panel / `/sa help` | r20; TOC load order fix | done |
+| Advisor panel / `/sa help` | r21; TOC load order fix | done |
+| Advisor party + corpse blips | r21 minimap/worldmap (cyan party / white ghost / purple corpse); `/sa crew` | done |
+| Corpse-run policy | hop legs + lateral detour in escort/shadow; live ghosts still nav-stuck NE of GY | **0** |
+| Defensive combat | escort nearest-attackable when in combat without focus | done |
 
-## Cast (do not expand without asking)
+## Cast (5-man)
 
 | Role | Name | Seat |
 |------|------|------|
-| Human | Murist | classic client `make play-classic` |
-| Bot | Shadowfel | slot 2 / `:41116` — `make warlock-bot` / `warlock-bot-fork` |
-| Bot | Igris | slot 3 / `:41117` — `make igris-bot` |
+| Human (leader) | Murist | classic client `make play-classic` |
+| DPS | Shadowfel | slot 2 / `:41116` — `make warlock-bot` / `warlock-bot-fork` |
+| DPS | Igris | slot 3 / `:41117` — `make igris-bot` |
+| Tank | Tusk | slot 4 / `:41118` — `make tusk-bot` |
+| Healer | Beru | slot 5 / `:41119` — `make beru-bot` |
 
-Out of scope today: Botwarrior, Botpriest, Botmage, etc.
+Bring-up: `make party-army` (accounts + 4 headless seats), wait for
+`:41116`–`:41119`, then `make escort-army`. Invite order from Murist:
+Shadowfel, Igris, Tusk, Beru.
+
+Foundation seats (Botwarrior/Botpriest) stay out of this cast.
 
 ---
 

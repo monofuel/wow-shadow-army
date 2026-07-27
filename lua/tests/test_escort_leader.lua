@@ -27,9 +27,129 @@ local leader_near = { id = 2, x = 3, y = 0, visible = true, assistable = true }
 local leader_far = { id = 2, x = 40, y = 0, visible = true, assistable = true }
 local me = { x = 0, y = 0 }
 
+-- Alive with no self still nil (legacy).
 check(tool.decide({}, nil) == nil, "nil without self")
 local r = tool.decide(frame(me, nil))
 check(r.kind == "hold" and r.reason == "leader_not_visible", "hold when leaderless")
+
+-- Dead (not ghost): release_spirit when allowed.
+r = tool.decide({
+  self_unit = me,
+  party = { leader_unit = leader_near },
+  combat = { casts = {}, mana_pct = 0, health_pct = 0, attackable = {} },
+  death = {
+    is_dead = true,
+    is_ghost = false,
+    can_release_spirit = true,
+    can_reclaim_corpse = false,
+    can_reclaim_action = false,
+    can_move = false,
+    corpse_known = false,
+  },
+})
+check(r.kind == "release_spirit", "dead selects release_spirit")
+
+-- Dead but release not masked: hold waiting.
+r = tool.decide({
+  self_unit = me,
+  party = { leader_unit = leader_near },
+  combat = { casts = {}, mana_pct = 0, health_pct = 0, attackable = {} },
+  death = {
+    is_dead = true,
+    is_ghost = false,
+    can_release_spirit = false,
+    can_reclaim_corpse = false,
+    can_reclaim_action = false,
+    can_move = false,
+    corpse_known = false,
+  },
+})
+check(r.kind == "hold" and r.reason == "dead_waiting_release", "dead holds without release mask")
+
+-- Ghost + reclaim ready.
+r = tool.decide({
+  self_unit = me,
+  party = { leader_unit = leader_near },
+  combat = { casts = {}, mana_pct = 0, health_pct = 0, attackable = {} },
+  death = {
+    is_dead = false,
+    is_ghost = true,
+    can_release_spirit = false,
+    can_reclaim_corpse = true,
+    can_reclaim_action = true,
+    can_move = true,
+    corpse_known = true,
+    corpse = { map_id = 0, x = 1, y = 2, z = 3 },
+  },
+})
+check(r.kind == "reclaim_corpse", "ghost reclaim when ready")
+
+-- Ghost not reclaimable: hop toward corpse when far (avoids long blocked moves).
+r = tool.decide({
+  self_unit = { x = 1965, y = 1729, z = 94, map_id = 0 },
+  party = { leader_unit = leader_near },
+  combat = { casts = {}, mana_pct = 0, health_pct = 0, attackable = {} },
+  death = {
+    is_dead = false,
+    is_ghost = true,
+    can_release_spirit = false,
+    can_reclaim_corpse = false,
+    can_reclaim_action = false,
+    can_move = true,
+    corpse_known = true,
+    corpse = { map_id = 0, x = 2040, y = 1840, z = 106 },
+  },
+})
+check(r.kind == "move_to_corpse", "ghost moves toward corpse")
+check(r.reason == "move_to_corpse_hop", "far corpse uses hop")
+check(r.x > 1965 and r.x < 2040, "hop x between self and corpse")
+check(r.y > 1729 and r.y < 1840, "hop y between self and corpse")
+
+-- Ghost close to corpse: go to body directly.
+r = tool.decide({
+  self_unit = { x = 2035, y = 1835, z = 105, map_id = 0 },
+  party = { leader_unit = leader_near },
+  combat = { casts = {}, mana_pct = 0, health_pct = 0, attackable = {} },
+  death = {
+    is_dead = false,
+    is_ghost = true,
+    can_release_spirit = false,
+    can_reclaim_corpse = false,
+    can_reclaim_action = false,
+    can_move = true,
+    corpse_known = true,
+    corpse = { map_id = 0, x = 2040, y = 1840, z = 106 },
+  },
+})
+check(r.kind == "move_to_corpse" and r.x == 2040 and r.z == 106, "near corpse goes direct")
+check(r.reason == "move_to_corpse", "near corpse reason is direct")
+
+-- Ghost blocked (no corpse point, no reclaim): hold.
+r = tool.decide({
+  self_unit = me,
+  party = { leader_unit = leader_near },
+  combat = { casts = {}, mana_pct = 0, health_pct = 0, attackable = {} },
+  death = {
+    is_dead = false,
+    is_ghost = true,
+    can_release_spirit = false,
+    can_reclaim_corpse = false,
+    can_reclaim_action = false,
+    can_move = false,
+    corpse_known = false,
+  },
+})
+check(r.kind == "hold" and r.reason == "ghost_waiting_corpse", "ghost holds when blocked")
+
+-- Death intents beat escort even with leader missing.
+r = tool.decide({
+  death = {
+    is_dead = true,
+    is_ghost = false,
+    can_release_spirit = true,
+  },
+})
+check(r.kind == "release_spirit", "release without leader/self")
 
 -- Focused + bolt: cast even when slightly far of "near" if within combat rejoin
 -- (40yd is still rejoin — cast only when we don't rejoin first). At 40yd with
@@ -147,10 +267,10 @@ r = tool.decide(frame(
 check(r.kind == "move_to_unit" and r.z == 132, "crypt vertical rejoin has z dest")
 check(r.reason and tostring(r.reason):find("vertical", 1, true), "vertical rejoin reason")
 
--- Same floor with z known: stock follow (no frozen xyz) so bots track live.
+-- Same floor with z: always destination rejoin (stock follow sticks on WMO).
 r = tool.decide(frame(
   { x = 1650, y = 1670, z = 120.5, map_id = 0 },
-  { id = 2, x = 1670, y = 1670, z = 120.6, map_id = 0, visible = true, assistable = true },
+  { id = 2, x = 1660, y = 1670, z = 120.6, map_id = 0, visible = true, assistable = true },
   {
     in_combat = false,
     mana_pct = 100,
@@ -161,8 +281,42 @@ r = tool.decide(frame(
     casts = {},
   }
 ))
-check(r.kind == "move_to_unit" and r.z == nil, "same-floor rejoin is follow not dest")
+check(r.kind == "move_to_unit" and r.z ~= nil, "same-floor rejoin uses dest when z known")
 check(r.unit_id == 2, "same-floor rejoin targets leader unit")
+check(r.reason and tostring(r.reason):find("dest", 1, true), "dest reason tag")
+
+-- Urgent/far: destination.
+r = tool.decide(frame(
+  { x = 1650, y = 1670, z = 120.5, map_id = 0 },
+  { id = 2, x = 1750, y = 1670, z = 120.6, map_id = 0, visible = true, assistable = true },
+  {
+    in_combat = false,
+    mana_pct = 100,
+    health_pct = 100,
+    focus_guid = "0",
+    auto_attack_guid = "0",
+    attackable = {},
+    casts = {},
+  }
+))
+check(r.kind == "move_to_unit" and r.z ~= nil, "urgent far rejoin uses dest")
+check(r.reason and tostring(r.reason):find("urgent", 1, true), "urgent dest reason")
+
+-- No leader z: stock follow (no xyz on intent).
+r = tool.decide(frame(
+  { x = 0, y = 0 },
+  { id = 2, x = 40, y = 0, visible = true, assistable = true },
+  {
+    in_combat = false,
+    mana_pct = 100,
+    health_pct = 100,
+    focus_guid = "0",
+    auto_attack_guid = "0",
+    attackable = {},
+    casts = {},
+  }
+))
+check(r.kind == "move_to_unit" and r.z == nil, "no-z rejoin is stock follow")
 
 -- OOM: Shoot over dagger.
 r = tool.decide(frame(me, leader_near, {
@@ -190,7 +344,7 @@ r = tool.decide(frame(me, leader_near, {
 }))
 check(r.kind == "attack_unit" and r.reason == "dagger_oom_only", "dagger only when oom")
 
--- No focus: assist.
+-- In combat, no focus: assist once when attackable empty.
 r = tool.decide(frame(me, leader_near, {
   in_combat = true,
   mana_pct = 80,
@@ -200,7 +354,37 @@ r = tool.decide(frame(me, leader_near, {
   attackable = {},
   casts = {},
 }))
-check(r.kind == "assist_unit" and r.unit_id == 2, "assist without focus")
+check(r.kind == "assist_unit" and r.unit_id == 2, "assist without focus when in combat")
+
+-- Defensive: in combat, no focus, but attackable hostiles — bolt nearest.
+r = tool.decide(frame(me, leader_near, {
+  in_combat = true,
+  mana_pct = 80,
+  health_pct = 90,
+  focus_guid = "0",
+  auto_attack_guid = "0",
+  attackable = {
+    { id = 9, guid = "90", x = 50, y = 0 },
+    { id = 5, guid = "50", x = 5, y = 0 },
+  },
+  casts = {
+    { target = 5, spell = 22, name = "Shadow Bolt", spell_id = 686 },
+    { target = 9, spell = 22, name = "Shadow Bolt", spell_id = 686 },
+  },
+}))
+check(r.kind == "cast_spell" and r.unit_id == 5, "defensive picks nearest attackable")
+
+-- OOC in formation: HOLD — never spam assist (was freezing follow + chat).
+r = tool.decide(frame(me, leader_near, {
+  in_combat = false,
+  mana_pct = 80,
+  health_pct = 90,
+  focus_guid = "0",
+  auto_attack_guid = "0",
+  attackable = {},
+  casts = {},
+}))
+check(r.kind == "hold" or r.kind == "cast_spell", "OOC in formation does not assist-spam")
 
 -- Life Tap when dry.
 r = tool.decide(frame(me, leader_near, {

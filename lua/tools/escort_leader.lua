@@ -4,14 +4,15 @@
 -- last resort only when truly out of mana and Shoot is not offered.
 --
 -- Priority (each decide):
+--   0. Death recovery (release / hop-to-corpse / reclaim) — never combat while dead.
 --   1. Life Tap when mana is critical and HP allows.
---   2. Combat target: warlock rotation from cast mask (never skip cast for
---      rejoin if we can cast on focus).
---   3. Any Shadow Bolt / offensive cast offered on any hostile.
---   4. Assist leader if we still have no focus.
---   5. Rejoin formation only when not mid-cast-cycle on a focus.
---   6. OOM: Shoot, then dagger only if still no ranged option.
---   7. OOC: Demon Skin / Demon Armor.
+--   2. Cast warlock rotation on a *hostile* focus (never self/party).
+--      Defensive: if in combat with no focus, pick nearest attackable.
+--   3. Rejoin formation when out of near band (destination when z known).
+--   4. Assist leader ONLY when in combat and we lack a hostile focus.
+--      Never spam assist OOC (was freezing follow + chat spam).
+--   5. OOM: Shoot, then dagger only if still no ranged option.
+--   6. OOC: Demon Skin / Demon Armor, else hold.
 --
 -- Cast list from projection combat.casts (masked only). Coupling isolation:
 -- field names owned by brain/frame_projection.py.
@@ -26,6 +27,10 @@ local LIFE_TAP_MANA = 18.0
 local LIFE_TAP_MIN_HP = 40.0
 -- Below this: prefer wand/dagger over spending for SB.
 local OOM_MANA = 8.0
+-- Corpse runs: never emit a single long direct move to the body (mountain /
+-- cave deaths). Brain/shadow rewrites destinations onto a multi-leg
+-- Detour/anchor corridor; Lua only names the body so reclaim/hop reasons stay.
+local CORPSE_HOP = 22.0
 
 local DOT_PRIORITY = {
   "curse of agony",
@@ -52,10 +57,10 @@ local function has_z(u)
   return u and u.z ~= nil
 end
 
--- Same floor: stock `follow` (unit-tracking). Destination `move` freezes a
--- world point from the decision frame, so bots chase where the leader *was*
--- (~cadence lag). Only pin x/y/z when floors diverge — stock follow fails
--- there with "client terrain floor diverges"; navmesh destination works.
+-- Prefer destination `move` whenever we have leader z. Stock `follow` settles
+-- "ok / observed no movement" or dies on WMO floor-diverge while the bot
+-- never walks. Point-move lag (~cadence) is better than standing still.
+-- Stock follow only if leader has no z (fallback).
 local VERTICAL_DEST_DZ = 2.5
 
 local function rejoin_intent(leader, me, near, far, d2, reason)
@@ -67,24 +72,31 @@ local function rejoin_intent(leader, me, near, far, d2, reason)
     urgent = urgent,
     reason = reason or "rejoin_formation",
   }
-  local need_dest = false
-  if has_z(leader) and me and has_z(me) then
+  if not has_z(leader) then
+    return intent
+  end
+  intent.x = leader.x
+  intent.y = leader.y
+  intent.z = leader.z
+  if leader.map_id ~= nil then
+    intent.map_id = leader.map_id
+  elseif me and me.map_id ~= nil then
+    intent.map_id = me.map_id
+  else
+    intent.map_id = 0
+  end
+  local vertical = false
+  if me and has_z(me) then
     local dz = leader.z - me.z
     if dz < 0 then dz = -dz end
-    need_dest = dz > VERTICAL_DEST_DZ
+    vertical = dz > VERTICAL_DEST_DZ
   end
-  if need_dest then
-    intent.x = leader.x
-    intent.y = leader.y
-    intent.z = leader.z
-    if leader.map_id ~= nil then
-      intent.map_id = leader.map_id
-    elseif me.map_id ~= nil then
-      intent.map_id = me.map_id
-    else
-      intent.map_id = 0
-    end
+  if vertical then
     intent.reason = (reason or "rejoin_formation") .. "_vertical"
+  elseif urgent then
+    intent.reason = (reason or "rejoin_formation") .. "_urgent_dest"
+  else
+    intent.reason = (reason or "rejoin_formation") .. "_dest"
   end
   return intent
 end
@@ -202,6 +214,63 @@ local function any_offensive(casts)
   return nil
 end
 
+-- Ghost corpse run: hop toward the body instead of one long blocked move.
+local function ghost_corpse_move(me, corpse)
+  local cx = corpse.x
+  local cy = corpse.y
+  local cz = corpse.z or 0
+  local map_id = corpse.map_id or 0
+  if not me or me.x == nil or me.y == nil then
+    return {
+      kind = "move_to_corpse",
+      map_id = map_id,
+      x = cx, y = cy, z = cz,
+      reason = "move_to_corpse",
+    }
+  end
+  local dx = cx - me.x
+  local dy = cy - me.y
+  local d = math.sqrt(dx * dx + dy * dy)
+  if d <= CORPSE_HOP + 2.0 then
+    return {
+      kind = "move_to_corpse",
+      map_id = map_id,
+      x = cx, y = cy, z = cz,
+      reason = "move_to_corpse",
+    }
+  end
+  local scale = CORPSE_HOP / d
+  local mx = me.z or cz
+  return {
+    kind = "move_to_corpse",
+    map_id = map_id,
+    x = me.x + dx * scale,
+    y = me.y + dy * scale,
+    z = mx + (cz - mx) * scale,
+    reason = "move_to_corpse_hop",
+  }
+end
+
+-- Defensive: nearest attackable hostile (2d). Used when fighting with no focus.
+local function nearest_attackable(me, attackable)
+  if not attackable then return nil end
+  local best, best_d2 = nil, nil
+  for i = 1, #attackable do
+    local u = attackable[i]
+    if u and u.id and u.id > 0 then
+      if me and u.x ~= nil and u.y ~= nil and me.x ~= nil and me.y ~= nil then
+        local d2 = dist2(me, u)
+        if best_d2 == nil or d2 < best_d2 then
+          best, best_d2 = u, d2
+        end
+      elseif best == nil then
+        best = u
+      end
+    end
+  end
+  return best
+end
+
 return registry.register({
   name = "escort_leader",
   when = "In party with a human leader: keep formation and ranged-DPS their target.",
@@ -215,15 +284,32 @@ return registry.register({
     local casts = combat.casts or {}
     local mana = combat.mana_pct or 100
     local hp = combat.health_pct or 100
+    local death = frame.death or {}
+
+    -- Death recovery FIRST (fair-play only). Never assist/cast while dead/ghost.
+    if death.is_dead and not death.is_ghost then
+      if death.can_release_spirit then
+        return { kind = "release_spirit", reason = "release_spirit" }
+      end
+      return { kind = "hold", reason = "dead_waiting_release" }
+    end
+    if death.is_ghost then
+      if death.can_reclaim_corpse and death.can_reclaim_action then
+        return { kind = "reclaim_corpse", reason = "reclaim_corpse" }
+      end
+      local corpse = death.corpse
+      if death.can_move and corpse and corpse.x ~= nil and corpse.y ~= nil then
+        return ghost_corpse_move(me, corpse)
+      end
+      return { kind = "hold", reason = "ghost_waiting_corpse" }
+    end
 
     if not me then return nil end
     if not leader or not leader.visible then
       return { kind = "hold", reason = "leader_not_visible" }
     end
 
-    -- Resolve combat target early so we can cast before walking.
-    -- Only trust focus_id when we still have casts or attack mask on it
-    -- (stale focus after a kill was freezing us on wait_cast_mask forever).
+    -- Hostile focus only (projection should strip self; double-check via attackable).
     local prefer = combat.auto_attack_guid
     if not guid_nonzero(prefer) then
       prefer = combat.focus_guid
@@ -232,19 +318,43 @@ return registry.register({
     local target_id = focused and focused.id or nil
     if (not target_id or target_id == 0) and combat.focus_id and combat.focus_id > 0 then
       local fid = combat.focus_id
-      local has_cast = any_offensive_on_target(casts, fid) ~= nil
       local still_attackable = false
       for i = 1, #(combat.attackable or {}) do
         local u = combat.attackable[i]
         if u and u.id == fid then
           still_attackable = true
+          target_id = fid
+          focused = u
           break
         end
       end
-      if has_cast or still_attackable or combat.in_combat then
-        target_id = fid
+      if not still_attackable then
+        -- Stale focus_id (self/party/corpse): ignore.
+        target_id = nil
       end
     end
+
+    -- Basic defensive combat: if we are in combat with no usable focus, take
+    -- the nearest attackable hostile so DoTs/bolts fire without waiting on
+    -- assist packet churn.
+    if (not target_id or target_id == 0) and combat.in_combat then
+      local near_h = nearest_attackable(me, combat.attackable)
+      if near_h then
+        focused = near_h
+        target_id = near_h.id
+      end
+    end
+
+    local d2 = dist2(me, leader)
+    local dz = 0
+    if has_z(me) and has_z(leader) then
+      dz = leader.z - me.z
+      if dz < 0 then dz = -dz end
+    end
+    local fighting = combat.in_combat or (target_id and target_id > 0)
+    local rejoin_limit = fighting and COMBAT_REJOIN or near
+    local need_rejoin = (d2 > rejoin_limit * rejoin_limit) or (dz > 2.5)
+        or (d2 > near * near and not fighting)
 
     -- Life Tap before everything else when dry (not a dagger problem).
     if mana < LIFE_TAP_MANA and hp >= LIFE_TAP_MIN_HP then
@@ -266,52 +376,14 @@ return registry.register({
       end
     end
 
-    -- NO free-fire on random hostiles (shadow_bolt_any pulled rats).
-    -- Only leader-mirrored focus / auto-attack target above.
-
-    -- No cast this frame but we have mana: re-acquire target, do NOT dagger.
-    if mana >= OOM_MANA then
-      local d2 = dist2(me, leader)
-      local fighting = combat.in_combat or (target_id and target_id > 0)
-      local rejoin_limit = fighting and COMBAT_REJOIN or near
-      -- Vertical separation counts as "far" even when 2D is small (crypt).
-      local dz = 0
-      if has_z(me) and has_z(leader) then
-        dz = leader.z - me.z
-        if dz < 0 then dz = -dz end
-      end
-      if d2 > rejoin_limit * rejoin_limit or dz > 2.5 then
-        return rejoin_intent(leader, me, near, far, d2, "rejoin_formation")
-      end
-      if d2 > near * near then
-        return rejoin_intent(leader, me, near, far, d2, "rejoin_formation")
-      end
-      -- Focus/GCD with no cast: re-assist to refresh target, never freeze.
-      if target_id and target_id > 0 and leader.assistable then
-        return {
-          kind = "assist_unit",
-          unit_id = leader.id,
-          reason = "refresh_target",
-        }
-      end
-      if not combat.in_combat then
-        local buff = pick_self_cast(casts, BUFF_PRIORITY)
-        if buff then
-          return cast_intent(buff, "self_buff")
-        end
-      end
-      if (not target_id or target_id == 0) and leader.assistable then
-        return {
-          kind = "assist_unit",
-          unit_id = leader.id,
-          reason = "mirror_leader_target",
-        }
-      end
-      return { kind = "hold", reason = "in_formation" }
+    -- Rejoin BEFORE assist. Assist spam was freezing bots in place and
+    -- flooding /say with "external factorized policy action".
+    if need_rejoin then
+      return rejoin_intent(leader, me, near, far, d2, "rejoin_formation")
     end
 
-    -- === Truly OOM: wand on focus only, then dagger only ===
-    if target_id and target_id > 0 then
+    -- === Truly OOM while on a hostile: wand then dagger ===
+    if mana < OOM_MANA and target_id and target_id > 0 then
       local wand = pick_cast(casts, target_id, WAND_PRIORITY)
       if wand then
         return cast_intent(wand, "wand_oom")
@@ -325,12 +397,19 @@ return registry.register({
       end
     end
 
-    if leader.assistable then
-      return {
-        kind = "assist_unit",
-        unit_id = leader.id,
-        reason = "mirror_leader_target",
-      }
+    -- Mirror leader target when we lack a hostile focus.
+    -- - in_combat: always try assist
+    -- - OOC but cast mask offers offensive spells: leader likely has/had a
+    --   pull in range — assist to acquire (not free-fire cast).
+    -- Brain throttles OOC assist so we don't chat-spam on empty target.
+    if (not target_id or target_id == 0) and leader.assistable then
+      if combat.in_combat or any_offensive(casts) ~= nil then
+        return {
+          kind = "assist_unit",
+          unit_id = leader.id,
+          reason = combat.in_combat and "mirror_leader_target" or "mirror_leader_ooc",
+        }
+      end
     end
 
     if not combat.in_combat then
@@ -338,16 +417,6 @@ return registry.register({
       if buff then
         return cast_intent(buff, "self_buff")
       end
-    end
-
-    local d2 = dist2(me, leader)
-    local dz = 0
-    if has_z(me) and has_z(leader) then
-      dz = leader.z - me.z
-      if dz < 0 then dz = -dz end
-    end
-    if d2 > near * near or dz > 2.5 then
-      return rejoin_intent(leader, me, near, far, d2, "rejoin_formation")
     end
 
     return { kind = "hold", reason = "in_formation" }

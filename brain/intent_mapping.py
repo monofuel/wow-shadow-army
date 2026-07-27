@@ -165,6 +165,43 @@ def map_intent(
             reason=str(intent.get("reason") or "accept_party"),
         )
 
+    if kind == "release_spirit":
+        return MappedAction(
+            kind="release_spirit",
+            target=0,
+            skip=False,
+            reason=str(intent.get("reason") or "release_spirit"),
+        )
+
+    if kind == "reclaim_corpse":
+        return MappedAction(
+            kind="reclaim_corpse",
+            target=0,
+            skip=False,
+            reason=str(intent.get("reason") or "reclaim_corpse"),
+        )
+
+    if kind == "move_to_corpse":
+        if (
+            intent.get("x") is None
+            or intent.get("y") is None
+            or intent.get("z") is None
+        ):
+            return MappedAction(kind=None, skip=True, reason="move_to_corpse_missing_xyz")
+        dest = {
+            "map_id": float(intent.get("map_id") or 0),
+            "x": float(intent["x"]),
+            "y": float(intent["y"]),
+            "z": float(intent["z"]),
+        }
+        return MappedAction(
+            kind="move",
+            target=0,
+            destination=dest,
+            skip=False,
+            reason=str(intent.get("reason") or "move_to_corpse"),
+        )
+
     return MappedAction(kind=None, skip=True, reason=f"unknown_intent:{kind}")
 
 
@@ -182,6 +219,8 @@ def mapped_to_factorized_kwargs(mapped: MappedAction) -> Optional[dict[str, Any]
         }
     if mapped.kind == "accept_party":
         return {"kind": "accept_party"}
+    if mapped.kind in ("release_spirit", "reclaim_corpse"):
+        return {"kind": mapped.kind}
     if mapped.kind == "move":
         assert mapped.destination is not None
         return {

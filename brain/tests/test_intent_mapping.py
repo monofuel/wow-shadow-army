@@ -123,6 +123,39 @@ class TestMapIntent(unittest.TestCase):
         self.assertEqual(kwargs["kind"], "move")
         self.assertEqual(kwargs["destination"]["z"], 132.0)
 
+    def test_release_spirit(self):
+        m = map_intent({"kind": "release_spirit", "reason": "release_spirit"})
+        self.assertFalse(m.skip)
+        self.assertEqual(m.kind, "release_spirit")
+        self.assertEqual(
+            mapped_to_factorized_kwargs(m),
+            {"kind": "release_spirit"},
+        )
+
+    def test_reclaim_corpse(self):
+        m = map_intent({"kind": "reclaim_corpse"})
+        self.assertFalse(m.skip)
+        self.assertEqual(m.kind, "reclaim_corpse")
+        self.assertEqual(mapped_to_factorized_kwargs(m), {"kind": "reclaim_corpse"})
+
+    def test_move_to_corpse(self):
+        m = map_intent(
+            {
+                "kind": "move_to_corpse",
+                "map_id": 0,
+                "x": 2040.0,
+                "y": 1840.0,
+                "z": 106.0,
+                "reason": "move_to_corpse",
+            }
+        )
+        self.assertFalse(m.skip)
+        self.assertEqual(m.kind, "move")
+        self.assertEqual(m.destination["x"], 2040.0)
+        kwargs = mapped_to_factorized_kwargs(m)
+        self.assertEqual(kwargs["kind"], "move")
+        self.assertEqual(kwargs["destination"]["y"], 1840.0)
+
 
 if __name__ == "__main__":
     unittest.main()

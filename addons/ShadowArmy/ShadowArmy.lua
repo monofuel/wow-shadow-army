@@ -8,7 +8,7 @@ ShadowArmy = ShadowArmy or {}
 
 -- Bump on every edit. The System watches Chat.log for "<SA> loaded rev=..."
 -- after sending a reload — a new rev proves the edit actually loaded.
-local REV = "r20"
+local REV = "r21"
 
 -- Log window (r16): every say()/emit() line also lands here with a
 -- timestamp, so errors survive chat scroll-off and can be reviewed in-game.
@@ -1913,6 +1913,248 @@ questEvents:SetScript("OnEvent", function()
   if not ok then emit("err", "questMarkers: " .. tostring(err)) end
 end)
 
+--------------------------------------------------------------------------
+-- CREW / CORPSE BLIPS (r21): party members + own corpse on minimap + world
+-- map. Independent of the quest helper — corpse runs still need a compass
+-- when quests are toggled off.
+--
+-- APIs (vanilla 1.12):
+--   GetPlayerMapPosition("party1".."party4") — unit map % (0,0 = unknown /
+--     other zone / map pointed elsewhere). Same zone gate as quest.posOK.
+--   GetCorpseMapPosition() — own corpse map % while a corpse exists; 0,0
+--     when none / wrong map surface (same contract as FrameXML proof).
+-- Party *corpses* while they ghost elsewhere are NOT exposed by the client;
+-- their ghost unit position is, which is what you need to find them mid-run.
+--------------------------------------------------------------------------
+
+local CREW_TICK_EVERY = 0.25
+local CREW_MAX_PARTY = 4
+
+local crew = {
+  enabled = true,
+  nextTickAt = 0,
+  nextMarkerAt = 0,
+  px = 0, py = 0, posOK = false,
+  spots = {}, -- { x, y, kind = "party"|"party_ghost"|"corpse", name? }
+}
+
+local function crewPosition()
+  -- Reuse quest map-fix so we never paint on a browsed foreign zone.
+  if quest.posOK then
+    crew.px, crew.py, crew.posOK = quest.px, quest.py, true
+    return true
+  end
+  local x, y = GetPlayerMapPosition("player")
+  if (not x) or (x == 0 and y == 0) then
+    if not (WorldMapFrame and WorldMapFrame:IsVisible()) then
+      pcall(SetMapToCurrentZone)
+      x, y = GetPlayerMapPosition("player")
+    end
+  end
+  if (not x) or (x == 0 and y == 0) then
+    crew.posOK = false
+    return false
+  end
+  crew.px, crew.py, crew.posOK = x * 100, y * 100, true
+  return true
+end
+
+local function crewScan()
+  crew.spots = {}
+  if not crew.posOK then return end
+  local n = 0
+  -- Own corpse first so it always wins a slot if we ever cap.
+  if type(GetCorpseMapPosition) == "function" then
+    local cx, cy = GetCorpseMapPosition()
+    if cx and cy and not (cx == 0 and cy == 0) then
+      n = n + 1
+      crew.spots[n] = {
+        x = cx * 100, y = cy * 100, kind = "corpse", name = "corpse",
+      }
+    end
+  end
+  local i = 1
+  while i <= CREW_MAX_PARTY do
+    local unit = "party" .. i
+    if UnitExists and UnitExists(unit) then
+      local ux, uy = GetPlayerMapPosition(unit)
+      if ux and uy and not (ux == 0 and uy == 0) then
+        local ghost = false
+        if UnitIsGhost and UnitIsGhost(unit) then
+          ghost = true
+        elseif UnitIsDeadOrGhost and UnitIsDeadOrGhost(unit) then
+          ghost = true
+        end
+        n = n + 1
+        crew.spots[n] = {
+          x = ux * 100, y = uy * 100,
+          kind = ghost and "party_ghost" or "party",
+          name = (UnitName and UnitName(unit)) or unit,
+        }
+      end
+    end
+    i = i + 1
+  end
+end
+
+local function crewPlaceMinimap(t, sx, sy)
+  if not Minimap then return false end
+  local radius = QUEST_MINIMAP_RADIUS[Minimap:GetZoom() or 0] or 200.0
+  local halfW = Minimap:GetWidth() / 2
+  local halfH = Minimap:GetHeight() / 2
+  local rim = halfW - 4
+  local ox = (sx - crew.px) / 100 * QUEST_ZONE_YARDS_X / radius * halfW
+  local oy = -((sy - crew.py) / 100 * QUEST_ZONE_YARDS_Y) / radius * halfH
+  local m = math.sqrt(ox * ox + oy * oy)
+  if m > rim and m > 0 then
+    ox, oy = ox / m * rim, oy / m * rim
+  end
+  t:ClearAllPoints()
+  t:SetPoint("CENTER", Minimap, "CENTER", ox, oy)
+  return true
+end
+
+local crewBlips = {}
+local function crewBlip(i)
+  local t = crewBlips[i]
+  if t then return t end
+  t = Minimap:CreateTexture(nil, "OVERLAY")
+  t:SetWidth(8)
+  t:SetHeight(8)
+  t:Hide()
+  crewBlips[i] = t
+  return t
+end
+
+local function crewDrawBlips()
+  if not Minimap then return end
+  local show = crew.enabled and crew.posOK
+  local max = CREW_MAX_PARTY + 1 -- party + corpse
+  local i = 1
+  while i <= max do
+    local s = crew.spots[i]
+    local t = crewBlip(i)
+    if show and s and crewPlaceMinimap(t, s.x, s.y) then
+      if s.kind == "corpse" then
+        t:SetWidth(10)
+        t:SetHeight(10)
+        t:SetTexture(0.85, 0.30, 1.00, 0.95) -- purple: body
+      elseif s.kind == "party_ghost" then
+        t:SetWidth(8)
+        t:SetHeight(8)
+        t:SetTexture(0.95, 0.95, 1.00, 0.95) -- white: ghost on corpse run
+      else
+        t:SetWidth(8)
+        t:SetHeight(8)
+        t:SetTexture(0.25, 0.85, 1.00, 0.95) -- cyan: living party
+      end
+      t:Show()
+    else
+      t:Hide()
+    end
+    i = i + 1
+  end
+end
+
+local crewMarkers = {}
+local function crewMarker(i)
+  local t = crewMarkers[i]
+  if t then return t end
+  t = WorldMapDetailFrame:CreateTexture(nil, "OVERLAY")
+  t:SetWidth(12)
+  t:SetHeight(12)
+  t:Hide()
+  crewMarkers[i] = t
+  return t
+end
+
+local function crewDrawMarkers()
+  if not WorldMapDetailFrame then return end
+  local show = crew.enabled and crew.posOK
+    and WorldMapFrame and WorldMapFrame:IsVisible()
+  local w = WorldMapDetailFrame:GetWidth()
+  local h = WorldMapDetailFrame:GetHeight()
+  local max = CREW_MAX_PARTY + 1
+  local i = 1
+  while i <= max do
+    local s = crew.spots[i]
+    local t = crewMarker(i)
+    if show and s then
+      t:ClearAllPoints()
+      t:SetPoint("CENTER", WorldMapDetailFrame, "TOPLEFT",
+        s.x / 100 * w, -(s.y / 100 * h))
+      if s.kind == "corpse" then
+        t:SetTexture(0.85, 0.30, 1.00, 0.95)
+      elseif s.kind == "party_ghost" then
+        t:SetTexture(0.95, 0.95, 1.00, 0.95)
+      else
+        t:SetTexture(0.25, 0.85, 1.00, 0.95)
+      end
+      t:Show()
+    else
+      t:Hide()
+    end
+    i = i + 1
+  end
+end
+
+-- Panel line when ghosting: bearing/yards to own corpse (quest line yields).
+local function corpseLineText()
+  if not (UnitIsGhost and UnitIsGhost("player")) then return nil end
+  if not crew.posOK then return "|cFFBB88FF corpse: map off-zone|r" end
+  local s = nil
+  local i = 1
+  while crew.spots[i] do
+    if crew.spots[i].kind == "corpse" then s = crew.spots[i] break end
+    i = i + 1
+  end
+  if not s then return "|cFFBB88FF corpse: not on this map|r" end
+  local dx = s.x - crew.px
+  local dy = s.y - crew.py
+  local dir = questBearing(dx, dy)
+  local yards = math.floor(questYards(dx, dy) + 0.5)
+  return string.format("|cFFD080FF>> CORPSE|r |cFFAAAAAA%s ~%dy %s|r",
+    "\194\183", yards, dir)
+end
+
+local function crewTick()
+  if not crew.enabled then return end
+  local now = GetTime()
+  if now < crew.nextTickAt then return end
+  crew.nextTickAt = now + CREW_TICK_EVERY
+  -- Keep map fixed when quests are off (questTick is the usual fixer).
+  if quest.enabled then
+    if quest.posOK then
+      crew.px, crew.py, crew.posOK = quest.px, quest.py, true
+    else
+      crewPosition()
+    end
+  else
+    crewPosition()
+  end
+  crewScan()
+  crewDrawBlips()
+  crewDrawMarkers()
+end
+
+local crewEvents = CreateFrame("Frame", "ShadowArmyCrewEvents", UIParent)
+crewEvents:RegisterEvent("WORLD_MAP_UPDATE")
+crewEvents:RegisterEvent("PARTY_MEMBERS_CHANGED")
+crewEvents:RegisterEvent("PLAYER_DEAD")
+crewEvents:RegisterEvent("PLAYER_ALIVE")
+crewEvents:RegisterEvent("PLAYER_UNGHOST")
+crewEvents:SetScript("OnEvent", function()
+  if not crew.enabled then return end
+  crew.nextTickAt = 0
+  if event == "WORLD_MAP_UPDATE" then
+    local now = GetTime()
+    if now < crew.nextMarkerAt then return end
+    crew.nextMarkerAt = now + QUEST_MARKER_EVERY
+    local ok, err = pcall(crewDrawMarkers)
+    if not ok then emit("err", "crewMarkers: " .. tostring(err)) end
+  end
+end)
+
 
 -- Rotation driver lives on its OWN always-shown frame — NOT the panel.
 -- (OnUpdate only fires for visible frames; hiding the panel via /sa must
@@ -2041,6 +2283,11 @@ driver:SetScript("OnUpdate", function()
     local qok, qerr = pcall(questTick)
     if not qok then emit("err", "questTick: " .. tostring(qerr)) end
   end
+  -- r21: party + corpse blips (always on when crew.enabled).
+  if crew.enabled then
+    local cok, cerr = pcall(crewTick)
+    if not cok then emit("err", "crewTick: " .. tostring(cerr)) end
+  end
   if loot.active then lootTick() end
   if pendingReload > 0 then
     pendingReload = pendingReload - 1
@@ -2086,7 +2333,9 @@ panel:SetScript("OnUpdate", function()
   line3:SetText(t1)
   line4:SetText(t2)
   line5:SetText(buffWatchLine())
-  line6:SetText(questLineText())
+  -- Corpse-run compass wins the quest line while ghosting.
+  local corpseLine = corpseLineText()
+  line6:SetText(corpseLine or questLineText())
 end)
 
 --------------------------------------------------------------------------
@@ -2261,6 +2510,7 @@ local function saHelp()
   say("  /sa log        toggle advisor log window")
   say("  /sa bags       open ShadowBags")
   say("  /sa quests     toggle quest helper (map blips / objectives)")
+  say("  /sa crew       toggle party + corpse map blips")
   say("  /sa reload     ReloadUI() — pick up disk edits")
 end
 
@@ -2292,6 +2542,19 @@ SlashCmdList["SHADOWARMY"] = function(msg)
   if msg == "quests" then
     questSetEnabled(not quest.enabled)
     say("quest helper " .. (quest.enabled and "ON" or "OFF"))
+    return
+  end
+  if msg == "crew" then
+    crew.enabled = not crew.enabled
+    if not crew.enabled then
+      crew.spots = {}
+      pcall(crewDrawBlips)
+      pcall(crewDrawMarkers)
+    else
+      crew.nextTickAt = 0
+    end
+    say("crew blips " .. (crew.enabled and "ON" or "OFF")
+      .. " (party cyan / ghost white / corpse purple)")
     return
   end
   if msg == "log" then

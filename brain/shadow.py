@@ -49,6 +49,54 @@ def _safe_last_settlement(client: NimControlClient) -> Any:
     except Exception as exc:  # noqa: BLE001 — upstream ValidationError surface
         return {"error": f"settlement_decode: {exc}"}
 
+
+def _corpse_detour_destination(
+    self_loc: dict[str, float],
+    dest: dict[str, float],
+    *,
+    phase: int,
+    hop: float = 18.0,
+    side: float = 14.0,
+) -> Optional[dict[str, float]]:
+    """Nudge a stuck ghost off a blocked line toward the corpse.
+
+    phase 0/2: left/right of the toward-corpse vector
+    phase 1/3: reverse-ish backstep then side, to unstick wall hugging
+    """
+    import math
+
+    sx = float(self_loc["x"])
+    sy = float(self_loc["y"])
+    sz = float(self_loc.get("z") or dest.get("z") or 0.0)
+    dx = float(dest["x"]) - sx
+    dy = float(dest["y"]) - sy
+    d = math.hypot(dx, dy)
+    if d < 1.0:
+        return None
+    ux, uy = dx / d, dy / d
+    # Perpendicular (left = (-uy, ux)).
+    lx, ly = -uy, ux
+    p = int(phase) % 4
+    if p == 0:
+        ox, oy = lx * side, ly * side
+        fx, fy = ux * hop, uy * hop
+    elif p == 1:
+        ox, oy = -lx * side, -ly * side
+        fx, fy = ux * hop, uy * hop
+    elif p == 2:
+        ox, oy = lx * side, ly * side
+        fx, fy = -ux * (hop * 0.5), -uy * (hop * 0.5)
+    else:
+        ox, oy = -lx * side, -ly * side
+        fx, fy = -ux * (hop * 0.5), -uy * (hop * 0.5)
+    return {
+        "map_id": float(dest.get("map_id") or self_loc.get("map_id") or 0),
+        "x": sx + fx + ox,
+        "y": sy + fy + oy,
+        "z": float(dest.get("z") or sz),
+    }
+
+
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _DEFAULT_LOG_DIR = _REPO_ROOT / "local_data" / "brain-logs"
 
@@ -250,6 +298,17 @@ def run(args: argparse.Namespace) -> int:
                 return 2
 
             loop_i = 0
+            # Ghost corpse-run stuck recovery: after repeated movement_blocked,
+            # apply lateral detours around the hop line (WMO/terrain walls).
+            # Also skip stock recommended full-corpse moves when they settle ok
+            # but leave the ghost parked (false-success graph advances).
+            death_nav: dict[str, Any] = {
+                "fails": 0,
+                "phase": 0,
+                "skip_stock_rec": 0,
+                "last_xy": None,
+                "best_gap": None,
+            }
             while not stop["flag"]:
                 if args.max_seconds > 0 and (time.monotonic() - started) >= args.max_seconds:
                     print("[shadow] max-seconds reached", flush=True)
@@ -331,6 +390,139 @@ def run(args: argparse.Namespace) -> int:
                     }
                 if self_loc:
                     last_pos = dict(self_loc)
+
+                # Fair-play corpse run: while dead/ghost, prefer the stock
+                # recommended recovery action (release / move:corpse / reclaim /
+                # spirit healer). Selecting the exact recommended action inherits
+                # private nav lowering (step limits, overhead) that bare
+                # destination moves lack — needed when ghosts path WMO terrain.
+                obs = frame.observation
+                is_casualty = bool(getattr(obs, "is_dead", False) or getattr(obs, "is_ghost", False))
+                if is_casualty:
+                    row["casualty"] = {
+                        "is_dead": bool(getattr(obs, "is_dead", False)),
+                        "is_ghost": bool(getattr(obs, "is_ghost", False)),
+                        "can_reclaim": bool(getattr(obs, "can_reclaim_corpse", False)),
+                    }
+                    rec = frame.recommended_action
+                    death_kinds = {
+                        "release_spirit",
+                        "reclaim_corpse",
+                        "move",
+                        "spirit_healer_resurrect",
+                        "accept_resurrect",
+                    }
+                    skip_stock = int(death_nav.get("skip_stock_rec") or 0) > 0
+                    if skip_stock:
+                        death_nav["skip_stock_rec"] = max(
+                            0, int(death_nav.get("skip_stock_rec") or 0) - 1
+                        )
+                    use_stock = (
+                        not skip_stock
+                        and frame.action_ready
+                        and rec is not None
+                        and rec.kind in death_kinds
+                        and frame.allows_action(rec)
+                    )
+                    # Stock death "move" aims straight at the corpse (false
+                    # success on mountain). Skip stock *move*; fall through to
+                    # corridor-rewritten move_to_corpse. Keep stock reclaim/release.
+                    if use_stock and rec is not None and rec.kind == "move":
+                        use_stock = False
+                    if use_stock:
+                        try:
+                            client.select(
+                                ActionSelectionRequest(
+                                    action=rec,
+                                    frame_id=frame.frame_id,
+                                    observed_tick=frame.observed_tick,
+                                    expected_slot=args.slot,
+                                    expected_revision=frame.revision,
+                                )
+                            )
+                            settlement = _safe_last_settlement(client)
+                            row["intent"] = {
+                                "kind": rec.kind,
+                                "reason": "stock_death_recovery_recommended",
+                            }
+                            row["settlement"] = (
+                                settlement.model_dump()
+                                if isinstance(settlement, ActionSettled)
+                                else settlement
+                            )
+                            print(
+                                f"[shadow] #{loop_i} DEATH-REC {rec.kind} "
+                                f"settlement={row.get('settlement')} pos={self_loc}",
+                                flush=True,
+                            )
+                            if isinstance(settlement, ActionSettled) and rec.kind == "move":
+                                import math
+
+                                ok = bool(settlement.success)
+                                msg = str(settlement.message or "")
+                                code = str(settlement.reason_code or "")
+                                stuck_msg = (
+                                    "no adjacent route" in msg.lower()
+                                    or "no goal-relative" in msg.lower()
+                                    or "blocked" in code.lower()
+                                )
+                                # Gap-to-corpse is the truth — tiny oscillates look
+                                # like "moved" on xy deltas but never close the run.
+                                try:
+                                    frame2 = client.status(include_environment_frame=True)
+                                    loc2 = frame2.observation.location
+                                    cur_xy = (float(loc2.x), float(loc2.y))
+                                    cl = getattr(frame2.observation, "corpse_location", None)
+                                    if cl is not None and getattr(
+                                        frame2.observation, "corpse_known", False
+                                    ):
+                                        gap = math.hypot(
+                                            float(loc2.x) - float(cl.x),
+                                            float(loc2.y) - float(cl.y),
+                                        )
+                                    else:
+                                        gap = None
+                                except Exception:  # noqa: BLE001
+                                    cur_xy = (
+                                        (float(self_loc["x"]), float(self_loc["y"]))
+                                        if self_loc
+                                        else None
+                                    )
+                                    gap = None
+                                best = death_nav.get("best_gap")
+                                gap_improved = (
+                                    gap is not None
+                                    and (best is None or gap < float(best) - 2.0)
+                                )
+                                if gap_improved and gap is not None:
+                                    death_nav["best_gap"] = gap
+                                    death_nav["fails"] = 0
+                                elif (not ok) or stuck_msg or not gap_improved:
+                                    death_nav["fails"] = int(death_nav.get("fails") or 0) + 1
+                                    death_nav["phase"] = (
+                                        int(death_nav.get("phase") or 0) + 1
+                                    ) % 4
+                                    # Next ticks: skip stock, force hop/detour path.
+                                    death_nav["skip_stock_rec"] = 12
+                                    print(
+                                        f"[shadow] #{loop_i} death-rec stuck "
+                                        f"fails={death_nav['fails']} "
+                                        f"phase={death_nav['phase']} "
+                                        f"gap={gap} best={best} ok={ok}",
+                                        flush=True,
+                                    )
+                                if cur_xy is not None:
+                                    death_nav["last_xy"] = cur_xy
+                            elif rec.kind != "move":
+                                death_nav["fails"] = 0
+                        except NimControlRequestError as exc:
+                            row["select_error"] = str(exc)
+                            print(f"[shadow] #{loop_i} death-rec error: {exc}", flush=True)
+                            death_nav["skip_stock_rec"] = 4
+                        logger.write(row)
+                        time.sleep(args.cadence)
+                        continue
+                    # Fall through to Lua death intents (release / hop / reclaim).
 
                 # Invite accept beats escort: one standing process per seat
                 # (no separate party_butler fighting the same socket).
@@ -455,6 +647,76 @@ def run(args: argparse.Namespace) -> int:
                 mapped = intent_mapping.map_intent(
                     intent, prefer_move_destination=prefer_dest
                 )
+                # Ghost moves: rewrite destination onto multi-leg Detour/anchor
+                # corridor (around mountain → elevated approach → corpse). Never
+                # leave a bare long direct-to-corpse dest as the only plan.
+                if (
+                    is_casualty
+                    and mapped.kind == "move"
+                    and mapped.destination is not None
+                    and self_loc is not None
+                    and intent
+                    and str(intent.get("kind") or "")
+                    in ("move_to_corpse", "move_to_corpse_hop")
+                ):
+                    try:
+                        from brain.corpse_recovery_path import next_corridor_index
+                        from brain.navmesh_route import plan_corridor
+
+                        dest = mapped.destination
+                        corridor, cnote = plan_corridor(
+                            float(self_loc["x"]),
+                            float(self_loc["y"]),
+                            float(self_loc.get("z") or dest.get("z") or 0),
+                            float(dest["x"]),
+                            float(dest["y"]),
+                            float(dest["z"]),
+                            min_spacing=7.0,
+                        )
+                        if len(corridor) < 3:
+                            from brain.corpse_recovery_path import (
+                                anchor_corridor_to_corpse,
+                            )
+
+                            corridor = anchor_corridor_to_corpse(
+                                float(self_loc["x"]),
+                                float(self_loc["y"]),
+                                float(self_loc.get("z") or 0),
+                                float(dest["x"]),
+                                float(dest["y"]),
+                                float(dest["z"]),
+                            )
+                            cnote = "anchor_fallback"
+                        leg = next_corridor_index(
+                            float(self_loc["x"]),
+                            float(self_loc["y"]),
+                            corridor,
+                            0,
+                            arrive=6.0,
+                        )
+                        if leg >= len(corridor):
+                            leg = len(corridor) - 1
+                        wx, wy, wz = corridor[leg]
+                        mapped = intent_mapping.MappedAction(
+                            kind="move",
+                            target=0,
+                            destination={
+                                "map_id": float(dest.get("map_id") or 0),
+                                "x": float(wx),
+                                "y": float(wy),
+                                "z": float(wz),
+                            },
+                            skip=False,
+                            reason=f"corridor_leg_{leg}/{len(corridor)}",
+                        )
+                        row["corridor"] = {
+                            "leg": leg,
+                            "n": len(corridor),
+                            "note": cnote[:160],
+                            "dest": mapped.destination,
+                        }
+                    except Exception as exc:  # noqa: BLE001
+                        row["corridor_error"] = str(exc)
                 row["mapped"] = {
                     "kind": mapped.kind,
                     "target": mapped.target,
@@ -498,6 +760,51 @@ def run(args: argparse.Namespace) -> int:
                                     f"msg={settlement.message!r} pos={self_loc}",
                                     flush=True,
                                 )
+                                if is_casualty and mapped.kind == "move":
+                                    import math
+
+                                    code = str(settlement.reason_code or "")
+                                    msg = str(settlement.message or "")
+                                    gap_now = None
+                                    if self_loc is not None:
+                                        corpse = getattr(obs, "corpse_location", None)
+                                        if corpse is not None:
+                                            gap_now = math.hypot(
+                                                float(self_loc["x"]) - float(corpse.x),
+                                                float(self_loc["y"]) - float(corpse.y),
+                                            )
+                                    best = death_nav.get("best_gap")
+                                    improved = (
+                                        gap_now is not None
+                                        and (
+                                            best is None
+                                            or gap_now < float(best) - 2.0
+                                        )
+                                    )
+                                    if improved and gap_now is not None:
+                                        death_nav["best_gap"] = gap_now
+                                        death_nav["fails"] = 0
+                                    elif (
+                                        not settlement.success
+                                        or "blocked" in code.lower()
+                                        or "no goal-relative" in msg.lower()
+                                        or "no adjacent" in msg.lower()
+                                        or not improved
+                                    ):
+                                        death_nav["fails"] = (
+                                            int(death_nav.get("fails") or 0) + 1
+                                        )
+                                        death_nav["phase"] = (
+                                            int(death_nav.get("phase") or 0) + 1
+                                        ) % 4
+                                        death_nav["skip_stock_rec"] = 12
+                                        print(
+                                            f"[shadow] #{loop_i} corpse-nav "
+                                            f"fails={death_nav['fails']} "
+                                            f"phase={death_nav['phase']} "
+                                            f"gap={gap_now}",
+                                            flush=True,
+                                        )
                             elif isinstance(settlement, dict):
                                 row["settlement"] = settlement
                                 print(

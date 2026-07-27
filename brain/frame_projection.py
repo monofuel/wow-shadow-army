@@ -80,8 +80,8 @@ def _kind_index(action_space: Any, kind: str) -> Optional[int]:
         return None
 
 
-def _mask_allows(frame: Any, kind: str, entity_index: int) -> bool:
-    """True when action_mask.target[kind][entity_index] is admitted."""
+def _kind_mask_allows(frame: Any, kind: str) -> bool:
+    """True when action_mask.kind admits this kind (no target index)."""
     mask = _get(frame, "action_mask")
     if mask is None:
         return False
@@ -89,7 +89,18 @@ def _mask_allows(frame: Any, kind: str, entity_index: int) -> bool:
     if kind_i is None:
         return False
     kind_row = _get(mask, "kind")
-    if kind_row is not None and kind_i < len(kind_row) and not kind_row[kind_i]:
+    if kind_row is None or kind_i >= len(kind_row):
+        return False
+    return bool(kind_row[kind_i])
+
+
+def _mask_allows(frame: Any, kind: str, entity_index: int) -> bool:
+    """True when action_mask.target[kind][entity_index] is admitted."""
+    if not _kind_mask_allows(frame, kind):
+        return False
+    mask = _get(frame, "action_mask")
+    kind_i = _kind_index(_get(frame, "action_space"), kind)
+    if kind_i is None:
         return False
     target = _get(mask, "target")
     if target is None or kind_i >= len(target):
@@ -332,23 +343,20 @@ def _cast_options(frame: Any) -> list[dict[str, Any]]:
 
 
 def project_for_escort_leader(frame: Any) -> dict[str, Any]:
-    """Map EnvironmentFrame → escort_leader table (follow + assist + cast/attack).
+    """Map EnvironmentFrame → escort_leader table (follow + assist + cast + death).
 
     Shape::
 
         {
-          self_unit = { x, y } | nil,
+          self_unit = { x, y, z?, map_id? } | nil,
           party = {
             leader_unit = { id, x, y, visible, assistable } | nil
           },
-          combat = {
-            in_combat = bool,
-            mana_pct = number,
-            health_pct = number,
-            focus_guid = string,
-            auto_attack_guid = string,
-            attackable = [ { id, guid, x?, y? }, ... ],
-            casts = [ { target, spell, name, spell_id }, ... ]
+          combat = { ... },
+          death = {
+            is_dead, is_ghost, can_reclaim_corpse,
+            can_release_spirit, can_reclaim_action, can_move,
+            corpse_known, corpse = { map_id, x, y, z } | nil
           }
         }
     """
@@ -373,6 +381,17 @@ def project_for_escort_leader(frame: Any) -> dict[str, Any]:
         if observation is not None
         else ""
     )
+    self_guid = (
+        str(_get(observation, "player_guid", default="") or "")
+        if observation is not None
+        else ""
+    )
+    # Self/party as combat_focus freezes escorts in assist loops (live bug:
+    # focus_guid == player_guid while OOC). Only hostiles matter for escort.
+    if self_guid and focus_guid == self_guid:
+        focus_guid = ""
+    if self_guid and auto_guid == self_guid:
+        auto_guid = ""
     combat: dict[str, Any] = {
         "in_combat": bool(_get(observation, "in_combat", default=False))
         if observation is not None
@@ -387,15 +406,29 @@ def project_for_escort_leader(frame: Any) -> dict[str, Any]:
     }
     bindings = _get(frame, "bindings")
     entities = _get(bindings, "entities") or []
+    party_guids: set[str] = set()
+    for e in entities:
+        kind = str(_get(e, "kind", default="") or "").lower()
+        eg = str(_get(e, "guid", default="") or "")
+        if eg and kind in ("self", "party", "player"):
+            party_guids.add(eg)
+    if focus_guid in party_guids:
+        focus_guid = ""
+        combat["focus_guid"] = ""
+    if auto_guid in party_guids:
+        auto_guid = ""
+        combat["auto_attack_guid"] = ""
     prefer_guids = {g for g in (focus_guid, auto_guid) if g and g != "0"}
     for e in entities:
         idx = int(_get(e, "index", default=0) or 0)
         if idx <= 0:
             continue
         eg = str(_get(e, "guid", default="") or "")
-        if eg in prefer_guids:
+        if eg in prefer_guids and eg not in party_guids:
             combat["focus_id"] = idx
         if not _mask_allows(frame, ATTACK_KIND, idx):
+            continue
+        if eg in party_guids:
             continue
         loc = _get(e, "location")
         xy = _xy(loc)
@@ -409,7 +442,52 @@ def project_for_escort_leader(frame: Any) -> dict[str, Any]:
         combat["attackable"].append(entry)
 
     base["combat"] = combat
+    base["death"] = _project_death(frame, observation)
     return base
+
+
+def _project_death(frame: Any, observation: Any) -> dict[str, Any]:
+    """Death/ghost recovery fields for escort_leader (fair-play actions only)."""
+    is_dead = bool(_get(observation, "is_dead", default=False)) if observation else False
+    is_ghost = bool(_get(observation, "is_ghost", default=False)) if observation else False
+    can_reclaim_corpse = (
+        bool(_get(observation, "can_reclaim_corpse", default=False))
+        if observation
+        else False
+    )
+    corpse_known = (
+        bool(_get(observation, "corpse_known", default=False)) if observation else False
+    )
+    corpse: Optional[dict[str, float]] = None
+    if observation is not None and corpse_known:
+        cl = _xy(_get(observation, "corpse_location"))
+        if cl is not None and "z" in cl and float(cl.get("z", 0) or 0) != 0.0:
+            corpse = {
+                "map_id": float(cl.get("map_id", 0) or 0),
+                "x": float(cl["x"]),
+                "y": float(cl["y"]),
+                "z": float(cl["z"]),
+            }
+        elif cl is not None and (cl.get("x") or cl.get("y")):
+            # Some frames know xy only; still useful for graph move.
+            corpse = {
+                "map_id": float(cl.get("map_id", 0) or 0),
+                "x": float(cl["x"]),
+                "y": float(cl["y"]),
+                "z": float(cl.get("z", 0) or 0),
+            }
+            if corpse["x"] == 0.0 and corpse["y"] == 0.0:
+                corpse = None
+    return {
+        "is_dead": is_dead,
+        "is_ghost": is_ghost,
+        "can_reclaim_corpse": can_reclaim_corpse,
+        "can_release_spirit": _kind_mask_allows(frame, "release_spirit"),
+        "can_reclaim_action": _kind_mask_allows(frame, "reclaim_corpse"),
+        "can_move": _kind_mask_allows(frame, "move"),
+        "corpse_known": corpse_known and corpse is not None,
+        "corpse": corpse,
+    }
 
 
 def project_self_location(frame: Any) -> Optional[dict[str, float]]:

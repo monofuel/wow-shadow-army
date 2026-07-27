@@ -32,7 +32,7 @@ COMPOSE_FILE := infra/compose.vmangos.yml
 ACCOUNT_USER := monofuel
 ACCOUNT_PASS := password
 
-.PHONY: test test-lua test-python test-nim system pin-check integration-test start-server stop-server server-logging logs account soap-account play play-classic shadow escort escort-army grind party-form breadcrumbs quest-data warlock-account warlock-bot botwarrior-bot navmesh-helper navmesh-status
+.PHONY: test test-lua test-python test-nim system pin-check integration-test start-server stop-server server-logging logs account soap-account play play-classic shadow escort escort-army grind party-form breadcrumbs quest-data warlock-account warlock-bot botwarrior-bot tusk-account tusk-bot beru-account beru-bot party-army navmesh-helper navmesh-status
 
 # Unit tier only. test-python is stdlib-only (projection + intent_mapping + optional
 # lua_runner smoke); it is wired into `make test` because it needs no venv/network.
@@ -123,7 +123,8 @@ shadow:
 #
 # Uses fork uv project when WOW_SHADOW_UPSTREAM points at the fork (Igris path).
 ESCORT_LEADER ?= Murist
-ESCORT_PARTY ?= Murist,Shadowfel,Igris
+# Full 5-man cast: human + 2 locks + warrior tank + priest healer.
+ESCORT_PARTY ?= Murist,Shadowfel,Igris,Tusk,Beru
 ESCORT_ACCEPT_FROM ?= Murist
 # Prefer fork SDK when the fork checkout exists (matches igris/warlock-bot-fork seats).
 ESCORT_UPSTREAM ?= $(shell if [ -d "$(abspath ../coworld-vanilla-wow-fork)" ]; then echo $(abspath ../coworld-vanilla-wow-fork); else echo $(UPSTREAM); fi)
@@ -135,21 +136,22 @@ escort:
 		--tool escort_leader --accept-from $(ESCORT_ACCEPT_FROM) \
 		--goal-id escort-slot-$(SLOT) $(EXTRA)
 
-# Standing army escorts: slots 2 (Shadowfel) + 3 (Igris). Background, no
-# max-seconds — kill the logged PIDs to stop. Logs under local_data/brain-logs/.
+# Standing army escorts: slots 2–5 (Shadowfel, Igris, Tusk, Beru). Background,
+# no max-seconds — kill the logged PIDs to stop. Logs under local_data/brain-logs/.
 # One brain per seat (accept + escort); do not also run party_butler on these slots.
+# Seats must already be online (warlock-bot / igris-bot / tusk-bot / beru-bot).
 escort-army:
 	@mkdir -p "$(CURDIR)/local_data/brain-logs"
 	@cd "$(CURDIR)" && \
 	UP=$${WOW_SHADOW_UPSTREAM:-$(ESCORT_UPSTREAM)}; \
-	echo "starting escort slot 2 (Shadowfel) + slot 3 (Igris) via $$UP"; \
-	nohup env WOW_SHADOW_UPSTREAM="$$UP" $(MAKE) escort SLOT=2 EXTRA='--cadence 0.25' \
-		> local_data/brain-logs/escort-slot2.log 2>&1 & echo $$! > local_data/brain-logs/escort-slot2.pid; \
-	nohup env WOW_SHADOW_UPSTREAM="$$UP" $(MAKE) escort SLOT=3 EXTRA='--cadence 0.25' \
-		> local_data/brain-logs/escort-slot3.log 2>&1 & echo $$! > local_data/brain-logs/escort-slot3.pid; \
+	echo "starting escort slots 2–5 (Shadowfel,Igris,Tusk,Beru) via $$UP"; \
+	for s in 2 3 4 5; do \
+		nohup env WOW_SHADOW_UPSTREAM="$$UP" $(MAKE) escort SLOT=$$s EXTRA='--cadence 0.25' \
+			> local_data/brain-logs/escort-slot$$s.log 2>&1 & echo $$! > local_data/brain-logs/escort-slot$$s.pid; \
+	done; \
 	sleep 1; \
-	echo "pids: $$(cat local_data/brain-logs/escort-slot2.pid) $$(cat local_data/brain-logs/escort-slot3.pid)"; \
-	echo "logs: local_data/brain-logs/escort-slot2.log local_data/brain-logs/escort-slot3.log"
+	echo "pids: $$(cat local_data/brain-logs/escort-slot2.pid) $$(cat local_data/brain-logs/escort-slot3.pid) $$(cat local_data/brain-logs/escort-slot4.pid) $$(cat local_data/brain-logs/escort-slot5.pid)"; \
+	echo "logs: local_data/brain-logs/escort-slot{2,3,4,5}.log"
 
 # Mob-grinding brain (docs/warlock-seat.md). Drives a seat entirely from OUR
 # policy using the goal-independent generic action masks, so it works for
@@ -624,6 +626,143 @@ warlock-bot-fork:
 	WOW_SDK_NIM_RUNTIME_DIR=$(WARLOCK_RUNTIME_DIR) \
 	WOW_SDK_NIM_CONTROL_HOST=127.0.0.1 \
 	nim r player/reference_player/reference_player.nim --scenario=nim-control
+
+# ---------------------------------------------------------------------------
+# Tusk — undead WARRIOR (tank) for the 5-man cast (docs/personas/tusk.md).
+# Same wire-create seat pattern as Igris/Shadowfel. Slot 4 → :41118.
+TUSK_ACCOUNT := shadow3
+TUSK_PASS := shadow3
+TUSK_CHARACTER := Tusk
+TUSK_RACE := undead
+TUSK_CLASS := warrior
+TUSK_GENDER := male
+TUSK_SLOT := 4
+TUSK_RUNTIME_DIR := $(CURDIR)/local_data/nim-runtime-slot$(TUSK_SLOT)
+
+tusk-account:
+	@set -e; \
+	if [ ! -d "$(UPSTREAM)" ]; then \
+		echo "error: upstream checkout missing: $(UPSTREAM)" >&2; exit 1; \
+	fi; \
+	cd "$(UPSTREAM)"; \
+	cid=$$(docker compose -f "$(COMPOSE_FILE)" --profile coworld ps -q coworld-game); \
+	if [ -z "$$cid" ]; then \
+		echo "error: coworld-game is not running; make start-server first" >&2; exit 1; \
+	fi; \
+	uv run python server/scripts/manage_coworld_accounts.py \
+		--entrant "$(TUSK_ACCOUNT):$(TUSK_ACCOUNT):$(TUSK_PASS)" \
+		--mysql-container "$$cid" \
+		--host 127.0.0.1 \
+		--port 3306 \
+		--db-user mangos \
+		--db-password mangos \
+		--apply; \
+	echo "account ready: $(TUSK_ACCOUNT) / $(TUSK_PASS)"
+
+# Foreground. Detach with:
+#   nohup make tusk-bot > local_data/tusk-bot.log 2>&1 &
+# Ready at: "Nim binary control socket listening on 127.0.0.1:41118."
+tusk-bot:
+	@set -e; \
+	if [ ! -d "$(FORK)" ]; then \
+		echo "error: fork checkout missing: $(FORK) (see docs/coworld-fork.md)" >&2; exit 1; \
+	fi; \
+	if [ ! -f "$(WOW_ENV)" ]; then \
+		echo "error: missing $(WOW_ENV)" >&2; exit 1; \
+	fi; \
+	mkdir -p "$(TUSK_RUNTIME_DIR)"; \
+	cd "$(FORK)"; \
+	. "$(WOW_ENV)"; \
+	VANILLA_WOW_PLAYER_REALM_HOST=127.0.0.1 \
+	VANILLA_WOW_PLAYER_REALM_PORT=3724 \
+	VANILLA_WOW_PLAYER_USERNAME=$(TUSK_ACCOUNT) \
+	VANILLA_WOW_PLAYER_PASSWORD=$(TUSK_PASS) \
+	VANILLA_WOW_PLAYER_CHARACTER_NAME=$(TUSK_CHARACTER) \
+	VANILLA_WOW_PLAYER_CHARACTER_RACE=$(TUSK_RACE) \
+	VANILLA_WOW_PLAYER_CHARACTER_CLASS=$(TUSK_CLASS) \
+	VANILLA_WOW_PLAYER_CHARACTER_GENDER=$(TUSK_GENDER) \
+	VANILLA_WOW_PLAYER_AUTONOMOUS=0 \
+	WOW_SDK_NIM_RUNTIME_SLOT=$(TUSK_SLOT) \
+	WOW_SDK_NIM_RUNTIME_DIR=$(TUSK_RUNTIME_DIR) \
+	WOW_SDK_NIM_CONTROL_HOST=127.0.0.1 \
+	nim r player/reference_player/reference_player.nim --scenario=nim-control
+
+# ---------------------------------------------------------------------------
+# Beru — undead PRIEST (healer) for the 5-man cast (docs/personas/beru.md).
+# Same wire-create seat pattern. Slot 5 → :41119.
+BERU_ACCOUNT := shadow4
+BERU_PASS := shadow4
+BERU_CHARACTER := Beru
+BERU_RACE := undead
+BERU_CLASS := priest
+BERU_GENDER := male
+BERU_SLOT := 5
+BERU_RUNTIME_DIR := $(CURDIR)/local_data/nim-runtime-slot$(BERU_SLOT)
+
+beru-account:
+	@set -e; \
+	if [ ! -d "$(UPSTREAM)" ]; then \
+		echo "error: upstream checkout missing: $(UPSTREAM)" >&2; exit 1; \
+	fi; \
+	cd "$(UPSTREAM)"; \
+	cid=$$(docker compose -f "$(COMPOSE_FILE)" --profile coworld ps -q coworld-game); \
+	if [ -z "$$cid" ]; then \
+		echo "error: coworld-game is not running; make start-server first" >&2; exit 1; \
+	fi; \
+	uv run python server/scripts/manage_coworld_accounts.py \
+		--entrant "$(BERU_ACCOUNT):$(BERU_ACCOUNT):$(BERU_PASS)" \
+		--mysql-container "$$cid" \
+		--host 127.0.0.1 \
+		--port 3306 \
+		--db-user mangos \
+		--db-password mangos \
+		--apply; \
+	echo "account ready: $(BERU_ACCOUNT) / $(BERU_PASS)"
+
+# Foreground. Detach with:
+#   nohup make beru-bot > local_data/beru-bot.log 2>&1 &
+# Ready at: "Nim binary control socket listening on 127.0.0.1:41119."
+beru-bot:
+	@set -e; \
+	if [ ! -d "$(FORK)" ]; then \
+		echo "error: fork checkout missing: $(FORK) (see docs/coworld-fork.md)" >&2; exit 1; \
+	fi; \
+	if [ ! -f "$(WOW_ENV)" ]; then \
+		echo "error: missing $(WOW_ENV)" >&2; exit 1; \
+	fi; \
+	mkdir -p "$(BERU_RUNTIME_DIR)"; \
+	cd "$(FORK)"; \
+	. "$(WOW_ENV)"; \
+	VANILLA_WOW_PLAYER_REALM_HOST=127.0.0.1 \
+	VANILLA_WOW_PLAYER_REALM_PORT=3724 \
+	VANILLA_WOW_PLAYER_USERNAME=$(BERU_ACCOUNT) \
+	VANILLA_WOW_PLAYER_PASSWORD=$(BERU_PASS) \
+	VANILLA_WOW_PLAYER_CHARACTER_NAME=$(BERU_CHARACTER) \
+	VANILLA_WOW_PLAYER_CHARACTER_RACE=$(BERU_RACE) \
+	VANILLA_WOW_PLAYER_CHARACTER_CLASS=$(BERU_CLASS) \
+	VANILLA_WOW_PLAYER_CHARACTER_GENDER=$(BERU_GENDER) \
+	VANILLA_WOW_PLAYER_AUTONOMOUS=0 \
+	WOW_SDK_NIM_RUNTIME_SLOT=$(BERU_SLOT) \
+	WOW_SDK_NIM_RUNTIME_DIR=$(BERU_RUNTIME_DIR) \
+	WOW_SDK_NIM_CONTROL_HOST=127.0.0.1 \
+	nim r player/reference_player/reference_player.nim --scenario=nim-control
+
+# Bring the full 5-man bot side online (accounts if needed + 4 headless seats).
+# Human (Murist) is still classic client. Does NOT start escort brains —
+# run `make escort-army` after seats print "listening".
+party-army:
+	@set -e; \
+	$(MAKE) tusk-account; \
+	$(MAKE) beru-account; \
+	mkdir -p "$(CURDIR)/local_data/brain-logs"; \
+	echo "starting headless seats (fork): Shadowfel:2 Igris:3 Tusk:4 Beru:5"; \
+	nohup $(MAKE) warlock-bot-fork > local_data/warlock-bot.log 2>&1 & echo $$! > local_data/brain-logs/warlock-bot.pid; \
+	nohup $(MAKE) igris-bot > local_data/igris-bot.log 2>&1 & echo $$! > local_data/brain-logs/igris-bot.pid; \
+	nohup $(MAKE) tusk-bot > local_data/tusk-bot.log 2>&1 & echo $$! > local_data/brain-logs/tusk-bot.pid; \
+	nohup $(MAKE) beru-bot > local_data/beru-bot.log 2>&1 & echo $$! > local_data/brain-logs/beru-bot.pid; \
+	echo "bot pids: $$(cat local_data/brain-logs/warlock-bot.pid) $$(cat local_data/brain-logs/igris-bot.pid) $$(cat local_data/brain-logs/tusk-bot.pid) $$(cat local_data/brain-logs/beru-bot.pid)"; \
+	echo "wait for :41116–:41119 listening, then: make escort-army"; \
+	echo "invite order in-game (Murist): Shadowfel, Igris, Tusk, Beru"
 
 # ---------------------------------------------------------------------------
 # Our fork of coworld-vanilla-wow (docs/coworld-fork.md): thin rebase layer

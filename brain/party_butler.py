@@ -100,7 +100,16 @@ def main() -> int:
                 in_party_reported = False
             if should_accept(party.invite_pending, party.invite_from, allowlist):
                 action = FactorizedAction(kind="accept_party")
-                if not frame.action_ready or not frame.allows_action(action):
+                allows = frame.allows_action(action)
+                if not frame.action_ready or not allows:
+                    # Loud fail — silent sleep was the stuck-invite postmortem.
+                    print(
+                        f"[butler] LOUD: allowlisted invite from "
+                        f"{party.invite_from!r} pending but cannot accept yet "
+                        f"action_ready={frame.action_ready} allows={allows} "
+                        f"phase={frame.phase} frame={frame.frame_id} "
+                        f"tick={frame.observed_tick}"
+                    )
                     time.sleep(0.5)
                     continue
                 print(f"[butler] invite from {party.invite_from!r}: accepting")
@@ -116,6 +125,8 @@ def main() -> int:
                     )
                 except NimControlRequestError as exc:
                     print(f"[butler] accept rejected: {exc}")
+                    time.sleep(args.cadence)
+                    continue
                 time.sleep(1.0)
                 try:
                     settled = client.last_settlement()
