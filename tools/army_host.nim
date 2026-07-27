@@ -2,11 +2,13 @@
 ##
 ## Upstream v2 runs policy **in-process** (step(observation)). External hosts
 ## install leveling goals with leader/party (escort) and observe frames; they
-## do **not** select factorized actions.
+## do **not** select factorized actions. Watchdogs may reinstall goals when a
+## seat thrashes (e.g. warlock selected_target_guid == active_pet_guid).
+## Never send control_directive cancel for thrash — live v2 seats exit on it.
 ##
 ##   nim r tools/army_host.nim --slot:2 --leader:Murist
 ##
-## Cadence defaults 1.0s (status/audit only). Audit: --audit-path / --no-audit.
+## Cadence defaults 1.0s (status/audit + thrash watch). Audit: --audit-path.
 
 import
   std/[
@@ -142,11 +144,14 @@ proc connectClient(slot: int): ControlClient =
 
 proc close(c: ControlClient) =
   if c.sock != nil:
-    c.sock.close()
+    try: c.sock.close()
+    except: discard
     c.sock = nil
 
 proc request(c: ControlClient; frameType: uint16; body: JsonNode):
     tuple[ft: uint16, node: JsonNode, raw: string] =
+  if c.sock.isNil:
+    raise newException(IOError, "socket closed")
   inc c.reqId
   let payload = $body
   c.sock.sendFrame(frameType, c.reqId, payload)
@@ -206,8 +211,71 @@ proc submitGoal(c: ControlClient; goalId, leader: string; party: seq[string];
   }
   discard c.request(FrameGoal, body)
 
+proc sendDirective(c: ControlClient; directive: string; revision: int) =
+  ## hold | resume | cancel — v2 control plane (no factorized SELECT).
+  let body = %*{
+    "protocol": Protocol,
+    "type": "control_directive",
+    "directive": directive,
+    "expected_slot": c.slot,
+    "expected_revision": revision
+  }
+  discard c.request(FrameDirective, body)
+
 proc isStaleRevisionError(msg: string): bool =
   msg.contains("stale controller revision") or msg.contains("stale revision")
+
+proc guidNonzero(s: string): bool =
+  s.len > 0 and s != "0"
+
+proc swingingAtOwnPet(obs: JsonNode): bool =
+  ## Real thrash: policy AA-swings the imp (attack/stop_attack forever).
+  ## Mere selected_target == pet is normal OOC (feed/pet-command) — do NOT
+  ## treat that as thrash (live false positive on Igris every pull).
+  if obs.isNil: return false
+  let pet = jstr(jget(obs, "active_pet_guid"))
+  if not guidNonzero(pet): return false
+  let aa = jstr(jget(obs, "auto_attack_guid"))
+  aa == pet
+
+proc stuckCombatFollowOnly(frame, obs: JsonNode): bool =
+  ## In combat, leveling reports no progress, and the only recommended
+  ## actions are movement (follow leader) — not cast/attack. Live Shadowfel:
+  ## sticky AA on a 60yd mob while only move→Murist for 20+s.
+  if obs.isNil or frame.isNil: return false
+  if not jbool(jget(obs, "in_combat")): return false
+  let nop = jnum(jget(frame, "leveling_lifecycle", "no_progress_seconds"))
+  if nop < 15.0: return false
+  let acts = jget(frame, "actions")
+  if acts.isNil or acts.kind != JArray or acts.len == 0: return false
+  for a in acts:
+    let k = jstr(jget(a, "kind"))
+    if k notin ["move", "follow", "face", "stop_attack", ""]:
+      return false
+  true
+
+proc moveActionFarDest(frame, obs: JsonNode; minDist = 25.0): bool =
+  ## True when recommended action is a move whose destination is still far
+  ## from self (not micro-reposition / in-formation hold).
+  if obs.isNil or frame.isNil: return false
+  let loc = jget(obs, "location")
+  if loc.isNil: return false
+  let sx = jnum(jget(loc, "x"))
+  let sy = jnum(jget(loc, "y"))
+  let acts = jget(frame, "actions")
+  if acts.isNil or acts.kind != JArray or acts.len == 0: return false
+  var sawMove = false
+  for a in acts:
+    let k = jstr(jget(a, "kind"))
+    if k != "move": continue
+    sawMove = true
+    let dest = jget(a, "destination")
+    if dest.isNil: return false
+    let dx = jnum(jget(dest, "x")) - sx
+    let dy = jnum(jget(dest, "y")) - sy
+    if dx * dx + dy * dy < minDist * minDist:
+      return false
+  sawMove
 
 # ---------- projection (subset of brain/frame_projection.py) ----------
 
@@ -986,7 +1054,7 @@ proc log(c: HostConfig; msg: string) =
       echo msg
 
 proc main() =
-  let cfg = parseConfig()
+  var cfg = parseConfig()
   echo &"[army_host] v2 goal-host slot={cfg.slot} leader={cfg.leader} party={cfg.party}"
   if cfg.auditPath.len > 0:
     echo &"[army_host] fair-play audit → {cfg.auditPath}"
@@ -1007,7 +1075,38 @@ proc main() =
   let t0 = epochTime()
   var i = 0
   var lastHeartbeatAt = 0.0
+  var petTargetStreak = 0
+  var stuckCombatStreak = 0
+  var zeroDispStreak = 0
+  var lastPosX = 0.0
+  var lastPosY = 0.0
+  var haveLastPos = false
+  var lastUnstickAt = 0.0
   const HeartbeatSec = 15.0
+  ## Cadence is often 0.35s (escort-army). Need multi-second confirmation.
+  const PetTargetStreakLimit = 20   ## ~7s at 0.35s cadence, OOC only
+  const StuckCombatStreakLimit = 8  ## ~3s of no-progress combat frames
+  ## Moves "succeed" but body does not move (Brill freeze 2026-07-27).
+  const ZeroDispStreakLimit = 25    ## ~9s @0.35 / 25s @1.0
+  ## Cooldown between goal-id bumps so we do not thrash installs.
+  const UnstickCooldownSec = 60.0
+  proc unstickGoal(reason, name: string) =
+    ## Bump goal_id so the controller drops sticky combat/target memory.
+    ## Never send control_directive cancel — it exits the seat on this pin.
+    if epochTime() - lastUnstickAt < UnstickCooldownSec:
+      return
+    let stU = client.statusJson()
+    let freshId = cfg.goalId & "-u" & $int(epochTime())
+    client.submitGoal(
+      freshId, cfg.leader, cfg.party, jint(jget(stU, "revision"))
+    )
+    cfg.goalId = freshId
+    lastUnstickAt = epochTime()
+    petTargetStreak = 0
+    stuckCombatStreak = 0
+    zeroDispStreak = 0
+    echo "[army_host] FAIL unstuck ", reason, " name=", name,
+      " slot=", cfg.slot, " goal=", freshId
   while true:
     if cfg.maxSeconds > 0 and epochTime() - t0 > cfg.maxSeconds:
       echo "[army_host] max-seconds"
@@ -1035,9 +1134,51 @@ proc main() =
       try:
         let frame = client.envFrame()
         discard processFrame(audit, frame)
-        let name = jstr(jget(frame, "observation", "name"))
-        let loc = jget(frame, "observation", "location")
-        let party = jget(frame, "observation", "party")
+        let obs = jget(frame, "observation")
+        let name = jstr(jget(obs, "name"))
+        let loc = jget(obs, "location")
+        let party = jget(obs, "party")
+        # AA on own pet (true thrash). Selected-pet alone is normal OOC.
+        if swingingAtOwnPet(obs):
+          inc petTargetStreak
+        else:
+          petTargetStreak = 0
+        if petTargetStreak >= PetTargetStreakLimit:
+          try:
+            unstickGoal("aa-on-own-pet thrash", name)
+          except:
+            echo "[army_host] FAIL pet-unstick: ", getCurrentExceptionMsg()
+        # Combat + no progress + only move/follow recommended (sticky far target).
+        if stuckCombatFollowOnly(frame, obs):
+          inc stuckCombatStreak
+        else:
+          stuckCombatStreak = 0
+        if stuckCombatStreak >= StuckCombatStreakLimit:
+          try:
+            unstickGoal("stuck-combat follow-only", name)
+          except:
+            echo "[army_host] FAIL combat-unstick: ", getCurrentExceptionMsg()
+        # Zero-displacement move thrash: far dest, body not moving.
+        let px = jnum(jget(loc, "x"))
+        let py = jnum(jget(loc, "y"))
+        if haveLastPos and moveActionFarDest(frame, obs):
+          let ddx = px - lastPosX
+          let ddy = py - lastPosY
+          if ddx * ddx + ddy * ddy < 0.6 * 0.6:
+            inc zeroDispStreak
+          else:
+            zeroDispStreak = 0
+        else:
+          zeroDispStreak = 0
+        if not (px == 0.0 and py == 0.0):
+          lastPosX = px
+          lastPosY = py
+          haveLastPos = true
+        if zeroDispStreak >= ZeroDispStreakLimit:
+          try:
+            unstickGoal("zero-displacement move", name)
+          except:
+            echo "[army_host] FAIL zero-disp-unstick: ", getCurrentExceptionMsg()
         if epochTime() - lastHeartbeatAt >= HeartbeatSec or not cfg.quiet:
           lastHeartbeatAt = epochTime()
           echo "[army_host] heartbeat #", i,

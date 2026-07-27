@@ -76,3 +76,52 @@ suite "shadow army cast":
     check "FAIL" in html
     check "revive B" in html
     check "partial" in html
+
+  test "admin chat bus maps Murist requests only":
+    check isAdminRequester("Murist")
+    check not isAdminRequester("Shadowfel")
+    check not isAdminRequester("Igris")
+    check AdminRequesterName == "Murist"
+
+    proc ev(name, kind, payload: string): AddonEvent =
+      AddonEvent(name: name, kind: kind, payload: payload)
+
+    check adminActionFromAddonEvent(ev("Murist", "admin", "respawn_shadow_army")) ==
+      "respawn_shadow_army"
+    check adminActionFromAddonEvent(ev("Murist", "admin", "respawn_shadow_army #3")) ==
+      "respawn_shadow_army"
+    check adminActionFromAddonEvent(ev("Murist", "admin", "respawn")) ==
+      "respawn_shadow_army"
+    check adminActionFromAddonEvent(ev("Murist", "admin", "reload_addon #1")) ==
+      "reload_addon"
+    check adminActionFromAddonEvent(ev("Murist", "admin", "reload")) ==
+      "reload_addon"
+    check adminActionFromAddonEvent(ev("Murist", "admin", "tele_party_to_murist #2")) ==
+      "tele_party_to_murist"
+    check adminActionFromAddonEvent(ev("Murist", "admin", "tele_to_murist")) ==
+      "tele_party_to_murist"
+    check adminActionFromAddonEvent(ev("Murist", "admin", "tele_party")) ==
+      "tele_party_to_murist"
+    check adminActionFromAddonEvent(ev("Murist", "admin", "nuke_all")) == ""
+    check adminActionFromAddonEvent(ev("Murist", "err", "respawn_shadow_army")) == ""
+    check adminActionFromAddonEvent(ev("Shadowfel", "admin", "respawn_shadow_army")) == ""
+    check adminActionFromAddonEvent(ev("Igris", "admin", "reload_addon")) == ""
+    check adminActionFromAddonEvent(ev("Shadowfel", "admin", "tele_party_to_murist")) == ""
+
+  test "tele-to-murist commands and SQL are fixed-name only":
+    check MuristMeetTeleName == "SA_MURIST_MEET"
+    let cmds = teleToMuristCommandsFor("Igris")
+    check cmds == @["tele name Igris SA_MURIST_MEET"]
+    expect ValueError:
+      discard teleToMuristCommandsFor("Murist")
+    expect ValueError:
+      discard teleToMuristCommandsFor("Igris", teleDest = "Deathknell")
+    check muristMeetDeleteSql().contains("SA_MURIST_MEET")
+    check not muristMeetDeleteSql().contains(";")
+    let ins = muristMeetInsertSql(0, 1847.5, 1591.4, 93.2)
+    check ins.contains("1847.5000")
+    check ins.contains("SA_MURIST_MEET")
+    check ins.contains("INSERT INTO game_tele")
+    expect ValueError:
+      discard muristMeetInsertSql(-1, 0, 0, 0)
+    check adminChatActionFromName("tele_party_to_murist") == acaTelePartyToMurist

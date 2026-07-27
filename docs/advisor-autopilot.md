@@ -1,179 +1,155 @@
 # Advisor as gradual autopilot (L0–L5)
 
-**Status:** product framing (2026-07-27). Captures how monofuel wants the
-vanilla-client **ShadowArmy advisor** to evolve, and how that relates to the
-Softmax tournament bots. Supplements — does not replace — `docs/advisor.md`
-(hypothesis + early design) and `docs/the-system-loop.md` (reload/telemetry).
+**Status:** product decision (2026-07-27). Supplements `docs/advisor.md`
+(hypothesis) and `docs/the-system-loop.md` (reload/telemetry).
+
+## Decision (read this first)
+
+| Seat | Automation level | Where |
+|------|------------------|--------|
+| **Vanilla 1.12 + ShadowArmy** | **Strictly L0** | Human eyes, instruments only |
+| **Nim client + army host + `lua/tools`** | L1–L5 (tournament path) | Real control plane |
+| **Nim client Lua addon system** (upstream, in progress) | **Future home for advisor L1–L4** | Wait for them — do not invent unlock/patch workarounds on stock `WoW.exe` |
+
+**Why:** stock 1.12 action APIs are not a workable automation surface for
+levels 1–4 (Probe 2026-07-27; see appendix). Broad client unlock is too
+much pain for the value. Softmax is already building a Lua addon path into
+the **Nim** client — that is the place to climb L1–L4 with a human in the
+loop, not wine + binary patches.
+
+**Agents:** do not implement new advisor **actuation** (cast, loot, move,
+target, auto-combat, keep-up buffs, etc.) on vanilla ShadowArmy. L0 display
+and QoL that does not need restricted action APIs is fine. Do not spend
+time on unlockers (`docs/advisor-unlock.md` is reference-only / abandoned
+for product).
 
 ## Why this exists
 
-The tournament goal is **full autonomous dungeon play**: party of seats that
-walk the content without a human driving each character. That end state is
-**level-5 automation** on the **Nim client** path
-(`nim_control.v1` → host → `lua/tools` intents → upstream goals).
-
-The human seat is different. Monofuel plays on the **real 1.12 client**
-(`make play-classic`) to validate world, quests, combat, party, and recovery
-with eyes on the screen. The advisor addon is the **gradual autopilot** for
-that seat: same kind of ladder as car SAE levels — start as instruments and
-hints, climb toward “I only supervise,” then hand capability off to the Nim
-bots rather than trying to turn the vanilla client into the tournament
-runtime.
+Tournament goal: **full autonomous dungeon play** — party of seats without
+a human driving each character. That end state is **L5** on the Nim path:
 
 ```
-Vanilla 1.12 client + ShadowArmy     Nim client + army_host + lua tools
-─────────────────────────────────    ─────────────────────────────────
-Human validates with HITL            Tournament / army automation
-Advisor climbs L0 → L5 (here)        Target: L5 always (full policy)
-Same realm, same rules, no cheats    Same realm, same rules, no cheats
+nim_control.v1 → army_host → lua/tools intents → upstream goals
 ```
 
-Fair-play still applies on both faces: no GM gameplay outcomes, no out-of-
-band collusion, no stranger-invisible edges. Human seat is for **finding
-and fixing the real pipeline**, not papering over it.
+The human still plays Murist on **real 1.12** to validate the world. The
+vanilla advisor stays a **dashboard** (L0): stats, blips, logs, quest
+waypoints on the map — human does every action.
 
-## Two clients, deliberately different jobs
+```
+Vanilla 1.12 + ShadowArmy          Nim client
+─────────────────────────          ──────────────────────────────
+L0 instruments only (now)          Bots: L5 target (army + tools)
+Human validates with eyes          Future: Lua addons → advisor L1–L4
+No client unlock project           Same realm, fair play
+```
 
-| | Human seat | Bot seats |
-|---|---|---|
-| Client | Stock 1.12 `WoW.exe` (wine) | Upstream Nim client |
-| Policy surface | Addon Lua (`addons/ShadowArmy/`) | Named intents in `lua/tools/` |
-| Perception | Client UI APIs + local state | Typed environment frames |
-| Actuation | Whatever the 1.12 addon sandbox actually allows | Goals/actions over `nim_control.v1` |
-| Purpose | Gradual autopilot + live validation | Tournament automation |
+## Levels (SAE-style)
 
-Do **not** treat the advisor as a second tournament bot. If a capability
-only works as a vanilla-addon hack and cannot transfer to the Nim/Lua path,
-it is still useful as human QoL — but it is not a win condition. Prefer
-features whose *decision* can live as structured advice or a named intent
-the bots can also consume (transfer hedge from `docs/advisor.md`).
+Levels = how much the human must still do. **Per domain** when we climb
+again on Nim addons — not one global switch.
 
-## Automation levels (advisor ladder)
+| Level | Name | Human | System |
+|------:|------|-------|--------|
+| **0** | Instruments | Everything | Display only |
+| **1** | Assisted | Acts on prompts | Suggests / warns |
+| **2** | Partial | Sets goals, supervises | Runs one slice while engaged |
+| **3** | Conditional | Monitors edge cases | Whole activity under conditions |
+| **4** | High | Starts run, rare takeover | Multi-step route / recovery |
+| **5** | Full | Not required | Entire session / dungeon |
 
-Rough SAE analogy. Levels describe **how much the human must still do**, not
-how clever the UI looks. A feature can be L2 for combat and L0 for quests
-at the same time — the level is per domain, not a single global switch.
+### Where each level lives (2026-07-27)
 
-| Level | Name | Human does | Advisor does | Example (current or intended) |
-|------:|---|---|---|---|
-| **0** | Instruments | Everything | Display only | XP/h, target intel, log window, quest blips |
-| **1** | Assisted | Acts on prompts | Suggests / warns | Buff missing nag, “elite — skip”, nearest objective line |
-| **2** | Partial | Sets goals, supervises | Runs one slice while engaged | Auto-combat while you hold target; auto Demon Skin when proven; one-click loot vacuum |
-| **3** | Conditional | Monitors, takes over on edge cases | Runs a whole activity under conditions | “Grind this area while mana > X and bags free”; auto drink/eat; stay in formation if party |
-| **4** | High | Starts the run, intervenes rarely | Multi-step route / quest chain / recovery under broad conditions | Full Tirisfal quest circuit with corpse run; RFC trash packs with role scripts |
-| **5** | Full | Not required on this seat | Entire dungeon/session without human input | **Not the advisor’s job.** This is the Nim bot army. |
+| Level | Vanilla ShadowArmy | Nim bots / host | Nim Lua addons (when ready) |
+|------:|:------------------:|:---------------:|:---------------------------:|
+| **0** | **Yes — only scope** | n/a | Yes |
+| **1** | **No** (wait) | Policy as intents / chat later | **Yes — target** |
+| **2–4** | **No** (wait) | Growing via tools + upstream | **Yes — target** |
+| **5** | Never | **Yes — tournament** | Optional later |
 
-**Crossover test (from advisor.md):** when a thin L3/L4 advisor plus almost
-no human input out-levels “L1 advisor + attentive human,” the policy side
-is ready to live on bots. The human should *feel* that shift (they’re
-mostly rubber-stamping).
+**Crossover test** (from original hypothesis): when thin L3/L4 plus almost
+no human input out-levels “hints + attentive human,” that policy belongs
+on bot seats. We re-run that test on the **Nim addon** seat, not wine 1.12.
 
-### What “gradual” means in practice
+## Vanilla ShadowArmy — L0 only
 
-- Climb by **domain** (combat, loot, bags, quests, navigation, party, recovery),
-  not by dumping a full bot into the addon.
-- Each step should leave a **manual override** (toggle off, or just don’t
-  target / don’t open the corpse).
-- Prefer **structured recommendations** first (L0–L1), then bind them to
-  actuation only when the human seat proves the call is right (L2+).
-- Anything that reaches L3+ on the advisor should have a clear story for
-  the **same decision** on Nim seats (Lua tool or upstream goal) — otherwise
-  we built a local toy.
+### In scope
 
-## Current honest placement (ShadowArmy ~r21)
+- HUD: XP/h, target intel, buff **status text** (not auto-cast)
+- Quest / crew / corpse **map blips** and compass lines
+- Advisor log, Probe panel (for sandbox forensics if needed)
+- Quest data (`QuestData.lua`) as **display** waypoints
+- The System loop: telemetry + remote reload (ops, not gameplay automation)
+- Bag UI as pure inventory view if useful — not as automation project
 
-Not a scorecard to game — a map of where we actually are.
+### Out of scope (do not grow)
 
-| Domain | ~Level | Notes |
-|---|:---:|---|
-| HUD / grind stats / log | 0 | Solid instruments |
-| Quest objective blips + line | 0–1 | Data-backed waypoints; human still walks and turns in |
-| Buff watch | 0–1 | Reminder path; autocast attempted but disabled when texture verify fails |
-| Auto Demon Skin / Armor | 2 (intent) / 0–1 (live) | Designed as keep-up from driver; live failure was **detection**, not “must click” |
-| Auto-combat (warlock) | 2 | Target + toggle; rotation from OnUpdate |
-| Auto-loot | ~1.5 | Not zero-click; one click per corpse after gate findings |
-| Bag UI + sort | 1–2 | Human opens / starts sort; swaps can continue after first accepted call |
-| Remote reload / The System | n/a | Dev loop, not gameplay automation |
-| Navigation / dungeon AI | 0 | Human or Nim bots; not advisor policy |
-| Full dungeon autopilot | — | **Nim L5 path only** |
+- Auto-combat, spell keep-up, auto-loot, programmatic movement/targeting
+- “Click-gated L2” as a product direction
+- Client unlock / inject / patch projects for freer Lua actions
 
-## Client sandbox reality (stop the blanket story)
+Existing non-L0 code in the addon is **legacy debt**. Prefer not to extend
+it; removing or disabling it is fine when touching the file. Do not treat
+it as the ladder.
 
-Agents have repeatedly assumed “everything is a hardware-event check.” That
-is the **post-2.0 protected-function** mental model. Our human seat is
-**1.12**. Live findings:
+### Honest L0 map
 
-- **Not one global lockdown.** Behavior is **per API**, discovered by
-  probe (works from click? from `OnUpdate`? from `CHAT_MSG_SYSTEM`?).
-- **`CastSpellByName` works from software context** on this client —
-  auto-combat and armor ticks fire from the driver `OnUpdate`. Demon Skin
-  is not blocked because “it needs a hardware event”; when autocast died,
-  the safety path said the buff **never read present** after cast (texture
-  / scan issue).
-- **Some calls do silent no-ops outside input-derived context** on this
-  build, notably **`ReloadUI`** (remote announce / deferred tick fail;
-  slash, button click, action-bar piggyback work) and **`LootSlot`**
-  (vacuum from `LOOT_OPENED` failed; piggyback on loot-row click works).
-- **Bag pickup/sort** accepted continuing swaps from `OnUpdate` after a
-  first click-started swap — different from loot.
+| Domain | Level | Notes |
+|--------|:-----:|-------|
+| HUD / grind stats / log | 0 | Keep |
+| Quest / crew blips | 0 | Keep (human walks) |
+| Buff **display** | 0 | Text only |
+| Combat coach (ability list) | 0 | Suggestions only — you press the keys |
+| Auto cast / combat / loot | — | **Not product** on this client |
+| Full dungeon | — | Nim L5 |
 
-Rule for agents and future revs:
+## Tournament path (unchanged)
 
-1. Do not invent a hardware-event requirement without a live probe or a
-   line in this doc / the addon comments.
-2. Prefer measuring: same call from OnClick vs OnUpdate vs chat handler;
-   emit a one-shot `gated` / `ok` line if unsure.
-3. Gameplay L2+ features that need a real click every time are still
-   useful as HITL assists — document them as **click-gated L2**, not as
-   “vanilla is fully free” or “vanilla is fully locked.”
-
-Details of the reload/loot ladders live in addon comments and
-`docs/the-system-loop.md` / session checkpoints — this section is the
-policy so we stop thrashing the wrong root cause.
-
-## How this serves the tournament
-
-1. **Faster truth than bot logs alone.** Human eyes catch “stuck in geometry,”
-   bad quest text, threat death, loot that never looted — then we fix Nim/Lua
-   or upstream, not the wine UI.
-2. **Curriculum for policy.** L0–L1 advice forces us to name decisions
-   (skip elite, drink now, next objective). Those names become intents.
-3. **Crossover before dungeon day.** If the advisor cannot reliably run
-   combat + loot + a short quest loop under supervision, the army will not
-   clear a dungeon by magic on Nim.
-4. **Separation of concerns.** Vanilla addon may implement a *preview* of
-   a behavior; the **ship path for L5** remains Nim host + Lua tools +
-   upstream capabilities. No cheating either face.
+1. Human L0 seat finds world/quest/party/recovery truth with eyes.
+2. Named decisions live in **`kb/`** + **`lua/tools/`** on Nim seats.
+3. Rely on upstream for pathing, combat, loot, recovery — not vanilla addon hacks.
+4. Fair play on both faces. No GM gameplay outcomes, no seat collusion.
+5. L5 win = Nim army through `nim_control`, not a perfect 1.12 addon.
 
 ## Relationship to other docs
 
 | Doc | Role |
-|---|---|
-| `docs/advisor.md` | Original hypothesis, advice classes, transfer hedge, live-edit loop idea |
-| `docs/advisor-autopilot.md` (this file) | Product ladder L0–L5, two-client split, sandbox honesty |
-| `docs/the-system-loop.md` | SOAP announce / Chat.log / remote reload |
-| `docs/quest-data.md` | Ground-truth waypoints for L0–L1 quest instruments |
-| `docs/v2.md` | Army architecture (kb / lua / host); advisor listed as separate |
-| `AGENTS.md` | Fair play, no Python bot policy, rely on upstream |
+|-----|------|
+| `docs/advisor.md` | Original hypothesis / advice classes |
+| `docs/advisor-autopilot.md` (this file) | **Levels + product decision** |
+| `docs/advisor-unlock.md` | Unlock research notes — **not pursuing** for product |
+| `kb/advisor-sandbox-gates.md` | Probe measurements (why vanilla L1–4 stopped) |
+| `docs/the-system-loop.md` | SOAP / Chat.log / reload |
+| `docs/quest-data.md` | Waypoint data for L0 display |
+| `docs/v2.md` | Army architecture |
+| `AGENTS.md` | Fair play, Lua tools, no Python policy |
 
-## Open rungs (when we next climb)
+## Open work
 
-Not a sprint plan — ordered by how much they teach the tournament path:
-
-1. **Fix Demon Skin detect → restore L2 keep-up** (texture list / buff scan).
-2. **Loot:** document click-gated L2 as the 1.12 ceiling unless a real
-   ungated path appears; do not spend weeks on wine-only loot hacks that
-   Nim already loots correctly via upstream.
-3. **L1 danger / resource lines** from real state (mana, elite, corpse with
-   quest item) — structured first, prose second.
-4. **L2 “follow this waypoint”** only if it teaches pathing issues we still
-   see on bots — else leave walking to human or Nim.
-5. **Never prioritize vanilla L5.** When a domain is “good enough under
-   supervision,” move the decision into `lua/tools` and prove it on a Nim
-   seat.
+1. Keep vanilla advisor useful as **L0** (display, data, ops loop).
+2. Drive automation on **Nim host + lua tools** (tournament).
+3. When upstream Nim **Lua addon** support lands: port advisor ladder
+   **L1→L4** there; re-open this doc’s “where levels live” table.
+4. Do **not** open a client-unlock workstream.
 
 ## One-liner
 
-**Advisor = SAE ladder on the human vanilla client so monofuel can validate
-and climb automation with hands on the wheel; tournament win = Nim seats at
-L5 through the real control plane — not a perfect 1.12 addon bot.**
+**Vanilla advisor = L0 dashboard. L1–L4 wait for Nim addons. L5 = Nim
+bots. No unlock rabbit hole.**
+
+---
+
+## Appendix — why vanilla stopped at L0 (Probe 2026-07-27)
+
+Instrument: advisor **Probe** (Click / Frame / Delay). Historical; product
+decision above does not depend on re-probing forever.
+
+| API | Click | Frame | Delay | Notes |
+|-----|:-----:|:-----:|:-----:|-------|
+| Cast armor (`CastSpellByName`) | OK | no | no | Software cast dead |
+| ReloadUI | OK | no | no | Remote reload only arms button / next press |
+| Loot all (`LootSlot`) | no | no | no | Even panel click insufficient |
+
+Broad freer Lua on stock 1.12 would mean a large unlock surface (or shared
+gate RE). **Rejected** for time cost; see `docs/advisor-unlock.md` +
+`../zebra` as reference only. Do not download/run third-party unlockers.

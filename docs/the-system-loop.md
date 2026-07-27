@@ -86,10 +86,26 @@ arrives, the most likely cause is a Lua error at file scope — check
    `curl -sS -X POST http://127.0.0.1:7777/mcp -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"send_announce","arguments":{"text":"<SYS> ping"}}}'`
    → a `pong rev=r1` event lands in /events.
 
+## Admin from the advisor (addon → System)
+
+The vanilla client cannot HTTP. Admin write actions from Murist go out as
+`/say` telemetry and The System’s Chat.log worker runs the **same** procs
+as the dashboard/MCP:
+
+| Advisor Admin button | Chat bus | Dispatch |
+|----------------------|----------|----------|
+| **Respawn army** | `<SA> admin respawn_shadow_army #N` | `respawnShadowArmy()` |
+| **Tele party to me** | `<SA> admin tele_party_to_murist #N` | `telePartyToMurist()` |
+| **Reload addon (via System)** | `<SA> admin reload_addon #N` | `reloadAddon()` |
+
+Only character **Murist** is accepted (`AdminRequesterName`). Debounced
+(~8s). Result announce: `<SYS> admin respawned …` (addon displays it).
+
 ## Design notes
 
 - Same one-dispatch-path rule as ever: `recentEvents()`, `reloadAddon()`,
-  `announceInGame()` each feed both the htmx face and the MCP face.
+  `announceInGame()`, `respawnShadowArmy()` feed htmx, MCP, and (where
+  useful) the Murist admin chat bus.
 - The System is no longer a pure observer — see system/README.md "Scoped
   write exception". The write surface is exactly: GM `announce` via a
   dedicated SOAP account. No world-state, item, gold, or teleport commands.

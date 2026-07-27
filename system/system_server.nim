@@ -12,6 +12,9 @@
 ##   reloadAddon()           — SOAP announce <SYS> reload + wait for <SA> loaded
 ##   announceInGame()        — SOAP announce <text>
 ##   respawnShadowArmy()     — admin SOAP revive + tele (ops escape hatch)
+##
+## Admin faces (same procs): HTTP /admin, MCP tools, and human-seat addon
+## chat (`<SA> admin <action>` from Murist → Chat.log tailer).
 
 import
   std/[
@@ -25,8 +28,17 @@ import
   ../tools/fair_play_audit
 
 const
-  Version = "0.6.0"
+  Version = "0.8.0"
   ServerName = "TheSystem"
+  ## Only this character may request admin actions via `<SA> admin …` (human seat).
+  AdminRequesterName* = "Murist"
+  ## Min seconds between chat-triggered admin actions (double-click / say dedupe).
+  AdminChatCooldownSec = 8.0
+  ## World DB (game_tele lives here; characters DB is separate).
+  WorldDbName = "mangos"
+  ## Scratch game_tele name: upserted to Murist's live coords, then used by
+  ## `tele name <cast> SA_MURIST_MEET`. Console SOAP cannot `go xyz` another player.
+  MuristMeetTeleName* = "SA_MURIST_MEET"
   ## Dashboard + MCP share this port (not 8080 healthz / 8085 world / 3724 realmd).
   HttpPort = 7777
   ## htmx auto-refresh interval for the roster / events table bodies.
@@ -145,6 +157,13 @@ type
     steps*: seq[AdminStepResult]
     summary*: string
 
+  ## Queued chat-bus admin op (no GC'd string — tailer thread is GC-safe).
+  AdminChatAction* = enum
+    acaNone = 0
+    acaRespawnShadowArmy = 1
+    acaReloadAddon = 2
+    acaTelePartyToMurist = 3
+
 # Classic 1.12 race/class IDs are stable enums; hardcode the small tables.
 const
   RaceNames = [
@@ -175,8 +194,13 @@ var
   gEvents: seq[AddonEvent]
   gNextEventId: int
   gTailerThread: Thread[void]
+  gAdminChatLock: Lock
+  gLastAdminChatAt: float ## epoch seconds; debounce chat-triggered admin
+  gPendingAdminAction: AdminChatAction ## acaNone when idle
+  gAdminWorkerThread: Thread[void]
 
 initLock(gEventLock)
+initLock(gAdminChatLock)
 
 proc raceName*(raceId: int): string =
   ## Map a classic 1.12 race ID to a display name.
@@ -681,14 +705,78 @@ proc eventsToJson*(events: seq[AddonEvent]): JsonNode =
   for e in events:
     result.add(eventToJson(e))
 
+proc isAdminRequester*(name: string): bool =
+  ## True when `name` may trigger System admin actions from the addon chat bus.
+  result = name == AdminRequesterName
+
+proc adminActionFromAddonEvent*(e: AddonEvent): string =
+  ## Map a parsed `<SA> admin …` event to a dispatch action name, or "".
+  ##
+  ## Payload forms (first token is the action; trailing tokens ignored):
+  ##   respawn_shadow_army
+  ##   respawn_shadow_army #3
+  ##   respawn
+  ##   reload_addon
+  ##   reload_addon #1
+  ##   tele_party_to_murist
+  ##   tele_to_murist #2
+  if e.kind != "admin":
+    return ""
+  if not isAdminRequester(e.name):
+    return ""
+  let parts = e.payload.strip().splitWhitespace()
+  if parts.len == 0:
+    return ""
+  case parts[0].toLowerAscii()
+  of "respawn_shadow_army", "respawn":
+    result = "respawn_shadow_army"
+  of "reload_addon", "reload":
+    result = "reload_addon"
+  of "tele_party_to_murist", "tele_to_murist", "tele_party":
+    result = "tele_party_to_murist"
+  else:
+    result = ""
+
+proc tryClaimAdminChatSlot*(): bool =
+  ## Debounce: true if this process may run a chat-triggered admin action now.
+  let now = epochTime()
+  withLock gAdminChatLock:
+    if now - gLastAdminChatAt < AdminChatCooldownSec:
+      return false
+    gLastAdminChatAt = now
+    return true
+
+proc adminChatActionFromName*(action: string): AdminChatAction =
+  ## Map dispatch name → queue enum (empty / unknown → acaNone).
+  case action
+  of "respawn_shadow_army": acaRespawnShadowArmy
+  of "reload_addon": acaReloadAddon
+  of "tele_party_to_murist": acaTelePartyToMurist
+  else: acaNone
+
+proc queueAdminFromAddon*(e: AddonEvent) {.gcsafe.} =
+  ## Enqueue an admin action for the worker thread (tailer stays GC-safe).
+  ## Actual SOAP runs in `adminWorkerLoop` via the same procs as HTTP/MCP.
+  let op = adminChatActionFromName(adminActionFromAddonEvent(e))
+  if op == acaNone:
+    return
+  if not tryClaimAdminChatSlot():
+    return
+  withLock gAdminChatLock:
+    # Coalesce: latest wins if the worker is still busy.
+    gPendingAdminAction = op
+
 proc pushParsedLine(line: string) {.gcsafe.} =
   ## Parse a complete Chat.log line and append if it is an addon event.
+  ## Admin requests (`<SA> admin …`) are queued for the admin worker thread.
   let parsed = parseAddonEvent(line)
   if parsed.isNone:
     return
+  let ev = parsed.get
   {.gcsafe.}:
     withLock gEventLock:
-      discard appendAddonEvent(gEvents, gNextEventId, parsed.get)
+      discard appendAddonEvent(gEvents, gNextEventId, ev)
+    queueAdminFromAddon(ev)
 
 proc processTailChunk(chunk: string, partial: var string) {.gcsafe.} =
   ## Split a newly-read chunk into complete lines; keep a trailing partial.
@@ -746,6 +834,42 @@ proc tailerLoop() {.thread, gcsafe.} =
 proc startChatLogTailer() =
   ## Spawn the Chat.log tailer thread (call once from main before serve).
   createThread(gTailerThread, tailerLoop)
+
+# Defined with SOAP section; admin worker reuses the same faces.
+proc respawnShadowArmy*(): AdminActionResult
+proc reloadAddon*(): JsonNode
+proc telePartyToMurist*(): AdminActionResult
+
+proc adminWorkerLoop() {.thread.} =
+  ## Runs queued chat-bus admin actions with the same procs as HTTP/MCP.
+  ## Kept off the GC-safe Chat.log tailer so SOAP/HTTP is allowed here.
+  while true:
+    sleep(200)
+    var op = acaNone
+    {.gcsafe.}:
+      withLock gAdminChatLock:
+        op = gPendingAdminAction
+        gPendingAdminAction = acaNone
+    if op == acaNone:
+      continue
+    # SOAP/HTTP clients are not GC-safe; this worker exists so the tailer can be.
+    try:
+      {.cast(gcsafe).}:
+        case op
+        of acaRespawnShadowArmy:
+          discard respawnShadowArmy()
+        of acaReloadAddon:
+          discard reloadAddon()
+        of acaTelePartyToMurist:
+          discard telePartyToMurist()
+        of acaNone:
+          discard
+    except Exception:
+      discard
+
+proc startAdminWorker() =
+  ## Spawn the admin chat-bus worker (call once from main before serve).
+  createThread(gAdminWorkerThread, adminWorkerLoop)
 
 # ---------------------------------------------------------------------------
 # SOAP GM command client (inbound: System → addon via announce)
@@ -858,6 +982,67 @@ proc respawnCommandsFor*(name: string, teleDest: string = ShadowArmyRespawnTele)
     &"repairitems {name}",
   ]
 
+proc teleToMuristCommandsFor*(name: string, teleDest: string = MuristMeetTeleName): seq[string] =
+  ## SOAP command to pull one cast seat to the Murist-meet game_tele pin.
+  if not isShadowArmyCastName(name):
+    raise newException(ValueError, &"not a shadow-army cast name: {name}")
+  if teleDest != MuristMeetTeleName:
+    raise newException(ValueError, &"tele-to-murist only allows {MuristMeetTeleName}")
+  result = @[&"tele name {name} {teleDest}"]
+
+proc muristMeetDeleteSql*(): string =
+  ## DELETE scratch game_tele row (fixed name — no user input).
+  result = &"DELETE FROM game_tele WHERE name = '{MuristMeetTeleName}'"
+
+proc muristMeetInsertSql*(mapId: int, x, y, z: float): string =
+  ## INSERT scratch game_tele at Murist's coords (next free id).
+  if mapId < 0 or mapId > 10000:
+    raise newException(ValueError, &"invalid map id: {mapId}")
+  # Floats only — never interpolate free text.
+  let xs = formatFloat(x, ffDecimal, 4)
+  let ys = formatFloat(y, ffDecimal, 4)
+  let zs = formatFloat(z, ffDecimal, 4)
+  result = &"INSERT INTO game_tele (id, position_x, position_y, position_z, orientation, map, name) SELECT COALESCE(MAX(id),0)+1, {xs}, {ys}, {zs}, 0, {mapId}, '{MuristMeetTeleName}' FROM game_tele"
+
+proc findShadowByName*(shadows: seq[Shadow], name: string): Option[Shadow] =
+  ## Linear lookup by exact character name.
+  for s in shadows:
+    if s.name == name:
+      return some(s)
+  result = none(Shadow)
+
+proc execMariadbSql*(db, sql: string) =
+  ## Run one SQL statement via docker exec + mariadb (admin path; not policy).
+  let container = gameContainer()
+  let process = startProcess(
+    "docker",
+    args = [
+      "exec", container,
+      "mariadb",
+      &"-u{DbUser}",
+      &"-p{DbPass}",
+      db,
+      "-e", sql
+    ],
+    options = {poUsePath}
+  )
+  let output = process.outputStream.readAll()
+  let err = process.errorStream.readAll()
+  let exitCode = process.waitForExit()
+  process.close()
+  if exitCode != 0:
+    raise newException(IOError,
+      &"SQL failed (exit {exitCode}) db={db}: {err}\n{output}\nSQL: {sql}")
+
+proc soapStepOk(detail: string): bool =
+  ## Heuristic: VMaNGOS SOAP success text vs denial.
+  let low = detail.toLowerAscii()
+  result = not (
+    low.contains("not available") or low.contains("not found") or
+    low.contains("no such") or low.contains("incorrect syntax") or
+    low.contains("does not exist")
+  )
+
 proc adminActionToJson*(r: AdminActionResult): JsonNode =
   ## Serialize an admin action for MCP / JSON APIs.
   var steps = newJArray()
@@ -882,7 +1067,8 @@ proc respawnShadowArmy*(): AdminActionResult =
   ##
   ## This is **not** fair-play recovery. It is an admin-only testing reset when
   ## corpse runs stall (ghost masks, elevated death pockets, etc.). Policy
-  ## brains must never call this; only the System dashboard/MCP admin face.
+  ## brains must never call this; only The System admin faces (HTTP / MCP /
+  ## human-seat `<SA> admin respawn_shadow_army`).
   result = AdminActionResult(ok: true, action: "respawn_shadow_army", steps: @[])
   recordAdmin(
     DefaultAuditPath,
@@ -939,6 +1125,124 @@ proc respawnShadowArmy*(): AdminActionResult =
       &"respawned {ShadowArmyCast.len} cast seats → {ShadowArmyRespawnTele} ({okCount} SOAP steps ok)"
     else:
       &"respawn partial/fail ({okCount}/{result.steps.len} SOAP steps ok) — see steps"
+
+proc telePartyToMurist*(): AdminActionResult =
+  ## Ops escape hatch: pin game_tele to Murist's coords, reload, tele cast seats.
+  ##
+  ## Console SOAP only supports `tele name <player> <game_tele>` (not free xyz).
+  ## So we upsert `SA_MURIST_MEET` in mangos.game_tele from characters.position_*,
+  ## `reload game_tele`, then `tele name` each fixed cast seat. Not fair-play.
+  result = AdminActionResult(ok: true, action: "tele_party_to_murist", steps: @[])
+  recordAdmin(
+    DefaultAuditPath,
+    kind = "tele_party_to_murist_begin",
+    detail = "pin SA_MURIST_MEET + tele cast seats"
+  )
+
+  var muristOpt: Option[Shadow]
+  try:
+    muristOpt = findShadowByName(listShadows(), AdminRequesterName)
+  except Exception as e:
+    result.ok = false
+    result.summary = "failed to read roster: " & e.msg
+    result.steps.add(AdminStepResult(
+      name: AdminRequesterName, command: "listShadows", ok: false, detail: e.msg))
+    return
+
+  if muristOpt.isNone:
+    result.ok = false
+    result.summary = &"{AdminRequesterName} not found in characters DB"
+    result.steps.add(AdminStepResult(
+      name: AdminRequesterName, command: "find Murist", ok: false,
+      detail: "missing from roster"))
+    return
+
+  let murist = muristOpt.get
+  let where =
+    &"map={murist.mapId} ({murist.posX:.1f}, {murist.posY:.1f}, {murist.posZ:.1f})"
+
+  # 1) Upsert scratch game_tele at Murist's last DB position.
+  try:
+    execMariadbSql(WorldDbName, muristMeetDeleteSql())
+    execMariadbSql(WorldDbName, muristMeetInsertSql(
+      murist.mapId, murist.posX, murist.posY, murist.posZ))
+    result.steps.add(AdminStepResult(
+      name: MuristMeetTeleName,
+      command: "game_tele upsert",
+      ok: true,
+      detail: where
+    ))
+    recordAdmin(
+      DefaultAuditPath,
+      kind = "teleport",
+      character = AdminRequesterName,
+      detail = "upsert " & MuristMeetTeleName & " " & where
+    )
+  except Exception as e:
+    result.ok = false
+    result.steps.add(AdminStepResult(
+      name: MuristMeetTeleName, command: "game_tele upsert",
+      ok: false, detail: e.msg))
+    result.summary = "game_tele upsert failed: " & e.msg
+    return
+
+  # 2) Reload ObjectMgr game_tele cache.
+  try:
+    let detail = gmCommand("reload game_tele").strip()
+    let ok = soapStepOk(detail)
+    if not ok:
+      result.ok = false
+    result.steps.add(AdminStepResult(
+      name: "(world)", command: "reload game_tele", ok: ok, detail: detail))
+    if not ok:
+      result.summary = "reload game_tele failed"
+      return
+  except Exception as e:
+    result.ok = false
+    result.steps.add(AdminStepResult(
+      name: "(world)", command: "reload game_tele", ok: false, detail: e.msg))
+    result.summary = "reload game_tele failed: " & e.msg
+    return
+
+  # 3) Tele each cast seat to the pin.
+  for name in ShadowArmyCast:
+    for cmd in teleToMuristCommandsFor(name):
+      var step = AdminStepResult(name: name, command: cmd, ok: true, detail: "")
+      try:
+        step.detail = gmCommand(cmd).strip()
+        if not soapStepOk(step.detail):
+          step.ok = false
+          result.ok = false
+      except Exception as e:
+        step.ok = false
+        step.detail = e.msg
+        result.ok = false
+      result.steps.add(step)
+      recordAdmin(
+        DefaultAuditPath,
+        kind = "teleport",
+        character = name,
+        detail = cmd & (if step.ok: " ok" else: " FAIL " & step.detail)
+      )
+
+  try:
+    discard announceInGame(
+      "<SYS> admin teleported party to Murist (" & where & ")"
+    )
+  except Exception as e:
+    result.ok = false
+    result.steps.add(AdminStepResult(
+      name: "(announce)", command: "announce …", ok: false, detail: e.msg))
+
+  var okCount = 0
+  for s in result.steps:
+    if s.ok:
+      inc okCount
+  result.summary =
+    if result.ok:
+      &"teleported {ShadowArmyCast.len} cast seats → Murist {where} ({okCount} steps ok)"
+    else:
+      &"tele-to-murist partial/fail ({okCount}/{result.steps.len} steps ok) — see steps"
 
 proc newestEventIdSnapshot(): int =
   ## Newest assigned event id, or -1 when the ring is empty.
@@ -1596,6 +1900,8 @@ proc renderAdminPage*(): string =
           <code>tele name … {escapeHtml(ShadowArmyRespawnTele)}</code> +
           <code>repairitems</code> per seat. <strong>Not</strong> fair-play recovery —
           testing / ops only. Does not restart headless clients or brains.
+          Same action from in-game advisor <strong>Admin → Respawn army</strong>
+          (Murist only: <code>&lt;SA&gt; admin respawn_shadow_army</code>).
         </p>
         <p class="admin-note">
           Cast:
@@ -1609,13 +1915,44 @@ proc renderAdminPage*(): string =
                 hx-confirm="Respawn Shadowfel, Igris, Tusk, Beru at Deathknell? (GM revive + tele)">
           Respawn shadow army
         </button>
+      </div>
+    </div>
+    <div class="panel" style="margin-top:1rem;">
+      <div class="panel-head">
+        <h2>Teleport party to Murist</h2>
+        <span class="meta">ops</span>
+      </div>
+      <div class="panel-body">
+        <p class="admin-note">
+          Pulls the bot cast to Murist's current DB position. Upserts
+          <code>{escapeHtml(MuristMeetTeleName)}</code> in
+          <code>game_tele</code>, reloads it, then
+          <code>tele name &lt;cast&gt; {escapeHtml(MuristMeetTeleName)}</code>.
+          <strong>Not</strong> fair-play. Same as MCP
+          <code>tele_party_to_murist</code> and advisor
+          <strong>Admin → Tele party to me</strong>.
+        </p>
+        <p class="admin-note">
+          Cast:
+          <span class="admin-cast">{escapeHtml(castList)}</span>
+          → Murist live pos
+        </p>
+        <button class="admin"
+                hx-post="/admin/tele-party-to-murist"
+                hx-target="#admin-result"
+                hx-swap="innerHTML"
+                hx-confirm="Teleport Shadowfel, Igris, Tusk, Beru to Murist's position?">
+          Teleport party to Murist
+        </button>
         <div id="admin-result" style="margin-top:1rem;"></div>
       </div>
     </div>
   </main>
   <footer>
-    Dispatch: <code>respawnShadowArmy()</code> · HTTP <code>POST /admin/respawn-shadow-army</code>
-    · MCP <code>respawn_shadow_army</code>
+    Dispatch: <code>respawnShadowArmy()</code> /
+    <code>telePartyToMurist()</code>
+    · HTTP <code>/admin/*</code>
+    · MCP · Murist <code>&lt;SA&gt; admin …</code>
   </footer>
 </body>
 </html>
@@ -1705,6 +2042,18 @@ proc respawnShadowArmyHandler(request: Request) {.gcsafe.} =
     request.respond(500, htmlHeaders(),
       &"""<div class="admin-err">error: {escapeHtml(e.msg)}</div>""")
 
+proc telePartyToMuristHandler(request: Request) {.gcsafe.} =
+  ## POST /admin/tele-party-to-murist — pin game_tele to Murist + tele cast.
+  try:
+    var r: AdminActionResult
+    {.gcsafe.}:
+      r = telePartyToMurist()
+    let code = if r.ok: 200 else: 207
+    request.respond(code, htmlHeaders(), renderAdminResult(r))
+  except Exception as e:
+    request.respond(500, htmlHeaders(),
+      &"""<div class="admin-err">error: {escapeHtml(e.msg)}</div>""")
+
 proc healthHandler(request: Request) {.gcsafe.} =
   ## GET /healthz — process liveness (does not hit the realm DB).
   request.respond(200, jsonHeaders(), """{"ok":true,"service":"the-system"}""")
@@ -1753,14 +2102,15 @@ proc serverInfoHandler(request: Request) {.gcsafe.} =
         "events_partial": "/events",
         "reload": "/reload",
         "respawn_shadow_army": "/admin/respawn-shadow-army",
+        "tele_party_to_murist": "/admin/tele-party-to-murist",
         "jsonrpc": "/mcp",
         "healthz": "/healthz"
       },
       "tools": [
         "list_shadows", "addon_events", "reload_addon", "send_announce",
-        "respawn_shadow_army"
+        "respawn_shadow_army", "tele_party_to_murist"
       ],
-      "write_scope": "SOAP announce + admin revive/tele for fixed cast (local ops)"
+      "write_scope": "SOAP announce + admin revive/tele/tele-to-murist for fixed cast (local ops)"
     }
   request.respond(200, jsonHeaders(), $info)
 
@@ -1924,6 +2274,30 @@ proc registerMcpTools(server: McpServer) =
       isError: not r.ok
     )
 
+  let telePartyTool = McpTool(
+    name: "tele_party_to_murist",
+    description: "ADMIN ops escape hatch (not fair-play): upsert game_tele SA_MURIST_MEET at Murist's DB position, reload game_tele, tele name Shadowfel/Igris/Tusk/Beru there.",
+    inputSchema: %*{
+      "type": "object",
+      "properties": newJObject(),
+      "additionalProperties": false,
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    }
+  )
+
+  proc telePartyToMuristMcpHandler(arguments: JsonNode): ToolResult {.gcsafe.} =
+    ## Same dispatch as the Admin tab Teleport party to Murist button.
+    discard arguments
+    var r: AdminActionResult
+    {.gcsafe.}:
+      r = telePartyToMurist()
+    let payload = adminActionToJson(r)
+    result = ToolResult(
+      content: @[textContent($payload)],
+      structuredContent: some(payload),
+      isError: not r.ok
+    )
+
   # registerRichTool: plain registerTool only surfaces getStr() on JsonNode
   # (arrays become empty text). Monky uses the rich path for the same reason.
   server.registerRichTool(listTool, listShadowsHandler)
@@ -1931,12 +2305,14 @@ proc registerMcpTools(server: McpServer) =
   server.registerRichTool(reloadTool, reloadAddonHandler)
   server.registerRichTool(announceTool, sendAnnounceHandler)
   server.registerRichTool(respawnTool, respawnShadowArmyMcpHandler)
+  server.registerRichTool(telePartyTool, telePartyToMuristMcpHandler)
 
 proc main() =
   ## Boot The System: Chat.log tailer + one mummy server (dashboard + MCP).
   gMcpServer = newMcpServer(ServerName, Version)
   registerMcpTools(gMcpServer)
   startChatLogTailer()
+  startAdminWorker()
 
   var router: Router
   router.get("/", indexHandler)
@@ -1945,6 +2321,7 @@ proc main() =
   router.get("/events", eventsPartialHandler)
   router.post("/reload", reloadHandler)
   router.post("/admin/respawn-shadow-army", respawnShadowArmyHandler)
+  router.post("/admin/tele-party-to-murist", telePartyToMuristHandler)
   router.get("/healthz", healthHandler)
   router.get("/server-info", serverInfoHandler)
   router.post("/mcp", mcpHandler)
@@ -1956,6 +2333,7 @@ proc main() =
   echo &"  Events:      GET  http://127.0.0.1:{HttpPort}/events"
   echo &"  Reload:      POST http://127.0.0.1:{HttpPort}/reload"
   echo &"  Respawn:     POST http://127.0.0.1:{HttpPort}/admin/respawn-shadow-army"
+  echo &"  Tele party:  POST http://127.0.0.1:{HttpPort}/admin/tele-party-to-murist"
   echo &"  MCP:         POST http://127.0.0.1:{HttpPort}/mcp"
   echo &"  container:   {gameContainer()} (SYSTEM_MYSQL_CONTAINER to override)"
   echo &"  Chat.log:    {chatLogPath()} (SYSTEM_CHAT_LOG to override)"

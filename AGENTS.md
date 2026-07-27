@@ -56,10 +56,10 @@ upstream controller already owns.
   and tell monofuel — he decides whether to report it.
 - **Respect the client/bot boundary.** Our layer sees typed frames and
   sends typed goals/actions. No database pokes for progress, no GM-command
-  gameplay, no memory reads. Local GM is allowed only for **observation /
-  testing setup** (e.g. revive after a stuck corpse, tele to a known start
-  so you can re-test). Never for levels, XP, quest completion, loot, or
-  any outcome that should come from play. When in doubt, do not use GM.
+  gameplay, no memory reads. Local GM for **observation / testing setup**
+  is narrow: e.g. account create, server logs — **not** position control.
+  Never for levels, XP, quest completion, loot, or tele (see **NO TELEPORT**
+  above). When in doubt, do not use GM.
 - **Tests stay green and instant.** `make test` before every commit; unit
   tier has no network, no docker, no sleeps (testing doctrine:
   racha_notes `Programming/testing.md`). Integration tier may use the

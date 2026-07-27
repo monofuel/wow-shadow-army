@@ -10,6 +10,8 @@ Management server for the wow-shadow-army: one Nim binary, two faces.
 | Events partial | `GET /events` | htmx fragment (addon event rows) |
 | Reload | `POST /reload` | SOAP `announce <SYS> reload` + wait for `<SA> loaded` |
 | Respawn army | `POST /admin/respawn-shadow-army` | SOAP revive + tele Deathknell for bot cast |
+| Tele party → Murist | `POST /admin/tele-party-to-murist` | Pin `game_tele` to Murist + tele cast |
+| Addon admin bus | Chat.log `<SA> admin …` (Murist) | Same write procs as Admin tab / MCP |
 | MCP | `POST /mcp` | MCPort JSON-RPC tools (see below) |
 | Health | `GET /healthz` | process liveness |
 | Info | `GET /server-info` | MCP metadata |
@@ -23,6 +25,7 @@ MCP tools (same dispatch procs as the dashboard):
 | `reload_addon` | `reloadAddon()` | SOAP reload loop |
 | `send_announce` | `announceInGame(text)` | broadcast system message |
 | `respawn_shadow_army` | `respawnShadowArmy()` | admin revive + tele Deathknell (ops only) |
+| `tele_party_to_murist` | `telePartyToMurist()` | pin meet tele to Murist + tele cast (ops only) |
 
 Design source: `coworld-playbook/games/solo-leveling.md` → **The System (management server)**.
 
@@ -58,7 +61,7 @@ Tabs in the header: **Status** | **Admin**.
 
 - **Roster** (Status) — cast view by default (hides foundation `Bot*` / Nightsun / Cowcam). Toggle **Show foundation seats** (or `?all=1`) for the full realm. Order: Murist → Shadowfel → Igris → Tusk → Beru, then others. Columns: name · level · XP · **HP/MP** · class · **zone** · **pos** · gold · **life** · **seat** (realm online + nim_control port up/down). Panel head shows army strip (`N online · alive/ghost/dead · ctrl k/n`). Polls `GET /roster` every few seconds via htmx. Zone from `characters.zone` → `area_template`; ghost = `character_flags & 0x2000`. HP/MP from health + class stats + power fields. Pos = `position_x/y`. Seat control probes `127.0.0.1:41114+slot` for bot seats.
 - **Addon events** (Status) — live ring of parsed `<SA>` / `<ShadowArmy>` lines from Chat.log. Table body polls `GET /events`. **Reload addon** posts to `POST /reload`.
-- **Admin** (`GET /admin`) — local ops only. **Respawn shadow army** runs SOAP `revive` + `tele name … Deathknell` + `repairitems` for Shadowfel, Igris, Tusk, Beru. This is **not** fair-play corpse recovery; use it when ghost/corpse runs stall in testing. Does not restart headless clients or brains.
+- **Admin** (`GET /admin`) — local ops only. **Respawn shadow army** runs SOAP `revive` + `tele name … Deathknell` + `repairitems` for Shadowfel, Igris, Tusk, Beru. This is **not** fair-play corpse recovery; use it when ghost/corpse runs stall in testing. Does not restart headless clients or brains. The vanilla advisor **Admin** panel requests the same action via `/say` (`<SA> admin respawn_shadow_army`); only **Murist** is accepted.
 
 ## Reload loop
 
@@ -105,7 +108,8 @@ The System is an **observer first**. Roster data is `SELECT`-only against the `c
 Write paths (dedicated SOAP account `SYSTEM_SOAP_USER` / `SYSTEM_SOAP_PASS`):
 
 1. **Announce** — `announce <text>` for system chat / addon `<SYS>` verbs (`reload`, `ping`, `status`, `say …`).
-2. **Admin respawn** (explicit Admin tab / `respawn_shadow_army` only) — `revive`, `tele name`, `repairitems` for the fixed cast list. Not available to policy brains; local testing escape hatch when fair-play corpse runs fail.
+2. **Admin respawn** (Admin tab / MCP `respawn_shadow_army` / Murist `<SA> admin respawn_shadow_army`) — `revive`, `tele name`, `repairitems` for the fixed cast list. Not available to policy brains; local testing escape hatch when fair-play corpse runs fail.
+3. **Admin tele party to Murist** (Admin tab / MCP `tele_party_to_murist` / Murist `<SA> admin tele_party_to_murist`) — upsert `game_tele` `SA_MURIST_MEET` from Murist's DB coords, `reload game_tele`, `tele name` each cast seat. Ops regroup only.
 
 No free-form GM command surface, no database pokes for progress, no out-of-band seat collusion.
 
@@ -120,10 +124,12 @@ listShadows()          ──►  htmx roster     / MCP list_shadows
 recentEvents()         ──►  htmx events     / MCP addon_events
 reloadAddon()          ──►  htmx POST /reload / MCP reload_addon
 announceInGame()       ──►  MCP send_announce (and reloadAddon internals)
-respawnShadowArmy()    ──►  htmx Admin tab  / MCP respawn_shadow_army
+respawnShadowArmy()    ──►  htmx Admin tab / MCP / Murist admin chat
+telePartyToMurist()    ──►  htmx Admin tab / MCP / Murist admin chat
+reloadAddon()          ──►  htmx Reload / MCP / Murist admin chat
 ```
 
-**Rule for future pages/tools:** add a single data/action proc first; wire the dashboard button and the MCP tool to that same proc. Never let the two faces diverge.
+**Rule for future pages/tools:** add a single data/action proc first; wire the dashboard button, the MCP tool, and (if human-seat useful) the addon admin chat verb to that same proc. Never let the faces diverge.
 
 ## Stack choices
 

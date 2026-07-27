@@ -1,17 +1,21 @@
 # The advisor — human augmentation as a ramp to full AI guidance
 
 Design brainstorm (2026-07-25). Early pieces shipped in `addons/ShadowArmy/`;
-this file is still the hypothesis + advice-class notes. **Product framing
-for the gradual autopilot ladder (L0–L5), two-client split, and sandbox
-honesty lives in `docs/advisor-autopilot.md`.**
+this file is still the hypothesis + advice-class notes.
+
+**Product decision (2026-07-27):** vanilla ShadowArmy is **L0 only**
+(instruments). L1–L4 wait for the Nim client’s Lua addon system; L5 stays
+Nim bots / army host. Details: `docs/advisor-autopilot.md`. Do not grow
+vanilla addon actuation or client-unlock work.
 
 This is the shadow-army application of the racha_notes hypothesis
 `AI/game_bots/hypotheses.md` → "Human augmentation as a ramp to full AI
 guidance" (monofuel, 2026-07-24): build tools that advise a *human* player
 first — the human is the training wheels, and the handoff to a fully
-autonomous policy is gradual instead of a day-0 leap.
+autonomous policy is gradual instead of a day-0 leap. On stock 1.12 that
+ramp **stops at instruments** until the Nim addon seat exists.
 
-Companion docs: `advisor-autopilot.md` (ladder + tournament relationship);
+Companion docs: `advisor-autopilot.md` (levels + decision);
 `command-channel.md` — same chat bus, opposite direction. Commands flow
 human→shadows; advice flows shadows→human.
 

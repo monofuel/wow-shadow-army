@@ -17,6 +17,8 @@ const
     "2026-07-25 18:00:05 [Chat] (acc 100008, ip 172.20.0.1, guid 1000007, name Murist, map 0, pos 1994.96 1559.28 78.2792) [Say] Murist:1000007 : <SA> err rotation: attempt to compare nil with number"
   LineExtraColons =
     "2026-07-25 19:00:00 [Chat] (acc 1, ip 10.0.0.1, guid 42, name Tester, map 0, pos 1.0 2.0 3.0) [Say] Tester:42 : <SA> status hp:100/100 mana:50:25"
+  LineAdminRespawn =
+    "2026-07-27 16:00:00 [Chat] (acc 100008, ip 172.20.0.1, guid 1000007, name Murist, map 0, pos 1994.96 1559.28 78.2792) [Say] Murist:1000007 : <SA> admin respawn_shadow_army #1"
 
 suite "parseAddonEvent":
   test "legacy <ShadowArmy> prefix":
@@ -72,6 +74,15 @@ suite "parseAddonEvent":
   test "empty / garbage → none":
     check parseAddonEvent("").isNone
     check parseAddonEvent("not a chat log line").isNone
+
+  test "<SA> admin respawn request":
+    let ev = parseAddonEvent(LineAdminRespawn)
+    check ev.isSome
+    let e = ev.get
+    check e.name == "Murist"
+    check e.kind == "admin"
+    check e.payload == "respawn_shadow_army #1"
+    check adminActionFromAddonEvent(e) == "respawn_shadow_army"
 
 suite "ring buffer":
   test "append assigns ids and drops oldest at cap":

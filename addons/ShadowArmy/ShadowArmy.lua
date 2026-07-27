@@ -6,19 +6,22 @@
 
 ShadowArmy = ShadowArmy or {}
 
+-- Lua 5.0 hard limit: 200 locals per function. Helpers live on F.
+local F = {}
+
 -- Bump on every edit. The System watches Chat.log for "<SA> loaded rev=..."
 -- after sending a reload — a new rev proves the edit actually loaded.
-local REV = "r21"
+local REV = "r31"
 
--- Log window (r16): every say()/emit() line also lands here with a
+-- Log window (r16): every F.say()/F.emit() line also lands here with a
 -- timestamp, so errors survive chat scroll-off and can be reviewed in-game.
 -- ScrollingMessageFrame is the same widget chat frames are built on —
 -- free history, free scrolling. Forward-declared; UI built after the panel.
-local addLog -- (kind, text)
+-- F.addLog assigned when log UI is built
 
-local function say(msg)
+function F.say(msg)
   DEFAULT_CHAT_FRAME:AddMessage("|cFF9482C9[ShadowArmy]|r " .. tostring(msg))
-  if addLog then addLog("say", tostring(msg)) end
+  if F.addLog then F.addLog("say", tostring(msg)) end
 end
 
 -- /say lands in the server's Chat.log; The System tails it. This is
@@ -26,7 +29,7 @@ end
 -- r11 flood control (live incident): the trace firehose tripped the server's
 -- chat throttle — "you must wait 4s before speaking again" — which blocked
 -- the HUMAN's own chat too. So nothing is sent straight from the call site
--- any more. emit() queues; the driver's OnUpdate drains at most one line per
+-- any more. F.emit() queues; the driver's OnUpdate drains at most one line per
 -- EMIT_GAP seconds. The queue is deliberately tiny and priority-aware: under
 -- pressure we throw away chatter (traces) and never the lines The System
 -- actually reads (loaded / reloading / reload-click / err / pong / status).
@@ -38,7 +41,7 @@ local emitQueue = {}        -- FIFO of { msg = string, drop = bool }
 local lastSendAt = 0
 local lastEmitMsg, lastEmitTime = nil, 0 -- 30s identical-message dedupe
 
-local function emit(kind, text)
+function F.emit(kind, text)
   local msg = "<SA> " .. kind .. " " .. text
   local now = GetTime()
   if msg == lastEmitMsg and (now - lastEmitTime) < 30 then
@@ -46,7 +49,7 @@ local function emit(kind, text)
   end
   lastEmitMsg = msg
   lastEmitTime = now
-  if addLog then addLog(kind, text) end
+  if F.addLog then F.addLog(kind, text) end
   local droppable = DROPPABLE[kind] and true or false
   if table.getn(emitQueue) >= EMIT_QUEUE_MAX then
     -- Make room: evict the oldest droppable line first.
@@ -71,7 +74,7 @@ local function emit(kind, text)
 end
 
 -- Called every frame by the driver; sends at most one queued line.
-local function emitDrain()
+function F.emitDrain()
   if table.getn(emitQueue) == 0 then
     return
   end
@@ -87,11 +90,11 @@ end
 -- Diagnosis mode (r7): trace every action attempt so the telemetry shows
 -- WHERE each path dies. OFF by default since r11 — left on, the traces
 -- tripped the server chat throttle and locked the human out of their own
--- /say. Opt in with `<SYS> debug on`, off again with `<SYS> debug off`.
+-- /F.say. Opt in with `<SYS> debug on`, off again with `<SYS> debug off`.
 local debugMode = false
-local function dtrace(text)
+function F.dtrace(text)
   if debugMode then
-    emit("trace", text)
+    F.emit("trace", text)
   end
 end
 
@@ -105,7 +108,7 @@ local grind = {
   kills = 0,
 }
 
-local function fmtDuration(seconds)
+function F.fmtDuration(seconds)
   if seconds ~= seconds or seconds < 0 or seconds > 359999 then
     return "--"
   end
@@ -117,7 +120,7 @@ local function fmtDuration(seconds)
   return string.format("%dm", m)
 end
 
-local function grindStats()
+function F.grindStats()
   if not grind.startTime then
     return 0, "--"
   end
@@ -131,7 +134,7 @@ local function grindStats()
   end
   local perHour = gained / (elapsed / 3600)
   local toLevel = UnitXPMax("player") - UnitXP("player")
-  return math.floor(perHour), fmtDuration(toLevel / (perHour / 3600))
+  return math.floor(perHour), F.fmtDuration(toLevel / (perHour / 3600))
 end
 
 --------------------------------------------------------------------------
@@ -140,7 +143,7 @@ end
 
 local panel = CreateFrame("Frame", "ShadowArmyPanel", UIParent)
 panel:SetWidth(210)
-panel:SetHeight(192) -- +24 second button row, +8 the r18 quest line
+panel:SetHeight(216) -- +24 third button row (Probe)
 panel:SetPoint("RIGHT", UIParent, "RIGHT", -40, 60)
 panel:SetFrameStrata("HIGH")
 panel:SetBackdrop({
@@ -159,7 +162,7 @@ panel:SetScript("OnDragStop", function() panel:StopMovingOrSizing() end)
 -- Show() after strata/backdrop avoids "loaded but nowhere" on some clients.
 panel:Show()
 
-local function panelShowReset()
+function F.panelShowReset()
   -- Recover from off-screen drag or a hide that left no way back.
   panel:ClearAllPoints()
   panel:SetPoint("RIGHT", UIParent, "RIGHT", -40, 60)
@@ -170,7 +173,7 @@ local title = panel:CreateFontString(nil, "OVERLAY", "GameFontNormal")
 title:SetPoint("TOP", panel, "TOP", 0, -8)
 title:SetText("|cFF9482C9Shadow Advisor|r")
 
-local function makeLine(prev, offset)
+function F.makeLine(prev, offset)
   local fs = panel:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
   fs:SetPoint("TOPLEFT", prev, "BOTTOMLEFT", 0, offset or -3)
   fs:SetJustifyH("LEFT")
@@ -182,62 +185,52 @@ end
 local line1 = panel:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
 line1:SetPoint("TOPLEFT", panel, "TOPLEFT", 10, -26)
 line1:SetJustifyH("LEFT")
-local line2 = makeLine(line1)
-local line3 = makeLine(line2)
-local line4 = makeLine(line3)
-local line5 = makeLine(line4, -6) -- buff watch / warnings
-local line6 = makeLine(line5, -6) -- r18: nearest quest objective
+local line2 = F.makeLine(line1)
+local line3 = F.makeLine(line2)
+local line4 = F.makeLine(line3)
+local line5 = F.makeLine(line4, -6) -- buff watch / warnings
+local line6 = F.makeLine(line5, -6) -- r18: nearest quest objective
 
 -- (v0.1 had Nearest-foe/Attack buttons; removed — they duplicated Tab and
 -- the T auto-attack keybind. Rule: a button earns its place only by doing
 -- something the default UI can't. Full-auto combat qualifies.)
 
 --------------------------------------------------------------------------
--- Auto-combat: toggle + warlock rotation. When ON and you target an
--- attackable enemy, the advisor plays the fight: Corruption up, Shadow
--- Bolt while mana holds, wand otherwise, melee as last resort.
--- Uses only spells the character has LEARNED (spellbook scan) — the
--- human still trains everything at the trainer themselves.
+-- Combat coach (r26): L0 suggestions only — vanilla action APIs are
+-- click/software gated, so we do NOT auto-cast. Opens a window of
+-- priority abilities for the human to press. Warlock leveling priority
+-- (Corruption → Shadow Bolt → wand → melee), spellbook-gated.
+-- See docs/advisor-autopilot.md (vanilla = L0 only).
 --------------------------------------------------------------------------
 
 local auto = {
-  enabled = false,
-  casting = false,   -- SPELLCAST_START..STOP window (cast-time spells)
-  castingSince = 0,  -- stuck-flag safety: clear if STOP never arrives
-  gcdUntil = 0,      -- our own 1.6s guard after any cast request
-  failUntil = 0,     -- backoff after SPELLCAST_FAILED (no machine-gun retry)
-  shooting = false,  -- wand auto-repeat active (don't re-toggle it off!)
-  melee = false,     -- auto-attack swing loop active
-  lastMeleeAt = 0,   -- AttackTarget re-fire guard (2nd call toggles OFF)
+  casting = false,
+  castingSince = 0,
+  gcdUntil = 0,      -- used only by legacy F.armorTick if it still casts
+  failUntil = 0,
+  shooting = false,  -- wand auto-repeat observed via events
+  melee = false,     -- auto-attack swing observed via events
   known = {},        -- lowercase spell name -> true
 }
 
--- Movement detection (r8): Shadow Bolt while moving fails with "Can't do
--- that while moving" and the rotation would retry forever instead of
--- falling back to the wand ("breaks down if I'm moving" — monofuel, live).
--- 1.12 exposes no IsMoving(); poll GetPlayerMapPosition deltas instead.
--- r11: sampled from the DRIVER's OnUpdate (every frame), not from
--- rotationStep — rotationStep is skipped during GCD/backoff windows, so
--- move.at went stale and a player who had stopped still read as moving for
--- a whole extra cycle, starving Shadow Bolt. rotationStep now only READS
--- move.moving.
+-- 1.12 has no IsMoving(); sample map position deltas for cast vs wand tips.
 local move = { x = 0, y = 0, at = 0, moving = false }
-local function updateMoving()
+function F.updateMoving()
   local x, y = GetPlayerMapPosition("player")
   if x and (x ~= 0 or y ~= 0) then
     if x ~= move.x or y ~= move.y then
       move.moving = true
       move.at = GetTime()
     elseif GetTime() - move.at > 0.3 then
-      move.moving = false -- standing still for a beat
+      move.moving = false
     end
     move.x, move.y = x, y
   else
-    move.moving = false -- no map position (instance): assume stationary
+    move.moving = false
   end
 end
 
-local function scanSpellbook()
+function F.scanSpellbook()
   auto.known = {}
   local i = 1
   while true do
@@ -251,7 +244,7 @@ end
 -- 1.12 UnitDebuff returns the TEXTURE first; names aren't exposed.
 local CORRUPTION_TEX = "Interface\\Icons\\Spell_Shadow_AbominationExplosion"
 
-local function targetHasDebuff(texture)
+function F.targetHasDebuff(texture)
   local i = 1
   while true do
     local tex = UnitDebuff("target", i)
@@ -261,118 +254,309 @@ local function targetHasDebuff(texture)
   end
 end
 
-local function castNow(spell)
-  dtrace("cast " .. spell)
+-- Shared by F.armorTick legacy path (cast still gated on this client).
+function F.castNow(spell)
+  F.dtrace("cast " .. spell)
   CastSpellByName(spell)
   auto.gcdUntil = GetTime() + 1.6
 end
 
-local function rotationStep()
-  if not auto.enabled then return end
-  if not UnitExists("target") then return end
-  if UnitIsDeadOrGhost("target") or not UnitCanAttack("player", "target") then return end
-  -- stuck-casting safety: a missed SPELLCAST_STOP would freeze the whole
-  -- rotation ("doesn't work" with no error). No 1.12 cast lasts 4s at our
-  -- level; clear and move on.
-  if auto.casting and GetTime() - auto.castingSince > 4 then
-    auto.casting = false
-    dtrace("casting flag stuck >4s — cleared")
-  end
-  if auto.casting or GetTime() < auto.gcdUntil then return end
-  if GetTime() < auto.failUntil then return end
+-- Warlock ability buttons (fixed order). Click = hardware event = cast works.
+-- No pet button: imp is on Aggressive — it engages without PetAttack.
+local COMBAT_ABILITIES = {
+  { id = "corruption", label = "Corruption",  kind = "spell", spell = "Corruption", book = "corruption" },
+  { id = "shadowbolt", label = "Shadow Bolt", kind = "spell", spell = "Shadow Bolt", book = "shadow bolt" },
+  { id = "shoot",      label = "Shoot",       kind = "spell", spell = "Shoot", book = "shoot" },
+  { id = "melee",      label = "Melee Attack", kind = "melee" },
+}
 
-  -- move.moving is sampled by the driver every frame (see updateMoving).
+-- Evaluate each ability: ready (priority pick), usable (click ok), reason text.
+-- Returns status line, nextId, and rows[id] = { usable, ready, reason }.
+function F.combatAdvice()
+  local rows = {}
+  local nextId = nil
+  local function set(id, usable, ready, reason)
+    rows[id] = { usable = usable, ready = ready, reason = reason or "" }
+    if ready and not nextId then
+      nextId = id
+    end
+  end
+
+  local status
+  if not UnitExists("target") then
+    status = "|cFFFFAA00No target|r"
+    local i = 1
+    while i <= table.getn(COMBAT_ABILITIES) do
+      set(COMBAT_ABILITIES[i].id, false, false, "need target")
+      i = i + 1
+    end
+    return status, nil, rows
+  end
+  if UnitIsDeadOrGhost("target") then
+    status = "|cFFFFAA00Target dead|r"
+    local i = 1
+    while i <= table.getn(COMBAT_ABILITIES) do
+      set(COMBAT_ABILITIES[i].id, false, false, "target dead")
+      i = i + 1
+    end
+    return status, nil, rows
+  end
+  if not UnitCanAttack("player", "target") then
+    status = "|cFFFFAA00Friendly target|r"
+    local i = 1
+    while i <= table.getn(COMBAT_ABILITIES) do
+      set(COMBAT_ABILITIES[i].id, false, false, "not hostile")
+      i = i + 1
+    end
+    return status, nil, rows
+  end
+
+  local tName = UnitName("target") or "?"
   local manaPct = 0
   if UnitManaMax("player") > 0 then
     manaPct = UnitMana("player") / UnitManaMax("player") * 100
   end
-  local inCastRange = CheckInteractDistance("target", 4)  -- ~28yd
-
-  -- Pet first: sic the imp whenever it isn't on our target (Firebolt is on
-  -- autocast, so PetAttack is the only command it needs). No GCD cost.
-  -- UnitIsUnit handles both "no pet target" and "pet on the wrong mob".
-  if UnitExists("pet") and not UnitIsDead("pet")
-      and not UnitIsUnit("pettarget", "target") then
-    dtrace("pet attack")
-    PetAttack()
+  local in28 = CheckInteractDistance("target", 4) and true or false
+  local in10 = CheckInteractDistance("target", 3) and true or false
+  local hasWand = GetInventoryItemLink("player", 18) and true or false
+  local corrUp = F.targetHasDebuff(CORRUPTION_TEX)
+  local casting = auto.casting
+  if casting and GetTime() - auto.castingSince > 4 then
+    casting = false
   end
 
-  -- Priority: DoT up -> nuke while mana holds -> wand -> melee.
-  -- While MOVING only instants + wand are legal: Shadow Bolt would fail
-  -- "Can't do that while moving"; wand auto-repeat keeps firing on the run.
-  if inCastRange and auto.known["corruption"] and manaPct > 25
-      and not targetHasDebuff(CORRUPTION_TEX) then
-    castNow("Corruption") -- instant: fine while moving
-    return
-  end
-  -- Mana reserve: 30→45 (r10) was too greedy — "shadow bolt still not
-  -- working" (monofuel, live): with Corruption + the imp burning mana the
-  -- pool sits under 45% most of a fight, so the nuke never fired. r11 puts
-  -- the floor at 35: still leaves a wand/Corruption reserve, but lets the
-  -- bolt actually cast.
-  if inCastRange and not move.moving
-      and auto.known["shadow bolt"] and manaPct > 35 then
-    castNow("Shadow Bolt")
-    return
-  end
-  -- "Shoot" sits in the spellbook even with no wand equipped (live find);
-  -- gate on the ranged slot (18) actually holding something.
-  if inCastRange and auto.known["shoot"] and not auto.shooting
-      and GetInventoryItemLink("player", 18) then
-    -- wand toggle: casting Shoot while already repeating would turn it OFF
-    dtrace("cast Shoot" .. (move.moving and " (moving)" or ""))
-    CastSpellByName("Shoot")
-    return
-  end
-  -- Melee is a LAST resort for a warlock (the imp + DoTs are the plan):
-  -- only when the mob is already in our face. 3s re-fire guard — the live
-  -- traces showed back-to-back AttackTarget calls, and the second one
-  -- TOGGLES auto-attack off (that was the melee stutter).
-  if not auto.melee and CheckInteractDistance("target", 3)
-      and GetTime() - auto.lastMeleeAt > 3 then
-    auto.lastMeleeAt = GetTime()
-    dtrace("melee AttackTarget (last resort)")
-    AttackTarget()
-    return
-  end
-  -- Nothing fired: say why, once per situation (dedupe handles repeats).
-  local known = 0
-  for _ in pairs(auto.known) do known = known + 1 end
-  dtrace(string.format("idle: known=%d mana=%d%% range28=%s range10=%s moving=%s shooting=%s melee=%s",
-    known, manaPct, tostring(inCastRange),
-    tostring(CheckInteractDistance("target", 3) and true or false),
-    tostring(move.moving), tostring(auto.shooting), tostring(auto.melee)))
-end
+  status = string.format(
+    "|cFF9482C9%s|r  mana %d%%  %s%s",
+    tName, math.floor(manaPct),
+    move.moving and "moving  " or "still  ",
+    casting and "|cFFFFFF00casting|r" or "")
 
-local function setAuto(on)
-  auto.enabled = on
-  -- r11: label always reads "Auto Combat" (the old "Auto: ON/OFF" was
-  -- unclear); the STATE lives in the colour — green on, grey off.
-  local label = on and "|cFF44FF44Auto Combat|r" or "|cFF999999Auto Combat|r"
-  ShadowArmyAutoBtn:SetText(label)
-  say(on and "auto-combat ON — target something and watch"
-        or "auto-combat OFF — back to manual")
-  -- /say lands in the server's Chat.log, labeling the breadcrumb corpus:
-  -- everything between ON/OFF markers is addon play, not human play.
-  emit("auto", on and "ON" or "OFF")
-end
+  -- Corruption
+  if not auto.known["corruption"] then
+    set("corruption", false, false, "not trained")
+  elseif corrUp then
+    set("corruption", true, false, "already up")
+  elseif not in28 then
+    set("corruption", true, false, "out of range")
+  elseif manaPct <= 25 then
+    set("corruption", true, false, "mana low")
+  else
+    set("corruption", true, true, "DoT")
+  end
 
-local autoBtn = CreateFrame("Button", "ShadowArmyAutoBtn", panel, "UIPanelButtonTemplate")
-autoBtn:SetWidth(118)
-autoBtn:SetHeight(20)
-autoBtn:SetPoint("BOTTOMLEFT", panel, "BOTTOMLEFT", 8, 32) -- upper button row
-autoBtn:SetText("|cFF999999Auto Combat|r")
-autoBtn:SetScript("OnClick", function()
-  setAuto(not auto.enabled)
-  -- Hardware-event probe: this click IS a hardware event. If a cast fires
-  -- here but never from OnUpdate, the client gates combat calls the same
-  -- way it gates ReloadUI. (Target something attackable, then click.)
-  if auto.enabled then
-    local ok, err = pcall(rotationStep)
-    if not ok then
-      emit("err", "rotation(click): " .. tostring(err))
+  -- Shadow Bolt
+  if not auto.known["shadow bolt"] then
+    set("shadowbolt", false, false, "not trained")
+  elseif move.moving then
+    set("shadowbolt", true, false, "stand still")
+  elseif casting then
+    set("shadowbolt", true, false, "casting")
+  elseif not in28 then
+    set("shadowbolt", true, false, "out of range")
+  elseif manaPct <= 35 then
+    set("shadowbolt", true, false, "mana low")
+  else
+    set("shadowbolt", true, true, "nuke")
+  end
+
+  -- Shoot
+  if not auto.known["shoot"] then
+    set("shoot", false, false, "not trained")
+  elseif not hasWand then
+    set("shoot", false, false, "no wand")
+  elseif auto.shooting then
+    set("shoot", true, false, "firing")
+  elseif not in28 then
+    set("shoot", true, false, "out of range")
+  else
+    set("shoot", true, true, "wand")
+  end
+
+  -- Melee
+  if auto.melee then
+    set("melee", true, false, "swinging")
+  elseif not in10 then
+    set("melee", true, false, "not in melee")
+  else
+    set("melee", true, true, "last resort")
+  end
+
+  if not nextId then
+    if casting then
+      status = status .. "  |cFFFFFF00finish cast|r"
+    elseif auto.shooting then
+      status = status .. "  |cFFAAAAAAwanding|r"
     end
   end
+  return status, nextId, rows
+end
+
+-- Fire ability from a button OnClick (hardware event — casts work).
+function F.combatUse(id)
+  local i = 1
+  while i <= table.getn(COMBAT_ABILITIES) do
+    local a = COMBAT_ABILITIES[i]
+    if a.id == id then
+      if a.kind == "melee" then
+        if UnitExists("target") and UnitCanAttack("player", "target")
+            and not UnitIsDeadOrGhost("target") then
+          AttackTarget()
+        end
+      elseif a.kind == "spell" and a.spell then
+        if a.book and not auto.known[a.book] then
+          return
+        end
+        F.castNow(a.spell)
+      end
+      return
+    end
+    i = i + 1
+  end
+end
+
+-- Combat coach UI: clickable ability buttons
+local combatFrame = CreateFrame("Frame", "ShadowArmyCombatFrame", UIParent)
+combatFrame:SetWidth(260)
+combatFrame:SetHeight(174) -- 4 ability buttons (no pet)
+combatFrame:SetPoint("CENTER", UIParent, "CENTER", 120, 20)
+combatFrame:SetBackdrop({
+  bgFile = "Interface\\Tooltips\\UI-Tooltip-Background",
+  edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+  tile = true, tileSize = 16, edgeSize = 16,
+  insets = { left = 4, right = 4, top = 4, bottom = 4 },
+})
+combatFrame:SetBackdropColor(0.08, 0.02, 0.10, 0.92)
+combatFrame:EnableMouse(true)
+combatFrame:SetMovable(true)
+combatFrame:RegisterForDrag("LeftButton")
+combatFrame:SetScript("OnDragStart", function() combatFrame:StartMoving() end)
+combatFrame:SetScript("OnDragStop", function() combatFrame:StopMovingOrSizing() end)
+combatFrame:Hide()
+tinsert(UISpecialFrames, "ShadowArmyCombatFrame")
+
+local combatTitle = combatFrame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+combatTitle:SetPoint("TOP", combatFrame, "TOP", 0, -8)
+combatTitle:SetText("|cFF9482C9Combat coach|r")
+
+local combatClose = CreateFrame("Button", nil, combatFrame, "UIPanelCloseButton")
+combatClose:SetPoint("TOPRIGHT", combatFrame, "TOPRIGHT", -2, -2)
+
+local combatStatus = combatFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+combatStatus:SetPoint("TOPLEFT", combatFrame, "TOPLEFT", 12, -28)
+combatStatus:SetPoint("TOPRIGHT", combatFrame, "TOPRIGHT", -12, -28)
+combatStatus:SetJustifyH("LEFT")
+combatStatus:SetText("")
+
+local combatBtns = {}
+local cbi = 1
+while cbi <= table.getn(COMBAT_ABILITIES) do
+  local ab = COMBAT_ABILITIES[cbi]
+  local b = CreateFrame("Button", "ShadowArmyCombatBtn" .. ab.id, combatFrame, "UIPanelButtonTemplate")
+  b:SetWidth(232)
+  b:SetHeight(22)
+  b:SetPoint("TOP", combatFrame, "TOP", 0, -44 - (cbi - 1) * 26)
+  b:SetText(ab.label)
+  b.abilityId = ab.id
+  b:SetScript("OnClick", function()
+    F.combatUse(this.abilityId)
+  end)
+  combatBtns[ab.id] = b
+  cbi = cbi + 1
+end
+
+-- Sort key: 0 = recommended next, 1 = usable (ready or not), 2 = grey/unusable.
+-- Within a tier, keep the warlock priority order from COMBAT_ABILITIES.
+function F.combatSortRank(id, nextId, rows)
+  local r = rows and rows[id]
+  if not r then return 9 end
+  if nextId and id == nextId then return 0 end
+  if r.usable then return 1 end
+  return 2
+end
+
+local combatAcc = 0
+function F.combatRefresh()
+  if not combatFrame:IsShown() then return end
+  local status, nextId, rows = F.combatAdvice()
+  combatStatus:SetText(status or "")
+
+  -- Build ordered list of ability indices (stable within tier).
+  local order = {}
+  local n = table.getn(COMBAT_ABILITIES)
+  local i = 1
+  while i <= n do
+    order[i] = i
+    i = i + 1
+  end
+  -- Insertion sort (Lua 5.0, tiny n).
+  local a = 2
+  while a <= n do
+    local key = order[a]
+    local keyId = COMBAT_ABILITIES[key].id
+    local keyRank = F.combatSortRank(keyId, nextId, rows)
+    local b = a - 1
+    while b >= 1 do
+      local otherId = COMBAT_ABILITIES[order[b]].id
+      local otherRank = F.combatSortRank(otherId, nextId, rows)
+      -- Lower rank first; same rank keeps original priority (order[b] < key).
+      if otherRank < keyRank or (otherRank == keyRank and order[b] < key) then
+        break
+      end
+      order[b + 1] = order[b]
+      b = b - 1
+    end
+    order[b + 1] = key
+    a = a + 1
+  end
+
+  i = 1
+  while i <= n do
+    local ab = COMBAT_ABILITIES[order[i]]
+    local btn = combatBtns[ab.id]
+    local r = rows and rows[ab.id]
+    if btn and r then
+      local label = ab.label
+      if r.reason and r.reason ~= "" then
+        label = ab.label .. "  |cFF888888" .. r.reason .. "|r"
+      end
+      if nextId == ab.id then
+        btn:SetText("|cFF44FF44→ " .. label .. "|r")
+      elseif r.usable then
+        btn:SetText("|cFFCCCCCC" .. label .. "|r")
+      else
+        btn:SetText("|cFF666666" .. label .. "|r")
+      end
+      if r.usable then
+        btn:Enable()
+      else
+        btn:Disable()
+      end
+      -- Re-stack top → bottom by importance every refresh.
+      btn:ClearAllPoints()
+      btn:SetPoint("TOP", combatFrame, "TOP", 0, -44 - (i - 1) * 26)
+    end
+    i = i + 1
+  end
+end
+
+function F.combatToggle()
+  if combatFrame:IsShown() then
+    combatFrame:Hide()
+  else
+    combatFrame:Show()
+    F.combatRefresh()
+  end
+end
+
+combatClose:SetScript("OnClick", function() combatFrame:Hide() end)
+
+local combatBtn = CreateFrame("Button", "ShadowArmyCombatBtn", panel, "UIPanelButtonTemplate")
+combatBtn:SetWidth(118)
+combatBtn:SetHeight(20)
+combatBtn:SetPoint("BOTTOMLEFT", panel, "BOTTOMLEFT", 8, 56) -- top button row
+combatBtn:SetText("|cFF9482C9Combat|r")
+combatBtn:SetScript("OnClick", function()
+  F.combatToggle()
 end)
 
 -- Remote-reload button: hidden until The System requests a reload. It must
@@ -381,7 +565,7 @@ end)
 local reloadBtn = CreateFrame("Button", "ShadowArmyReloadBtn", panel, "UIPanelButtonTemplate")
 reloadBtn:SetWidth(68) -- 118 + 8 gap + 68 = 194 = panel width minus insets
 reloadBtn:SetHeight(20)
-reloadBtn:SetPoint("BOTTOMRIGHT", panel, "BOTTOMRIGHT", -8, 32) -- upper row, beside Auto Combat
+reloadBtn:SetPoint("BOTTOMRIGHT", panel, "BOTTOMRIGHT", -8, 56) -- top row, beside Combat
 reloadBtn:SetText("|cFF44FF44Reload!|r")
 reloadBtn:Hide()
 reloadBtn:SetScript("OnClick", function()
@@ -464,7 +648,7 @@ logMsg:SetJustifyH("LEFT")
 logMsg:SetMaxLines(250)
 logMsg:SetFading(false)
 
-local function makeLogBtn(label, xOff, fn)
+function F.makeLogBtn(label, xOff, fn)
   local b = CreateFrame("Button", nil, logFrame, "UIPanelButtonTemplate")
   b:SetWidth(56)
   b:SetHeight(18)
@@ -473,9 +657,9 @@ local function makeLogBtn(label, xOff, fn)
   b:SetScript("OnClick", fn)
   return b
 end
-makeLogBtn("Up", 12, function() logMsg:ScrollUp() end)
-makeLogBtn("Down", 72, function() logMsg:ScrollDown() end)
-makeLogBtn("Latest", 132, function() logMsg:ScrollToBottom() end)
+F.makeLogBtn("Up", 12, function() logMsg:ScrollUp() end)
+F.makeLogBtn("Down", 72, function() logMsg:ScrollDown() end)
+F.makeLogBtn("Latest", 132, function() logMsg:ScrollToBottom() end)
 
 -- kind -> color; errors pop, telemetry chatter stays muted
 local LOG_COLORS = {
@@ -483,11 +667,13 @@ local LOG_COLORS = {
   say = { 0.72, 0.62, 0.9 },
   trace = { 0.55, 0.55, 0.55 },
   loaded = { 0.35, 1.0, 0.35 },
+  probe = { 0.4, 0.85, 1.0 },
+  admin = { 1.0, 0.55, 0.25 },
 }
 
 local logErrCount = 0 -- unseen errors since the window was last opened
 
-addLog = function(kind, text)
+F.addLog = function(kind, text)
   local c = LOG_COLORS[kind] or { 0.8, 0.8, 0.8 }
   local tag = (kind == "say") and "" or ("[" .. kind .. "] ")
   logMsg:AddMessage(date("%H:%M:%S ") .. tag .. text, c[1], c[2], c[3])
@@ -501,12 +687,12 @@ addLog = function(kind, text)
 end
 
 -- Panel button (r17): the log is a window, so it gets a button — /sa log
--- stays as a fallback. Lives on its own row under Auto Combat / Reload.
+-- stays as a fallback. Lives on its own row under Combat / Reload.
 local logBtn = CreateFrame("Button", "ShadowArmyLogBtn", panel, "UIPanelButtonTemplate")
 -- r18: half the bottom row; the Quests toggle takes the other half.
 logBtn:SetWidth(93)
 logBtn:SetHeight(20)
-logBtn:SetPoint("BOTTOMLEFT", panel, "BOTTOMLEFT", 8, 8)
+logBtn:SetPoint("BOTTOMLEFT", panel, "BOTTOMLEFT", 8, 32) -- middle row
 logBtn:SetText("Log")
 logBtn:SetScript("OnClick", function()
   if logFrame:IsVisible() then
@@ -538,11 +724,11 @@ local WATCHED_BUFFS = {
       "Interface\\Icons\\Spell_Shadow_SpectralSight", -- Demon Armor (lvl 20+)
     },
     warnBelow = 300, -- seconds; warn under 5 minutes
-    autoCast = true, -- r12: the advisor keeps this one up itself (see armorTick)
+    autoCast = true, -- r12: the advisor keeps this one up itself (see F.armorTick)
   },
 }
 
-local function buffTimeLeftByTexture(textures)
+function F.buffTimeLeftByTexture(textures)
   local i = 0
   while true do
     local buffIndex = GetPlayerBuff(i, "HELPFUL")
@@ -586,7 +772,7 @@ local armorNextCheck = 0
 -- Which spell to use. Demon Armor supersedes Demon Skin at 20+; auto.known
 -- is the spellbook scan, so we never CastSpellByName something untrained
 -- (that throws "you don't know that spell" red text at the human).
-local function armorSpell()
+function F.armorSpell()
   if auto.known["demon armor"] then return "Demon Armor" end
   if auto.known["demon skin"] then return "Demon Skin" end
   return nil
@@ -596,7 +782,7 @@ end
 -- "Interface\Icons\" prefix stripped — the payload of the one diagnostic
 -- line. Hard-bounded: 1.12 buff indices are 0..31 and a runaway while-loop
 -- here would hang the client, not just the addon.
-local function playerBuffTextureList(maxN)
+function F.playerBuffTextureList(maxN)
   local out, n, i = nil, 0, 0
   while n < maxN and i < 32 do
     local buffIndex = GetPlayerBuff(i, "HELPFUL")
@@ -614,13 +800,13 @@ local function playerBuffTextureList(maxN)
   return out or "none"
 end
 
-local function armorTick()
+function F.armorTick()
   local now = GetTime()
   if now < armorNextCheck then return end
   armorNextCheck = now + ARMOR_CHECK_EVERY
   for _, watch in ipairs(WATCHED_BUFFS) do
     if watch.autoCast and not watch.acDisabled then
-      local left = buffTimeLeftByTexture(watch.textures)
+      local left = F.buffTimeLeftByTexture(watch.textures)
       if left then
         -- Texture guess CONFIRMED the first time the buff reads at all. From
         -- here the safety can never trip: a short timer is not a bad texture,
@@ -629,12 +815,12 @@ local function armorTick()
         watch.acVerifyAt = nil
       elseif watch.acVerifyAt and now >= watch.acVerifyAt then
         watch.acDisabled = true
-        emit("err", "demon-skin autocast: buff never detected after cast — "
-          .. "texture guess likely wrong; captured=" .. playerBuffTextureList(8))
+        F.emit("err", "demon-skin autocast: buff never detected after cast — "
+          .. "texture guess likely wrong; captured=" .. F.playerBuffTextureList(8))
       end
       -- Cast when the buff is missing entirely OR inside the refresh window.
       if not watch.acDisabled and (not left or left < watch.warnBelow) then
-        local spell = armorSpell()
+        local spell = F.armorSpell()
         if spell and not auto.casting
             and now >= auto.gcdUntil and now >= auto.failUntil
             and now >= (watch.acNextTryAt or 0)
@@ -646,7 +832,7 @@ local function armorTick()
           if not watch.acProven and not watch.acVerifyAt then
             watch.acVerifyAt = now + ARMOR_VERIFY_AFTER
           end
-          castNow(spell) -- shared GCD bookkeeping + dtrace
+          F.castNow(spell) -- shared GCD bookkeeping + F.dtrace
         end
       end
     end
@@ -654,11 +840,11 @@ local function armorTick()
 end
 
 local lastNag = 0
-local function buffWatchLine()
+function F.buffWatchLine()
   local warnings = nil
   local nags = nil
   for _, watch in ipairs(WATCHED_BUFFS) do
-    local left = buffTimeLeftByTexture(watch.textures)
+    local left = F.buffTimeLeftByTexture(watch.textures)
     local warn
     if not left then
       warn = string.format("|cFFFF4444%s MISSING|r", watch.label)
@@ -672,7 +858,7 @@ local function buffWatchLine()
       -- texture-guess safety disabled auto-cast, we fall straight back to the
       -- old warning text AND the old once-a-minute chat nag.
       if watch.autoCast and not watch.acDisabled then
-        warn = string.format("|cFF44FF44armor: auto (%s)|r", armorSpell() or "untrained")
+        warn = string.format("|cFF44FF44armor: auto (%s)|r", F.armorSpell() or "untrained")
         nag = nil
       end
       warnings = warnings and (warnings .. "  " .. warn) or warn
@@ -683,12 +869,549 @@ local function buffWatchLine()
   end
   if nags and (GetTime() - lastNag) > 60 then
     lastNag = GetTime()
-    say("buff watch: " .. nags) -- chat nag at most once a minute
+    F.say("buff watch: " .. nags) -- chat nag at most once a minute
   end
   return warnings or "|cFF44FF44buffs OK|r"
 end
 
-local function targetSummary()
+--------------------------------------------------------------------------
+-- Probe panel (r22): measure which APIs work from which call contexts.
+-- Stops the "everything is a hardware event" guess — same call, three
+-- contexts (click / next OnUpdate frame / delayed 0.5s), observable
+-- before/after. See docs/advisor-autopilot.md "Client sandbox reality".
+-- /sa debug toggles. Results stay local (advisor log + this window);
+-- only final verdicts F.emit to Chat.log so we do not re-trip the throttle.
+--------------------------------------------------------------------------
+
+local probe = {
+  mode = "click", -- "click" | "frame" | "delay"
+  pending = nil,  -- { kind=, at=, ctx= } for frame/delay
+  follow = nil,   -- deferred after-cast check
+  recording = true,
+  lastEvents = {}, -- ring of recent interesting events (strings)
+  lastN = 0,
+}
+
+local probeLogMsg -- ScrollingMessageFrame; set when UI is built
+local probeModeBtns = {}
+local probeStatusLine
+
+function F.probeLog(text)
+  local line = tostring(text)
+  if probeLogMsg then
+    probeLogMsg:AddMessage(date("%H:%M:%S ") .. line, 0.4, 0.85, 1.0)
+  end
+  if F.addLog then F.addLog("probe", line) end
+end
+
+function F.probeEmitVerdict(text)
+  -- One Chat.log line per finished probe — System can tail it.
+  F.emit("probe", text)
+  F.probeLog(text)
+end
+
+function F.probeNoteEvent(ev, detail)
+  if not probe.recording then return end
+  local s = ev
+  if detail and detail ~= "" then
+    s = ev .. " " .. detail
+  end
+  -- ring of 40
+  if table.getn(probe.lastEvents) >= 40 then
+    table.remove(probe.lastEvents, 1)
+  end
+  table.insert(probe.lastEvents, date("%H:%M:%S ") .. s)
+  if probeLogMsg and probe.uiShown then
+    probeLogMsg:AddMessage(date("%H:%M:%S ") .. "[ev] " .. s, 0.55, 0.55, 0.55)
+  end
+end
+
+function F.probeCountLootItems()
+  local n = GetNumLootItems()
+  if not n or n == 0 then return 0, 0 end
+  local left, i = 0, 1
+  while i <= n do
+    if GetLootSlotInfo(i) then left = left + 1 end
+    i = i + 1
+  end
+  return n, left
+end
+
+function F.probeFindBagItem()
+  local bag = 0
+  while bag <= 4 do
+    local slots = GetContainerNumSlots(bag)
+    if slots and slots > 0 then
+      local slot = 1
+      while slot <= slots do
+        local link = GetContainerItemLink(bag, slot)
+        if link then return bag, slot, link end
+        slot = slot + 1
+      end
+    end
+    bag = bag + 1
+  end
+  return nil, nil, nil
+end
+
+function F.probeStatusDump()
+  local n, left = F.probeCountLootItems()
+  local spell = F.armorSpell() or "none"
+  local mana = UnitMana("player") or 0
+  local manaMax = UnitManaMax("player") or 0
+  local cast = auto.casting and "yes" or "no"
+  local shoot = auto.shooting and "yes" or "no"
+  local move = move.moving and "yes" or "no"
+  local cursor = (CursorHasItem and CursorHasItem()) and "item" or "empty"
+  local tex = F.playerBuffTextureList(6)
+  return string.format(
+    "mode=%s lootSlots=%d lootItems=%d armor=%s mana=%d/%d casting=%s shoot=%s moving=%s cursor=%s buffs=%s",
+    probe.mode, n, left, spell, mana, manaMax, cast, shoot, move, cursor, tex)
+end
+
+function F.probeRefreshStatus()
+  if probeStatusLine then
+    probeStatusLine:SetText(F.probeStatusDump())
+  end
+end
+
+function F.probeRun(kind, ctx)
+  -- kind: status | buffs | cast | loot | pickup | reload
+  if kind == "status" then
+    F.probeEmitVerdict("status ctx=" .. ctx .. " " .. F.probeStatusDump())
+    return
+  end
+  if kind == "buffs" then
+    F.probeEmitVerdict("buffs ctx=" .. ctx .. " tex=" .. F.playerBuffTextureList(12))
+    return
+  end
+  if kind == "cast" then
+    local spell = F.armorSpell()
+    if not spell then
+      F.probeEmitVerdict("cast ctx=" .. ctx .. " FAIL no Demon Skin/Armor trained")
+      return
+    end
+    local mana0 = UnitMana("player") or 0
+    local left0 = F.buffTimeLeftByTexture(WATCHED_BUFFS[1].textures)
+    local ok, err = pcall(CastSpellByName, spell)
+    auto.gcdUntil = GetTime() + 1.6
+    local msg = string.format(
+      "cast ctx=%s spell=%s pcall=%s mana0=%d buff0=%s%s",
+      ctx, spell, tostring(ok), mana0,
+      left0 and string.format("%.0fs", left0) or "nil",
+      (not ok and err) and (" err=" .. tostring(err)) or "")
+    F.probeLog(msg)
+    -- After 1.2s: did mana move, did buff appear, did SPELLCAST fire?
+    probe.follow = {
+      at = GetTime() + 1.2,
+      kind = "castcheck",
+      ctx = ctx,
+      spell = spell,
+      mana0 = mana0,
+      buff0 = left0 and true or false,
+    }
+    return
+  end
+  if kind == "loot" then
+    local n, left0 = F.probeCountLootItems()
+    if n == 0 then
+      F.probeEmitVerdict("loot ctx=" .. ctx .. " FAIL no loot window (open a corpse first)")
+      return
+    end
+    local i = n
+    while i >= 1 do
+      pcall(LootSlot, i)
+      pcall(ConfirmLootSlot, i)
+      i = i - 1
+    end
+    local _, left1 = F.probeCountLootItems()
+    local verdict
+    if left1 < left0 then
+      verdict = "OK"
+    elseif left0 == 0 then
+      verdict = "EMPTY"
+    else
+      verdict = "GATED" -- calls returned, items still there
+    end
+    F.probeEmitVerdict(string.format(
+      "loot ctx=%s %s slots=%d items %d->%d", ctx, verdict, n, left0, left1))
+    return
+  end
+  if kind == "pickup" then
+    if CursorHasItem and CursorHasItem() then
+      F.probeEmitVerdict("pickup ctx=" .. ctx .. " FAIL cursor already holds item — drop it first")
+      return
+    end
+    local bag, slot, link = F.probeFindBagItem()
+    if not bag then
+      F.probeEmitVerdict("pickup ctx=" .. ctx .. " FAIL bags empty")
+      return
+    end
+    local ok, err = pcall(PickupContainerItem, bag, slot)
+    local has = (CursorHasItem and CursorHasItem()) and true or false
+    if has then
+      -- put it back so we don't leave junk on the cursor
+      pcall(PickupContainerItem, bag, slot)
+    end
+    local verdict = has and "OK" or "GATED"
+    local short = link and string.gsub(link, "|c%x%x%x%x%x%x%x%x|Hitem:%d+:[^|]+|h%[(.-)%]|h|r", "%1") or "?"
+    F.probeEmitVerdict(string.format(
+      "pickup ctx=%s %s bag=%d slot=%d item=%s pcall=%s%s",
+      ctx, verdict, bag, slot, short, tostring(ok),
+      (not ok and err) and (" err=" .. tostring(err)) or ""))
+    return
+  end
+  if kind == "reload" then
+    -- Destructive if ungated. Log first so Chat.log has a line either way;
+    -- if gated, you stay in-world and read GATED by still being here.
+    F.probeEmitVerdict("reload ctx=" .. ctx .. " calling ReloadUI (if gated, nothing happens)")
+    local ok, err = pcall(ReloadUI)
+    if not ok then
+      F.probeEmitVerdict("reload ctx=" .. ctx .. " pcall FAIL " .. tostring(err))
+    else
+      -- If we still execute, ReloadUI returned without reloading.
+      F.probeEmitVerdict("reload ctx=" .. ctx .. " GATED (ReloadUI returned, UI still up)")
+    end
+    return
+  end
+  F.probeEmitVerdict("unknown probe kind=" .. tostring(kind) .. " ctx=" .. ctx)
+end
+
+function F.probeSchedule(kind)
+  if probe.mode == "click" then
+    F.probeRun(kind, "click")
+  elseif probe.mode == "frame" then
+    probe.pending = { kind = kind, at = 0, ctx = "frame" }
+    F.probeLog("queued " .. kind .. " for next OnUpdate frame")
+  else
+    probe.pending = { kind = kind, at = GetTime() + 0.5, ctx = "delay0.5" }
+    F.probeLog("queued " .. kind .. " for +0.5s (software timer)")
+  end
+  F.probeRefreshStatus()
+end
+
+function F.probeTick()
+  local now = GetTime()
+  if probe.pending and now >= (probe.pending.at or 0) then
+    local p = probe.pending
+    probe.pending = nil
+    local ok, err = pcall(F.probeRun, p.kind, p.ctx)
+    if not ok then
+      F.probeEmitVerdict("probe error kind=" .. tostring(p.kind) .. " " .. tostring(err))
+    end
+  end
+  if probe.follow and now >= probe.follow.at then
+    local f = probe.follow
+    probe.follow = nil
+    if f.kind == "castcheck" then
+      local mana1 = UnitMana("player") or 0
+      local left1 = F.buffTimeLeftByTexture(WATCHED_BUFFS[1].textures)
+      local buff1 = left1 and true or false
+      local manaDrop = mana1 < f.mana0
+      local buffNew = buff1 and not f.buff0
+      local buffOk = buff1
+      local verdict
+      if buffNew or (buffOk and manaDrop) then
+        verdict = "OK"
+      elseif manaDrop or auto.casting then
+        verdict = "FIRED_UNCONFIRMED" -- mana/cast moved; buff texture may be wrong
+      else
+        verdict = "GATED_OR_NOOP" -- no mana change, no buff — silent ignore or full
+      end
+      F.probeEmitVerdict(string.format(
+        "castcheck ctx=%s %s spell=%s mana %d->%d buff=%s casting=%s",
+        f.ctx, verdict, f.spell, f.mana0, mana1,
+        buff1 and "yes" or "no", auto.casting and "yes" or "no"))
+    end
+  end
+  if probe.uiShown then
+    F.probeRefreshStatus()
+  end
+end
+
+function F.probeSetMode(mode)
+  probe.mode = mode
+  local names = { "click", "frame", "delay" }
+  local i = 1
+  while i <= 3 do
+    local m = names[i]
+    local b = probeModeBtns[m]
+    if b then
+      if m == mode then
+        b:SetText("|cFF44FF44" .. b.probeLabel .. "|r")
+      else
+        b:SetText("|cFF999999" .. b.probeLabel .. "|r")
+      end
+    end
+    i = i + 1
+  end
+  F.probeLog("mode=" .. mode .. " (Click=hardware OnClick, Frame=next OnUpdate, Delay=+0.5s)")
+  F.probeRefreshStatus()
+end
+
+-- UI
+local probeFrame = CreateFrame("Frame", "ShadowArmyProbeFrame", UIParent)
+probeFrame:SetWidth(420)
+probeFrame:SetHeight(300)
+probeFrame:SetPoint("CENTER", UIParent, "CENTER", 80, 40)
+probeFrame:SetBackdrop({
+  bgFile = "Interface\\Tooltips\\UI-Tooltip-Background",
+  edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+  tile = true, tileSize = 16, edgeSize = 16,
+  insets = { left = 4, right = 4, top = 4, bottom = 4 },
+})
+probeFrame:SetBackdropColor(0.02, 0.05, 0.08, 0.92)
+probeFrame:EnableMouse(true)
+probeFrame:SetMovable(true)
+probeFrame:RegisterForDrag("LeftButton")
+probeFrame:SetScript("OnDragStart", function() probeFrame:StartMoving() end)
+probeFrame:SetScript("OnDragStop", function() probeFrame:StopMovingOrSizing() end)
+probeFrame:Hide()
+probe.uiShown = false
+tinsert(UISpecialFrames, "ShadowArmyProbeFrame")
+
+local probeTitle = probeFrame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+probeTitle:SetPoint("TOP", probeFrame, "TOP", 0, -8)
+probeTitle:SetText("|cFF66CCFFSA Probe|r  (context gates)")
+
+local probeClose = CreateFrame("Button", nil, probeFrame, "UIPanelCloseButton")
+probeClose:SetPoint("TOPRIGHT", probeFrame, "TOPRIGHT", -2, -2)
+probeClose:SetScript("OnClick", function()
+  probeFrame:Hide()
+  probe.uiShown = false
+end)
+
+probeStatusLine = probeFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+probeStatusLine:SetPoint("TOPLEFT", probeFrame, "TOPLEFT", 10, -26)
+probeStatusLine:SetPoint("TOPRIGHT", probeFrame, "TOPRIGHT", -10, -26)
+probeStatusLine:SetJustifyH("LEFT")
+probeStatusLine:SetText("…")
+
+function F.makeProbeBtn(label, x, y, w, fn)
+  local b = CreateFrame("Button", nil, probeFrame, "UIPanelButtonTemplate")
+  b:SetWidth(w or 64)
+  b:SetHeight(18)
+  b:SetPoint("TOPLEFT", probeFrame, "TOPLEFT", x, y)
+  b:SetText(label)
+  b:SetScript("OnClick", fn)
+  return b
+end
+
+-- Mode row
+local modeY = -48
+local modeLbl = probeFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+modeLbl:SetPoint("TOPLEFT", probeFrame, "TOPLEFT", 10, modeY - 2)
+modeLbl:SetText("Mode")
+local mb
+mb = F.makeProbeBtn("Click", 48, modeY, 52, function() F.probeSetMode("click") end)
+mb.probeLabel = "Click"
+probeModeBtns.click = mb
+mb = F.makeProbeBtn("Frame", 114, modeY, 52, function() F.probeSetMode("frame") end)
+mb.probeLabel = "Frame"
+probeModeBtns.frame = mb
+mb = F.makeProbeBtn("Delay", 170, modeY, 52, function() F.probeSetMode("delay") end)
+mb.probeLabel = "Delay"
+probeModeBtns.delay = mb
+F.makeProbeBtn("Status", 240, modeY, 56, function() F.probeSchedule("status") end)
+F.makeProbeBtn("Buffs", 300, modeY, 52, function() F.probeSchedule("buffs") end)
+F.makeProbeBtn("Help", 356, modeY, 48, function()
+  F.probeLog("Mode = call context for the next probe button.")
+  F.probeLog("  Click: runs inside this button OnClick (hardware).")
+  F.probeLog("  Frame: runs on next driver OnUpdate (software).")
+  F.probeLog("  Delay: runs after 0.5s timer (software).")
+  F.probeLog("Cast: Demon Skin/Armor + 1.2s follow-up (mana/buff).")
+  F.probeLog("Loot: needs open loot window; OK if item count drops.")
+  F.probeLog("Pickup: bag item on/off cursor; OK if cursor takes item.")
+  F.probeLog("Reload: WILL reload UI if ungated — use last.")
+  F.probeLog("Compare same probe under Click vs Frame vs Delay.")
+end)
+
+-- Action row
+local actY = -70
+F.makeProbeBtn("Cast armor", 10, actY, 80, function() F.probeSchedule("cast") end)
+F.makeProbeBtn("Loot all", 94, actY, 70, function() F.probeSchedule("loot") end)
+F.makeProbeBtn("Pickup", 168, actY, 60, function() F.probeSchedule("pickup") end)
+F.makeProbeBtn("|cFFFF6644ReloadUI|r", 232, actY, 80, function() F.probeSchedule("reload") end)
+F.makeProbeBtn("Clear", 316, actY, 48, function()
+  if probeLogMsg then probeLogMsg:Clear() end
+end)
+F.makeProbeBtn("Rec", 368, actY, 36, function()
+  probe.recording = not probe.recording
+  F.probeLog("event recording " .. (probe.recording and "ON" or "OFF"))
+end)
+
+probeLogMsg = CreateFrame("ScrollingMessageFrame", "ShadowArmyProbeLog", probeFrame)
+probeLogMsg:SetPoint("TOPLEFT", probeFrame, "TOPLEFT", 10, -96)
+probeLogMsg:SetPoint("BOTTOMRIGHT", probeFrame, "BOTTOMRIGHT", -10, 10)
+probeLogMsg:SetFontObject(GameFontNormalSmall)
+probeLogMsg:SetJustifyH("LEFT")
+probeLogMsg:SetMaxLines(200)
+probeLogMsg:SetFading(false)
+probeLogMsg:EnableMouseWheel(true)
+probeLogMsg:SetScript("OnMouseWheel", function()
+  if arg1 > 0 then
+    probeLogMsg:ScrollUp()
+  else
+    probeLogMsg:ScrollDown()
+  end
+end)
+
+function F.probeShow()
+  probeFrame:Show()
+  probe.uiShown = true
+  F.probeSetMode(probe.mode)
+  F.probeRefreshStatus()
+  F.probeLog("probe panel open rev=" .. REV .. " — pick mode, run probes, compare contexts")
+end
+
+function F.probeHide()
+  probeFrame:Hide()
+  probe.uiShown = false
+end
+
+function F.probeToggle()
+  if probeFrame:IsShown() then F.probeHide() else F.probeShow() end
+end
+
+-- Bottom row: Admin (System ops) + Probe (sandbox instrument).
+local adminBtn = CreateFrame("Button", "ShadowArmyAdminBtn", panel, "UIPanelButtonTemplate")
+adminBtn:SetWidth(93)
+adminBtn:SetHeight(20)
+adminBtn:SetPoint("BOTTOMLEFT", panel, "BOTTOMLEFT", 8, 8)
+adminBtn:SetText("|cFFFF8844Admin|r")
+
+local probeBtn = CreateFrame("Button", "ShadowArmyProbeBtn", panel, "UIPanelButtonTemplate")
+probeBtn:SetWidth(93)
+probeBtn:SetHeight(20)
+probeBtn:SetPoint("BOTTOMRIGHT", panel, "BOTTOMRIGHT", -8, 8)
+probeBtn:SetText("|cFF66CCFFProbe|r")
+probeBtn:SetScript("OnClick", function()
+  F.probeToggle()
+end)
+
+--------------------------------------------------------------------------
+-- Admin panel (r24): same write actions as The System HTTP Admin + MCP.
+-- 1.12 has no HTTP client — we /say "<SA> admin <action>" and the System
+-- Chat.log tailer runs respawnShadowArmy() / reloadAddon() (Murist only).
+-- NOT fair-play; local testing escape hatch only.
+--------------------------------------------------------------------------
+
+local adminSeq = 0
+local adminFrame = CreateFrame("Frame", "ShadowArmyAdminFrame", UIParent)
+adminFrame:SetWidth(280)
+adminFrame:SetHeight(198)
+adminFrame:SetPoint("CENTER", UIParent, "CENTER", -100, 40)
+adminFrame:SetBackdrop({
+  bgFile = "Interface\\Tooltips\\UI-Tooltip-Background",
+  edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+  tile = true, tileSize = 16, edgeSize = 16,
+  insets = { left = 4, right = 4, top = 4, bottom = 4 },
+})
+adminFrame:SetBackdropColor(0.12, 0.04, 0.02, 0.92)
+adminFrame:EnableMouse(true)
+adminFrame:SetMovable(true)
+adminFrame:RegisterForDrag("LeftButton")
+adminFrame:SetScript("OnDragStart", function() adminFrame:StartMoving() end)
+adminFrame:SetScript("OnDragStop", function() adminFrame:StopMovingOrSizing() end)
+adminFrame:Hide()
+tinsert(UISpecialFrames, "ShadowArmyAdminFrame")
+
+local adminTitle = adminFrame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+adminTitle:SetPoint("TOP", adminFrame, "TOP", 0, -8)
+adminTitle:SetText("|cFFFF8844SA Admin|r  (The System)")
+
+local adminClose = CreateFrame("Button", nil, adminFrame, "UIPanelCloseButton")
+adminClose:SetPoint("TOPRIGHT", adminFrame, "TOPRIGHT", -2, -2)
+
+local adminNote = adminFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+adminNote:SetPoint("TOPLEFT", adminFrame, "TOPLEFT", 12, -30)
+adminNote:SetPoint("TOPRIGHT", adminFrame, "TOPRIGHT", -12, -30)
+adminNote:SetJustifyH("LEFT")
+adminNote:SetText(
+  "Ops only — same as http://127.0.0.1:7777/admin\n" ..
+  "Cast: Shadowfel, Igris, Tusk, Beru → Deathknell\n" ..
+  "Not fair-play corpse recovery.")
+
+function F.adminRequest(action)
+  -- #N beats F.emit()'s 30s identical-message dedupe so a second click works.
+  adminSeq = adminSeq + 1
+  local payload = action .. " #" .. adminSeq
+  F.emit("admin", payload)
+  F.say("admin: requested " .. action .. " (The System must be running)")
+end
+
+function F.makeAdminBtn(label, y, r, g, b, fn)
+  local b = CreateFrame("Button", nil, adminFrame, "UIPanelButtonTemplate")
+  b:SetWidth(250)
+  b:SetHeight(22)
+  b:SetPoint("TOP", adminFrame, "TOP", 0, y)
+  b:SetText(label)
+  b:SetScript("OnClick", fn)
+  return b
+end
+
+F.makeAdminBtn("|cFFFF6644Respawn army|r", -78, 1, 0.4, 0.2, function()
+  F.adminRequest("respawn_shadow_army")
+end)
+
+F.makeAdminBtn("|cFFFFAA44Tele party to me|r", -108, 1, 0.7, 0.3, function()
+  F.adminRequest("tele_party_to_murist")
+end)
+
+F.makeAdminBtn("Reload addon (via System)", -138, 0.5, 0.8, 0.5, function()
+  F.adminRequest("reload_addon")
+end)
+
+function F.adminToggle()
+  if adminFrame:IsShown() then
+    adminFrame:Hide()
+  else
+    adminFrame:Show()
+  end
+end
+
+adminBtn:SetScript("OnClick", function()
+  F.adminToggle()
+end)
+adminClose:SetScript("OnClick", function()
+  adminFrame:Hide()
+end)
+
+-- Event sniffer dedicated to the probe (does not own combat logic).
+local probeEvents = CreateFrame("Frame", "ShadowArmyProbeEvents", UIParent)
+probeEvents:RegisterEvent("CHAT_MSG_SYSTEM")
+probeEvents:RegisterEvent("LOOT_OPENED")
+probeEvents:RegisterEvent("LOOT_SLOT_CLEARED")
+probeEvents:RegisterEvent("LOOT_CLOSED")
+probeEvents:RegisterEvent("SPELLCAST_START")
+probeEvents:RegisterEvent("SPELLCAST_STOP")
+probeEvents:RegisterEvent("SPELLCAST_FAILED")
+probeEvents:RegisterEvent("SPELLCAST_INTERRUPTED")
+probeEvents:RegisterEvent("START_AUTOREPEAT_SPELL")
+probeEvents:RegisterEvent("STOP_AUTOREPEAT_SPELL")
+probeEvents:RegisterEvent("PLAYER_ENTER_COMBAT")
+probeEvents:RegisterEvent("PLAYER_LEAVE_COMBAT")
+probeEvents:RegisterEvent("PLAYER_AURAS_CHANGED")
+probeEvents:RegisterEvent("UI_ERROR_MESSAGE")
+probeEvents:SetScript("OnEvent", function()
+  if not probe.recording then return end
+  local detail = ""
+  if event == "CHAT_MSG_SYSTEM" or event == "UI_ERROR_MESSAGE" or event == "SPELLCAST_START" then
+    detail = tostring(arg1 or "")
+    -- strip color codes for readability
+    detail = string.gsub(detail, "|c%x%x%x%x%x%x%x%x", "")
+    detail = string.gsub(detail, "|r", "")
+    if string.len(detail) > 80 then
+      detail = string.sub(detail, 1, 80) .. "…"
+    end
+  elseif event == "LOOT_OPENED" then
+    local n, left = F.probeCountLootItems()
+    detail = "slots=" .. n .. " items=" .. left
+  end
+  F.probeNoteEvent(event, detail)
+end)
+
+function F.targetSummary()
   if not UnitExists("target") then
     return "target: |cFF777777none|r", ""
   end
@@ -793,7 +1516,7 @@ bagsMoney:SetPoint("BOTTOMRIGHT", bagsFrame, "BOTTOMRIGHT", -10, 8)
 bagsMoney:SetJustifyH("RIGHT")
 bagsMoney:SetText("")
 
-local function moneyString()
+function F.moneyString()
   local c = GetMoney() or 0
   local gold = math.floor(c / 10000)
   local silver = math.floor(math.mod(c, 10000) / 100)
@@ -814,7 +1537,7 @@ bagsClose:SetScript("OnClick", function() bagsFrame:Hide() end)
 
 -- Buttons are created on demand and then REUSED forever (creating frames
 -- every refresh would leak — 1.12 frames cannot be destroyed).
-local function bagButton(index)
+function F.bagButton(index)
   local btn = bags.buttons[index]
   if btn then return btn end
   btn = CreateFrame("Button", nil, bagsFrame)
@@ -882,7 +1605,7 @@ function bagsUpdate()
       local slot = 1
       while slot <= n do
         index = index + 1
-        local btn = bagButton(index)
+        local btn = F.bagButton(index)
         -- 1.12 signature: texture, itemCount, locked, quality, readable
         local texture, itemCount, locked, quality = GetContainerItemInfo(bag, slot)
         btn.saBag, btn.saSlot = bag, slot
@@ -939,20 +1662,20 @@ function bagsUpdate()
   -- +16: money footer row under the grid
   bagsFrame:SetHeight(BAG_HEADER + rows * (BAG_BTN_SIZE + BAG_BTN_PAD) + BAG_MARGIN - BAG_BTN_PAD + 16)
   bagsCount:SetText(string.format("|cFFCCCCCC%d/%d used|r", used, index))
-  bagsMoney:SetText(moneyString())
+  bagsMoney:SetText(F.moneyString())
 end
 
-local function bagsShow()
+function F.bagsShow()
   bagsFrame:Show()
   bagsUpdate()
 end
 
-local function bagsHide()
+function F.bagsHide()
   bagsFrame:Hide()
 end
 
-local function bagsToggle()
-  if bagsFrame:IsShown() then bagsHide() else bagsShow() end
+function F.bagsToggle()
+  if bagsFrame:IsShown() then F.bagsHide() else F.bagsShow() end
 end
 
 bagsFrame:SetScript("OnShow", function()
@@ -985,7 +1708,7 @@ end)
 -- lock and no content change at all. The engine measures exactly that: the
 -- FIRST swap goes out inside the button's OnClick (hardware event, known-good
 -- path), the rest from OnUpdate. Two consecutive no-effect OnUpdate swaps
--- after a click swap provably worked = gated, and we say so once and stop.
+-- after a click swap provably worked = gated, and we F.say so once and stop.
 -- The fix for that world is a click-stepper button; NOT implemented here on
 -- purpose — no point building it before the telemetry says we need it.
 --------------------------------------------------------------------------
@@ -998,7 +1721,7 @@ local sort = {
   active = false,
   moves = 0,
   seq = 0,          -- like reloadSeq: keeps two identical results from being
-                    -- swallowed by emit()'s 30s dedupe
+                    -- swallowed by F.emit()'s 30s dedupe
   lastMoveAt = 0,
   pend = nil,       -- the single in-flight swap, or nil
   clickWorked = false,
@@ -1011,7 +1734,7 @@ local sort = {
 -- and never cache the misses, so a later pass can still learn the type.
 local sortTypeCache = {}
 
-local function cursorBusy()
+function F.cursorBusy()
   local ok, has = pcall(CursorHasItem)
   if not ok then return false end
   return has and true or false
@@ -1019,13 +1742,13 @@ end
 
 -- ClearCursor RETURNS a held bag item to where it came from (it does not
 -- destroy it). pcall because a missing global here would kill the driver.
-local function cursorDrop()
+function F.cursorDrop()
   pcall(ClearCursor)
 end
 
 -- "type/subtype", or "zz-unknown" so unidentified items sort to the end
 -- instead of scattering through the grid.
-local function itemTypeKey(id)
+function F.itemTypeKey(id)
   if not id then return "zz-unknown" end
   local cached = sortTypeCache[id]
   if cached then return cached end
@@ -1055,7 +1778,7 @@ end
 -- 1.12's second return here is not something to bet on, hence the guard AND
 -- the empirical fallback in the tick (a bag that rejects a placement gets
 -- added to sort.skipBag for the rest of the run).
-local function bagIsNormal(bag)
+function F.bagIsNormal(bag)
   if sort.skipBag[bag] then return false end
   if bag == 0 then return true end -- backpack is never a specialty bag
   local ok, free, btype = pcall(GetContainerNumFreeSlots, bag)
@@ -1064,7 +1787,7 @@ local function bagIsNormal(bag)
   return true
 end
 
-local function slotLocked(bag, slot)
+function F.slotLocked(bag, slot)
   local _, _, locked = GetContainerItemInfo(bag, slot)
   return locked and true or false
 end
@@ -1072,18 +1795,18 @@ end
 -- Content fingerprint of one slot. `locked` is deliberately NOT in here:
 -- the lock flag is tracked separately as proof the client accepted the call,
 -- and folding it in would make a lock flicker look like a completed move.
-local function slotSig(bag, slot)
+function F.slotSig(bag, slot)
   local tex, count = GetContainerItemInfo(bag, slot)
   return tostring(tex) .. "#" .. tostring(count)
 end
 
 -- Flat scan of every sortable slot, in bag/slot order. Index in this list IS
 -- the position the sort reasons about; entry.tex nil = empty socket.
-local function sortScan()
+function F.sortScan()
   local list, n = {}, 0
   local bag = 0
   while bag <= 4 do -- NEVER -1/5+ (bank) and never -2 (keyring)
-    if bagIsNormal(bag) then
+    if F.bagIsNormal(bag) then
       local slots = GetContainerNumSlots(bag)
       if slots and slots > 0 then
         local slot = 1
@@ -1105,7 +1828,7 @@ local function sortScan()
               local _, _, idStr = string.find(link, "item:(%d+)")
               if idStr then e.id = tonumber(idStr) end
             end
-            e.tkey = itemTypeKey(e.id)
+            e.tkey = F.itemTypeKey(e.id)
           end
           list[n] = e
           slot = slot + 1
@@ -1121,7 +1844,7 @@ end
 -- "invalid order function" on a sloppy comparator. The trailing idx tiebreak
 -- does double duty: it makes the order total, and it means items that compare
 -- equal keep their current positions, so equal items never generate a swap.
-local function sortCmp(a, b)
+function F.sortCmp(a, b)
   if a.tkey ~= b.tkey then return a.tkey < b.tkey end
   if a.quality ~= b.quality then return a.quality > b.quality end
   local ai, bi = a.id or 0, b.id or 0
@@ -1132,7 +1855,7 @@ end
 
 -- Returns destinationIndex, sourceEntry for the next swap, or nil when the
 -- grid already matches the desired arrangement.
-local function sortNextSwap(list, n)
+function F.sortNextSwap(list, n)
   local occ, m = {}, 0
   local i = 1
   while i <= n do
@@ -1142,7 +1865,7 @@ local function sortNextSwap(list, n)
     end
     i = i + 1
   end
-  table.sort(occ, sortCmp)
+  table.sort(occ, F.sortCmp)
   -- occ[i] is the entry that BELONGS at position i; entries are the very same
   -- tables the scan produced, so identity comparison is the whole test.
   i = 1
@@ -1165,44 +1888,44 @@ end
 -- first (and the creation must ASSIGN, not re-declare).
 local sortBtn
 
-local function sortSetLabel(active)
+function F.sortSetLabel(active)
   if not sortBtn then return end
   sortBtn:SetText(active and "|cFFFFAA00Sorting...|r" or "|cFFCCCCCCSort|r")
 end
 
-local function sortStop(reason)
+function F.sortStop(reason)
   sort.active = false
   sort.pend = nil
-  if cursorBusy() then cursorDrop() end
-  sortSetLabel(false)
-  dtrace("sort stop " .. tostring(reason) .. " moves=" .. sort.moves)
+  if F.cursorBusy() then F.cursorDrop() end
+  F.sortSetLabel(false)
+  F.dtrace("sort stop " .. tostring(reason) .. " moves=" .. sort.moves)
   bagsUpdate()
 end
 
-local function sortFinish()
+function F.sortFinish()
   local n = sort.moves
-  sortStop("done")
-  emit("sort", "done moves=" .. n .. " #" .. sort.seq)
+  F.sortStop("done")
+  F.emit("sort", "done moves=" .. n .. " #" .. sort.seq)
 end
 
-local function sortAbort(why)
+function F.sortAbort(why)
   local n = sort.moves
-  sortStop(why)
+  F.sortStop(why)
   if why == "stalled" then
-    emit("err", "sort stalled at " .. n .. " moves #" .. sort.seq)
+    F.emit("err", "sort stalled at " .. n .. " moves #" .. sort.seq)
   elseif why == "runaway" then
-    emit("err", "sort runaway at " .. n .. " moves #" .. sort.seq)
+    F.emit("err", "sort runaway at " .. n .. " moves #" .. sort.seq)
   end
 end
 
 -- Fire at most ONE swap. ctx is "click" (hardware event) or "onupdate".
-local function sortIssue(ctx)
+function F.sortIssue(ctx)
   if sort.pend then return end
-  if cursorBusy() then return end -- the human is carrying something; wait
-  local list, n = sortScan()
-  local dstIdx, src = sortNextSwap(list, n)
+  if F.cursorBusy() then return end -- the human is carrying something; wait
+  local list, n = F.sortScan()
+  local dstIdx, src = F.sortNextSwap(list, n)
   if not dstIdx then
-    sortFinish()
+    F.sortFinish()
     return
   end
   local dst = list[dstIdx]
@@ -1210,10 +1933,10 @@ local function sortIssue(ctx)
   -- Skip gracefully: no plan to invalidate, the next tick just re-scans.
   if src.locked or dst.locked then return end
   if sort.moves >= SORT_MAX_MOVES then
-    sortAbort("runaway")
+    F.sortAbort("runaway")
     return
   end
-  local sig = slotSig(src.bag, src.slot) .. "|" .. slotSig(dst.bag, dst.slot)
+  local sig = F.slotSig(src.bag, src.slot) .. "|" .. F.slotSig(dst.bag, dst.slot)
   -- SOURCE FIRST, ALWAYS. The destination may be an empty socket, and
   -- picking up an empty slot is a no-op — doing it in the other order would
   -- leave the item stranded on the cursor.
@@ -1223,7 +1946,7 @@ local function sortIssue(ctx)
   -- tops it up and leaves the remainder on the cursor instead of swapping.
   -- Put the remainder back where it came from; the recompute then sees two
   -- re-balanced stacks (and this quietly consolidates stacks as a bonus).
-  if cursorBusy() then
+  if F.cursorBusy() then
     PickupContainerItem(src.bag, src.slot)
   end
   sort.pend = {
@@ -1235,16 +1958,16 @@ local function sortIssue(ctx)
 end
 
 -- Driven from the driver's OnUpdate (see below). Never sends chat directly.
-local function sortTick()
+function F.sortTick()
   if not sort.active then return end
   local now = GetTime()
   local p = sort.pend
   if p then
-    if slotLocked(p.sbag, p.sslot) or slotLocked(p.dbag, p.dslot) then
+    if F.slotLocked(p.sbag, p.sslot) or F.slotLocked(p.dbag, p.dslot) then
       p.sawLock = true -- the client ACCEPTED the call; this path is not gated
       return
     end
-    local sigNow = slotSig(p.sbag, p.sslot) .. "|" .. slotSig(p.dbag, p.dslot)
+    local sigNow = F.slotSig(p.sbag, p.sslot) .. "|" .. F.slotSig(p.dbag, p.dslot)
     if sigNow ~= p.sig then
       sort.moves = sort.moves + 1
       sort.lastMoveAt = now
@@ -1255,20 +1978,20 @@ local function sortTick()
     elseif (now - p.at) > SORT_SETTLE then
       -- No lock, no content change: that call did literally nothing.
       sort.pend = nil
-      if cursorBusy() then cursorDrop() end
+      if F.cursorBusy() then F.cursorDrop() end
       if not p.sawLock and p.ctx == "onupdate" then
         sort.ctxFail = sort.ctxFail + 1
         if sort.ctxFail >= 2 then
           if sort.clickWorked then
             -- The one line that settles it: clicks move items, OnUpdate does
             -- not. Next rev = click-stepper.
-            emit("sort", "gated ctx=onupdate")
+            F.emit("sort", "gated ctx=onupdate")
           else
             -- No click swap ever landed either, so this is not proof of a
-            -- context gate — say so rather than blame the wrong thing.
-            emit("sort", "noeffect ctx=onupdate click=untested")
+            -- context gate — F.say so rather than blame the wrong thing.
+            F.emit("sort", "noeffect ctx=onupdate click=untested")
           end
-          sortStop("gated")
+          F.sortStop("gated")
           return
         end
       end
@@ -1276,7 +1999,7 @@ local function sortTick()
       -- item. Drop it from the grid and carry on with the rest.
       if not sort.skipBag[p.dbag] then
         sort.skipBag[p.dbag] = true
-        dtrace("sort skipping bag " .. p.dbag .. " (placement refused)")
+        F.dtrace("sort skipping bag " .. p.dbag .. " (placement refused)")
       end
     else
       return -- still inside the settle window
@@ -1284,13 +2007,13 @@ local function sortTick()
   end
   if not sort.active then return end
   if (now - sort.lastMoveAt) > SORT_TIMEOUT then
-    sortAbort("stalled")
+    F.sortAbort("stalled")
     return
   end
-  sortIssue("onupdate")
+  F.sortIssue("onupdate")
 end
 
-local function sortStart()
+function F.sortStart()
   sort.seq = sort.seq + 1
   sort.active = true
   sort.moves = 0
@@ -1299,11 +2022,11 @@ local function sortStart()
   sort.clickWorked = false
   sort.skipBag = {}
   sort.lastMoveAt = GetTime()
-  sortSetLabel(true)
-  dtrace("sort start #" .. sort.seq)
+  F.sortSetLabel(true)
+  F.dtrace("sort start #" .. sort.seq)
   -- The first swap goes out RIGHT HERE, still inside the mouse click, so the
   -- known-good hardware-event path is exercised before OnUpdate is trusted.
-  sortIssue("click")
+  F.sortIssue("click")
 end
 
 sortBtn = CreateFrame("Button", "ShadowBagsSortBtn", bagsFrame, "UIPanelButtonTemplate")
@@ -1313,15 +2036,15 @@ sortBtn:SetPoint("LEFT", bagsTitle, "RIGHT", 14, 0)
 sortBtn:SetText("|cFFCCCCCCSort|r")
 sortBtn:SetScript("OnClick", function()
   if sort.active then
-    sortStop("cancel") -- re-click = cancel, and the label snaps back
+    F.sortStop("cancel") -- re-click = cancel, and the label snaps back
     return
   end
   -- pcall: an error in here would die silently (scriptErrors is off) and the
   -- button would just look broken.
-  local ok, err = pcall(sortStart)
+  local ok, err = pcall(F.sortStart)
   if not ok then
-    emit("err", "sort start: " .. tostring(err))
-    sortStop("error")
+    F.emit("err", "sort start: " .. tostring(err))
+    F.sortStop("error")
   end
 end)
 
@@ -1355,30 +2078,30 @@ ShadowArmy.origBagFuncs = {
 }
 
 function ToggleBackpack()
-  bagsToggle()
+  F.bagsToggle()
 end
 
 -- The bag id is irrelevant now: there is one window and it holds every bag.
 function ToggleBag(id)
-  bagsToggle()
+  F.bagsToggle()
 end
 
 function OpenBackpack()
-  bagsShow()
+  F.bagsShow()
 end
 
 function CloseBackpack()
-  bagsHide()
+  F.bagsHide()
 end
 
 -- Called with the requesting frame (merchant/bank/trade) in vanilla; we do not
 -- need it, but the parameter stays so the signature matches what callers pass.
 function OpenAllBags(frame)
-  bagsShow()
+  F.bagsShow()
 end
 
 function CloseAllBags()
-  bagsHide()
+  F.bagsHide()
 end
 
 -- ToggleKeyRing is deliberately NOT hooked: the keyring is bag -2 and is not
@@ -1469,7 +2192,7 @@ local COMPASS_TAN22 = 0.4142 -- tan(22.5 deg): the 8-point octant boundary
 
 local quest = {
   enabled = true,
-  dataWarned = false,   -- the one-and-only "no data file" emit
+  dataWarned = false,   -- the one-and-only "no data file" F.emit
   nextTickAt = 0,
   nextMarkerAt = 0,
   nextMapFix = 0,
@@ -1481,13 +2204,13 @@ local quest = {
   px = 0, py = 0, posOK = false,
 }
 
-local questBtn -- created below; questSetEnabled closes over this local
+local questBtn -- created below; F.questSetEnabled closes over this local
 
-local function questData()
+function F.questData()
   if ShadowArmyQuestData then return ShadowArmyQuestData end
   if not quest.dataWarned then
     quest.dataWarned = true
-    emit("err", "quest data missing")
+    F.emit("err", "quest data missing")
   end
   return nil
 end
@@ -1499,7 +2222,7 @@ end
 -- the human's browsing alone and stop drawing instead. A stale sample is
 -- never reused — that is how you end up with an arrow pointing at a spot in
 -- the zone you left twenty minutes ago.
-local function questPosition()
+function F.questPosition()
   local x, y = GetPlayerMapPosition("player")
   if (not x) or (x == 0 and y == 0) then
     local now = GetTime()
@@ -1519,7 +2242,7 @@ local function questPosition()
   return true
 end
 
-local function questLearn(id, name)
+function F.questLearn(id, name)
   if not id or not name or name == "" then return end
   local known = quest.learned[id]
   if known == nil then
@@ -1530,7 +2253,7 @@ local function questLearn(id, name)
 end
 
 -- Rule (1) OR the learned-id fallback; see the section header.
-local function questSpotHere(q, spotZone, headerMatch, zone)
+function F.questSpotHere(q, spotZone, headerMatch, zone)
   if headerMatch and (not spotZone or spotZone == q.zone) then return true end
   local learned = spotZone and quest.learned[spotZone]
   if learned and learned == zone then return true end
@@ -1542,7 +2265,7 @@ end
 -- 1.12, so no rotation enters any of this. Octants are decided by comparing
 -- the two legs against tan(22.5) rather than calling atan2 — one less 5.0
 -- math library assumption for the same answer.
-local function questBearing(dx, dy)
+function F.questBearing(dx, dy)
   local ax = dx >= 0 and dx or -dx
   local ay = dy >= 0 and dy or -dy
   local ns = (dy < 0) and "N" or "S"
@@ -1552,7 +2275,7 @@ local function questBearing(dx, dy)
   return ns .. ew
 end
 
-local function questYards(dx, dy)
+function F.questYards(dx, dy)
   local ux = dx / 100 * QUEST_ZONE_YARDS_X
   local uy = dy / 100 * QUEST_ZONE_YARDS_Y
   return math.sqrt(ux * ux + uy * uy)
@@ -1563,7 +2286,7 @@ end
 -- human's selection in an open quest log — so the caller restores the old
 -- selection once the whole scan is done, and the scan is skipped outright
 -- while the log is on screen.
-local function questBoards(i)
+function F.questBoards(i)
   SelectQuestLogEntry(i)
   local out = {}
   local n = GetNumQuestLeaderBoards() or 0
@@ -1591,7 +2314,7 @@ end
 -- in the same order the database stores them, so index N usually is index N,
 -- and a wrong count is better than no line at all here (the count is cosmetic
 -- — the coordinates come from the data file either way).
-local function questMatchBoard(boards, nb, label, idx)
+function F.questMatchBoard(boards, nb, label, idx)
   if label then
     local want = string.lower(label)
     local j = 1
@@ -1608,13 +2331,13 @@ end
 
 -- Strict TOTAL order: table.sort in 5.0 is unstable and raises "invalid order
 -- function" on a sloppy comparator (the same lesson the bag sort learned).
-local function questCandCmp(a, b)
+function F.questCandCmp(a, b)
   if a.dist ~= b.dist then return a.dist < b.dist end
   return a.idx < b.idx
 end
 
-local function questScan()
-  local data = questData()
+function F.questScan()
+  local data = F.questData()
   local zone = GetRealZoneText() or ""
   quest.zoneName = zone
   if not data or not quest.posOK then
@@ -1655,12 +2378,12 @@ local function questScan()
       local q = data[title]
       if q then
         local headerMatch = (header == zone)
-        if headerMatch then questLearn(q.zone, zone) end
+        if headerMatch then F.questLearn(q.zone, zone) end
         sig = sig .. title .. (isComplete and "!" or "-")
         if isComplete then
           -- Objectives are done: the only useful waypoint is the turn-in NPC.
           local w = q.turnIn
-          if w and w.x and w.y and questSpotHere(q, w.zone, headerMatch, zone) then
+          if w and w.x and w.y and F.questSpotHere(q, w.zone, headerMatch, zone) then
             nc = nc + 1
             cand[nc] = {
               label = w.label or title, x = w.x, y = w.y,
@@ -1668,12 +2391,12 @@ local function questScan()
             }
           end
         elseif q.objectives then
-          local boards, nb = questBoards(i)
+          local boards, nb = F.questBoards(i)
           local nObj = table.getn(q.objectives)
           local oi = 1
           while oi <= nObj and nc < QUEST_MAX_CAND do
             local obj = q.objectives[oi]
-            local b = questMatchBoard(boards, nb, obj.label, oi)
+            local b = F.questMatchBoard(boards, nb, obj.label, oi)
             local have = (b and b.have) or 0
             local need = (b and b.need) or obj.count or 0
             local done = b and (b.done or (need > 0 and have >= need))
@@ -1683,7 +2406,7 @@ local function questScan()
               local si = 1
               while si <= nSpots and nc < QUEST_MAX_CAND do
                 local s = obj.spots[si]
-                if s.x and s.y and questSpotHere(q, s.zone, headerMatch, zone) then
+                if s.x and s.y and F.questSpotHere(q, s.zone, headerMatch, zone) then
                   nc = nc + 1
                   cand[nc] = {
                     label = obj.label or title, have = have, need = need,
@@ -1709,10 +2432,10 @@ local function questScan()
     local c = cand[k]
     c.dx = c.x - quest.px
     c.dy = c.y - quest.py
-    c.dist = questYards(c.dx, c.dy)
+    c.dist = F.questYards(c.dx, c.dy)
     k = k + 1
   end
-  table.sort(cand, questCandCmp)
+  table.sort(cand, F.questCandCmp)
   quest.spots = cand
 
   -- Tracked quests win the panel LINE outright; the blips still show
@@ -1731,7 +2454,7 @@ local function questScan()
 
   if sig ~= quest.logSig then
     quest.logSig = sig
-    dtrace("quest " .. nc .. " waypoint(s) in " .. zone)
+    F.dtrace("quest " .. nc .. " waypoint(s) in " .. zone)
   end
 end
 
@@ -1743,7 +2466,7 @@ end
 --------------------------------------------------------------------------
 
 local questBlips = {}
-local function questBlip(i)
+function F.questBlip(i)
   local t = questBlips[i]
   if t then return t end
   t = Minimap:CreateTexture(nil, "OVERLAY")
@@ -1754,7 +2477,7 @@ local function questBlip(i)
   return t
 end
 
-local function questDrawBlips()
+function F.questDrawBlips()
   if not Minimap then return end
   local radius = QUEST_MINIMAP_RADIUS[Minimap:GetZoom() or 0] or 200.0
   local halfW = Minimap:GetWidth() / 2
@@ -1764,7 +2487,7 @@ local function questDrawBlips()
   local i = 1
   while i <= QUEST_MAX_BLIPS do
     local s = quest.spots[i]
-    local t = questBlip(i)
+    local t = F.questBlip(i)
     if show and s then
       -- North-up: screen "up" is NEGATIVE map y, hence the sign flip.
       local ox = (s.x - quest.px) / 100 * QUEST_ZONE_YARDS_X / radius * halfW
@@ -1791,7 +2514,7 @@ local function questDrawBlips()
 end
 
 local questMarkers = {}
-local function questMarker(i)
+function F.questMarker(i)
   local t = questMarkers[i]
   if t then return t end
   t = WorldMapDetailFrame:CreateTexture(nil, "OVERLAY")
@@ -1806,7 +2529,7 @@ end
 -- the oracle for that is quest.posOK: GetPlayerMapPosition reads 0,0 the
 -- moment the map is pointed anywhere else. No zone id lookup, no dropdown
 -- index math, and it cannot be fooled into decorating the wrong continent.
-local function questDrawMarkers()
+function F.questDrawMarkers()
   if not WorldMapDetailFrame then return end
   local show = quest.enabled and quest.posOK
     and WorldMapFrame and WorldMapFrame:IsVisible()
@@ -1815,7 +2538,7 @@ local function questDrawMarkers()
   local i = 1
   while i <= QUEST_MAX_MARKERS do
     local s = quest.spots[i]
-    local t = questMarker(i)
+    local t = F.questMarker(i)
     if show and s then
       t:ClearAllPoints()
       t:SetPoint("CENTER", WorldMapDetailFrame, "TOPLEFT",
@@ -1835,13 +2558,13 @@ end
 
 -- The advisor panel's quest line. Every state says WHY it has nothing to
 -- show; a blank line reads as a broken addon.
-local function questLineText()
+function F.questLineText()
   if not quest.enabled then return "" end
   if not ShadowArmyQuestData then return "|cFF777777quests: no data file|r" end
   if not quest.posOK then return "|cFF777777quests: map is off-zone|r" end
   local t = quest.target
   if not t then return "|cFF777777quests: nothing mapped here|r" end
-  local dir = questBearing(t.dx, t.dy)
+  local dir = F.questBearing(t.dx, t.dy)
   local yards = math.floor(t.dist + 0.5)
   if t.turnIn then
     return string.format("|cFF44FF44%s %s|r |cFFAAAAAA%s ~%dy %s|r",
@@ -1855,22 +2578,21 @@ local function questLineText()
     QUEST_MARK_GO, t.label, prog, "\194\183", yards, dir)
 end
 
-local function questTick()
+function F.questTick()
   if not quest.enabled then return end
   local now = GetTime()
   if now < quest.nextTickAt then return end
   quest.nextTickAt = now + QUEST_TICK_EVERY
-  questPosition()
-  questScan()
-  questDrawBlips()
-  questDrawMarkers()
+  F.questPosition()
+  F.questScan()
+  F.questDrawBlips()
+  F.questDrawMarkers()
 end
 
-local function questSetEnabled(on)
+function F.questSetEnabled(on)
   quest.enabled = on and true or false
   if questBtn then
-    -- Same convention as Auto Combat: the label never changes, the STATE is
-    -- the colour. Green on, grey off.
+    -- Label fixed; state is the colour. Green on, grey off.
     questBtn:SetText(quest.enabled and "|cFF44FF44Quests|r" or "|cFF999999Quests|r")
   end
   if quest.enabled then
@@ -1878,18 +2600,18 @@ local function questSetEnabled(on)
   else
     quest.spots = {}
     quest.target = nil
-    pcall(questDrawBlips)
-    pcall(questDrawMarkers)
+    pcall(F.questDrawBlips)
+    pcall(F.questDrawMarkers)
   end
 end
 
 questBtn = CreateFrame("Button", "ShadowArmyQuestBtn", panel, "UIPanelButtonTemplate")
 questBtn:SetWidth(93) -- 8 + 93 + 8 + 93 + 8 = 210 = panel width
 questBtn:SetHeight(20)
-questBtn:SetPoint("BOTTOMRIGHT", panel, "BOTTOMRIGHT", -8, 8) -- bottom row, right of Log
+questBtn:SetPoint("BOTTOMRIGHT", panel, "BOTTOMRIGHT", -8, 32) -- middle row, right of Log
 questBtn:SetText("|cFF44FF44Quests|r")
 questBtn:SetScript("OnClick", function()
-  questSetEnabled(not quest.enabled)
+  F.questSetEnabled(not quest.enabled)
 end)
 
 -- WORLD_MAP_UPDATE fires on pan/zoom/zone-switch and can arrive every frame
@@ -1909,8 +2631,8 @@ questEvents:SetScript("OnEvent", function()
   local now = GetTime()
   if now < quest.nextMarkerAt then return end
   quest.nextMarkerAt = now + QUEST_MARKER_EVERY
-  local ok, err = pcall(questDrawMarkers)
-  if not ok then emit("err", "questMarkers: " .. tostring(err)) end
+  local ok, err = pcall(F.questDrawMarkers)
+  if not ok then F.emit("err", "questMarkers: " .. tostring(err)) end
 end)
 
 --------------------------------------------------------------------------
@@ -1938,7 +2660,7 @@ local crew = {
   spots = {}, -- { x, y, kind = "party"|"party_ghost"|"corpse", name? }
 }
 
-local function crewPosition()
+function F.crewPosition()
   -- Reuse quest map-fix so we never paint on a browsed foreign zone.
   if quest.posOK then
     crew.px, crew.py, crew.posOK = quest.px, quest.py, true
@@ -1959,7 +2681,7 @@ local function crewPosition()
   return true
 end
 
-local function crewScan()
+function F.crewScan()
   crew.spots = {}
   if not crew.posOK then return end
   local n = 0
@@ -1997,7 +2719,7 @@ local function crewScan()
   end
 end
 
-local function crewPlaceMinimap(t, sx, sy)
+function F.crewPlaceMinimap(t, sx, sy)
   if not Minimap then return false end
   local radius = QUEST_MINIMAP_RADIUS[Minimap:GetZoom() or 0] or 200.0
   local halfW = Minimap:GetWidth() / 2
@@ -2015,7 +2737,7 @@ local function crewPlaceMinimap(t, sx, sy)
 end
 
 local crewBlips = {}
-local function crewBlip(i)
+function F.crewBlip(i)
   local t = crewBlips[i]
   if t then return t end
   t = Minimap:CreateTexture(nil, "OVERLAY")
@@ -2026,15 +2748,15 @@ local function crewBlip(i)
   return t
 end
 
-local function crewDrawBlips()
+function F.crewDrawBlips()
   if not Minimap then return end
   local show = crew.enabled and crew.posOK
   local max = CREW_MAX_PARTY + 1 -- party + corpse
   local i = 1
   while i <= max do
     local s = crew.spots[i]
-    local t = crewBlip(i)
-    if show and s and crewPlaceMinimap(t, s.x, s.y) then
+    local t = F.crewBlip(i)
+    if show and s and F.crewPlaceMinimap(t, s.x, s.y) then
       if s.kind == "corpse" then
         t:SetWidth(10)
         t:SetHeight(10)
@@ -2057,7 +2779,7 @@ local function crewDrawBlips()
 end
 
 local crewMarkers = {}
-local function crewMarker(i)
+function F.crewMarker(i)
   local t = crewMarkers[i]
   if t then return t end
   t = WorldMapDetailFrame:CreateTexture(nil, "OVERLAY")
@@ -2068,7 +2790,7 @@ local function crewMarker(i)
   return t
 end
 
-local function crewDrawMarkers()
+function F.crewDrawMarkers()
   if not WorldMapDetailFrame then return end
   local show = crew.enabled and crew.posOK
     and WorldMapFrame and WorldMapFrame:IsVisible()
@@ -2078,7 +2800,7 @@ local function crewDrawMarkers()
   local i = 1
   while i <= max do
     local s = crew.spots[i]
-    local t = crewMarker(i)
+    local t = F.crewMarker(i)
     if show and s then
       t:ClearAllPoints()
       t:SetPoint("CENTER", WorldMapDetailFrame, "TOPLEFT",
@@ -2099,7 +2821,7 @@ local function crewDrawMarkers()
 end
 
 -- Panel line when ghosting: bearing/yards to own corpse (quest line yields).
-local function corpseLineText()
+function F.corpseLineText()
   if not (UnitIsGhost and UnitIsGhost("player")) then return nil end
   if not crew.posOK then return "|cFFBB88FF corpse: map off-zone|r" end
   local s = nil
@@ -2111,30 +2833,30 @@ local function corpseLineText()
   if not s then return "|cFFBB88FF corpse: not on this map|r" end
   local dx = s.x - crew.px
   local dy = s.y - crew.py
-  local dir = questBearing(dx, dy)
-  local yards = math.floor(questYards(dx, dy) + 0.5)
+  local dir = F.questBearing(dx, dy)
+  local yards = math.floor(F.questYards(dx, dy) + 0.5)
   return string.format("|cFFD080FF>> CORPSE|r |cFFAAAAAA%s ~%dy %s|r",
     "\194\183", yards, dir)
 end
 
-local function crewTick()
+function F.crewTick()
   if not crew.enabled then return end
   local now = GetTime()
   if now < crew.nextTickAt then return end
   crew.nextTickAt = now + CREW_TICK_EVERY
-  -- Keep map fixed when quests are off (questTick is the usual fixer).
+  -- Keep map fixed when quests are off (F.questTick is the usual fixer).
   if quest.enabled then
     if quest.posOK then
       crew.px, crew.py, crew.posOK = quest.px, quest.py, true
     else
-      crewPosition()
+      F.crewPosition()
     end
   else
-    crewPosition()
+    F.crewPosition()
   end
-  crewScan()
-  crewDrawBlips()
-  crewDrawMarkers()
+  F.crewScan()
+  F.crewDrawBlips()
+  F.crewDrawMarkers()
 end
 
 local crewEvents = CreateFrame("Frame", "ShadowArmyCrewEvents", UIParent)
@@ -2150,8 +2872,8 @@ crewEvents:SetScript("OnEvent", function()
     local now = GetTime()
     if now < crew.nextMarkerAt then return end
     crew.nextMarkerAt = now + QUEST_MARKER_EVERY
-    local ok, err = pcall(crewDrawMarkers)
-    if not ok then emit("err", "crewMarkers: " .. tostring(err)) end
+    local ok, err = pcall(F.crewDrawMarkers)
+    if not ok then F.emit("err", "crewMarkers: " .. tostring(err)) end
   end
 end)
 
@@ -2192,7 +2914,7 @@ local loot = {
   gatedReported = false, -- one `loot gated` per session is the whole signal
 }
 
-local function lootSlotsLeft()
+function F.lootSlotsLeft()
   local n = GetNumLootItems()
   if not n then return 0 end
   local left = 0
@@ -2206,7 +2928,7 @@ local function lootSlotsLeft()
   return left
 end
 
-local function lootSweep()
+function F.lootSweep()
   local n = GetNumLootItems()
   if not n then return end
   -- Backwards: LootSlot removes entries, so forward indexing skips slots.
@@ -2219,14 +2941,14 @@ local function lootSweep()
     pcall(ConfirmLootSlot, i)
     i = i - 1
   end
-  loot.lastSeen = lootSlotsLeft()
+  loot.lastSeen = F.lootSlotsLeft()
 end
 
-local function lootTick()
+function F.lootTick()
   local now = GetTime()
   if now < loot.nextTryAt then return end
   loot.nextTryAt = now + LOOT_RETRY_EVERY
-  loot.lastSeen = lootSlotsLeft()
+  loot.lastSeen = F.lootSlotsLeft()
   if loot.lastSeen <= 0 then
     loot.active = false -- window is empty; summary lands on LOOT_CLOSED
     return
@@ -2238,85 +2960,76 @@ local function lootTick()
       -- ignored, not raced. More retries are wasted; the next rev needs a
       -- hardware-event piggyback (same shape as the reload button).
       loot.gatedReported = true
-      emit("loot", "gated")
+      F.emit("loot", "gated")
     end
     return
   end
-  lootSweep()
+  F.lootSweep()
 end
 
 local pendingReload = 0 -- countdown of escalation steps; 0 = idle
 -- r11: every request gets a number so the ladder is traceable end to end, and
--- two reloads within emit()'s 30s identical-message window can never collapse
+-- two reloads within F.emit()'s 30s identical-message window can never collapse
 -- into one line.
 local reloadSeq = 0
 
 local driver = CreateFrame("Frame", "ShadowArmyDriver", UIParent)
 driver:SetScript("OnUpdate", function()
-  -- Sample position EVERY frame: rotationStep is skipped during GCD and
-  -- failure-backoff windows, and a stale sample made a standing player read
-  -- as "moving" (which blocks Shadow Bolt). Two float compares, negligible.
-  updateMoving()
-  emitDrain() -- paced outbound chat; see EMIT_GAP
-  -- r12: keep Demon Skin/Armor up. Deliberately ABOVE the auto.enabled gate —
-  -- it is a self-buff, not a fight, so it works whether or not auto-combat is
-  -- on. pcall for the same reason as the rotation: a raw error here would
-  -- silently kill the rest of this OnUpdate (loot retries, reload ladder).
-  local aok, aerr = pcall(armorTick)
-  if not aok then emit("err", "armorTick: " .. tostring(aerr)) end
-  -- r13: bag autosort steps here (one swap in flight, lock-polled). Above the
-  -- auto.enabled gate on purpose — sorting has nothing to do with combat — and
-  -- pcall'd for the same reason armorTick is: a raw error would take the rest
-  -- of this OnUpdate down with it, silently.
+  -- Sample position EVERY frame for combat-coach move tips.
+  F.updateMoving()
+  F.emitDrain() -- paced outbound chat; see EMIT_GAP
+  -- r22: deferred probe runs (Frame / Delay modes) + cast follow-ups.
+  local pok, perr = pcall(F.probeTick)
+  if not pok then F.emit("err", "probeTick: " .. tostring(perr)) end
+  -- r12: Demon Skin/Armor keep-up attempt (cast is click-gated on this client;
+  -- legacy path). pcall so a failure cannot kill the rest of OnUpdate.
+  local aok, aerr = pcall(F.armorTick)
+  if not aok then F.emit("err", "armorTick: " .. tostring(aerr)) end
+  -- r13: bag autosort (one swap in flight).
   if sort.active then
-    local sok, serr = pcall(sortTick)
+    local sok, serr = pcall(F.sortTick)
     if not sok then
-      emit("err", "sortTick: " .. tostring(serr))
-      pcall(sortStop, "error")
+      F.emit("err", "sortTick: " .. tostring(serr))
+      pcall(F.sortStop, "error")
     end
   end
-  -- r18: quest waypoints. Self-throttled to 0.5s internally, above the
-  -- auto.enabled gate (knowing where to walk has nothing to do with combat)
-  -- and pcall'd like every other tick body here — a bug in the quest data
-  -- must not be able to take loot retries or the reload ladder down with it.
+  -- r18: quest waypoints.
   if quest.enabled then
-    local qok, qerr = pcall(questTick)
-    if not qok then emit("err", "questTick: " .. tostring(qerr)) end
+    local qok, qerr = pcall(F.questTick)
+    if not qok then F.emit("err", "questTick: " .. tostring(qerr)) end
   end
-  -- r21: party + corpse blips (always on when crew.enabled).
+  -- r21: party + corpse blips.
   if crew.enabled then
-    local cok, cerr = pcall(crewTick)
-    if not cok then emit("err", "crewTick: " .. tostring(cerr)) end
+    local cok, cerr = pcall(F.crewTick)
+    if not cok then F.emit("err", "crewTick: " .. tostring(cerr)) end
   end
-  if loot.active then lootTick() end
+  if loot.active then F.lootTick() end
+  -- r26: combat coach panel refresh (~4 Hz when open). Display only.
+  if combatFrame:IsShown() then
+    combatAcc = combatAcc + (arg1 or 0)
+    if combatAcc >= 0.25 then
+      combatAcc = 0
+      local cok, cerr = pcall(F.combatRefresh)
+      if not cok then F.emit("err", "combatRefresh: " .. tostring(cerr)) end
+    end
+  end
   if pendingReload > 0 then
     pendingReload = pendingReload - 1
     if pendingReload == 2 then
-      -- pcall: if this build has no ReloadUI/ConsoleExec global, a raw call
-      -- would raise and (scriptErrors off) silently kill the whole OnUpdate
-      -- for that frame with zero telemetry. Report instead.
-      dtrace("reload #" .. reloadSeq .. " step 1/3 ReloadUI()")
-      local ok, err = pcall(ReloadUI) -- if this works we never reach step 2
-      if not ok then emit("err", "ReloadUI: " .. tostring(err)) end
+      F.dtrace("reload #" .. reloadSeq .. " step 1/3 ReloadUI()")
+      local ok, err = pcall(ReloadUI)
+      if not ok then F.emit("err", "ReloadUI: " .. tostring(err)) end
     elseif pendingReload == 1 then
-      dtrace("reload #" .. reloadSeq .. " step 2/3 ConsoleExec(reloadui)")
+      F.dtrace("reload #" .. reloadSeq .. " step 2/3 ConsoleExec(reloadui)")
       local ok, err = pcall(ConsoleExec, "reloadui")
-      if not ok then emit("err", "ConsoleExec: " .. tostring(err)) end
+      if not ok then F.emit("err", "ConsoleExec: " .. tostring(err)) end
     elseif pendingReload == 0 then
-      emit("reload-click",
+      F.emit("reload-click",
         "#" .. reloadSeq .. " auto paths no-op; button lit + next-press armed")
-      panel:Show() -- the button lives in the panel; unhide if /sa'd away
+      panel:Show()
       reloadBtn:Show()
-      reloadArmed = true -- next out-of-combat action press applies it
+      reloadArmed = true
     end
-    return
-  end
-  if not auto.enabled then return end
-  local ok, err = pcall(rotationStep)
-  if not ok and err ~= auto.lastErr then
-    auto.lastErr = err
-    say("|cFFFF4444rotation error:|r " .. tostring(err))
-    emit("err", "rotation: " .. tostring(err))
   end
 end)
 
@@ -2325,17 +3038,17 @@ panel:SetScript("OnUpdate", function()
   acc = acc + arg1
   if acc < 0.5 then return end
   acc = 0
-  local xph, tta = grindStats()
+  local xph, tta = F.grindStats()
   line1:SetText(string.format("lvl %d  %d/%d xp",
     UnitLevel("player"), UnitXP("player"), UnitXPMax("player")))
   line2:SetText(string.format("%d xp/h  |  level up in %s", xph, tta))
-  local t1, t2 = targetSummary()
+  local t1, t2 = F.targetSummary()
   line3:SetText(t1)
   line4:SetText(t2)
-  line5:SetText(buffWatchLine())
+  line5:SetText(F.buffWatchLine())
   -- Corpse-run compass wins the quest line while ghosting.
-  local corpseLine = corpseLineText()
-  line6:SetText(corpseLine or questLineText())
+  local corpseLine = F.corpseLineText()
+  line6:SetText(corpseLine or F.questLineText())
 end)
 
 --------------------------------------------------------------------------
@@ -2347,7 +3060,7 @@ end)
 -- effect; the classic fix is hooking the scroll frames' OnShow to call
 -- the "text finished" path immediately. QuestFrameDetailPanel shows quest
 -- description; QuestFrameProgressPanel the turn-in text.
-local function instantQuestText()
+function F.instantQuestText()
   -- The crawl is driven by the detail panel's OnUpdate revealing text over
   -- time; killing it + forcing alpha shows everything at once. Progress
   -- panel = quest turn-in text.
@@ -2391,21 +3104,21 @@ frame:SetScript("OnEvent", function()
   if event == "PLAYER_ENTERING_WORLD" then
     grind.startTime = GetTime()
     grind.startXP = UnitXP("player")
-    scanSpellbook()
+    F.scanSpellbook()
     -- QoL defaults the advisor asserts on every login:
-    -- instantQuestText() DISABLED (r14): prime remaining suspect for the
+    -- F.instantQuestText() DISABLED (r14): prime remaining suspect for the
     -- reproducible crash+lockup on Complete Quest (it nils the quest
     -- panels' OnUpdate — exactly the surface involved in that click). The
     -- fanfare mute didn't take (music still played), so this is the next
     -- single-variable test. Re-enable only after turn-ins are proven safe.
-    panelShowReset()
-    say("ARISE. Advisor online for " .. UnitName("player") .. " — /sa help (rev=" .. REV .. ")")
-    emit("loaded", "rev=" .. REV)
+    F.panelShowReset()
+    F.say("ARISE. Advisor online for " .. UnitName("player") .. " — /sa help (rev=" .. REV .. ")")
+    F.emit("loaded", "rev=" .. REV)
     if not ShadowArmyQuestData then
-      say("quest data missing (QuestData.lua failed to load) — panel still works")
+      F.say("quest data missing (QuestData.lua failed to load) — panel still works")
     end
   elseif event == "LEARNED_SPELL_IN_TAB" then
-    scanSpellbook()
+    F.scanSpellbook()
   elseif event == "SPELLCAST_START" then
     auto.casting = true
     auto.castingSince = GetTime()
@@ -2416,7 +3129,7 @@ frame:SetScript("OnEvent", function()
     -- brief backoff so a failing cast (moving/silenced/oom) can't retry
     -- every frame and starve the wand fallback
     auto.failUntil = GetTime() + 0.5
-    dtrace("cast failed/interrupted — 0.5s backoff")
+    F.dtrace("cast failed/interrupted — 0.5s backoff")
   elseif event == "START_AUTOREPEAT_SPELL" then
     auto.shooting = true
   elseif event == "STOP_AUTOREPEAT_SPELL" then
@@ -2428,21 +3141,21 @@ frame:SetScript("OnEvent", function()
   elseif event == "LOOT_OPENED" then
     loot.active = true
     loot.openedAt = GetTime()
-    loot.startSlots = lootSlotsLeft()
+    loot.startSlots = F.lootSlotsLeft()
     loot.lastSeen = loot.startSlots
     loot.nextTryAt = GetTime() + LOOT_RETRY_EVERY
-    dtrace("loot opened slots=" .. tostring(GetNumLootItems())
+    F.dtrace("loot opened slots=" .. tostring(GetNumLootItems())
       .. " items=" .. loot.startSlots)
-    lootSweep() -- first attempt now; the driver retries for ~2s after this
+    F.lootSweep() -- first attempt now; the driver retries for ~2s after this
   elseif event == "LOOT_SLOT_CLEARED" then
     -- Keeps lastSeen honest when the window empties and auto-closes inside
     -- a single retry interval.
-    loot.lastSeen = lootSlotsLeft()
+    loot.lastSeen = F.lootSlotsLeft()
   elseif event == "LOOT_CLOSED" then
     loot.active = false
     if loot.startSlots > 0 then
       -- The one line that settles "do these calls do anything at all".
-      emit("loot", "result took=" .. (loot.startSlots - loot.lastSeen)
+      F.emit("loot", "result took=" .. (loot.startSlots - loot.lastSeen)
         .. " left=" .. loot.lastSeen)
       loot.startSlots = 0
     end
@@ -2459,10 +3172,10 @@ frame:SetScript("OnEvent", function()
     -- r11: marker matched. Trace it BEFORE the verb parse so a future
     -- "the addon ignored my command" can be told apart from "the announce
     -- never arrived" without guessing.
-    dtrace("sys rx [" .. cmd .. "]")
+    F.dtrace("sys rx [" .. cmd .. "]")
     local _, _, verb, rest = string.find(cmd, "^(%S+)%s*(.*)$")
     if not verb then
-      emit("err", "sys unparsed: [" .. cmd .. "]")
+      F.emit("err", "sys unparsed: [" .. cmd .. "]")
       return
     end
     verb = string.lower(verb)
@@ -2473,25 +3186,29 @@ frame:SetScript("OnEvent", function()
       -- following `loaded` line. Never grep `reloading rev=<the rev I just
       -- pushed>`; it can never match, and reading its absence as "reload is
       -- broken" is exactly the wrong turn taken on 2026-07-25.
-      -- #N makes each request unique so emit()'s 30s dedupe can't swallow a
+      -- #N makes each request unique so F.emit()'s 30s dedupe can't swallow a
       -- retry, and pairs this line with its reload-click.
       reloadSeq = reloadSeq + 1
-      emit("reloading", "#" .. reloadSeq .. " from-rev=" .. REV)
+      F.emit("reloading", "#" .. reloadSeq .. " from-rev=" .. REV)
       pendingReload = 3 -- escalation ladder runs on the driver; see above
     elseif verb == "ping" then
-      emit("pong", "rev=" .. REV)
+      F.emit("pong", "rev=" .. REV)
     elseif verb == "debug" then
       debugMode = (rest ~= "off")
-      emit("debug", debugMode and "on" or "off")
+      F.emit("debug", debugMode and "on" or "off")
     elseif verb == "status" then
-      local xph = grindStats()
-      emit("status", string.format("lvl=%d hp=%d/%d zone=%s xph=%d",
+      local xph = F.grindStats()
+      F.emit("status", string.format("lvl=%d hp=%d/%d zone=%s xph=%d",
         UnitLevel("player"), UnitHealth("player"), UnitHealthMax("player"),
         GetZoneText(), xph))
     elseif verb == "say" then
-      say(rest)
+      F.say(rest)
+    elseif verb == "admin" then
+      -- Feedback from The System after an admin action (respawn, etc.).
+      -- Not an executable verb — display only so we do not F.emit "unknown".
+      F.say("|cFFFF8844[System admin]|r " .. (rest ~= "" and rest or "ok"))
     else
-      emit("err", "unknown sys command: " .. verb)
+      F.emit("err", "unknown sys command: " .. verb)
     end
   end
 end)
@@ -2500,18 +3217,21 @@ end)
 -- /sa — toggle panel; /sa help — command list; /sa reload, status, …
 --------------------------------------------------------------------------
 
-local function saHelp()
+function F.saHelp()
   -- Keep this list next to the slash handler so they cannot drift.
-  say("ShadowArmy " .. REV .. " — commands:")
-  say("  /sa            toggle advisor panel")
-  say("  /sa show       show panel (reset position if off-screen)")
-  say("  /sa help       this list")
-  say("  /sa status     level, HP, zone, XP/h")
-  say("  /sa log        toggle advisor log window")
-  say("  /sa bags       open ShadowBags")
-  say("  /sa quests     toggle quest helper (map blips / objectives)")
-  say("  /sa crew       toggle party + corpse map blips")
-  say("  /sa reload     ReloadUI() — pick up disk edits")
+  F.say("ShadowArmy " .. REV .. " — commands:")
+  F.say("  /sa            toggle advisor panel")
+  F.say("  /sa show       show panel (reset position if off-screen)")
+  F.say("  /sa help       this list")
+  F.say("  /sa status     level, HP, zone, XP/h")
+  F.say("  /sa log        toggle advisor log window")
+  F.say("  /sa admin      toggle admin panel (The System ops)")
+  F.say("  /sa combat     toggle combat coach (ability suggestions)")
+  F.say("  /sa debug      toggle API probe panel (context gates)")
+  F.say("  /sa bags       open ShadowBags")
+  F.say("  /sa quests     toggle quest helper (map blips / objectives)")
+  F.say("  /sa crew       toggle party + corpse map blips")
+  F.say("  /sa reload     ReloadUI() — pick up disk edits")
 end
 
 SLASH_SHADOWARMY1 = "/sa"
@@ -2520,12 +3240,12 @@ SlashCmdList["SHADOWARMY"] = function(msg)
   msg = string.gsub(msg, "%s+$", "")
   msg = string.lower(msg)
   if msg == "help" or msg == "?" then
-    saHelp()
+    F.saHelp()
     return
   end
   if msg == "show" then
-    panelShowReset()
-    say("panel shown (position reset)")
+    F.panelShowReset()
+    F.say("panel shown (position reset)")
     return
   end
   if msg == "reload" then
@@ -2536,24 +3256,24 @@ SlashCmdList["SHADOWARMY"] = function(msg)
   -- take (another addon loading after us and re-replacing ToggleBackpack),
   -- this still opens it.
   if msg == "bags" then
-    bagsToggle()
+    F.bagsToggle()
     return
   end
   if msg == "quests" then
-    questSetEnabled(not quest.enabled)
-    say("quest helper " .. (quest.enabled and "ON" or "OFF"))
+    F.questSetEnabled(not quest.enabled)
+    F.say("quest helper " .. (quest.enabled and "ON" or "OFF"))
     return
   end
   if msg == "crew" then
     crew.enabled = not crew.enabled
     if not crew.enabled then
       crew.spots = {}
-      pcall(crewDrawBlips)
-      pcall(crewDrawMarkers)
+      pcall(F.crewDrawBlips)
+      pcall(F.crewDrawMarkers)
     else
       crew.nextTickAt = 0
     end
-    say("crew blips " .. (crew.enabled and "ON" or "OFF")
+    F.say("crew blips " .. (crew.enabled and "ON" or "OFF")
       .. " (party cyan / ghost white / corpse purple)")
     return
   end
@@ -2561,22 +3281,34 @@ SlashCmdList["SHADOWARMY"] = function(msg)
     if logFrame:IsVisible() then logFrame:Hide() else logFrame:Show() end
     return
   end
+  if msg == "debug" or msg == "probe" then
+    F.probeToggle()
+    return
+  end
+  if msg == "admin" then
+    F.adminToggle()
+    return
+  end
+  if msg == "combat" then
+    F.combatToggle()
+    return
+  end
   if msg == "status" then
     local hp = UnitHealth("player")
     local hpMax = UnitHealthMax("player")
-    local xph, tta = grindStats()
-    say(string.format("%s — lvl %d, %d/%d hp, %s | %d xp/h, level in %s",
+    local xph, tta = F.grindStats()
+    F.say(string.format("%s — lvl %d, %d/%d hp, %s | %d xp/h, level in %s",
       UnitName("player"), UnitLevel("player"), hp, hpMax, GetZoneText(), xph, tta))
     return
   end
   if msg ~= "" then
-    say("unknown /sa command — try /sa help")
+    F.say("unknown /sa command — try /sa help")
     return
   end
   -- Toggle: prefer IsShown (local flag) over IsVisible (parent chain).
   if panel:IsShown() then
     panel:Hide()
   else
-    panelShowReset()
+    F.panelShowReset()
   end
 end
