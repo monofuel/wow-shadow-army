@@ -176,17 +176,16 @@ grind-army-nim: army-host-build
 	done; \
 	echo "grind army started (audit: local_data/audit/fair-play.jsonl)"
 
-# Single-seat mob grind on the Nim host (docs/warlock-seat.md). Uses the
-# goal-independent generic action masks, so it works for classes the upstream
-# leveling planner refuses (an undead warlock resolves `unsupported_profile`
-# and the planner noops forever — that only silences `recommended_action`, it
-# does not close the masks).
+# Single-seat mob grind, Lua-driven: lua/tools/grind_nearest decides every
+# tick and the host fires typed BotActions through the fork's execute_action
+# frame (kb/nim-control-v2-external-select.md). Requires the seat to run the
+# fork `lua-external-policy` build with an idle/held planner.
 #
 #   make grind SLOT=2 EXTRA='--max-seconds=600'
 grind: army-host-build
-	@./tools/army_host --slot=$(SLOT) --tool=grind_nearest --leader=$(or $(ESCORT_LEADER),Murist) \
-		--party=$(or $(ESCORT_PARTY),Murist,Shadowfel,Igris,Tusk,Beru) --goal-id=grind-slot-$(SLOT) \
-		--cadence=$(or $(CADENCE),0.3) --audit-path=local_data/audit/fair-play.jsonl $(EXTRA)
+	@./tools/army_host --slot=$(SLOT) --tool=grind_nearest --external \
+		--leader=$(or $(ESCORT_LEADER),Murist) \
+		--cadence=$(or $(CADENCE),1.0) --audit-path=local_data/audit/fair-play.jsonl $(EXTRA)
 
 # Party formation across our headless seats: human (or bot leader) invites,
 # seats accept via escort_leader; promote with tools/party_promote
@@ -550,6 +549,13 @@ play-xr:
 	fi; \
 	if [ ! -f "$(WOW_ENV)" ]; then \
 		echo "error: missing $(WOW_ENV)" >&2; exit 1; \
+	fi; \
+	if [ ! -e "$(XR_FORK)/local_data/coworld-bundle" ] && \
+			[ -d "$(UPSTREAM)/local_data/coworld-bundle" ]; then \
+		mkdir -p "$(XR_FORK)/local_data"; \
+		ln -sfn "$(UPSTREAM)/local_data/coworld-bundle" \
+			"$(XR_FORK)/local_data/coworld-bundle"; \
+		echo "linked client bundle from upstream local_data (read-only source)"; \
 	fi; \
 	cd "$(XR_FORK)"; \
 	nix shell nixpkgs\#nginx --command sh -c \
