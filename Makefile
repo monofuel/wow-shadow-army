@@ -536,8 +536,11 @@ play-classic:
 # Launch the native client from the XR fork checkout in VR (OpenXR PoC,
 # branch monofuel/xr). Quick play on purpose: no --login-screen, so the
 # launcher drops straight into the world with the local-realm credentials.
-# --xr passes through to the player and enables the stereo OpenXR path
-# (SteamVR must be running; without it the client falls back to flat).
+# --xr makes the launcher build the player with -d:xr (stereo OpenXR path;
+# SteamVR must be running, otherwise the client falls back to flat). The
+# xr library links with -lopenxr_loader, which wow_env.sh does not carry,
+# so the recipe puts nixpkgs#openxr-loader on LIBRARY_PATH — the nix gcc
+# wrapper turns that into -L plus a baked RUNPATH for runtime resolution.
 # Do not run unattended (opens a GUI).
 XR_FORK := $(abspath ../coworld-vanilla-wow-xr)
 play-xr:
@@ -550,7 +553,11 @@ play-xr:
 	fi; \
 	cd "$(XR_FORK)"; \
 	nix shell nixpkgs\#nginx --command sh -c \
-		'. "$(WOW_ENV)"; nim r tools/launch_nim_player.nim -- \
+		'. "$(WOW_ENV)"; \
+		openxr=$$(nix build --no-link --print-out-paths nixpkgs#openxr-loader); \
+		export LIBRARY_PATH="$$openxr/lib$${LIBRARY_PATH:+:$$LIBRARY_PATH}"; \
+		export LD_LIBRARY_PATH="$$openxr/lib$${LD_LIBRARY_PATH:+:$$LD_LIBRARY_PATH}"; \
+		nim r tools/launch_nim_player.nim -- \
 			--realm-host=127.0.0.1 \
 			--realm-port=3724 \
 			--world-port=8085 \
