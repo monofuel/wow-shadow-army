@@ -90,7 +90,7 @@ echo '{"op":"route","mmaps_dir":"'"$VANILLA_WOW_EXTRACTED_DATA_DIR"'/mmaps",
 ## Env wiring
 
 `Makefile` exports it globally next to the other realm operator inputs, so
-every seat target and `make shadow` inherit it:
+every seat target inherits it:
 
 ```make
 export VANILLA_WOW_NAVMESH_HELPER := $(UPSTREAM)/tmp/vmangos-navmesh-helper
@@ -112,8 +112,8 @@ produced the original `movement_blocked` evidence, so this is a clean A/B.
 ```sh
 make navmesh-helper
 # relaunch the seat so it inherits VANILLA_WOW_NAVMESH_HELPER
-make shadow SLOT=0 LEADER=Botwarrior PARTY=Botwarrior \
-  EXTRA='--move-fallback --max-seconds 75'
+# (2026-07-26 proof used the v1-era `make shadow` Python host, since deleted;
+# today: make escort SLOT=0)
 ```
 
 Brain output — settlements now succeed:

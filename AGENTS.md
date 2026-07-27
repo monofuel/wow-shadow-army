@@ -16,19 +16,19 @@ upstream controller already owns.
 
 - **NO PYTHON.** Do not write, extend, or land new Python for bots, policy,
   tools, brain loops, or tests of those layers. Policy and named-intent
-  tools live in **`lua/`** (and Lua unit tests under `lua/tests/`). The
-  `brain/*.py` tree is legacy drift from a prior agent pass — do not grow
-  it; do not copy its patterns. If a task seems to "need Python," stop and
+  tools live in **`lua/`** (and Lua unit tests under `lua/tests/`). The old
+  `brain/*.py` tree was deleted 2026-07-27 — do not resurrect it or copy
+  its patterns from git history. If a task seems to "need Python," stop and
   either (a) call **upstream** (Nim client / existing goals / control
   surface) or (b) add a **Lua** tool. One-off host scripts outside the bot
   army are monofuel's call, not an agent default.
 - **Rely on upstream as much as possible.** `../coworld-vanilla-wow` already
   owns perception, pathing, combat sequencing, looting, formation, recovery,
-  and the `nim_control.v1` socket. Do not reimplement that stack here. Prefer
-  typed goals and thin named intents that *select* among upstream
-  capabilities over home-grown action FSMs. If upstream is missing a
-  capability, document the gap and tell monofuel — do not paper over it with
-  a local Python (or other) policy brain.
+  and the `nim_control.v2` socket. Under v2 there is **no external action
+  selection** (`kb/nim-control-v2-no-select.md`): per-frame policy runs
+  in-process upstream, configured by typed goals. Do not reimplement that
+  stack here. If upstream is missing a capability, document the gap and
+  tell monofuel — do not paper over it with a local policy brain.
 - **DO NOT CHEAT.** We need to do things properly so we can win in the
   tournament. If you cheat, you only make things harder: you mask real
   issues in pathing, combat, quests, party, and recovery that we would

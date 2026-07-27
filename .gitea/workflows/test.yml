@@ -1,8 +1,8 @@
 name: Tests
 
-# Unit + integration CI. Unit stays first and cheap (green checkmark on every
-# push). Integration needs the private Monolab/coworld-vanilla-wow mirror at
-# the upstream.lock pin as a sibling path (see docs/testing.md).
+# Unit + pin CI. Unit stays first and cheap (green checkmark on every push).
+# Pin check needs the private Monolab/coworld-vanilla-wow mirror at the
+# upstream.lock pin as a sibling path (see docs/testing.md).
 # House style: crewrift-prime-bots/.gitea/workflows/test.yml (apt lua on
 # monolab-builder). Testing doctrine: racha_notes Programming/testing.md.
 
@@ -22,9 +22,9 @@ jobs:
       - name: Unit suite
         run: make test
 
-  # Recorded-frame fixtures through real upstream EnvironmentFrame + pin drift.
-  # No docker, no realm. Needs private mirror checkout + uv + lua5.3.
-  integration-tests:
+  # Pin drift only (pure shell pin-check). No docker, no realm, no Python.
+  # Needs the private mirror checkout as a sibling path.
+  pin-check:
     runs-on: monolab-builder
     steps:
       - uses: actions/checkout@v3
@@ -51,7 +51,7 @@ jobs:
             exit 1
           fi
           # Sibling of GITHUB_WORKSPACE so ../coworld-vanilla-wow resolves
-          # for Makefile UPSTREAM and tests/integration/test_pin_drift.py.
+          # for Makefile UPSTREAM (pin-check).
           SIBLING="$(dirname "$GITHUB_WORKSPACE")/coworld-vanilla-wow"
           MIRROR_URL="ssh://git@10.11.4.11:222/Monolab/coworld-vanilla-wow.git"
           echo "[integration] cloning mirror → $SIBLING @ $PIN"
@@ -70,32 +70,5 @@ jobs:
           fi
           echo "[integration] mirror HEAD=$(git -C "$SIBLING" rev-parse HEAD)"
 
-      - name: Install lua 5.3 + uv
-        run: |
-          set -euo pipefail
-          apt-get update
-          apt-get install -y lua5.3 curl ca-certificates
-          if ! command -v uv >/dev/null 2>&1; then
-            curl -LsSf https://astral.sh/uv/install.sh | sh
-            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-            export PATH="$HOME/.local/bin:$PATH"
-          fi
-          uv --version
-          lua5.3 -v
-
-      - name: Cache uv
-        uses: actions/cache@v3
-        with:
-          path: |
-            ~/.cache/uv
-            ~/.local/share/uv
-          key: ${{ runner.os }}-uv-integration-${{ hashFiles('upstream.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-uv-integration-
-
-      - name: Integration suite
-        run: |
-          set -euo pipefail
-          export PATH="$HOME/.local/bin:$PATH"
-          make pin-check
-          make integration-test
+      - name: Pin check
+        run: make pin-check

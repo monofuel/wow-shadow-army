@@ -13,16 +13,20 @@ layers: knowledgebase / Lua tool library / LLM planner).
 We do NOT fork the game client. The upstream repo-owned Nim client handles
 the WoW 1.12 protocol, perception (typed environment frames), and execution
 (pathing, combat, looting) via its `BotController`. Our layer speaks the
-sole mutable out-of-process boundary, `vanilla_wow.nim_control.v1`:
-typed `GoalRequest` / `ActionSelectionRequest` in, typed settlements +
-MessagePack environment frames out.
+sole mutable out-of-process boundary, `vanilla_wow.nim_control.v2`:
+typed goals (leader/party/roster) + hold/resume/cancel directives in,
+control status + MessagePack environment frames out. **v2 has no external
+action selection** — per-frame policy runs in-process upstream
+(`kb/nim-control-v2-no-select.md`); our host installs goals, observes,
+watchdogs, and audits.
 
 ```
 knowledgebase (kb/)          <- what the army has learned
-LLM planner (brain/)         <- goal selection, toolsmithing (later phase)
-Lua tool library (lua/)      <- named intents: follow_leader(), support_party_tank(), ...
-────────── nim_control.v1 socket ──────────
-upstream Nim client          <- perception + execution (pinned, unmodified)
+LLM planner (later)          <- goal selection, toolsmithing
+Lua tool library (lua/)      <- named intents (dormant until upstream re-exposes a select surface)
+Nim host (tools/army_host)   <- goal install + watchdogs + fair-play audit
+────────── nim_control.v2 socket ──────────
+upstream Nim client          <- perception + policy + execution (pinned; fixes via ../coworld-vanilla-wow-fork)
 ────────── WoW 1.12 protocol over ws bridge ──────────
 VMaNGOS realm
 ```
@@ -37,10 +41,11 @@ against. The upstream checkout lives as a sibling:
 
 - `lua/tools/` — named-intent tool library (the LLM-facing language)
 - `lua/tests/` — fast unit tests, run by `make test` (must stay instant)
-- `brain/` — strategist harness that owns the control socket + embeds Lua
+- `tools/` — Nim host (`army_host.nim`), party promote, fair-play audit
 - `kb/` — the bot-readable/writable knowledgebase (map facts, tool notes,
   postmortems)
-- `docs/` — design notes; start with `docs/control-plane.md`
+- `docs/` — design notes; start with `docs/v2.md` (`docs/control-plane.md`
+  is the v1-era design, kept as history)
 
 ## Human quickstart
 
@@ -83,11 +88,9 @@ make play
   (`vmangos-coworld-db`). Accounts and characters survive `stop-server` /
   restarts. Only `docker_vmangos_server.py down --volumes` or `up --fresh`
   wipes state (not exposed by these targets).
-- **Unit tests:** `make test` stays instant (no docker). Runtime targets
-  above are exempt. Includes Lua tools + stdlib Python projection/intent
-  tests (`make test-python`). Live brain needs upstream deps via
-  `uv run --project ../coworld-vanilla-wow python -m brain.shadow …`
-  (see `brain/README.md`, `docs/control-plane.md`, `docs/milestone-1-evidence.md`).
+- **Unit tests:** `make test` stays instant (no docker): Lua tools under
+  `lua/tests/` + Nim tiers (`system/tests/`, `tools/tests/`). No Python.
+  Live seats run through `make escort-army` / `make grind` (Nim host).
 
 ## Rules
 

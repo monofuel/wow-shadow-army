@@ -8,9 +8,14 @@ shaped assertions). This file maps that doctrine onto **this** repo.
 
 | Tier | Make target | Required? | What it is here |
 |---|---|---|---|
-| **Unit** | `make test` | **YES — every push** | Lua tool library under `lua/tests/test_*.lua` + stdlib Python under `brain/tests/`. Instant: no network, no docker, no sleeps, no realm. |
-| **Integration** | `make integration-test` | **YES — every push** (separate job; unit stays independent) | Recorded-frame fixtures (`tests/fixtures/frames/wire_*.bin`) decoded through the **real** upstream `EnvironmentFrame` client, projected, run through real Lua tools, intent-mapped. Also pin-drift vs `upstream.lock`. No live services, no realm, no docker. |
-| **e2e** | `tests/e2e/mechanism_e2e.py` | optional; **nightly + dispatch only** | Full stack: VMaNGOS realm + headless reference player + brain mechanism assertions. Never on push (see e2e plan + `.gitea/workflows/e2e.yml`). |
+| **Unit** | `make test` | **YES — every push** | Lua tool library under `lua/tests/test_*.lua` + Nim tiers (`system/tests/`, `tools/tests/`; soft-skip when nim is missing). Instant: no network, no docker, no sleeps, no realm. No Python. |
+| **Pin** | `make pin-check` | on upstream bumps | Pure shell: `git rev-parse HEAD` of `../coworld-vanilla-wow` equals the SHA in `upstream.lock`. |
+| **Live smoke** | `make escort-army` / `make grind` | before milestone claims | Real realm + seats on the Nim host. Evidence lands in `local_data/audit/fair-play.jsonl` + realm logs (LevelUp/Loot). |
+
+The old Python integration/e2e tiers (recorded-frame replay through
+`brain/`, `tests/e2e/mechanism_e2e.py`) died with the v1 select protocol —
+brain/ was deleted 2026-07-27 (`docs/v2.md`). Frame fixtures remain under
+`tests/fixtures/frames/` for forensics.
 
 Rules that stay fixed:
 
@@ -34,21 +39,17 @@ No docker, no nix, no nim. Current tools have zero Lua module deps
 test actually needs them. Unit job stays independent of integration so a
 mirror/token problem cannot hide a unit failure behind a single job.
 
-## Integration tier (IMPLEMENTED — local + CI)
-
-### CI job (`integration-tests` in `test.yml`)
+## Pin tier (CI job `pin-check` in `test.yml`)
 
 Runs on every push / workflow_dispatch **in parallel with** `lua-tests`
-(unit stays first in the file and does not depend on integration):
+(unit stays first in the file and does not depend on it):
 
 1. checkout this repo
-2. HTTPS clone private mirror `Monolab/coworld-vanilla-wow` into
+2. ssh-clone private mirror `Monolab/coworld-vanilla-wow` into
    `$(dirname $GITHUB_WORKSPACE)/coworld-vanilla-wow` (sibling so
    `../coworld-vanilla-wow` resolves), then `git checkout` the SHA from
    `upstream.lock`
-3. install `lua5.3` + `uv` (curl installer if missing)
-4. cache `~/.cache/uv` keyed on `upstream.lock`
-5. `make pin-check && make integration-test`
+3. `make pin-check` (pure shell — no lua, no uv, no Python)
 
 **Cross-repo auth:** `GITHUB_TOKEN` is repo-scoped and cannot read other
 private Monolab repos. Jobs use the **`CI_DEPLOY_KEY` Monolab org secret**
@@ -58,69 +59,23 @@ over `ssh://git@10.11.4.11:222/...` with `GIT_SSH_COMMAND` pointing at the
 key. Registry login tries the built-in actions token first, `GIT_PAT`
 fallback.
 
-## Integration tier (local)
-
-### How to run
+## Pin tier (local)
 
 ```sh
 # From wow-shadow-army root. Needs sibling ../coworld-vanilla-wow at the
-# commit in upstream.lock, uv, and lua5.3 (or lua / nix shell).
-make integration-test
-# pin only:
+# commit in upstream.lock.
 make pin-check
 ```
 
-`integration-test` invokes `pin-check` then:
+After an intentional upstream pin bump: update `upstream.lock`, re-run
+`make pin-check`, and re-run a live smoke before the next milestone claim.
 
-```sh
-uv run --project ../coworld-vanilla-wow python -m unittest discover \
-  -s tests/integration -p 'test_*.py' -v
-```
-
-Same interpreter env as live brain (`brain/README.md`): upstream's uv project
-supplies pydantic + msgpack. Target runtime is a few seconds.
-
-### What it covers
-
-| Check | Where | Mechanism assertion |
-|---|---|---|
-| Pin drift | `tests/integration/test_pin_drift.py` | `git rev-parse HEAD` of `../coworld-vanilla-wow` equals the SHA in `upstream.lock`; required files (`player/sdk/nim_control.py`, …) still exist. Mismatch message: *upstream checkout does not match upstream.lock — bump the pin deliberately and re-run integration*. |
-| Wire parse | `tests/integration/test_wire_replay.py` | Each `tests/fixtures/frames/wire_*.bin` (raw kind-6 MessagePack, no 16-byte header) → `msgpack.unpackb` → `frame_coerce` → `EnvironmentFrame.model_validate` succeeds. |
-| Projection | same | `project_for_follow_leader` yields `self_unit` with finite `x`/`y`; party not formed ⇒ `leader_unit is None`. |
-| Lua tools | same | Real `lua5.3` via `brain/lua_runner` + `lua/tools/follow_leader.lua`: party absent ⇒ `{kind="hold", reason="leader_not_visible"}`. |
-| Intent map | same | `map_intent(hold)` ⇒ `skip=True`, no `FactorizedAction` kwargs (brain must not call `select()`). |
-
-Fixtures and capture notes: `tests/fixtures/frames/README.md`. Summaries
-(`frame_*.summary.json`) document the live session shape (solo seat,
-`in_group=false`); tests assert those **mechanisms**, not magic radii or
-hard-coded map coords.
-
-### Capture new fixtures
-
-With realm + headless seat up (see `docs/control-plane.md` / milestone-1
-runbook):
-
-```sh
-uv run --project ../coworld-vanilla-wow python -m brain.shadow \
-  --slot 0 --leader-name Botpriest --party-members Botpriest,Botwarrior \
-  --move-fallback --max-seconds 65 --capture-frames 5
-```
-
-`brain.shadow --capture-frames N` writes `frame_*.bin` / summaries under
-`tests/fixtures/frames/`. Raw wire payloads (`wire_*.bin`) are the preferred
-integration input (kind-6 MessagePack only); see fixtures README for the
-re-decode sketch and how wire probes were taken during milestone 1.
-
-After an intentional upstream pin bump: update `upstream.lock`, re-capture
-if the frame schema changed, then `make integration-test`.
-
-### Integration CI prerequisites (satisfied)
-
-1. Private mirror `Monolab/coworld-vanilla-wow` on gitea (branch main, pin
-   in `upstream.lock`).
-2. Checkout at pin as sibling path (workflow step above).
-3. `uv` + upstream project install on the runner.
-4. `lua5.3` on the runner.
+Historical note (2026-07-27): the Python integration tier (recorded
+`wire_*.bin` replay through `brain/` frame_coerce → projection → Lua →
+intent_mapping) and the nightly mechanism e2e were deleted along with
+`brain/` — they asserted the v1 external-select mechanism, which
+`nim_control.v2` removed (`kb/nim-control-v2-no-select.md`). Fixtures stay
+under `tests/fixtures/frames/` for forensics.
 
 ## Copyright / data boundary
 

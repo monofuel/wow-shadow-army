@@ -131,8 +131,8 @@ trusted sender. So the loop becomes:
 This is the toolsmithing rail from architecture.md wearing a product
 face: the human's requests are the feature backlog, arriving at play-time,
 verified by the requester seconds after deployment. Note our own Lua tool
-tier already hot-reloads by construction (brain/lua_runner.py spawns a
-fresh interpreter per decide, so edits apply on the next tick) — the same
+tier already hot-reloads by construction (the v1-era host spawned a fresh
+interpreter per decide, so edits applied on the next tick) — the same
 property, achieved statelessly. Caveat for both sides: a syntax error in
 a freshly-written file fails the next call rather than keeping the old
 version running — the toolsmithing rail should parse-check (`luac -p`)

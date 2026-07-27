@@ -16,5 +16,7 @@ local GM or Python FSM.
 
 ## Host note
 
-Thin wire still maps intents via `brain/intent_mapping.py` (`accept_quest`,
-`turn_in_quest`, `interact`). Policy logic is Lua only.
+Intent→wire mapping lives in `tools/army_host.nim` (`mapIntent`:
+`accept_quest`, `turn_in_quest`, `interact`) — dormant under v2's
+no-select protocol (`kb/nim-control-v2-no-select.md`). Policy logic is
+Lua only.
