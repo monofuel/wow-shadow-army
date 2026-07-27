@@ -540,6 +540,9 @@ play-classic:
 # xr library links with -lopenxr_loader, which wow_env.sh does not carry,
 # so the recipe puts nixpkgs#openxr-loader on LIBRARY_PATH — the nix gcc
 # wrapper turns that into -L plus a baked RUNPATH for runtime resolution.
+# libuuid + vulkan-loader ride along on LD_LIBRARY_PATH because the OpenXR
+# loader dlopens SteamVR's vrclient.so, which needs both (verified via ldd;
+# same set as the xr repo flake's shellHook).
 # Do not run unattended (opens a GUI).
 XR_FORK := $(abspath ../coworld-vanilla-wow-xr)
 play-xr:
@@ -560,9 +563,14 @@ play-xr:
 	cd "$(XR_FORK)"; \
 	nix shell nixpkgs\#nginx --command sh -c \
 		'. "$(WOW_ENV)"; \
-		openxr=$$(nix build --no-link --print-out-paths nixpkgs#openxr-loader); \
-		export LIBRARY_PATH="$$openxr/lib$${LIBRARY_PATH:+:$$LIBRARY_PATH}"; \
-		export LD_LIBRARY_PATH="$$openxr/lib$${LD_LIBRARY_PATH:+:$$LD_LIBRARY_PATH}"; \
+		xrlibs=""; \
+		for p in $$(nix build --no-link --print-out-paths \
+				nixpkgs#openxr-loader nixpkgs#util-linux.lib \
+				nixpkgs#vulkan-loader); do \
+			xrlibs="$$p/lib$${xrlibs:+:$$xrlibs}"; \
+		done; \
+		export LIBRARY_PATH="$$xrlibs$${LIBRARY_PATH:+:$$LIBRARY_PATH}"; \
+		export LD_LIBRARY_PATH="$$xrlibs$${LD_LIBRARY_PATH:+:$$LD_LIBRARY_PATH}"; \
 		nim r tools/launch_nim_player.nim -- \
 			--realm-host=127.0.0.1 \
 			--realm-port=3724 \
