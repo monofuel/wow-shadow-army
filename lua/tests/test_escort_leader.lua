@@ -805,4 +805,183 @@ r = tool.decide({
 })
 check(r.kind ~= "attack_unit" or r.unit_id ~= 12, "no free-fire far hostile")
 
+-- === projectV2-shaped frames (army_host.projectV2) ===
+-- Shape: self_unit, leader_unit (top-level), combat{focus_id, attackable no guid,
+-- casts=[]}, spells{}, death{}, party{invite_*, leader_name} — no focus_guid /
+-- auto_attack_guid / party.leader_unit.
+
+local function v2_frame(opts)
+  opts = opts or {}
+  return {
+    self_unit = opts.self_unit or {
+      x = 0, y = 0, z = 10, map_id = 0, class_id = 9, level = 8,
+    },
+    leader_unit = opts.leader_unit,
+    combat = opts.combat or {
+      in_combat = false,
+      health_pct = 100,
+      mana_pct = 100,
+      focus_id = 0,
+      attackable = {},
+      lootable = {},
+      casts = {},
+    },
+    spells = opts.spells or {
+      known = {},
+      cooldowns = {},
+      mana = 100,
+      mana_pct = 100,
+    },
+    death = opts.death or {
+      is_dead = false,
+      is_ghost = false,
+      can_release_spirit = false,
+      can_reclaim_corpse = false,
+      can_reclaim_action = false,
+      can_move = true,
+      corpse = nil,
+    },
+    party = opts.party or {
+      in_group = true,
+      invite_pending = false,
+      invite_from = "",
+      leader_name = "Murist",
+    },
+  }
+end
+
+-- Accept invite from allowlist (fail-closed when empty).
+r = tool.decide(v2_frame({
+  leader_unit = nil,
+  party = {
+    in_group = false,
+    invite_pending = true,
+    invite_from = "Murist",
+    leader_name = "",
+  },
+}), { allowlist = { "Murist" } })
+check(r.kind == "accept_party", "v2 accept invite from allowlist")
+check(r.reason == "accept_invite_allowlist", "v2 accept_invite_allowlist reason")
+
+r = tool.decide(v2_frame({
+  leader_unit = nil,
+  party = {
+    in_group = false,
+    invite_pending = true,
+    invite_from = "Stranger",
+    leader_name = "",
+  },
+}), { allowlist = { "Murist" } })
+check(r.kind ~= "accept_party", "v2 reject invite off allowlist")
+
+r = tool.decide(v2_frame({
+  leader_unit = nil,
+  party = {
+    in_group = false,
+    invite_pending = true,
+    invite_from = "Murist",
+    leader_name = "",
+  },
+}), {})
+check(r.kind ~= "accept_party", "v2 fail-closed empty allowlist")
+
+-- Follow far leader (top-level leader_unit, position_reliable, no guids).
+r = tool.decide(v2_frame({
+  self_unit = { x = 0, y = 0, z = 10, map_id = 0, class_id = 9, level = 8 },
+  leader_unit = {
+    id = 1, x = 40, y = 0, z = 10, map_id = 0,
+    visible = true, assistable = true,
+    health_pct = 100, in_combat = false,
+    position_reliable = true,
+  },
+}))
+check(r.kind == "move_to_unit", "v2 follow far leader")
+check(r.unit_id == 1, "v2 rejoin targets leader id")
+check(r.x == 40 and r.z == 10, "v2 rejoin uses leader dest")
+
+-- Assist leader target in combat (focus_id only, no focus_guid/auto_attack_guid).
+r = tool.decide(v2_frame({
+  self_unit = { x = 0, y = 0, z = 10, map_id = 0, class_id = 1, level = 8 },
+  leader_unit = {
+    id = 1, x = 3, y = 0, z = 10, map_id = 0,
+    visible = true, assistable = true,
+    health_pct = 70, in_combat = true,
+    position_reliable = true,
+  },
+  combat = {
+    in_combat = true,
+    health_pct = 90,
+    mana_pct = 0,
+    focus_id = 2,
+    attackable = {
+      {
+        id = 2, x = 4, y = 0, z = 10, map_id = 0,
+        entry = 1501, level = 6, distance = 4,
+        los_blocked = false, lootable = false,
+      },
+    },
+    lootable = {},
+    casts = {},
+  },
+}))
+check(r.kind == "attack_unit" and r.unit_id == 2, "v2 assist/attack leader focus_id")
+
+-- In combat, empty attackable, assistable leader → assist hand-off (v2).
+r = tool.decide(v2_frame({
+  self_unit = { x = 0, y = 0, z = 10, map_id = 0, class_id = 9, level = 8 },
+  leader_unit = {
+    id = 1, x = 2, y = 0, z = 10, map_id = 0,
+    visible = true, assistable = true,
+    health_pct = 55, in_combat = true,
+    position_reliable = true,
+  },
+  combat = {
+    in_combat = true,
+    health_pct = 90,
+    mana_pct = 80,
+    focus_id = 0,
+    attackable = {},
+    lootable = {},
+    casts = {},
+  },
+}))
+check(r.kind == "assist_unit" and r.unit_id == 1, "v2 assist leader when no focus_id")
+
+-- Ghost corpse recovery on v2 death projection.
+r = tool.decide(v2_frame({
+  self_unit = { x = 1965, y = 1729, z = 94, map_id = 0, class_id = 9, level = 8 },
+  leader_unit = {
+    id = 1, x = 3, y = 0, z = 10, map_id = 0,
+    visible = true, assistable = true,
+    health_pct = 100, in_combat = false,
+    position_reliable = true,
+  },
+  death = {
+    is_dead = false,
+    is_ghost = true,
+    can_release_spirit = false,
+    can_reclaim_corpse = false,
+    can_reclaim_action = false,
+    can_move = true,
+    corpse = { map_id = 0, x = 2040, y = 1840, z = 106 },
+  },
+}))
+check(r.kind == "move_to_corpse", "v2 ghost moves toward corpse")
+check(r.reason == "move_to_corpse_hop", "v2 far corpse hop")
+
+r = tool.decide(v2_frame({
+  self_unit = { x = 2038, y = 1838, z = 105, map_id = 0, class_id = 9, level = 8 },
+  leader_unit = nil,
+  death = {
+    is_dead = false,
+    is_ghost = true,
+    can_release_spirit = false,
+    can_reclaim_corpse = true,
+    can_reclaim_action = true,
+    can_move = true,
+    corpse = { map_id = 0, x = 2040, y = 1840, z = 106 },
+  },
+}))
+check(r.kind == "reclaim_corpse", "v2 ghost reclaim when ready")
+
 print("OK " .. passed .. " checks")

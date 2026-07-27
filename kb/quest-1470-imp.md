@@ -18,5 +18,5 @@ local GM or Python FSM.
 
 Intent→wire mapping lives in `tools/army_host.nim` (`mapIntent`:
 `accept_quest`, `turn_in_quest`, `interact`) — dormant under v2's
-no-select protocol (`kb/nim-control-v2-no-select.md`). Policy logic is
+no-select protocol (`kb/nim-control-v2-external-select.md`). Policy logic is
 Lua only.

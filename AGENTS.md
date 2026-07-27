@@ -25,7 +25,7 @@ upstream controller already owns.
 - **Rely on upstream as much as possible.** `../coworld-vanilla-wow` already
   owns perception, pathing, combat sequencing, looting, formation, recovery,
   and the `nim_control.v2` socket. Under v2 there is **no external action
-  selection** (`kb/nim-control-v2-no-select.md`): per-frame policy runs
+  selection** (`kb/nim-control-v2-external-select.md`): per-frame policy runs
   in-process upstream, configured by typed goals. Do not reimplement that
   stack here. If upstream is missing a capability, document the gap and
   tell monofuel — do not paper over it with a local policy brain.

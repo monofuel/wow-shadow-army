@@ -17,7 +17,7 @@ sole mutable out-of-process boundary, `vanilla_wow.nim_control.v2`:
 typed goals (leader/party/roster) + hold/resume/cancel directives in,
 control status + MessagePack environment frames out. **v2 has no external
 action selection** — per-frame policy runs in-process upstream
-(`kb/nim-control-v2-no-select.md`); our host installs goals, observes,
+(`kb/nim-control-v2-external-select.md`); our host installs goals, observes,
 watchdogs, and audits.
 
 ```

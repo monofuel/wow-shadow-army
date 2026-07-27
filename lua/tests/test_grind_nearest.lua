@@ -85,4 +85,56 @@ r = tool.decide({
 })
 check(r.kind == "hold", "hold without hostiles")
 
+-- v2: nuke from frame.spells (no per-target cast mask), highest known rank.
+r = tool.decide({
+  self_unit = { x = 0, y = 0, class_id = 9 },
+  combat = {
+    attackable = { { id = 3, x = 4, y = 0 } },
+    casts = {},
+    focus_id = 0,
+  },
+  spells = { known = { 686, 695 }, cooldowns = {}, mana_pct = 80 },
+  death = {},
+})
+check(r.kind == "cast_spell" and r.spell == 695 and r.unit_id == 3,
+  "v2 highest known Shadow Bolt rank")
+
+-- v2: dry mana falls back to melee.
+r = tool.decide({
+  self_unit = { x = 0, y = 0, class_id = 9 },
+  combat = {
+    attackable = { { id = 3, x = 4, y = 0 } },
+    casts = {},
+    focus_id = 0,
+  },
+  spells = { known = { 686 }, cooldowns = {}, mana_pct = 4 },
+  death = {},
+})
+check(r.kind == "attack_unit" and r.unit_id == 3, "v2 melee when OOM")
+
+-- v2: cooldown skips to lower rank; unknown class melees.
+r = tool.decide({
+  self_unit = { x = 0, y = 0, class_id = 5 },
+  combat = {
+    attackable = { { id = 2, x = 4, y = 0 } },
+    casts = {},
+    focus_id = 0,
+  },
+  spells = { known = { 585, 591 }, cooldowns = { 591 }, mana_pct = 50 },
+  death = {},
+})
+check(r.kind == "cast_spell" and r.spell == 585, "v2 cooldown skips rank")
+
+r = tool.decide({
+  self_unit = { x = 0, y = 0, class_id = 1 },
+  combat = {
+    attackable = { { id = 2, x = 4, y = 0 } },
+    casts = {},
+    focus_id = 0,
+  },
+  spells = { known = { 78 }, cooldowns = {}, mana_pct = 100 },
+  death = {},
+})
+check(r.kind == "attack_unit", "v2 warrior melees")
+
 print("test_grind_nearest: " .. passed .. " checks passed")

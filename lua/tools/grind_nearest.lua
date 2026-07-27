@@ -69,6 +69,35 @@ local function pick_cast(casts, tid)
   return nil
 end
 
+-- v2 frames carry no per-target cast mask — the tool owns the spell table.
+-- One nuke family per class, highest known rank first, skipped on cooldown
+-- or when mana is dry (melee still lands XP).
+local NUKES_BY_CLASS = {
+  [9] = { 705, 695, 686 }, -- warlock: Shadow Bolt r3/r2/r1
+  [5] = { 591, 585 },      -- priest: Smite r2/r1
+  [8] = { 143, 133 },      -- mage: Fireball r2/r1
+}
+local MIN_CAST_MANA_PCT = 10.0
+
+local function pick_nuke(frame, tid)
+  local class_id = frame.self_unit and frame.self_unit.class_id
+  local prio = class_id and NUKES_BY_CLASS[class_id]
+  if not prio then return nil end
+  local sp = frame.spells or {}
+  if (sp.mana_pct or 100.0) < MIN_CAST_MANA_PCT then return nil end
+  local known, cooling = {}, {}
+  for i = 1, #(sp.known or {}) do known[sp.known[i]] = true end
+  for i = 1, #(sp.cooldowns or {}) do cooling[sp.cooldowns[i]] = true end
+  for i = 1, #prio do
+    local id = prio[i]
+    if known[id] and not cooling[id] then
+      return { kind = "cast_spell", unit_id = tid, spell = id,
+               reason = "grind_cast:" .. id }
+    end
+  end
+  return nil
+end
+
 return registry.register({
   name = "grind_nearest",
   when = "Solo outdoor grind: kill nearest attackable for XP.",
@@ -99,13 +128,15 @@ return registry.register({
     end
     if not me then return nil end
 
-    -- Loot before pulling the next (quest drops / XP packs).
+    -- Loot before pulling the next (quest drops / XP packs). loot_unit maps
+    -- to the executor's auto-loot flow; interact only opens the window and
+    -- leaves the corpse lootable forever (live loop, 2026-07-27).
     local lootables = combat.lootable or frame.lootable or {}
     if type(lootables) == "table" then
       for i = 1, #lootables do
         local u = lootables[i]
         if u and u.id and u.id > 0 then
-          return { kind = "interact_unit", unit_id = u.id, reason = "loot" }
+          return { kind = "loot_unit", unit_id = u.id, reason = "loot" }
         end
       end
     end
@@ -157,6 +188,8 @@ return registry.register({
       }
     end
 
+    local nuke = pick_nuke(frame, target_id)
+    if nuke then return nuke end
     local cast = pick_cast(casts, target_id)
     if cast then
       return {

@@ -27,6 +27,10 @@ const
   FrameControlStatus = 5'u16
   FrameEnv = 6'u16
   FrameErr = 8'u16
+  ## Fork extension (lua-external-policy branch): one typed BotAction per
+  ## request while the in-process planner is held/idle.
+  FrameExecAction = 7'u16
+  FrameActionResult = 9'u16
   BasePort = 41114
 
 type
@@ -45,6 +49,9 @@ type
     quiet: bool
     ## Append-only fair-play milestone log (empty = disabled).
     auditPath: string
+    ## External policy mode: hold the in-process planner and drive the seat
+    ## from lua/tools/<tool>.decide via the fork's execute_action frame.
+    external: bool
 
 proc jget(n: JsonNode; keys: varargs[string]): JsonNode =
   result = n
@@ -141,6 +148,9 @@ proc connectClient(slot: int): ControlClient =
   result = ControlClient(slot: slot, reqId: 0)
   result.sock = newSocket()
   result.sock.connect("127.0.0.1", Port(BasePort + slot))
+  # Let the server's accept handler reach its first await before the first
+  # frame lands (fast local connect+send raced it on fork builds).
+  sleep(250)
 
 proc close(c: ControlClient) =
   if c.sock != nil:
@@ -222,6 +232,21 @@ proc sendDirective(c: ControlClient; directive: string; revision: int) =
   }
   discard c.request(FrameDirective, body)
 
+proc executeAction(c: ControlClient; action: JsonNode; revision: int): JsonNode =
+  ## Fire one typed BotAction through the fork's execute_action frame.
+  ## Blocks until the executor settles (moves walk their corridor first).
+  let body = %*{
+    "protocol": Protocol,
+    "type": "execute_action",
+    "expected_slot": c.slot,
+    "expected_revision": revision,
+    "action": action
+  }
+  let (ft, node, _) = c.request(FrameExecAction, body)
+  if ft != FrameActionResult:
+    raise newException(IOError, "expected action_result got " & $ft)
+  node
+
 proc isStaleRevisionError(msg: string): bool =
   msg.contains("stale controller revision") or msg.contains("stale revision")
 
@@ -277,493 +302,6 @@ proc moveActionFarDest(frame, obs: JsonNode; minDist = 25.0): bool =
       return false
   sawMove
 
-# ---------- projection (subset of brain/frame_projection.py) ----------
-
-proc kindsList(frame: JsonNode): seq[string] =
-  result = @[]
-  let kinds = jget(frame, "action_space", "kinds")
-  if kinds.isNil or kinds.kind != JArray: return
-  for k in kinds:
-    result.add k.getStr
-
-proc kindAllows(frame: JsonNode; kind: string): bool =
-  let kinds = kindsList(frame)
-  let i = kinds.find(kind)
-  if i < 0: return false
-  let row = jget(frame, "action_mask", "kind")
-  if row.isNil or row.kind != JArray or i >= row.len: return false
-  jbool(row[i])
-
-proc targetAllows(frame: JsonNode; kind: string; entityIndex: int): bool =
-  if not kindAllows(frame, kind): return false
-  let kinds = kindsList(frame)
-  let ki = kinds.find(kind)
-  let mask = jget(frame, "action_mask", "target")
-  if mask.isNil or mask.kind != JArray or ki >= mask.len: return false
-  let row = mask[ki]
-  if row.kind != JArray or entityIndex >= row.len: return false
-  jbool(row[entityIndex])
-
-proc questFactorAllows(frame: JsonNode; kind: string; factor: int): bool =
-  if not kindAllows(frame, kind): return false
-  let kinds = kindsList(frame)
-  let ki = kinds.find(kind)
-  let mask = jget(frame, "action_mask", "quest")
-  if mask.isNil or mask.kind != JArray or ki >= mask.len: return false
-  let row = mask[ki]
-  if row.kind != JArray or factor >= row.len: return false
-  jbool(row[factor])
-
-proc firstQuestFactor(frame: JsonNode; kind: string): int =
-  ## Factorized quest index (NOT quest_id). 0 is valid when dialog admits it.
-  if not kindAllows(frame, kind): return -1
-  let kinds = kindsList(frame)
-  let ki = kinds.find(kind)
-  let mask = jget(frame, "action_mask", "quest")
-  if mask.isNil or mask.kind != JArray or ki >= mask.len: return -1
-  let row = mask[ki]
-  if row.kind != JArray: return -1
-  for i in 0 ..< row.len:
-    if jbool(row[i]): return i
-  return -1
-
-proc questBindingFactor(frame: JsonNode; questId: int): int =
-  ## Map quest_id → bindings.quests[].index when present.
-  let qs = jget(frame, "bindings", "quests")
-  if qs.isNil or qs.kind != JArray: return -1
-  for q in qs:
-    if jint(jget(q, "quest_id")) == questId:
-      return jint(jget(q, "index"))
-  return -1
-
-proc projectEscort(frame: JsonNode; preferLeaderName = ""): JsonNode =
-  ## Build the plain table escort_leader / warlock_imp_quest expect.
-  ## preferLeaderName: when set (e.g. human Murist), follow that party member
-  ## even if the party leader flag is on another seat.
-  let obs = jget(frame, "observation")
-  let loc = jget(obs, "location")
-  let selfUnit = %*{
-    "x": jnum(jget(loc, "x")),
-    "y": jnum(jget(loc, "y")),
-    "z": jnum(jget(loc, "z")),
-    "map_id": jnum(jget(loc, "map_id")),
-    "class_id": jint(jget(obs, "class_id"))
-  }
-  var leaderUnit = newJNull()
-  let party = jget(obs, "party")
-  if jbool(jget(party, "in_group")):
-    let ents = jget(frame, "bindings", "entities")
-    var found: JsonNode = nil
-    let prefer = preferLeaderName.toLowerAscii
-    let partyLeaderName = jstr(jget(party, "leader_name")).toLowerAscii
-    let partyLeaderGuid = jstr(jget(party, "leader_guid"))
-    # Prefer explicit host --leader name (human Murist) over party flag.
-    let leaderName = if prefer.len > 0: prefer else: partyLeaderName
-    var leaderGuid = ""
-    if prefer.len == 0:
-      leaderGuid = partyLeaderGuid
-    else:
-      # Resolve guid for preferred name from members.
-      let members = jget(party, "members")
-      if not members.isNil and members.kind == JArray:
-        for m in members:
-          if jstr(jget(m, "name")).toLowerAscii == prefer:
-            leaderGuid = jstr(jget(m, "guid"))
-            break
-    if not ents.isNil and ents.kind == JArray:
-      for e in ents:
-        let kind = jstr(jget(e, "kind")).toLowerAscii
-        # Party rows first; also accept player entity for the leader guid.
-        if kind notin ["party", "player"]: continue
-        let eg = jstr(jget(e, "guid"))
-        let en = jstr(jget(e, "name")).toLowerAscii
-        if (leaderGuid.len > 0 and eg == leaderGuid) or
-            (leaderName.len > 0 and en == leaderName):
-          found = e
-          if kind == "party":
-            break
-    if not found.isNil:
-      let idx = jint(jget(found, "index"))
-      let eloc = jget(found, "location")
-      var x = jnum(jget(eloc, "x"))
-      var y = jnum(jget(eloc, "y"))
-      var z = jnum(jget(eloc, "z"))
-      var mapId = jnum(jget(eloc, "map_id"))
-      var visible = true
-      var leaderHpPct = 100.0
-      var leaderInCombat = false
-      # Party bindings freeze leader xy while the human runs (play-classic has
-      # no control socket for overlay). Only trust coords from live units obs,
-      # elevation-known party packets, or leader-slot overlay.
-      var positionReliable = false
-      # Prefer live observation.units row for the leader guid — party binding
-      # locations are often stale/zero-z and can equal the follower's own
-      # square, which falsely kills rejoin.
-      let unitsObs = jget(obs, "units")
-      if not unitsObs.isNil and unitsObs.kind == JArray and leaderGuid.len > 0:
-        for u in unitsObs:
-          if jstr(jget(u, "guid")) == leaderGuid:
-            let uloc = jget(u, "location")
-            if not uloc.isNil:
-              let ux = jnum(jget(uloc, "x"))
-              let uy = jnum(jget(uloc, "y"))
-              if not (ux == 0.0 and uy == 0.0):
-                x = ux
-                y = uy
-                z = jnum(jget(uloc, "z"), z)
-                mapId = jnum(jget(uloc, "map_id"), mapId)
-                visible = true
-                positionReliable = true
-            if jget(u, "in_combat") != nil:
-              leaderInCombat = jbool(jget(u, "in_combat"))
-            break
-      # last_visible: only fill a FULL missing location (xy zero). Never glue
-      # last_visible z onto party xy — that made dest rejoin walk to a frozen
-      # square and look "in formation" while Murist is 50yd away.
-      # Also project leader health (party members) so OOC join can assist when
-      # the human is fighting — attack kind is false OOC, assist is not.
-      let members = jget(party, "members")
-      if not members.isNil and members.kind == JArray:
-        for m in members:
-          if jbool(jget(m, "leader")) or
-              jstr(jget(m, "name")).toLowerAscii == leaderName:
-            let last = jget(m, "last_visible_location")
-            let locKnown = jbool(jget(m, "location_known"))
-            let elevKnown = jbool(jget(m, "elevation_known"))
-            if not last.isNil:
-              let lz = jnum(jget(last, "z"))
-              let lx = jnum(jget(last, "x"))
-              let ly = jnum(jget(last, "y"))
-              if not locKnown and (x == 0.0 and y == 0.0) and lx != 0.0:
-                x = lx
-                y = ly
-                z = lz
-                mapId = jnum(jget(last, "map_id"), mapId)
-                # last_visible alone is still often frozen; not reliable.
-            if locKnown and elevKnown and not (x == 0.0 and y == 0.0):
-              positionReliable = true
-            if jbool(jget(m, "health_known")):
-              let mh = max(1.0, jnum(jget(m, "max_health"), 1.0))
-              let hh = jnum(jget(m, "health"), mh)
-              leaderHpPct = hh / mh * 100.0
-            if jget(m, "in_combat") != nil:
-              leaderInCombat = leaderInCombat or jbool(jget(m, "in_combat"))
-            break
-      # Damaged leader with no explicit in_combat bit still means join window.
-      if not leaderInCombat and leaderHpPct < 99.5:
-        leaderInCombat = true
-      leaderUnit = %*{
-        "id": idx,
-        "x": x,
-        "y": y,
-        "z": z,
-        "map_id": mapId,
-        "visible": visible,
-        "assistable": targetAllows(frame, "assist", idx),
-        "health_pct": leaderHpPct,
-        "in_combat": leaderInCombat,
-        "position_reliable": positionReliable
-      }
-
-  # combat casts from spell mask
-  var casts = newJArray()
-  let spellMask = jget(frame, "action_mask", "spell")
-  let spells = jget(frame, "bindings", "spells")
-  if not spellMask.isNil and spellMask.kind == JArray and kindAllows(frame, "cast"):
-    for ti in 0 ..< spellMask.len:
-      let row = spellMask[ti]
-      if row.kind != JArray: continue
-      for si in 1 ..< row.len:
-        if not jbool(row[si]): continue
-        var name = ""
-        var spellId = 0
-        if not spells.isNil and spells.kind == JArray and si - 1 < spells.len:
-          name = jstr(jget(spells[si - 1], "name"))
-          spellId = jint(jget(spells[si - 1], "spell_id"))
-        casts.add %*{
-          "target": ti,
-          "spell": si,
-          "name": name,
-          "spell_id": spellId
-        }
-
-  var attackable = newJArray()
-  var focusId = 0
-  let focusGuid = jstr(jget(obs, "combat_focus_guid"))
-  let autoGuid = jstr(jget(obs, "auto_attack_guid"))
-  let ents = jget(frame, "bindings", "entities")
-  if not ents.isNil and ents.kind == JArray:
-    for e in ents:
-      let idx = jint(jget(e, "index"))
-      if idx <= 0: continue
-      let eg = jstr(jget(e, "guid"))
-      let kind = jstr(jget(e, "kind")).toLowerAscii
-      if kind in ["self", "party", "player"]: continue
-      if eg == focusGuid or eg == autoGuid:
-        focusId = idx
-      let lootable = jbool(jget(e, "lootable"))
-      if not targetAllows(frame, "attack", idx) and not lootable: continue
-      let eloc = jget(e, "location")
-      var entry = %*{"id": idx, "guid": eg, "lootable": lootable}
-      if not eloc.isNil:
-        entry["x"] = %jnum(jget(eloc, "x"))
-        entry["y"] = %jnum(jget(eloc, "y"))
-        entry["z"] = %jnum(jget(eloc, "z"))
-        entry["map_id"] = %jnum(jget(eloc, "map_id"))
-      attackable.add entry
-
-  # mana/health pct
-  let maxHp = max(1.0, jnum(jget(obs, "max_health"), 1.0))
-  let hp = jnum(jget(obs, "health"), maxHp)
-  let maxMana = max(1.0, jnum(jget(obs, "max_power"), 1.0))
-  let mana = jnum(jget(obs, "power"), maxMana)
-
-  # quest projection
-  var offers = newJArray()
-  let qOffers = jget(obs, "quest_offers")
-  if not qOffers.isNil and qOffers.kind == JArray:
-    for o in qOffers:
-      let qid = jint(jget(o, "quest_id"))
-      var qf = questBindingFactor(frame, qid)
-      if qf < 0:
-        qf = firstQuestFactor(frame, "accept_quest")
-      if qf < 0:
-        qf = 0
-      var entityId = 0
-      let entsO = jget(frame, "bindings", "entities")
-      if not entsO.isNil and entsO.kind == JArray:
-        for e in entsO:
-          let idx = jint(jget(e, "index"))
-          if targetAllows(frame, "accept_quest", idx):
-            entityId = idx
-            break
-      offers.add %*{
-        "id": qid,
-        "entity_id": entityId,
-        "quest_factor": qf,
-        "title": jstr(jget(o, "title"))
-      }
-  # Dialog-open discovery: accept kind allowed but no concrete offer rows yet.
-  if offers.len == 0 and kindAllows(frame, "accept_quest"):
-    var entityId = 0
-    let entsA = jget(frame, "bindings", "entities")
-    if not entsA.isNil and entsA.kind == JArray:
-      for e in entsA:
-        let idx = jint(jget(e, "index"))
-        if targetAllows(frame, "accept_quest", idx):
-          entityId = idx
-          break
-    var qf = firstQuestFactor(frame, "accept_quest")
-    if qf < 0:
-      qf = 0
-    if entityId > 0 or qf >= 0:
-      offers.add %*{
-        "id": 0,
-        "entity_id": entityId,
-        "quest_factor": qf,
-        "title": ""
-      }
-  # Inventory counts for quest item progress (1470 Rattlecage Skull = 6281).
-  var skullCount = 0
-  let inv = jget(obs, "inventory_items")
-  if not inv.isNil and inv.kind == JArray:
-    for it in inv:
-      if jint(jget(it, "item_id")) == 6281:
-        skullCount = jint(jget(it, "count"))
-        break
-
-  # Server-side completed set (objectives done, ready to turn in).
-  var completedIds = initHashSet[int]()
-  let completed = jget(obs, "completed_quest_ids")
-  if not completed.isNil and completed.kind == JArray:
-    for c in completed:
-      completedIds.incl jint(c)
-
-  var active = newJArray()
-  let qLog = jget(obs, "quest_log_quest_ids")
-  let accepted = jget(obs, "accepted_quests")
-  proc addActive(qid: int) =
-    var itemCount = 0
-    var complete = qid in completedIds
-    if qid == 1470:
-      itemCount = skullCount
-      if skullCount >= 3:
-        complete = true
-    active.add %*{
-      "id": qid,
-      "complete": complete,
-      "item_count": itemCount
-    }
-  if not accepted.isNil and accepted.kind == JArray:
-    for a in accepted:
-      addActive(jint(jget(a, "quest_id")))
-  elif not qLog.isNil and qLog.kind == JArray:
-    for qid in qLog:
-      addActive(jint(qid))
-
-  # Turn-ins: entity with turn_in_quest target mask.
-  # Wire `quest` is 1-based index into bindings.quests (NOT quest_id, NOT 0).
-  # policy.quest==0 leaves questId=0 and turnInQuestAtQuestgiver fails.
-  var turnIns = newJArray()
-  let bind1470 = questBindingFactor(frame, 1470)
-  var qFactorTurn = -1
-  if bind1470 > 0 and (
-      questFactorAllows(frame, "turn_in_quest", bind1470) or
-      kindAllows(frame, "turn_in_quest")
-  ):
-    qFactorTurn = bind1470
-  if qFactorTurn < 0:
-    let f = firstQuestFactor(frame, "turn_in_quest")
-    if f > 0:
-      qFactorTurn = f
-  let entsAll = jget(frame, "bindings", "entities")
-  if qFactorTurn > 0 and not entsAll.isNil and entsAll.kind == JArray:
-    for e in entsAll:
-      let idx = jint(jget(e, "index"))
-      if idx <= 0: continue
-      if targetAllows(frame, "turn_in_quest", idx):
-        turnIns.add %*{
-          "id": 1470,
-          "entity_id": idx,
-          "quest_factor": qFactorTurn
-        }
-
-  # Interactable units/objects for open-dialog path (Venya before masks appear).
-  # Prefer units with questgiver service; pass services so Lua can skip vendors
-  # that open empty gossip and sticky-accept forever.
-  var interactables = newJArray()
-  if not entsAll.isNil and entsAll.kind == JArray:
-    for e in entsAll:
-      let idx = jint(jget(e, "index"))
-      let kind = jstr(jget(e, "kind")).toLowerAscii
-      if idx <= 0: continue
-      if kind in ["self", "party", "player"]: continue
-      if not targetAllows(frame, "interact", idx): continue
-      let eloc = jget(e, "location")
-      var services = newJArray()
-      let sv = jget(e, "services")
-      var isQuestgiver = false
-      if not sv.isNil and sv.kind == JArray:
-        for s in sv:
-          let sn = jstr(s).toLowerAscii
-          services.add %sn
-          if sn == "questgiver":
-            isQuestgiver = true
-      # Also match observation units by guid for entry + services if entity lacks them.
-      var creatureEntry = 0
-      let guidStr = jstr(jget(e, "guid"))
-      let unitsObs = jget(obs, "units")
-      if not unitsObs.isNil and unitsObs.kind == JArray:
-        for u in unitsObs:
-          if jstr(jget(u, "guid")) == guidStr:
-            creatureEntry = jint(jget(u, "entry"))
-            let usv = jget(u, "services")
-            if not usv.isNil and usv.kind == JArray:
-              for s in usv:
-                let sn = jstr(s).toLowerAscii
-                var already = false
-                for existing in services:
-                  if jstr(existing) == sn:
-                    already = true
-                    break
-                if not already:
-                  services.add %sn
-                if sn == "questgiver":
-                  isQuestgiver = true
-            break
-      var entry = %*{
-        "id": idx,
-        "kind": kind,
-        "is_questgiver": isQuestgiver,
-        "entry": creatureEntry,
-        "services": services
-      }
-      if not eloc.isNil:
-        entry["x"] = %jnum(jget(eloc, "x"))
-        entry["y"] = %jnum(jget(eloc, "y"))
-        entry["z"] = %jnum(jget(eloc, "z"))
-        entry["map_id"] = %jnum(jget(eloc, "map_id"))
-      interactables.add entry
-  # Prefer pure questgivers first (no vendor/trainer/innkeeper) so decide walks
-  # the useful surface before empty gossip NPCs.
-  var ranked = newJArray()
-  var rest = newJArray()
-  for it in interactables:
-    let sv = jget(it, "services")
-    var pureQg = jbool(jget(it, "is_questgiver"))
-    if pureQg and not sv.isNil and sv.kind == JArray:
-      for s in sv:
-        let sn = jstr(s)
-        if sn in ["vendor", "trainer", "innkeeper"]:
-          pureQg = false
-          break
-    if pureQg:
-      ranked.add it
-    else:
-      rest.add it
-  interactables = ranked
-  for it in rest:
-    interactables.add it
-
-  var abilities = newJObject()
-  let known = jget(obs, "known_spells")
-  # Summon Imp classic id 688
-  if not known.isNil and known.kind == JArray:
-    for sid in known:
-      if jint(sid) == 688:
-        # find spell binding index for cast
-        if not spells.isNil and spells.kind == JArray:
-          var si = 0
-          for sp in spells:
-            inc si
-            if jint(jget(sp, "spell_id")) == 688:
-              abilities["summon_imp"] = %*{"spell": si}
-              break
-
-  let death = %*{
-    "is_dead": jbool(jget(obs, "is_dead")),
-    "is_ghost": jbool(jget(obs, "is_ghost")),
-    "can_reclaim_corpse": jbool(jget(obs, "can_reclaim_corpse")),
-    "can_release_spirit": kindAllows(frame, "release_spirit"),
-    "can_reclaim_action": kindAllows(frame, "reclaim_corpse"),
-    "can_move": kindAllows(frame, "move"),
-    "corpse_known": jbool(jget(obs, "corpse_known")),
-    "corpse": newJNull()
-  }
-  let cl = jget(obs, "corpse_location")
-  if jbool(jget(obs, "corpse_known")) and not cl.isNil:
-    death["corpse"] = %*{
-      "map_id": jnum(jget(cl, "map_id")),
-      "x": jnum(jget(cl, "x")),
-      "y": jnum(jget(cl, "y")),
-      "z": jnum(jget(cl, "z"))
-    }
-    death["corpse_known"] = %true
-
-  result = %*{
-    "self_unit": selfUnit,
-    "party": %*{"leader_unit": leaderUnit},
-    "combat": %*{
-      "in_combat": jbool(jget(obs, "in_combat")),
-      "mana_pct": mana / maxMana * 100.0,
-      "health_pct": hp / maxHp * 100.0,
-      "focus_guid": focusGuid,
-      "auto_attack_guid": autoGuid,
-      "focus_id": focusId,
-      "attackable": attackable,
-      "casts": casts
-    },
-    "death": death,
-    "quest": %*{
-      "offers": offers,
-      "active": active,
-      "turn_ins": turnIns,
-      "interactables": interactables,
-      "masks_empty": offers.len == 0 and active.len == 0 and turnIns.len == 0
-    },
-    "abilities": abilities
-  }
-
 # ---------- Lua decide ----------
 
 proc luaEscape(s: string): string =
@@ -796,6 +334,267 @@ proc toLua(n: JsonNode): string =
     for k, v in n.pairs:
       parts.add "[" & luaEscape(k) & "] = " & toLua(v)
     "{" & parts.join(", ") & "}"
+
+# ---------- v2 projection (observation → plain Lua table) ----------
+#
+# The v2 environment frame has no action_space/action_mask/bindings — those
+# died with the v1 select protocol. Units carry real guids (uint64, may not
+# fit a Lua double), so tools see dense 1-based ids and the host resolves
+# id → guid on the way back out.
+
+proc projectV2(frame: JsonNode; preferLeaderName = ""):
+    tuple[proj: JsonNode, guids: seq[string]] =
+  let obs = jget(frame, "observation")
+  let loc = jget(obs, "location")
+  var guids: seq[string] = @[]
+  let selfUnit = %*{
+    "x": jnum(jget(loc, "x")),
+    "y": jnum(jget(loc, "y")),
+    "z": jnum(jget(loc, "z")),
+    "map_id": jnum(jget(loc, "map_id")),
+    "class_id": jint(jget(obs, "class_id")),
+    "level": jint(jget(obs, "level"))
+  }
+  let maxHp = max(1.0, jnum(jget(obs, "max_health"), 1.0))
+  let hpPct = jnum(jget(obs, "health"), maxHp) / maxHp * 100.0
+  # Mana from pool 0 — active_power_type latches onto pet focus (old
+  # grind_policy lesson, still true on live warlock frames).
+  var manaPct = 100.0
+  var mana = 0
+  let powers = jget(obs, "powers")
+  let maxPowers = jget(obs, "max_powers")
+  if not powers.isNil and powers.kind == JArray and powers.len > 0 and
+      not maxPowers.isNil and maxPowers.kind == JArray and maxPowers.len > 0:
+    mana = jint(powers[0])
+    let mm = max(1, jint(maxPowers[0]))
+    manaPct = float(mana) / float(mm) * 100.0
+
+  var attackable = newJArray()
+  var lootable = newJArray()
+  var focusId = 0
+  let selectedGuid = jstr(jget(obs, "selected_target_guid"))
+  let units = jget(obs, "units")
+  if not units.isNil and units.kind == JArray:
+    for u in units:
+      let g = jstr(jget(u, "guid"))
+      if not guidNonzero(g): continue
+      let uloc = jget(u, "location")
+      if uloc.isNil: continue
+      let hostile = jstr(jget(u, "reaction")) == "hostile"
+      let alive = jint(jget(u, "health")) > 0
+      let isLoot = jbool(jget(u, "is_lootable"))
+      if not hostile and not isLoot: continue
+      guids.add g
+      let id = guids.len
+      let row = %*{
+        "id": id,
+        "x": jnum(jget(uloc, "x")),
+        "y": jnum(jget(uloc, "y")),
+        "z": jnum(jget(uloc, "z")),
+        "map_id": jnum(jget(uloc, "map_id")),
+        "entry": jint(jget(u, "entry")),
+        "level": jint(jget(u, "level")),
+        "distance": jnum(jget(u, "distance")),
+        "los_blocked": jbool(jget(u, "line_of_sight_blocked")),
+        "lootable": isLoot and not alive
+      }
+      if isLoot and not alive:
+        lootable.add row
+      elif hostile and alive:
+        attackable.add row
+        if g == selectedGuid:
+          focusId = id
+
+  # Leader projection for escort tools: party member row + live unit overlay.
+  var leaderUnit = newJNull()
+  let party = jget(obs, "party")
+  let prefer = preferLeaderName.toLowerAscii
+  if jbool(jget(party, "in_group")):
+    let leaderName =
+      if prefer.len > 0: prefer
+      else: jstr(jget(party, "leader_name")).toLowerAscii
+    let members = jget(party, "members")
+    if not members.isNil and members.kind == JArray:
+      for m in members:
+        if jstr(jget(m, "name")).toLowerAscii != leaderName: continue
+        let g = jstr(jget(m, "guid"))
+        var x, y, z, mapId = 0.0
+        var visible = false
+        var inCombat = false
+        if not units.isNil and units.kind == JArray:
+          for u in units:
+            if jstr(jget(u, "guid")) != g: continue
+            let uloc = jget(u, "location")
+            if not uloc.isNil:
+              x = jnum(jget(uloc, "x"))
+              y = jnum(jget(uloc, "y"))
+              z = jnum(jget(uloc, "z"))
+              mapId = jnum(jget(uloc, "map_id"))
+              visible = not (x == 0.0 and y == 0.0)
+            let tg = jstr(jget(u, "target_guid"))
+            inCombat = guidNonzero(tg)
+            break
+        var leaderHpPct = 100.0
+        if jbool(jget(m, "health_known")):
+          let mh = max(1.0, jnum(jget(m, "max_health"), 1.0))
+          leaderHpPct = jnum(jget(m, "health"), mh) / mh * 100.0
+        if not inCombat and leaderHpPct < 99.5:
+          inCombat = true
+        guids.add g
+        leaderUnit = %*{
+          "id": guids.len,
+          "x": x, "y": y, "z": z, "map_id": mapId,
+          "visible": visible,
+          "assistable": visible,
+          "health_pct": leaderHpPct,
+          "in_combat": inCombat,
+          "position_reliable": visible
+        }
+        break
+
+  let corpseKnown = jbool(jget(obs, "corpse_known"))
+  let corpseLoc = jget(obs, "corpse_location")
+  var corpse = newJNull()
+  if corpseKnown and not corpseLoc.isNil:
+    corpse = %*{
+      "map_id": jnum(jget(corpseLoc, "map_id")),
+      "x": jnum(jget(corpseLoc, "x")),
+      "y": jnum(jget(corpseLoc, "y")),
+      "z": jnum(jget(corpseLoc, "z"))
+    }
+  let isDead = jbool(jget(obs, "is_dead"))
+  let isGhost = jbool(jget(obs, "is_ghost"))
+
+  var known = newJArray()
+  let ks = jget(obs, "known_spells")
+  if not ks.isNil and ks.kind == JArray:
+    for s in ks: known.add s
+  var cooldowns = newJArray()
+  let cds = jget(obs, "cooldown_spell_ids")
+  if not cds.isNil and cds.kind == JArray:
+    for s in cds: cooldowns.add s
+
+  let proj = %*{
+    "self_unit": selfUnit,
+    "leader_unit": leaderUnit,
+    "combat": {
+      "in_combat": jbool(jget(obs, "in_combat")),
+      "health_pct": hpPct,
+      "mana_pct": manaPct,
+      "focus_id": focusId,
+      "attackable": attackable,
+      "lootable": lootable,
+      "casts": newJArray()
+    },
+    "spells": {
+      "known": known,
+      "cooldowns": cooldowns,
+      "mana": mana,
+      "mana_pct": manaPct
+    },
+    "death": {
+      "is_dead": isDead,
+      "is_ghost": isGhost,
+      "can_release_spirit": isDead and not isGhost,
+      "can_reclaim_corpse": jbool(jget(obs, "can_reclaim_corpse")),
+      "can_reclaim_action": jbool(jget(obs, "can_reclaim_corpse")),
+      "can_move": true,
+      "corpse": corpse
+    },
+    "party": {
+      "in_group": jbool(jget(party, "in_group")),
+      "invite_pending": jbool(jget(party, "invite_pending")),
+      "invite_from": jstr(jget(party, "invite_from")),
+      "leader_name": jstr(jget(party, "leader_name"))
+    }
+  }
+  (proj, guids)
+
+proc guidFor(guids: seq[string]; unitId: int): string =
+  if unitId >= 1 and unitId <= guids.len:
+    return guids[unitId - 1]
+  ""
+
+proc mapIntentV2(intent: JsonNode; guids: seq[string]): Option[JsonNode] =
+  ## Lua intent → typed BotAction JSON for the fork's execute_action frame.
+  if intent.isNil or intent.kind != JObject: return none(JsonNode)
+  let kind = jstr(jget(intent, "kind"))
+  let uid = jint(jget(intent, "unit_id"))
+  let guid = guidFor(guids, uid)
+  proc dest(arrival: float): JsonNode =
+    %*{
+      "kind": "move",
+      "destination": {
+        "map_id": jint(jget(intent, "map_id")),
+        "x": jnum(jget(intent, "x")),
+        "y": jnum(jget(intent, "y")),
+        "z": jnum(jget(intent, "z")),
+        "orientation": 0.0
+      },
+      "arrival_radius": arrival
+    }
+  case kind
+  of "hold", "":
+    none(JsonNode)
+  of "move_to_unit":
+    if jget(intent, "x") != nil and jget(intent, "y") != nil:
+      some(dest(4.0))
+    elif guid.len > 0:
+      some(%*{"kind": "follow", "target_guid": guid})
+    else:
+      none(JsonNode)
+  of "move_to_corpse":
+    some(dest(6.0))
+  of "follow_unit":
+    if guid.len == 0: none(JsonNode)
+    else: some(%*{"kind": "follow", "target_guid": guid})
+  of "assist_unit":
+    if guid.len == 0: none(JsonNode)
+    else: some(%*{"kind": "assist", "target_guid": guid})
+  of "attack_unit":
+    if guid.len == 0: none(JsonNode)
+    else: some(%*{"kind": "attack", "target_guid": guid})
+  of "cast_spell":
+    let spell = jint(jget(intent, "spell"))
+    if spell <= 0: none(JsonNode)
+    else:
+      var a = %*{"kind": "cast", "spell_id": spell}
+      if guid.len > 0: a["target_guid"] = %guid
+      some(a)
+  of "stop_attack":
+    some(%*{"kind": "stop_attack"})
+  of "loot_unit":
+    if guid.len == 0: none(JsonNode)
+    else: some(%*{"kind": "loot", "target_guid": guid})
+  of "interact_unit":
+    if guid.len == 0: none(JsonNode)
+    else: some(%*{"kind": "interact", "target_guid": guid})
+  of "accept_party":
+    some(%*{"kind": "accept_party"})
+  of "promote_party":
+    if guid.len == 0: none(JsonNode)
+    else: some(%*{"kind": "promote_party", "target_guid": guid})
+  of "accept_quest":
+    if guid.len == 0: none(JsonNode)
+    else:
+      some(%*{
+        "kind": "accept_quest", "target_guid": guid,
+        "quest_id": jint(jget(intent, "quest_id"))
+      })
+  of "turn_in_quest":
+    if guid.len == 0: none(JsonNode)
+    else:
+      some(%*{
+        "kind": "turn_in_quest", "target_guid": guid,
+        "quest_id": jint(jget(intent, "quest_id")),
+        "quest_reward_choice": jint(jget(intent, "reward_choice"))
+      })
+  of "release_spirit":
+    some(%*{"kind": "release_spirit"})
+  of "reclaim_corpse":
+    some(%*{"kind": "reclaim_corpse"})
+  else:
+    none(JsonNode)
 
 proc runDecide(tool: string; proj: JsonNode): JsonNode =
   let repo = getCurrentDir()
@@ -855,161 +654,6 @@ print(enc(intent))
   let line = outp.strip().splitLines()[^1]
   parseJson(line)
 
-# ---------- intent → factorized action ----------
-
-proc mapIntent(intent: JsonNode): Option[JsonNode] =
-  if intent.isNil or intent.kind != JObject: return none(JsonNode)
-  let kind = jstr(jget(intent, "kind"))
-  case kind
-  of "hold", "":
-    return none(JsonNode)
-  of "move_to_unit":
-    if jget(intent, "x") != nil and jget(intent, "y") != nil and jget(intent, "z") != nil:
-      return some(%*{
-        "kind": "move",
-        "target": 0,
-        "spell": 0,
-        "item": 0,
-        "equipment_slot": 0,
-        "quest": 0,
-        "choice": 0,
-        "recipient": 0,
-        "text": 0,
-        "trigger": 0,
-        "dialog": 0,
-        "destination": {
-          "map_id": jint(jget(intent, "map_id")),
-          "x": jnum(jget(intent, "x")),
-          "y": jnum(jget(intent, "y")),
-          "z": jnum(jget(intent, "z")),
-          "orientation": 0.0
-        }
-      })
-    let uid = jint(jget(intent, "unit_id"))
-    if uid <= 0: return none(JsonNode)
-    return some(%*{
-      "kind": "follow", "target": uid, "spell": 0, "item": 0,
-      "equipment_slot": 0, "quest": 0, "choice": 0, "recipient": 0,
-      "text": 0, "trigger": 0, "dialog": 0
-    })
-  of "assist_unit":
-    return some(%*{
-      "kind": "assist", "target": jint(jget(intent, "unit_id")),
-      "spell": 0, "item": 0, "equipment_slot": 0, "quest": 0, "choice": 0,
-      "recipient": 0, "text": 0, "trigger": 0, "dialog": 0
-    })
-  of "promote_party":
-    return some(%*{
-      "kind": "promote_party", "target": jint(jget(intent, "unit_id")),
-      "spell": 0, "item": 0, "equipment_slot": 0, "quest": 0, "choice": 0,
-      "recipient": 0, "text": 0, "trigger": 0, "dialog": 0
-    })
-  of "attack_unit":
-    return some(%*{
-      "kind": "attack", "target": jint(jget(intent, "unit_id")),
-      "spell": 0, "item": 0, "equipment_slot": 0, "quest": 0, "choice": 0,
-      "recipient": 0, "text": 0, "trigger": 0, "dialog": 0
-    })
-  of "cast_spell":
-    return some(%*{
-      "kind": "cast",
-      "target": jint(jget(intent, "unit_id")),
-      "spell": jint(jget(intent, "spell")),
-      "item": 0, "equipment_slot": 0, "quest": 0, "choice": 0,
-      "recipient": 0, "text": 0, "trigger": 0, "dialog": 0
-    })
-  of "accept_party":
-    return some(%*{"kind": "accept_party", "target": 0, "spell": 0, "item": 0,
-      "equipment_slot": 0, "quest": 0, "choice": 0, "recipient": 0,
-      "text": 0, "trigger": 0, "dialog": 0})
-  of "accept_quest":
-    # `quest` on the wire is the factorized binding index, not quest_id.
-    var qf = jint(jget(intent, "quest_factor"))
-    if jget(intent, "quest_factor").isNil:
-      qf = 0
-    return some(%*{
-      "kind": "accept_quest", "target": jint(jget(intent, "unit_id")),
-      "spell": 0, "item": 0, "equipment_slot": 0,
-      "quest": qf, "choice": 0,
-      "recipient": 0, "text": 0, "trigger": 0, "dialog": 0
-    })
-  of "turn_in_quest":
-    var qf = jint(jget(intent, "quest_factor"))
-    if jget(intent, "quest_factor").isNil:
-      qf = 0
-    return some(%*{
-      "kind": "turn_in_quest", "target": jint(jget(intent, "unit_id")),
-      "spell": 0, "item": 0, "equipment_slot": 0,
-      "quest": qf, "choice": 0,
-      "recipient": 0, "text": 0, "trigger": 0, "dialog": 0
-    })
-  of "interact_unit":
-    return some(%*{
-      "kind": "interact", "target": jint(jget(intent, "unit_id")),
-      "spell": 0, "item": 0, "equipment_slot": 0, "quest": 0, "choice": 0,
-      "recipient": 0, "text": 0, "trigger": 0, "dialog": 0
-    })
-  of "loot_unit":
-    return some(%*{
-      "kind": "loot", "target": jint(jget(intent, "unit_id")),
-      "spell": 0, "item": 0, "equipment_slot": 0, "quest": 0, "choice": 0,
-      "recipient": 0, "text": 0, "trigger": 0, "dialog": 0
-    })
-  of "release_spirit":
-    return some(%*{"kind": "release_spirit", "target": 0, "spell": 0, "item": 0,
-      "equipment_slot": 0, "quest": 0, "choice": 0, "recipient": 0,
-      "text": 0, "trigger": 0, "dialog": 0})
-  of "reclaim_corpse":
-    return some(%*{"kind": "reclaim_corpse", "target": 0, "spell": 0, "item": 0,
-      "equipment_slot": 0, "quest": 0, "choice": 0, "recipient": 0,
-      "text": 0, "trigger": 0, "dialog": 0})
-  of "move_to_corpse":
-    return some(%*{
-      "kind": "move", "target": 0, "spell": 0, "item": 0,
-      "equipment_slot": 0, "quest": 0, "choice": 0, "recipient": 0,
-      "text": 0, "trigger": 0, "dialog": 0,
-      "destination": {
-        "map_id": jint(jget(intent, "map_id")),
-        "x": jnum(jget(intent, "x")),
-        "y": jnum(jget(intent, "y")),
-        "z": jnum(jget(intent, "z")),
-        "orientation": 0.0
-      }
-    })
-  else:
-    return none(JsonNode)
-
-proc overlayLeaderLive(proj: JsonNode; leaderFrame: JsonNode) =
-  ## Party bindings often freeze leader xy / omit in_combat. Overlay the
-  ## leader seat's own observation (same control plane, not in-game collusion).
-  ## play-classic has no socket on slot 0 — callers must tolerate connect fail.
-  if proj.isNil or leaderFrame.isNil: return
-  let obs = jget(leaderFrame, "observation")
-  if obs.isNil: return
-  let loc = jget(obs, "location")
-  let lu = jget(proj, "party", "leader_unit")
-  if lu.isNil or lu.kind != JObject: return
-  if not loc.isNil:
-    let lx = jnum(jget(loc, "x"))
-    let ly = jnum(jget(loc, "y"))
-    # Ignore broken 0,0 desync snapshots.
-    if not (lx == 0.0 and ly == 0.0):
-      lu["x"] = %lx
-      lu["y"] = %ly
-      lu["z"] = %jnum(jget(loc, "z"))
-      lu["map_id"] = %jnum(jget(loc, "map_id"))
-      lu["visible"] = %true
-      lu["position_reliable"] = %true
-  let maxHp = max(1.0, jnum(jget(obs, "max_health"), 1.0))
-  let hp = jnum(jget(obs, "health"), maxHp)
-  lu["health_pct"] = %(hp / maxHp * 100.0)
-  # Real combat only: obs.in_combat and/or missing HP. Sticky
-  # auto_attack_guid / combat_focus_guid must NOT force fighting — that caused
-  # permanent join_leader_assist thrash while the human sat full-HP.
-  let fighting =
-    jbool(jget(obs, "in_combat")) or (hp / maxHp * 100.0 < 99.5)
-  lu["in_combat"] = %fighting
-
 proc parseConfig(): HostConfig =
   result = HostConfig(
     slot: 2,
@@ -1040,6 +684,7 @@ proc parseConfig(): HostConfig =
       of "verbose": result.quiet = false
       of "audit-path": result.auditPath = val
       of "no-audit": result.auditPath = ""
+      of "external": result.external = true
       else: discard
     else: discard
   if result.goalId == "army-slot-2":
@@ -1053,8 +698,100 @@ proc log(c: HostConfig; msg: string) =
     if msg.contains("FAIL") or msg.contains("fatal") or msg.contains("goal"):
       echo msg
 
+proc say(msg: string) =
+  echo msg
+  flushFile(stdout)
+
+proc runExternal(cfg: var HostConfig) =
+  ## Lua drives the seat: hold the in-process planner, then each tick
+  ## project the env frame, run lua/tools/<tool>.decide, and fire the intent
+  ## through the fork's execute_action frame. Fair-play audit still runs;
+  ## the client also appends every action to action-results.jsonl.
+  echo &"[army_host] EXTERNAL lua policy slot={cfg.slot} tool={cfg.tool} leader={cfg.leader}"
+  var audit = AuditState(path: cfg.auditPath, slot: cfg.slot, tool: cfg.tool)
+  var client = connectClient(cfg.slot)
+  defer: client.close()
+  proc ensureHeld(): int =
+    ## The execute frame is only legal while the planner cannot step.
+    let st = client.statusJson()
+    var rev = jint(jget(st, "revision"))
+    if jstr(jget(st, "phase")) == "running":
+      client.sendDirective("hold", rev)
+      rev = jint(jget(client.statusJson(), "revision"))
+      echo &"[army_host] planner held (rev={rev})"
+    rev
+  var rev = ensureHeld()
+  let t0 = epochTime()
+  var i = 0
+  var lastHeartbeatAt = 0.0
+  var lastIntent = ""
+  const HeartbeatSec = 15.0
+  while true:
+    if cfg.maxSeconds > 0 and epochTime() - t0 > cfg.maxSeconds:
+      echo "[army_host] max-seconds"
+      break
+    inc i
+    try:
+      let frame = client.envFrame()
+      discard processFrame(audit, frame)
+      let obs = jget(frame, "observation")
+      let name = jstr(jget(obs, "name"))
+      let (proj, guids) = projectV2(frame, cfg.leader)
+      var intentDesc = "hold"
+      try:
+        let intent = runDecide(cfg.tool, proj)
+        if not cfg.quiet:
+          say "[external] intent " & $intent
+        let action = mapIntentV2(intent, guids)
+        intentDesc = jstr(jget(intent, "kind"), "hold") & ":" &
+          jstr(jget(intent, "reason"))
+        if action.isSome:
+          try:
+            let res = client.executeAction(action.get, rev)
+            if not jbool(jget(res, "success")):
+              echo "[army_host] action FAIL ", intentDesc, " → ",
+                jstr(jget(res, "message"))
+            rev = jint(jget(res, "revision"), rev)
+          except:
+            let msg = getCurrentExceptionMsg()
+            if isStaleRevisionError(msg):
+              rev = ensureHeld()
+            else:
+              raise
+      except:
+        echo "[army_host] decide FAIL: ", getCurrentExceptionMsg()
+      if intentDesc != lastIntent or
+          epochTime() - lastHeartbeatAt >= HeartbeatSec:
+        lastHeartbeatAt = epochTime()
+        lastIntent = intentDesc
+        let loc = jget(obs, "location")
+        echo "[army_host] #", i, " ", name,
+          " intent=", intentDesc,
+          " pos=(",
+          jnum(jget(loc, "x")).formatFloat(ffDecimal, 0), ",",
+          jnum(jget(loc, "y")).formatFloat(ffDecimal, 0), ")",
+          " hp=", jnum(jget(proj, "combat", "health_pct")).formatFloat(ffDecimal, 0)
+    except:
+      let msg = getCurrentExceptionMsg()
+      echo "[army_host] loop error: ", msg
+      if msg.contains("socket") or msg.contains("closed") or
+          msg.contains("send failed"):
+        try: client.close()
+        except: discard
+        sleep(1000)
+        try:
+          client = connectClient(cfg.slot)
+          rev = ensureHeld()
+          echo "[army_host] reconnected slot=", cfg.slot
+        except:
+          echo "[army_host] reconnect failed: ", getCurrentExceptionMsg()
+    sleep(int(cfg.cadence * 1000))
+
 proc main() =
   var cfg = parseConfig()
+  if cfg.external:
+    runExternal(cfg)
+    return
   echo &"[army_host] v2 goal-host slot={cfg.slot} leader={cfg.leader} party={cfg.party}"
   if cfg.auditPath.len > 0:
     echo &"[army_host] fair-play audit → {cfg.auditPath}"

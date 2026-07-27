@@ -188,9 +188,44 @@ local function find_attackable_by_guid(attackable, guid)
   local want = tostring(guid)
   for i = 1, #attackable do
     local u = attackable[i]
-    if u and tostring(u.guid) == want then
+    if u and u.guid ~= nil and tostring(u.guid) == want then
       return u
     end
+  end
+  return nil
+end
+
+-- Invite allowlist: fail-closed when empty (kb/nim-control-v2-no-select.md).
+local function invite_names(args, party)
+  local list = args and (args.allowlist or args.invite_allowlist)
+  if type(list) == "table" and #list > 0 then return list end
+  local names = {}
+  if args and args.leader and tostring(args.leader) ~= "" then
+    names[#names + 1] = tostring(args.leader)
+  end
+  if party and party.leader_name and tostring(party.leader_name) ~= "" then
+    names[#names + 1] = tostring(party.leader_name)
+  end
+  return names
+end
+
+local function should_accept_invite(party, args)
+  if not party or not party.invite_pending then return false end
+  local from = lower(party.invite_from)
+  if from == "" then return false end
+  local names = invite_names(args, party)
+  if #names == 0 then return false end
+  for i = 1, #names do
+    if from == lower(names[i]) then return true end
+  end
+  return false
+end
+
+-- v2 projectV2: leader_unit is top-level; legacy frames nest under party.
+local function resolve_leader(frame)
+  if frame.leader_unit ~= nil then return frame.leader_unit end
+  if frame.party and frame.party.leader_unit ~= nil then
+    return frame.party.leader_unit
   end
   return nil
 end
@@ -509,7 +544,8 @@ return registry.register({
     local near = args.near or DEFAULT_NEAR
     local far = args.far or DEFAULT_FAR
     local me = frame.self_unit
-    local leader = frame.party and frame.party.leader_unit
+    local party = frame.party or {}
+    local leader = resolve_leader(frame)
     local combat = frame.combat or {}
     local casts = combat.casts or {}
     local mana = combat.mana_pct or 100
@@ -535,6 +571,11 @@ return registry.register({
       return { kind = "hold", reason = "ghost_waiting_corpse" }
     end
 
+    -- Accept invite from allowlist (fail-closed). v2 party.invite_*.
+    if should_accept_invite(party, args) then
+      return { kind = "accept_party", reason = "accept_invite_allowlist" }
+    end
+
     if not me then return nil end
     if not leader or not leader.visible then
       return { kind = "hold", reason = "leader_not_visible" }
@@ -544,13 +585,15 @@ return registry.register({
     -- Do not trust dist/hold while position_reliable is false — stock follow.
     local pos_ok = leader_pos_reliable(leader)
     if not pos_ok then
+      -- v2: no auto_attack_guid; in_combat alone is the engaged signal.
       local engaged_early = combat.in_combat or guid_nonzero(combat.auto_attack_guid)
       if not engaged_early then
         return rejoin_intent(leader, me, near, far, far * far + 1, "rejoin_stale")
       end
     end
 
-    -- Hostile focus only (projection should strip self; double-check via attackable).
+    -- Hostile focus: legacy frames use auto_attack_guid/focus_guid + attackable.guid;
+    -- projectV2 only provides combat.focus_id + attackable[].id (no guids).
     local prefer = combat.auto_attack_guid
     if not guid_nonzero(prefer) then
       prefer = combat.focus_guid
@@ -651,8 +694,10 @@ return registry.register({
       -- not yet marked engaged (hand-off already started).
       local leader_hp = tonumber(leader.health_pct)
       local leader_damaged = leader_hp ~= nil and leader_hp < 99.5
-      local has_focus = guid_nonzero(combat.focus_guid) or
-        guid_nonzero(combat.auto_attack_guid)
+      -- v2: focus_id path already resolved into target_id; guids are legacy-only.
+      local has_focus = (target_id and target_id > 0)
+        or guid_nonzero(combat.focus_guid)
+        or guid_nonzero(combat.auto_attack_guid)
       if leader_damaged and leader.assistable and leader.id and leader.id > 0
           and not has_focus then
         return {

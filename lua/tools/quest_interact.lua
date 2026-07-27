@@ -60,21 +60,19 @@ return registry.register({
     local me = frame.self_unit
     local quest = frame.quest or {}
 
-    -- Offers: concrete quest id/factor first; else discovery accept (quest=0
-    -- lets the executor pick the first live offer from the open dialog).
-    -- Do not rotate away while a dialog is open — rotate only between
-    -- interact targets when no offer surface exists yet.
+    -- Offers: real quest_id only (v2 mapIntent → accept_quest.quest_id).
+    -- Observation rows may use id or quest_id; never use quest_factor as the
+    -- wire identity (factor was a v1 bindings.quests index).
+    -- Discovery (quest_id=0): dialog open, first live offer — executor greets.
     if quest.offers and #quest.offers > 0 then
       local discovery = nil
       for i = 1, #quest.offers do
         local o = quest.offers[i]
-        local qid = o.id or 0
-        local qf = o.quest_factor or 0
-        if qid > 0 or qf > 0 then
+        local qid = o.id or o.quest_id or 0
+        if qid > 0 then
           return {
             kind = "accept_quest",
             quest_id = qid,
-            quest_factor = qf,
             unit_id = o.entity_id or o.unit_id or 0,
             reason = "accept_offer",
           }
@@ -85,7 +83,6 @@ return registry.register({
         return {
           kind = "accept_quest",
           quest_id = 0,
-          quest_factor = discovery.quest_factor or 0,
           unit_id = discovery.entity_id or discovery.unit_id or 0,
           reason = "accept_discovery",
         }
@@ -94,10 +91,10 @@ return registry.register({
 
     if quest.turn_ins and #quest.turn_ins > 0 then
       local t = quest.turn_ins[1]
+      local qid = t.id or t.quest_id or 0
       return {
         kind = "turn_in_quest",
-        quest_id = t.id or 0,
-        quest_factor = t.quest_factor or 0,
+        quest_id = qid,
         unit_id = t.entity_id or t.unit_id or 0,
         reason = "turn_in_offer",
       }

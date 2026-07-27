@@ -74,7 +74,7 @@ Historical note (2026-07-27): the Python integration tier (recorded
 `wire_*.bin` replay through `brain/` frame_coerce → projection → Lua →
 intent_mapping) and the nightly mechanism e2e were deleted along with
 `brain/` — they asserted the v1 external-select mechanism, which
-`nim_control.v2` removed (`kb/nim-control-v2-no-select.md`). Fixtures stay
+`nim_control.v2` removed (`kb/nim-control-v2-external-select.md`). Fixtures stay
 under `tests/fixtures/frames/` for forensics.
 
 ## Copyright / data boundary
