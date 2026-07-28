@@ -32,12 +32,11 @@ COMPOSE_FILE := infra/compose.vmangos.yml
 ACCOUNT_USER := monofuel
 ACCOUNT_PASS := password
 
-.PHONY: test test-lua test-breadcrumbs test-nim system pin-check start-server stop-server server-logging logs account soap-account play play-classic play-xr escort escort-army grind breadcrumbs quest-data warlock-account warlock-bot botwarrior-bot tusk-account tusk-bot beru-account beru-bot party-army navmesh-helper navmesh-status
+.PHONY: test test-lua test-nim system pin-check start-server stop-server server-logging logs account soap-account play play-classic play-xr escort escort-army grind quest-data warlock-account warlock-bot botwarrior-bot tusk-account tusk-bot beru-account beru-bot party-army navmesh-helper navmesh-status
 
 # Unit tier: Lua tools + Nim host/system tests only (v2 DoD: no Python required
 # for bot correctness). If nim is missing, test-nim-soft skips rather than
-# failing bare CI hosts. Breadcrumbs (non-bot ops poller) tests are optional:
-# `make test-breadcrumbs`.
+# failing bare CI hosts.
 test: test-lua test-nim-soft
 
 # Like test-nim but no-op when nim is unavailable (wired into `make test`).
@@ -53,11 +52,6 @@ test-lua:
 	@rc=0; for t in lua/tests/test_*.lua; do \
 		echo "== $$t"; LUA_PATH="lua/?.lua;lua/tools/?.lua;;" $(RUN_LUA) $$t || rc=1; \
 	done; exit $$rc
-
-# breadcrumbs: DB poller diff logic (fixture dicts only; no mariadb in unit
-# tier). Ops tooling, not the bot — kept out of default `make test`.
-test-breadcrumbs:
-	@python3 -m unittest discover -s breadcrumbs/tests -p 'test_*.py' -v
 
 # Optional Nim unit tier (enum maps / pure parsers). Not part of `make test`
 # so CI and bare hosts without nim stay green. PATH-nim first, else nix develop
@@ -210,13 +204,6 @@ navmesh-helper:
 navmesh-status:
 	@printf '{"op":"status","mmaps_dir":"%s/mmaps"}' "$(VANILLA_WOW_EXTRACTED_DATA_DIR)" \
 		| "$(VANILLA_WOW_NAVMESH_HELPER)"
-
-# DB breadcrumb poller: JSONL session stream from characters MariaDB while a
-# human plays. Requires realm up (docker exec → mariadb). Not unit tier.
-# Example: make breadcrumbs CHARACTER=Murist
-CHARACTER ?= Murist
-breadcrumbs:
-	@python3 breadcrumbs/poller.py --character "$(CHARACTER)"
 
 # Regenerate addons/ShadowArmy/QuestData.lua from the world DB + WorldMapArea.dbc
 # (docs/quest-data.md). Read-only DB access; requires the realm up. Deterministic,

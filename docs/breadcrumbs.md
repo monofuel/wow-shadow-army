@@ -5,6 +5,9 @@ Applied 2026-07-25 to the local Stack A all-in-one realm
 (`coworld-vanilla-wow` @ pin, `infra/compose.vmangos.yml --profile coworld`,
 service `coworld-game`).
 
+(The earlier `breadcrumbs/` Python DB poller this approach superseded was
+deleted 2026-07-27 — the save-interval staleness below is why it lost.)
+
 Everything here goes through the operator's config-override mechanism
 (`vmangos.mangosd_config_overrides` / `realmd_config_overrides` in
 `local_data/coworld-config/config.json`). The upstream repo is read-only —
