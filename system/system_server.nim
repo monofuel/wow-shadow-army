@@ -1,7 +1,8 @@
 ## The System — management server for the shadow army.
 ##
 ## One Nim binary, two faces on one mummy server:
-##   HTTP dashboard (htmx)  GET /  GET /roster  GET /events  POST /reload
+##   HTTP dashboard (htmx)  GET /  GET /roster  GET /events  GET /server
+##                          POST /reload  POST /server/start  POST /server/stop
 ##                          GET /admin  POST /admin/respawn-shadow-army
 ##   MCP endpoint (MCPort)  POST /mcp
 ##
@@ -12,6 +13,12 @@
 ##   reloadAddon()           — SOAP announce <SYS> reload + wait for <SA> loaded
 ##   announceInGame()        — SOAP announce <text>
 ##   respawnShadowArmy()     — admin SOAP revive + tele (ops escape hatch)
+##   serverStatus()          — realm container up/down + lifecycle op state
+##   startServer()/stopServer() — queue operator `up`/`down` (async worker)
+##
+## The dashboard stays useful with the realm DOWN: roster degrades to an
+## offline note; the Admin tab's Server panel offers Start/Stop. The human
+## only runs the client and this dashboard; realm lifecycle goes through here.
 ##
 ## Admin faces (same procs): HTTP /admin, MCP tools, and human-seat addon
 ## chat (`<SA> admin <action>` from Murist → Chat.log tailer).
@@ -28,7 +35,7 @@ import
   ../tools/fair_play_audit
 
 const
-  Version = "0.8.0"
+  Version = "0.10.0"
   ServerName = "TheSystem"
   ## Only this character may request admin actions via `<SA> admin …` (human seat).
   AdminRequesterName* = "Murist"
@@ -61,6 +68,14 @@ const
   ShadowArmyRespawnTele* = "Deathknell"
   ## Base nim_control port: slot N listens on 41114 + N (docs/control-plane.md).
   NimControlBasePort = 41114
+  ## Bot seat launch map: cast name → Makefile seat target (slot = control
+  ## port offset, matching seatControlPort). Murist is human — never listed.
+  SeatMakeTargets* = [
+    (name: "Shadowfel", target: "warlock-bot", slot: 2),
+    (name: "Igris", target: "igris-bot", slot: 3),
+    (name: "Tusk", target: "tusk-bot", slot: 4),
+    (name: "Beru", target: "beru-bot", slot: 5)
+  ]
   ## SELECT-only projection of characters (VMaNGOS schema) + xp bar + life/zone + HP/MP + pos.
   ## `xp` is progress into the current level; next-level threshold joins
   ## `mangos.player_xp_for_level` (world DB on the same MariaDB).
@@ -87,6 +102,10 @@ ORDER BY c.name"""
   SoapTimeoutMs = 10_000
   ## Default relative path to VMaNGOS Chat.log (resolved absolute from cwd).
   DefaultChatLogRel = "../coworld-vanilla-wow/local_data/coworld-run/logs/Chat.log"
+  ## Upstream checkout holding the compose operator (same as Makefile UPSTREAM).
+  DefaultUpstreamRel = "../coworld-vanilla-wow"
+  ## Realm lifecycle operator, run with cwd = upstream (same as Makefile OPERATOR).
+  OperatorScriptRel = "server/scripts/docker_vmangos_server.py"
   ## Prefix the addon emits over /say (structured telemetry).
   SaPrefix = "<SA> "
   ## Older addon banner still seen in the wild.
@@ -164,6 +183,21 @@ type
     acaReloadAddon = 2
     acaTelePartyToMurist = 3
 
+  ## Realm lifecycle op queued for the server-op worker thread.
+  ServerLifecycleOp* = enum
+    sloNone = 0
+    sloStart = 1
+    sloStop = 2
+
+  ServerStatus* = object
+    ## Realm container + lifecycle state for the Server panel / MCP.
+    running*: bool ## coworld-game container is up
+    container*: string
+    op*: string ## "" | "start" | "stop" — queued or executing right now
+    lastOp*: string ## "" until a lifecycle op has finished
+    lastOpOk*: bool
+    lastOpDetail*: string ## tail of operator output / error message
+
 # Classic 1.12 race/class IDs are stable enums; hardcode the small tables.
 const
   RaceNames = [
@@ -198,9 +232,17 @@ var
   gLastAdminChatAt: float ## epoch seconds; debounce chat-triggered admin
   gPendingAdminAction: AdminChatAction ## acaNone when idle
   gAdminWorkerThread: Thread[void]
+  gServerOpLock: Lock
+  gPendingServerOp: ServerLifecycleOp ## queued, not yet picked up
+  gRunningServerOp: ServerLifecycleOp ## executing in the worker right now
+  gLastServerOp: string ## "start" | "stop" after first completed op
+  gLastServerOpOk: bool
+  gLastServerOpDetail: string
+  gServerOpWorkerThread: Thread[void]
 
 initLock(gEventLock)
 initLock(gAdminChatLock)
+initLock(gServerOpLock)
 
 proc raceName*(raceId: int): string =
   ## Map a classic 1.12 race ID to a display name.
@@ -872,6 +914,250 @@ proc startAdminWorker() =
   createThread(gAdminWorkerThread, adminWorkerLoop)
 
 # ---------------------------------------------------------------------------
+# Realm lifecycle (Server panel): status + start/stop via the upstream operator
+# ---------------------------------------------------------------------------
+
+proc upstreamDir*(): string =
+  ## Upstream coworld-vanilla-wow checkout (SYSTEM_UPSTREAM_DIR wins).
+  let env = getEnv("SYSTEM_UPSTREAM_DIR", "")
+  if env.len > 0:
+    return absolutePath(env)
+  result = absolutePath(DefaultUpstreamRel)
+
+proc parseDockerRunning*(output: string): bool =
+  ## Interpret `docker inspect -f {{.State.Running}}` stdout.
+  result = output.strip().toLowerAscii() == "true"
+
+proc containerRunning(): bool =
+  ## True when the coworld-game container exists and is running.
+  ## Missing container / docker error = down (that IS the stopped state:
+  ## the operator's `down` does compose rm, so the container disappears).
+  let container = gameContainer()
+  try:
+    let process = startProcess(
+      "docker",
+      args = ["inspect", "-f", "{{.State.Running}}", container],
+      options = {poUsePath}
+    )
+    let output = process.outputStream.readAll()
+    discard process.errorStream.readAll()
+    let exitCode = process.waitForExit()
+    process.close()
+    if exitCode != 0:
+      return false
+    result = parseDockerRunning(output)
+  except CatchableError:
+    result = false
+
+proc serverOpVerb*(op: ServerLifecycleOp): string =
+  ## Operator subcommand for a lifecycle op ("" for sloNone).
+  case op
+  of sloStart: "up"
+  of sloStop: "down"
+  of sloNone: ""
+
+proc serverOpLabel*(op: ServerLifecycleOp): string =
+  ## Short human label for a lifecycle op ("" for sloNone).
+  case op
+  of sloStart: "start"
+  of sloStop: "stop"
+  of sloNone: ""
+
+proc tailForDisplay*(s: string, maxLen = 600): string =
+  ## Keep the tail of operator output (the interesting part) for status lines.
+  let clean = s.strip()
+  if clean.len <= maxLen:
+    return clean
+  result = "…" & clean[clean.len - maxLen .. ^1]
+
+proc runServerOperator(op: ServerLifecycleOp): tuple[ok: bool, detail: string] =
+  ## Run the upstream compose operator (`up`/`down`) with cwd = upstream —
+  ## the exact path Makefile start-server / stop-server uses. Blocking; only
+  ## the server-op worker thread calls this.
+  let verb = serverOpVerb(op)
+  let dir = upstreamDir()
+  if not fileExists(dir / OperatorScriptRel):
+    return (ok: false,
+      detail: &"operator script missing: {dir / OperatorScriptRel} — set SYSTEM_UPSTREAM_DIR to a real coworld-vanilla-wow checkout")
+  try:
+    let process = startProcess(
+      "uv",
+      args = ["run", "python", OperatorScriptRel, verb],
+      workingDir = dir,
+      options = {poUsePath, poStdErrToStdOut}
+    )
+    let output = process.outputStream.readAll()
+    let exitCode = process.waitForExit()
+    process.close()
+    if exitCode != 0:
+      return (ok: false, detail: &"operator {verb} exit {exitCode}: {tailForDisplay(output)}")
+    result = (ok: true, detail: tailForDisplay(output))
+  except CatchableError as e:
+    result = (ok: false, detail: &"operator {verb} failed to launch: {e.msg}")
+
+proc currentServerOp(): ServerLifecycleOp =
+  ## Queued-or-executing lifecycle op (sloNone when idle).
+  withLock gServerOpLock:
+    if gRunningServerOp != sloNone:
+      return gRunningServerOp
+    return gPendingServerOp
+
+proc requestServerOp*(op: ServerLifecycleOp): tuple[accepted: bool, reason: string] =
+  ## Queue a lifecycle op for the worker. One op at a time; busy = rejected.
+  if op == sloNone:
+    return (accepted: false, reason: "no-op")
+  withLock gServerOpLock:
+    if gRunningServerOp != sloNone or gPendingServerOp != sloNone:
+      let busy = serverOpLabel(
+        if gRunningServerOp != sloNone: gRunningServerOp else: gPendingServerOp)
+      return (accepted: false, reason: &"busy: {busy} in progress")
+    gPendingServerOp = op
+    result = (accepted: true, reason: "")
+
+proc serverStatus*(): ServerStatus =
+  ## Single dispatch path for realm lifecycle state (Server panel + MCP).
+  result.container = gameContainer()
+  result.running = containerRunning()
+  withLock gServerOpLock:
+    result.op = serverOpLabel(
+      if gRunningServerOp != sloNone: gRunningServerOp else: gPendingServerOp)
+    result.lastOp = gLastServerOp
+    result.lastOpOk = gLastServerOpOk
+    result.lastOpDetail = gLastServerOpDetail
+
+proc startServer*(): ServerStatus =
+  ## Queue realm start (operator `up`). Returns fresh status either way.
+  discard requestServerOp(sloStart)
+  result = serverStatus()
+
+proc stopServer*(): ServerStatus =
+  ## Queue realm stop (operator `down` — compose rm, volumes kept).
+  discard requestServerOp(sloStop)
+  result = serverStatus()
+
+proc serverStatusToJson*(s: ServerStatus): JsonNode =
+  ## Serialize lifecycle status for the MCP face.
+  result = %*{
+    "running": s.running,
+    "container": s.container,
+    "op": s.op,
+    "last_op": s.lastOp,
+    "last_op_ok": s.lastOpOk,
+    "last_op_detail": s.lastOpDetail
+  }
+
+proc serverOpWorkerLoop() {.thread.} =
+  ## Runs queued lifecycle ops. Same worker-thread pattern as adminWorkerLoop:
+  ## HTTP handlers stay fast; compose up/down (minutes) happens here.
+  while true:
+    sleep(200)
+    var op = sloNone
+    {.gcsafe.}:
+      withLock gServerOpLock:
+        if gPendingServerOp != sloNone and gRunningServerOp == sloNone:
+          op = gPendingServerOp
+          gPendingServerOp = sloNone
+          gRunningServerOp = op
+    if op == sloNone:
+      continue
+    var opOk = false
+    var opDetail = ""
+    try:
+      {.cast(gcsafe).}:
+        let r = runServerOperator(op)
+        opOk = r.ok
+        opDetail = r.detail
+    except Exception as e:
+      opOk = false
+      opDetail = e.msg
+    {.gcsafe.}:
+      withLock gServerOpLock:
+        gRunningServerOp = sloNone
+        gLastServerOp = serverOpLabel(op)
+        gLastServerOpOk = opOk
+        gLastServerOpDetail = opDetail
+
+proc startServerOpWorker() =
+  ## Spawn the realm lifecycle worker (call once from main before serve).
+  createThread(gServerOpWorkerThread, serverOpWorkerLoop)
+
+# ---------------------------------------------------------------------------
+# Bot seat lifecycle: per-seat Start/Stop (roster buttons + MCP)
+# ---------------------------------------------------------------------------
+
+proc armyRoot(): string =
+  ## wow-shadow-army repo root holding the Makefile (SYSTEM_ARMY_DIR wins;
+  ## default cwd — `make system` runs from the repo root).
+  let env = getEnv("SYSTEM_ARMY_DIR", "")
+  if env.len > 0:
+    return absolutePath(env)
+  result = getCurrentDir()
+
+proc seatMakeTarget*(name: string): string =
+  ## Makefile seat target for a cast bot, or "" (human / unknown).
+  for seat in SeatMakeTargets:
+    if seat.name == name:
+      return seat.target
+  result = ""
+
+proc runShell(cmd: string): tuple[ok: bool, detail: string] =
+  ## Run one shell line, capture combined output (short admin ops only).
+  try:
+    let process = startProcess(
+      "sh", args = ["-c", cmd], options = {poUsePath, poStdErrToStdOut})
+    let output = process.outputStream.readAll()
+    let exitCode = process.waitForExit()
+    process.close()
+    result = (ok: exitCode == 0, detail: tailForDisplay(output, 200))
+  except CatchableError as e:
+    result = (ok: false, detail: e.msg)
+
+proc startBotSeat*(name: string): JsonNode =
+  ## Launch one cast bot seat: detached `make <seat>-bot` appending to its
+  ## local_data log (the documented nohup pattern). Ready when the seat's
+  ## nim_control socket (41114+slot) starts listening — the roster poll
+  ## flips the button on its own.
+  let target = seatMakeTarget(name)
+  if target.len == 0:
+    return %*{"ok": false, "name": name, "action": "start",
+              "detail": "not a launchable bot seat"}
+  let port = seatControlPort(name)
+  if isTcpPortOpen("127.0.0.1", port):
+    return %*{"ok": true, "name": name, "action": "start",
+              "detail": &"already running (ctrl :{port})"}
+  let root = armyRoot()
+  if not fileExists(root / "Makefile"):
+    return %*{"ok": false, "name": name, "action": "start",
+              "detail": &"Makefile missing in {root} — set SYSTEM_ARMY_DIR"}
+  let log = root / "local_data" / (target & ".log")
+  # The ( … & ) subshell orphans the seat to init immediately — without it the
+  # launching shell lives as make's parent holding our output pipe open, which
+  # blocks the HTTP worker for the bot's entire lifetime.
+  let r = runShell(
+    &"mkdir -p '{root}/local_data' && ( setsid nohup make -C '{root}' {target} >> '{log}' 2>&1 < /dev/null & )")
+  if not r.ok:
+    return %*{"ok": false, "name": name, "action": "start", "detail": r.detail}
+  result = %*{"ok": true, "name": name, "action": "start",
+              "detail": &"launched make {target} (log: local_data/{target}.log; ctrl :{port} when ready)"}
+
+proc stopBotSeat*(name: string): JsonNode =
+  ## Stop one cast bot seat: TERM whoever holds the seat's nim_control port.
+  ## The reference_player logs out; its parent make/nohup exits with it.
+  let target = seatMakeTarget(name)
+  if target.len == 0:
+    return %*{"ok": false, "name": name, "action": "stop",
+              "detail": "not a launchable bot seat"}
+  let port = seatControlPort(name)
+  if not isTcpPortOpen("127.0.0.1", port):
+    return %*{"ok": true, "name": name, "action": "stop",
+              "detail": "already stopped (no ctrl listener)"}
+  let r = runShell(&"lsof -ti tcp:{port} | xargs -r kill")
+  if not r.ok:
+    return %*{"ok": false, "name": name, "action": "stop", "detail": r.detail}
+  result = %*{"ok": true, "name": name, "action": "stop",
+              "detail": &"sent TERM to ctrl :{port} holder"}
+
+# ---------------------------------------------------------------------------
 # SOAP GM command client (inbound: System → addon via announce)
 # ---------------------------------------------------------------------------
 
@@ -1306,6 +1592,60 @@ proc renderReloadResult*(node: JsonNode): string =
     let hint = node{"hint"}.getStr("timeout")
     result = &"""<span class="reload-timeout">timeout — {escapeHtml(hint)}</span>"""
 
+proc renderServerPanel*(s: ServerStatus): string =
+  ## htmx partial: inner content of the Server panel (status pill + lifecycle
+  ## buttons). Rendered whether the realm is up, down, or mid-op — this is
+  ## what keeps the dashboard useful with the server offline.
+  var pill: string
+  if s.op == "start":
+    pill = """<span class="status busy">Starting…</span>"""
+  elif s.op == "stop":
+    pill = """<span class="status busy">Stopping…</span>"""
+  elif s.running:
+    pill = """<span class="status alive">Running</span>"""
+  else:
+    pill = """<span class="status offline">Stopped</span>"""
+
+  var action: string
+  if s.op.len > 0:
+    let verb = if s.op == "start": "compose up (image + db healthcheck)" else: "compose stop/rm"
+    action = &"""<span class="meta">operator {escapeHtml(s.op)} running — {escapeHtml(verb)}; this can take a few minutes</span>"""
+  elif s.running:
+    action = &"""
+      <button class="admin danger"
+              hx-post="/server/stop"
+              hx-target="#server-panel"
+              hx-swap="innerHTML"
+              hx-confirm="Stop the realm? (compose stop/rm — characters and accounts persist)">
+        Stop server
+      </button>"""
+  else:
+    action = &"""
+      <button class="reload"
+              hx-post="/server/start"
+              hx-target="#server-panel"
+              hx-swap="innerHTML">
+        Start server
+      </button>"""
+
+  var lastLine = ""
+  if s.lastOp.len > 0:
+    let cls = if s.lastOpOk: "admin-ok" else: "admin-err"
+    let mark = if s.lastOpOk: "ok" else: "FAIL"
+    lastLine = &"""
+      <div class="server-last {cls}" title="{escapeHtml(s.lastOpDetail)}">
+        last {escapeHtml(s.lastOp)}: {mark}
+      </div>"""
+
+  result = &"""
+    <div class="server-line">
+      <span class="server-label">Realm</span>
+      {pill}
+      <span class="meta server-container">{escapeHtml(s.container)}</span>
+      <span class="server-action">{action}</span>
+    </div>
+    {lastLine}"""
+
 proc renderXpCell*(s: Shadow): string =
   ## Level progress cell: bar + "cur/need (N to go)".
   if s.nextLevelXp <= 0:
@@ -1372,20 +1712,41 @@ proc renderPosCell*(s: Shadow): string =
   result = &"""<span class="pos" title="{escapeHtml(title)}">{escapeHtml(label)}</span>"""
 
 proc renderSeatCell*(s: Shadow): string =
-  ## Realm online + nim_control seat socket for bot cast.
+  ## Realm connection as a terse On/Off. Port/ctrl detail lives in the
+  ## tooltip only — it blew out table rows and duplicated the Bot column.
   let net = if s.online: "On" else: "Off"
   let netCls = if s.online: "online" else: "offline"
-  if s.controlPort <= 0:
-    return &"""<span class="seat-net {netCls}">{escapeHtml(net)}</span><span class="xp-muted"> · human</span>"""
-  let ctrl = if s.controlUp: "ctrl" else: "no-ctrl"
-  let ctrlCls = if s.controlUp: "ctrl-up" else: "ctrl-down"
-  let title = if s.controlUp:
+  let title =
+    if s.controlPort <= 0:
+      "human seat"
+    elif s.controlUp:
       &"nim_control listening on 127.0.0.1:{s.controlPort}"
     else:
-      &"no listener on 127.0.0.1:{s.controlPort}"
-  result = &"""
-    <span class="seat-net {netCls}">{escapeHtml(net)}</span>
-    <span class="seat-ctrl {ctrlCls}" title="{escapeHtml(title)}"> · {escapeHtml(ctrl)} :{s.controlPort}</span>"""
+      &"seat slot port {s.controlPort} (not listening)"
+  result = &"""<span class="seat-net {netCls}" title="{escapeHtml(title)}">{escapeHtml(net)}</span>"""
+
+proc renderBotCell*(s: Shadow): string =
+  ## Per-seat Start/Stop button for launchable cast bots ("—" otherwise).
+  ## controlUp is the truth signal: socket up = seat process alive.
+  if seatMakeTarget(s.name).len == 0:
+    return """<span class="xp-muted">—</span>"""
+  if s.controlUp:
+    result = &"""
+      <button class="bot-btn stop"
+              hx-post="/bots/stop?name={escapeHtml(s.name)}"
+              hx-target="#roster"
+              hx-swap="innerHTML"
+              hx-confirm="Stop {escapeHtml(s.name)}'s seat? (client logs out)">
+        Stop
+      </button>"""
+  else:
+    result = &"""
+      <button class="bot-btn start"
+              hx-post="/bots/start?name={escapeHtml(s.name)}"
+              hx-target="#roster"
+              hx-swap="innerHTML">
+        Start
+      </button>"""
 
 proc armySummary*(shadows: seq[Shadow]): string =
   ## One-line cast health strip for the roster panel head.
@@ -1433,16 +1794,23 @@ proc renderRosterRows*(shadows: seq[Shadow]): string =
         <td class="gold">{escapeHtml(s.gold)}</td>
         <td><span class="status {escapeHtml(life)}">{escapeHtml(lifeText)}{escapeHtml(connNote)}</span></td>
         <td class="seat">{renderSeatCell(s)}</td>
+        <td class="bot-cell">{renderBotCell(s)}</td>
       </tr>
 """)
+
+proc renderRosterOfflineRow*(): string =
+  ## Roster body when the realm is down: friendly nudge, not a red error.
+  result = """<tr><td colspan="11" class="empty">Realm is offline — start it from the <a href="/admin">Admin</a> tab and the roster will fill in here.</td></tr>"""
 
 proc renderRosterPage*(
     shadows: seq[Shadow],
     events: seq[AddonEvent],
-    includeFoundation = false
+    includeFoundation = false,
+    rosterOffline = false
 ): string =
   ## Full Status Window (htmx + auto-poll): roster + addon events.
-  let rows = renderRosterRows(shadows)
+  ## Realm lifecycle controls live on the Admin tab (renderAdminPage).
+  let rows = if rosterOffline: renderRosterOfflineRow() else: renderRosterRows(shadows)
   let eventRows = renderEventRows(events)
   let summary = armySummary(shadows)
   let stamped = now().format("yyyy-MM-dd HH:mm:ss")
@@ -1496,7 +1864,7 @@ proc renderRosterPage*(
       color: var(--muted);
       font-size: 0.9rem;
     }}
-    main {{ padding: 1.5rem; max-width: 1100px; margin: 0 auto; }}
+    main {{ padding: 1.5rem; max-width: 1280px; margin: 0 auto; }}
     .panel {{
       background: var(--panel);
       border: 1px solid var(--border);
@@ -1504,6 +1872,7 @@ proc renderRosterPage*(
       overflow: hidden;
       margin-bottom: 1.25rem;
     }}
+    .table-scroll {{ overflow-x: auto; }}
     .panel-head {{
       display: flex;
       justify-content: space-between;
@@ -1524,9 +1893,9 @@ proc renderRosterPage*(
     table {{ width: 100%; border-collapse: collapse; }}
     th, td {{
       text-align: left;
-      padding: 0.65rem 1rem;
+      padding: 0.55rem 0.7rem;
       border-bottom: 1px solid var(--border);
-      font-size: 0.95rem;
+      font-size: 0.9rem;
     }}
     th {{ color: var(--muted); font-weight: 600; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.04em; }}
     tr:last-child td {{ border-bottom: none; }}
@@ -1536,8 +1905,8 @@ proc renderRosterPage*(
     td.zone {{ color: var(--text); font-size: 0.9rem; max-width: 10rem; }}
     td.conn {{ color: var(--muted); font-size: 0.8rem; font-variant-numeric: tabular-nums; }}
     td.payload {{ color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.85rem; }}
-    td.xp-cell {{ min-width: 11rem; }}
-    td.vitals-cell {{ min-width: 9.5rem; }}
+    td.xp-cell {{ min-width: 9.5rem; }}
+    td.vitals-cell {{ min-width: 8rem; }}
     .xp-bar {{
       height: 6px;
       background: #21262d;
@@ -1588,6 +1957,18 @@ proc renderRosterPage*(
       white-space: nowrap;
     }}
     td.seat {{ font-size: 0.8rem; white-space: nowrap; }}
+    td.bot-cell {{ white-space: nowrap; }}
+    .bot-btn {{
+      border: none;
+      border-radius: 5px;
+      padding: 0.2rem 0.55rem;
+      font-size: 0.72rem;
+      font-weight: 600;
+      cursor: pointer;
+    }}
+    .bot-btn.start {{ background: var(--accent); color: #0d1117; }}
+    .bot-btn.stop {{ background: color-mix(in srgb, var(--dead) 85%, #000); color: #fff; }}
+    .bot-btn:hover {{ filter: brightness(1.1); }}
     .seat-net.online {{ color: var(--alive); font-weight: 600; }}
     .seat-net.offline {{ color: var(--offline); }}
     .seat-ctrl.ctrl-up {{ color: var(--accent); }}
@@ -1619,6 +2000,20 @@ proc renderRosterPage*(
     }}
     .status.online, .status.alive {{ background: color-mix(in srgb, var(--alive) 20%, transparent); color: var(--alive); }}
     .status.offline {{ background: color-mix(in srgb, var(--offline) 25%, transparent); color: var(--offline); }}
+    .status.busy {{ background: color-mix(in srgb, var(--accent) 20%, transparent); color: var(--accent); }}
+    .server-line {{
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+      flex-wrap: wrap;
+    }}
+    .server-label {{ font-weight: 600; font-size: 0.9rem; }}
+    .server-container {{
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 0.75rem;
+    }}
+    .server-action {{ margin-left: auto; }}
+    .server-last {{ margin-top: 0.5rem; font-size: 0.8rem; }}
     .status.ghost {{ background: color-mix(in srgb, var(--ghost) 22%, transparent); color: var(--ghost); }}
     .status.dead {{ background: color-mix(in srgb, var(--dead) 20%, transparent); color: var(--dead); }}
     .kind {{
@@ -1721,6 +2116,7 @@ proc renderRosterPage*(
           <span class="meta" id="stamp">as of {escapeHtml(stamped)} · refresh every {PollSeconds}s</span>
         </div>
       </div>
+      <div class="table-scroll">
       <table>
         <thead>
           <tr>
@@ -1734,6 +2130,7 @@ proc renderRosterPage*(
             <th>Gold</th>
             <th>Life</th>
             <th>Seat</th>
+            <th>Bot</th>
           </tr>
         </thead>
         <tbody id="roster"
@@ -1743,6 +2140,7 @@ proc renderRosterPage*(
 {rows}
         </tbody>
       </table>
+      </div>
     </div>
     <script>
       window.sysSetFoundation = function(on) {{
@@ -1769,6 +2167,7 @@ proc renderRosterPage*(
           <span class="meta">live tail · every {PollSeconds}s</span>
         </div>
       </div>
+      <div class="table-scroll">
       <table>
         <thead>
           <tr>
@@ -1785,14 +2184,16 @@ proc renderRosterPage*(
 {eventRows}
         </tbody>
       </table>
+      </div>
     </div>
   </main>
   <footer>
     One dispatch path per capability:
     <code>listShadows()</code>, <code>recentEvents()</code>, <code>reloadAddon()</code>,
-    <code>respawnShadowArmy()</code>
+    <code>respawnShadowArmy()</code>, <code>serverStatus()</code>,
+    <code>startServer()</code>/<code>stopServer()</code>
     feed both faces. MCP: <code>POST /mcp</code>.
-    Write path: SOAP <code>announce</code> + admin revive/tele (local ops only).
+    Write path: SOAP <code>announce</code> + admin revive/tele + realm lifecycle (local ops only).
   </footer>
 </body>
 </html>
@@ -1811,10 +2212,11 @@ proc renderAdminResult*(r: AdminActionResult): string =
     <div class="admin-steps">{body}</div>
 """
 
-proc renderAdminPage*(): string =
-  ## Admin tab: ops escape hatches (not fair-play policy).
+proc renderAdminPage*(server: ServerStatus): string =
+  ## Admin tab: realm lifecycle + ops escape hatches (not fair-play policy).
   let castList = ShadowArmyCast.join(", ")
   let stamped = now().format("yyyy-MM-dd HH:mm:ss")
+  let serverPanel = renderServerPanel(server)
   result = &"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1865,6 +2267,25 @@ proc renderAdminPage*(): string =
       padding: 0.45rem 0.9rem; font-size: 0.85rem; font-weight: 600; cursor: pointer;
     }}
     button.admin:hover {{ filter: brightness(1.08); }}
+    button.reload {{
+      background: var(--accent); color: #0d1117; border: none; border-radius: 6px;
+      padding: 0.45rem 0.9rem; font-size: 0.85rem; font-weight: 600; cursor: pointer;
+    }}
+    button.reload:hover {{ filter: brightness(1.08); }}
+    .status {{
+      display: inline-block; padding: 0.15rem 0.5rem; border-radius: 999px;
+      font-size: 0.75rem; font-weight: 600;
+    }}
+    .status.alive {{ background: color-mix(in srgb, var(--loaded) 20%, transparent); color: var(--loaded); }}
+    .status.offline {{ background: color-mix(in srgb, var(--muted) 25%, transparent); color: var(--muted); }}
+    .status.busy {{ background: color-mix(in srgb, var(--accent) 20%, transparent); color: var(--accent); }}
+    .server-line {{ display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap; }}
+    .server-label {{ font-weight: 600; font-size: 0.9rem; }}
+    .server-container {{
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.75rem;
+    }}
+    .server-action {{ margin-left: auto; }}
+    .server-last {{ margin-top: 0.5rem; font-size: 0.8rem; }}
     .admin-ok {{ color: var(--loaded); font-size: 0.85rem; }}
     .admin-err {{ color: var(--err); font-size: 0.85rem; }}
     .admin-steps {{
@@ -1888,6 +2309,19 @@ proc renderAdminPage*(): string =
     </nav>
   </header>
   <main>
+    <div class="panel">
+      <div class="panel-head">
+        <h2>Realm server</h2>
+        <span class="meta">operator up/down · characters and accounts persist across stop</span>
+      </div>
+      <div class="panel-body"
+           id="server-panel"
+           hx-get="/server"
+           hx-trigger="every {PollSeconds}s"
+           hx-swap="innerHTML">
+{serverPanel}
+      </div>
+    </div>
     <div class="panel">
       <div class="panel-head">
         <h2>Respawn shadow army</h2>
@@ -1974,22 +2408,36 @@ proc queryWantsAll*(request: Request): bool =
   result = v == "1" or v == "true" or v == "yes"
 
 proc indexHandler(request: Request) {.gcsafe.} =
-  ## GET / — full Status Window (roster + addon events).
+  ## GET / — full Status Window (server panel + roster + addon events).
+  ## Renders with the realm DOWN too: roster degrades to an offline note and
+  ## the Server panel offers Start (the whole point of the panel).
   try:
-    var shadows: seq[Shadow]
+    var shadows: seq[Shadow] = @[]
     var events: seq[AddonEvent]
+    var status: ServerStatus
+    var rosterOffline = false
     let showAll = queryWantsAll(request)
     {.gcsafe.}:
-      shadows = filterShadows(listShadows(), includeFoundation = showAll)
+      status = serverStatus()
+      if status.running:
+        try:
+          shadows = filterShadows(listShadows(), includeFoundation = showAll)
+        except CatchableError:
+          # Container up but DB not answering yet (mid-boot): offline view.
+          rosterOffline = true
+      else:
+        rosterOffline = true
       events = recentEvents(limit = 30)
     request.respond(200, htmlHeaders(),
-      renderRosterPage(shadows, events, includeFoundation = showAll))
+      renderRosterPage(shadows, events,
+        includeFoundation = showAll, rosterOffline = rosterOffline))
   except Exception as e:
     request.respond(500, htmlHeaders(),
       &"<!DOCTYPE html><html><body><h1>Roster error</h1><pre>{escapeHtml(e.msg)}</pre></body></html>")
 
 proc rosterPartialHandler(request: Request) {.gcsafe.} =
   ## GET /roster — htmx fragment (table rows only). ?all=1 includes foundation.
+  ## Realm down / DB unreachable → friendly offline row, not a red error.
   try:
     var shadows: seq[Shadow]
     let showAll = queryWantsAll(request)
@@ -1997,8 +2445,71 @@ proc rosterPartialHandler(request: Request) {.gcsafe.} =
       shadows = filterShadows(listShadows(), includeFoundation = showAll)
     request.respond(200, htmlHeaders(), renderRosterRows(shadows))
   except Exception as e:
+    var offline = false
+    {.gcsafe.}:
+      offline = not serverStatus().running
+    if offline:
+      request.respond(200, htmlHeaders(), renderRosterOfflineRow())
+    else:
+      request.respond(500, htmlHeaders(),
+        &"""<tr><td colspan="11" class="empty">error: {escapeHtml(e.msg)}</td></tr>""")
+
+proc serverPartialHandler(request: Request) {.gcsafe.} =
+  ## GET /server — htmx fragment: Server panel content (status + buttons).
+  try:
+    var status: ServerStatus
+    {.gcsafe.}:
+      status = serverStatus()
+    request.respond(200, htmlHeaders(), renderServerPanel(status))
+  except Exception as e:
     request.respond(500, htmlHeaders(),
-      &"""<tr><td colspan="11" class="empty">error: {escapeHtml(e.msg)}</td></tr>""")
+      &"""<span class="admin-err">server status error: {escapeHtml(e.msg)}</span>""")
+
+proc serverStartHandler(request: Request) {.gcsafe.} =
+  ## POST /server/start — queue operator `up`; returns the refreshed panel.
+  try:
+    var status: ServerStatus
+    {.gcsafe.}:
+      status = startServer()
+    request.respond(200, htmlHeaders(), renderServerPanel(status))
+  except Exception as e:
+    request.respond(500, htmlHeaders(),
+      &"""<span class="admin-err">start failed: {escapeHtml(e.msg)}</span>""")
+
+proc serverStopHandler(request: Request) {.gcsafe.} =
+  ## POST /server/stop — queue operator `down`; returns the refreshed panel.
+  try:
+    var status: ServerStatus
+    {.gcsafe.}:
+      status = stopServer()
+    request.respond(200, htmlHeaders(), renderServerPanel(status))
+  except Exception as e:
+    request.respond(500, htmlHeaders(),
+      &"""<span class="admin-err">stop failed: {escapeHtml(e.msg)}</span>""")
+
+proc respondRosterRows(request: Request) {.gcsafe.} =
+  ## Shared bot-handler response: fresh roster rows (offline row on failure).
+  try:
+    var shadows: seq[Shadow]
+    {.gcsafe.}:
+      shadows = filterShadows(listShadows())
+    request.respond(200, htmlHeaders(), renderRosterRows(shadows))
+  except CatchableError:
+    request.respond(200, htmlHeaders(), renderRosterOfflineRow())
+
+proc botStartHandler(request: Request) {.gcsafe.} =
+  ## POST /bots/start?name=<cast> — launch that seat, return roster rows.
+  let name = request.queryParams["name"]
+  {.gcsafe.}:
+    discard startBotSeat(name)
+  respondRosterRows(request)
+
+proc botStopHandler(request: Request) {.gcsafe.} =
+  ## POST /bots/stop?name=<cast> — stop that seat, return roster rows.
+  let name = request.queryParams["name"]
+  {.gcsafe.}:
+    discard stopBotSeat(name)
+  respondRosterRows(request)
 
 proc eventsPartialHandler(request: Request) {.gcsafe.} =
   ## GET /events — htmx fragment (addon event rows).
@@ -2023,9 +2534,12 @@ proc reloadHandler(request: Request) {.gcsafe.} =
       &"""<span class="reload-timeout">error: {escapeHtml(e.msg)}</span>""")
 
 proc adminPageHandler(request: Request) {.gcsafe.} =
-  ## GET /admin — Admin tab (ops escape hatches).
+  ## GET /admin — Admin tab (realm lifecycle + ops escape hatches).
   try:
-    request.respond(200, htmlHeaders(), renderAdminPage())
+    var status: ServerStatus
+    {.gcsafe.}:
+      status = serverStatus()
+    request.respond(200, htmlHeaders(), renderAdminPage(status))
   except Exception as e:
     request.respond(500, htmlHeaders(),
       &"<!DOCTYPE html><html><body><h1>Admin error</h1><pre>{escapeHtml(e.msg)}</pre></body></html>")
@@ -2100,6 +2614,11 @@ proc serverInfoHandler(request: Request) {.gcsafe.} =
         "admin": "/admin",
         "roster_partial": "/roster",
         "events_partial": "/events",
+        "server_partial": "/server",
+        "server_start": "/server/start",
+        "server_stop": "/server/stop",
+        "bot_start": "/bots/start?name=<cast>",
+        "bot_stop": "/bots/stop?name=<cast>",
         "reload": "/reload",
         "respawn_shadow_army": "/admin/respawn-shadow-army",
         "tele_party_to_murist": "/admin/tele-party-to-murist",
@@ -2108,9 +2627,11 @@ proc serverInfoHandler(request: Request) {.gcsafe.} =
       },
       "tools": [
         "list_shadows", "addon_events", "reload_addon", "send_announce",
-        "respawn_shadow_army", "tele_party_to_murist"
+        "respawn_shadow_army", "tele_party_to_murist",
+        "server_status", "start_server", "stop_server",
+        "start_bot", "stop_bot"
       ],
-      "write_scope": "SOAP announce + admin revive/tele/tele-to-murist for fixed cast (local ops)"
+      "write_scope": "SOAP announce + admin revive/tele/tele-to-murist for fixed cast + realm lifecycle up/down + bot seat start/stop (local ops)"
     }
   request.respond(200, jsonHeaders(), $info)
 
@@ -2298,6 +2819,127 @@ proc registerMcpTools(server: McpServer) =
       isError: not r.ok
     )
 
+  let serverStatusTool = McpTool(
+    name: "server_status",
+    description: "Realm lifecycle state: coworld-game container up/down, any start/stop op in progress, and the last op's outcome. Read-only.",
+    inputSchema: %*{
+      "type": "object",
+      "properties": newJObject(),
+      "additionalProperties": false,
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    }
+  )
+
+  proc serverStatusMcpHandler(arguments: JsonNode): ToolResult {.gcsafe.} =
+    ## Same dispatch as the dashboard Server panel.
+    discard arguments
+    var s: ServerStatus
+    {.gcsafe.}:
+      s = serverStatus()
+    let payload = serverStatusToJson(s)
+    result = ToolResult(
+      content: @[textContent($payload)],
+      structuredContent: some(payload),
+      isError: false
+    )
+
+  let startServerTool = McpTool(
+    name: "start_server",
+    description: "Queue realm start (upstream operator `up` — compose up + db healthcheck; can take minutes). Returns immediately with status; poll server_status for completion.",
+    inputSchema: %*{
+      "type": "object",
+      "properties": newJObject(),
+      "additionalProperties": false,
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    }
+  )
+
+  proc startServerMcpHandler(arguments: JsonNode): ToolResult {.gcsafe.} =
+    ## Same dispatch as the dashboard Start server button.
+    discard arguments
+    var s: ServerStatus
+    {.gcsafe.}:
+      s = startServer()
+    let payload = serverStatusToJson(s)
+    result = ToolResult(
+      content: @[textContent($payload)],
+      structuredContent: some(payload),
+      isError: false
+    )
+
+  let stopServerTool = McpTool(
+    name: "stop_server",
+    description: "Queue realm stop (upstream operator `down` — compose stop/rm; characters and accounts persist). Returns immediately with status; poll server_status for completion.",
+    inputSchema: %*{
+      "type": "object",
+      "properties": newJObject(),
+      "additionalProperties": false,
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    }
+  )
+
+  proc stopServerMcpHandler(arguments: JsonNode): ToolResult {.gcsafe.} =
+    ## Same dispatch as the dashboard Stop server button.
+    discard arguments
+    var s: ServerStatus
+    {.gcsafe.}:
+      s = stopServer()
+    let payload = serverStatusToJson(s)
+    result = ToolResult(
+      content: @[textContent($payload)],
+      structuredContent: some(payload),
+      isError: false
+    )
+
+  let botNameSchema = %*{
+    "type": "object",
+    "properties": {
+      "name": {
+        "type": "string",
+        "description": "Cast bot seat name: Shadowfel, Igris, Tusk, or Beru"
+      }
+    },
+    "required": ["name"],
+    "additionalProperties": false,
+    "$schema": "http://json-schema.org/draft-07/schema#"
+  }
+
+  let startBotTool = McpTool(
+    name: "start_bot",
+    description: "Launch one cast bot seat (detached `make <seat>-bot`). Seat is ready when its nim_control socket (41114+slot) listens; check list_shadows control_up.",
+    inputSchema: botNameSchema
+  )
+
+  proc startBotMcpHandler(arguments: JsonNode): ToolResult {.gcsafe.} =
+    ## Same dispatch as the roster Start button.
+    let name = if arguments != nil: arguments{"name"}.getStr("") else: ""
+    var payload: JsonNode
+    {.gcsafe.}:
+      payload = startBotSeat(name)
+    result = ToolResult(
+      content: @[textContent($payload)],
+      structuredContent: some(payload),
+      isError: not payload{"ok"}.getBool(false)
+    )
+
+  let stopBotTool = McpTool(
+    name: "stop_bot",
+    description: "Stop one cast bot seat (TERM the nim_control socket holder; the client logs out).",
+    inputSchema: botNameSchema
+  )
+
+  proc stopBotMcpHandler(arguments: JsonNode): ToolResult {.gcsafe.} =
+    ## Same dispatch as the roster Stop button.
+    let name = if arguments != nil: arguments{"name"}.getStr("") else: ""
+    var payload: JsonNode
+    {.gcsafe.}:
+      payload = stopBotSeat(name)
+    result = ToolResult(
+      content: @[textContent($payload)],
+      structuredContent: some(payload),
+      isError: not payload{"ok"}.getBool(false)
+    )
+
   # registerRichTool: plain registerTool only surfaces getStr() on JsonNode
   # (arrays become empty text). Monky uses the rich path for the same reason.
   server.registerRichTool(listTool, listShadowsHandler)
@@ -2306,6 +2948,11 @@ proc registerMcpTools(server: McpServer) =
   server.registerRichTool(announceTool, sendAnnounceHandler)
   server.registerRichTool(respawnTool, respawnShadowArmyMcpHandler)
   server.registerRichTool(telePartyTool, telePartyToMuristMcpHandler)
+  server.registerRichTool(serverStatusTool, serverStatusMcpHandler)
+  server.registerRichTool(startServerTool, startServerMcpHandler)
+  server.registerRichTool(stopServerTool, stopServerMcpHandler)
+  server.registerRichTool(startBotTool, startBotMcpHandler)
+  server.registerRichTool(stopBotTool, stopBotMcpHandler)
 
 proc main() =
   ## Boot The System: Chat.log tailer + one mummy server (dashboard + MCP).
@@ -2313,12 +2960,18 @@ proc main() =
   registerMcpTools(gMcpServer)
   startChatLogTailer()
   startAdminWorker()
+  startServerOpWorker()
 
   var router: Router
   router.get("/", indexHandler)
   router.get("/admin", adminPageHandler)
   router.get("/roster", rosterPartialHandler)
   router.get("/events", eventsPartialHandler)
+  router.get("/server", serverPartialHandler)
+  router.post("/server/start", serverStartHandler)
+  router.post("/server/stop", serverStopHandler)
+  router.post("/bots/start", botStartHandler)
+  router.post("/bots/stop", botStopHandler)
   router.post("/reload", reloadHandler)
   router.post("/admin/respawn-shadow-army", respawnShadowArmyHandler)
   router.post("/admin/tele-party-to-murist", telePartyToMuristHandler)
@@ -2331,14 +2984,17 @@ proc main() =
   echo &"  Status:      GET  http://127.0.0.1:{HttpPort}/"
   echo &"  Admin:       GET  http://127.0.0.1:{HttpPort}/admin"
   echo &"  Events:      GET  http://127.0.0.1:{HttpPort}/events"
+  echo &"  Server:      GET  http://127.0.0.1:{HttpPort}/server (POST /server/start /server/stop)"
   echo &"  Reload:      POST http://127.0.0.1:{HttpPort}/reload"
   echo &"  Respawn:     POST http://127.0.0.1:{HttpPort}/admin/respawn-shadow-army"
   echo &"  Tele party:  POST http://127.0.0.1:{HttpPort}/admin/tele-party-to-murist"
   echo &"  MCP:         POST http://127.0.0.1:{HttpPort}/mcp"
   echo &"  container:   {gameContainer()} (SYSTEM_MYSQL_CONTAINER to override)"
   echo &"  Chat.log:    {chatLogPath()} (SYSTEM_CHAT_LOG to override)"
+  echo &"  upstream:    {upstreamDir()} (SYSTEM_UPSTREAM_DIR to override)"
   echo "  DB access:   docker exec + mariadb SELECT (read-only)"
   echo "  SOAP write:  announce + admin revive/tele (SYSTEM_SOAP_* )"
+  echo "  lifecycle:   operator up/down via uv (async worker; Server panel)"
   server.serve(Port(HttpPort), "127.0.0.1")
 
 when isMainModule:

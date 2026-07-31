@@ -78,12 +78,13 @@ test-nim:
 	fi
 
 # The System: mummy dashboard + MCPort on :7777 (see system/README.md).
-# Needs a running realm for live roster data (docker exec → mariadb SELECT).
+# Works with the realm up or down; Admin tab starts/stops it via the operator.
+# SYSTEM_UPSTREAM_DIR pins the operator checkout explicitly (no cwd guessing).
 system:
 	@if command -v nim >/dev/null 2>&1; then \
-		nim r system/system_server.nim; \
+		SYSTEM_UPSTREAM_DIR="$${SYSTEM_UPSTREAM_DIR:-$(UPSTREAM)}" nim r system/system_server.nim; \
 	elif [ -f flake.nix ] || [ -f shell.nix ]; then \
-		nix develop --command nim r system/system_server.nim; \
+		SYSTEM_UPSTREAM_DIR="$${SYSTEM_UPSTREAM_DIR:-$(UPSTREAM)}" nix develop --command nim r system/system_server.nim; \
 	else \
 		echo "error: nim not on PATH and no flake/shell.nix fallback" >&2; exit 1; \
 	fi

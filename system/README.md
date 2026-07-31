@@ -4,10 +4,15 @@ Management server for the wow-shadow-army: one Nim binary, two faces.
 
 | Face | Path | Role |
 |---|---|---|
-| HTTP dashboard | `GET /` | htmx Status tab (roster + addon events) |
-| Admin tab | `GET /admin` | ops escape hatches (GM revive/tele cast) |
+| HTTP dashboard | `GET /` | htmx Status tab (roster + addon events; offline-safe) |
+| Admin tab | `GET /admin` | realm Server panel (Start/Stop) + ops escape hatches |
 | Roster partial | `GET /roster` | htmx fragment (roster table rows) |
 | Events partial | `GET /events` | htmx fragment (addon event rows) |
+| Server partial | `GET /server` | htmx fragment (realm status + Start/Stop buttons) |
+| Start realm | `POST /server/start` | queue upstream operator `up` (async worker) |
+| Stop realm | `POST /server/stop` | queue upstream operator `down` (volumes persist) |
+| Start bot | `POST /bots/start?name=<cast>` | detached `make <seat>-bot` (roster Bot column) |
+| Stop bot | `POST /bots/stop?name=<cast>` | TERM the seat's nim_control holder |
 | Reload | `POST /reload` | SOAP `announce <SYS> reload` + wait for `<SA> loaded` |
 | Respawn army | `POST /admin/respawn-shadow-army` | SOAP revive + tele Deathknell for bot cast |
 | Tele party → Murist | `POST /admin/tele-party-to-murist` | Pin `game_tele` to Murist + tele cast |
@@ -26,6 +31,11 @@ MCP tools (same dispatch procs as the dashboard):
 | `send_announce` | `announceInGame(text)` | broadcast system message |
 | `respawn_shadow_army` | `respawnShadowArmy()` | admin revive + tele Deathknell (ops only) |
 | `tele_party_to_murist` | `telePartyToMurist()` | pin meet tele to Murist + tele cast (ops only) |
+| `server_status` | `serverStatus()` | realm container up/down + lifecycle op state |
+| `start_server` | `startServer()` | queue operator `up`; poll `server_status` for done |
+| `stop_server` | `stopServer()` | queue operator `down`; characters/accounts persist |
+| `start_bot` | `startBotSeat(name)` | launch a cast seat; ready when `control_up` flips |
+| `stop_bot` | `stopBotSeat(name)` | stop a cast seat (client logs out) |
 
 Design source: `coworld-playbook/games/solo-leveling.md` → **The System (management server)**.
 
@@ -41,7 +51,13 @@ nim r system/system_server.nim
 
 Listens on **http://127.0.0.1:7777** (chosen to avoid realmd 3724, healthz 8080, world 8085, MariaDB 3307).
 
-Requires a running local realm (`make start-server`) so the game container can answer SQL / SOAP.
+Works with the realm **up or down**: when the game container is stopped the
+Status roster degrades to an offline note pointing at the Admin tab, where the
+Server panel offers **Start server** (operator `up` — same path as
+`make start-server`, run by an async worker so the page never blocks). Human
+workflow: run the client + this dashboard; realm lifecycle goes through the
+dashboard. `make system` passes the Makefile's `UPSTREAM` as
+`SYSTEM_UPSTREAM_DIR` so the operator checkout never depends on cwd guessing.
 
 Optional env:
 
@@ -49,6 +65,7 @@ Optional env:
 |---|---|---|
 | `SYSTEM_MYSQL_CONTAINER` | `coworld-vmangos-coworld-game-1` | docker container for MariaDB + SOAP IP |
 | `SYSTEM_CHAT_LOG` | `../coworld-vanilla-wow/local_data/coworld-run/logs/Chat.log` (absolute from cwd) | VMaNGOS Chat.log path to tail |
+| `SYSTEM_UPSTREAM_DIR` | `../coworld-vanilla-wow` (absolute from cwd) | upstream checkout holding the compose operator |
 | `SYSTEM_SOAP_URL` | `http://<game-bridge-ip>:7878/` (via `docker inspect`) | gsoap endpoint |
 | `SYSTEM_SOAP_USER` | `system` | SOAP Basic auth user |
 | `SYSTEM_SOAP_PASS` | `shadowsoap` | SOAP Basic auth password |
@@ -59,6 +76,8 @@ Open http://127.0.0.1:7777/
 
 Tabs in the header: **Status** | **Admin**.
 
+- **Realm server** (Admin, top panel) — realm pill (Running / Stopped / Starting… / Stopping…) + **Start server** / **Stop server** buttons. Lifecycle ops run the upstream operator (`up` / `down`) in a background worker; the panel polls `GET /server` and shows the last op's ok/FAIL with output tail on hover. Stop keeps DB volumes (characters/accounts persist).
+- **Bot column** (Status roster) — per-seat **Start**/**Stop** buttons for the launchable cast (Shadowfel/Igris/Tusk/Beru; Murist and foundation seats show —). Start runs `make <seat>-bot` detached, appending to `local_data/<seat>-bot.log`; the button flips to Stop when the seat's nim_control socket comes up. Stop TERMs the socket holder (clean client logout). Offline seats show a terse "Off" in the Seat column — detail lives in tooltips.
 - **Roster** (Status) — cast view by default (hides foundation `Bot*` / Nightsun / Cowcam). Toggle **Show foundation seats** (or `?all=1`) for the full realm. Order: Murist → Shadowfel → Igris → Tusk → Beru, then others. Columns: name · level · XP · **HP/MP** · class · **zone** · **pos** · gold · **life** · **seat** (realm online + nim_control port up/down). Panel head shows army strip (`N online · alive/ghost/dead · ctrl k/n`). Polls `GET /roster` every few seconds via htmx. Zone from `characters.zone` → `area_template`; ghost = `character_flags & 0x2000`. HP/MP from health + class stats + power fields. Pos = `position_x/y`. Seat control probes `127.0.0.1:41114+slot` for bot seats.
 - **Addon events** (Status) — live ring of parsed `<SA>` / `<ShadowArmy>` lines from Chat.log. Table body polls `GET /events`. **Reload addon** posts to `POST /reload`.
 - **Admin** (`GET /admin`) — local ops only. **Respawn shadow army** runs SOAP `revive` + `tele name … Deathknell` + `repairitems` for Shadowfel, Igris, Tusk, Beru. This is **not** fair-play corpse recovery; use it when ghost/corpse runs stall in testing. Does not restart headless clients or brains. The vanilla advisor **Admin** panel requests the same action via `/say` (`<SA> admin respawn_shadow_army`); only **Murist** is accepted.
