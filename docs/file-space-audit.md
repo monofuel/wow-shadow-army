@@ -74,7 +74,11 @@ include `docker volume ls`.
 
 ## Migration status (NFS share)
 
-Everything above is being copied to the share **in full** — nothing pruned
-until it's safely duplicated and checksum-verified (`rsync -aic`). Cleanup
-decisions come after, against the NFS copy, with the workstation originals as
-fallback until we're confident.
+Copied in full and **checksum-verified** (`rsync -aic`, zero content diffs)
+as of 2026-08-01: AGENTS.md, autoresearch, wow-shadow-army, wow-classic-data
+(15G), coworld-vanilla-wow (50G), coworld-vanilla-wow-fork,
+coworld-vanilla-wow-xr (9.5G), plus docker-volume snapshots under
+`backups/`. Not yet migrated: the other Softmax projects (coworld-games,
+crewrift, marketboard, playbook, workspace nim siblings mummy/jsony/…, etc.).
+Cleanup decisions happen against the NFS copy, with the workstation originals
+as fallback until we're confident.
