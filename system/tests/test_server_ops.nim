@@ -30,8 +30,8 @@ suite "server lifecycle ops":
     check tail.startsWith("…")
     check tail.endsWith("THE END")
 
-suite "server status faces":
-  test "json face carries all lifecycle fields":
+suite "server status views":
+  test "json view carries all lifecycle fields":
     let s = ServerStatus(
       running: true, container: "coworld-vmangos-coworld-game-1",
       op: "", lastOp: "start", lastOpOk: true, lastOpDetail: "operator up ok")
@@ -89,11 +89,11 @@ suite "server status faces":
 
 suite "seat cell":
   test "seat cell is always a terse On/Off (detail in tooltip only)":
-    let off = renderSeatCell(Shadow(
+    let off = renderSeatCell(Character(
       name: "Tusk", online: false, controlPort: 41118, controlUp: false))
     check "no-ctrl" notin off
     check ">Off<" in off
-    let on = renderSeatCell(Shadow(
+    let on = renderSeatCell(Character(
       name: "Igris", online: true, controlPort: 41117, controlUp: true))
     check ">On<" in on
     # Port shows up only inside the title attribute, never as cell text.
@@ -101,13 +101,13 @@ suite "seat cell":
     check "title=" in on
 
   test "human seat is terse too":
-    let html = renderSeatCell(Shadow(name: "Murist", online: true, controlPort: 0))
+    let html = renderSeatCell(Character(name: "Murist", online: true, controlPort: 0))
     check ">On<" in html
     check "human" in html # tooltip only
     check "· human" notin html
 
 suite "bot seat lifecycle":
-  test "seat make targets cover the bot cast only":
+  test "seat make targets cover the bot seats only":
     check seatMakeTarget("Shadowfel") == "warlock-bot"
     check seatMakeTarget("Igris") == "igris-bot"
     check seatMakeTarget("Tusk") == "tusk-bot"
@@ -121,17 +121,17 @@ suite "bot seat lifecycle":
       check seatControlPort(seat.name) == 41114 + seat.slot
 
   test "bot cell: Start when seat down, Stop when up, dash for humans":
-    let down = renderBotCell(Shadow(name: "Tusk", controlPort: 41118, controlUp: false))
+    let down = renderBotCell(Character(name: "Tusk", controlPort: 41118, controlUp: false))
     check "Start" in down
     check "/bots/start?name=Tusk" in down
-    let up = renderBotCell(Shadow(name: "Tusk", controlPort: 41118, controlUp: true))
+    let up = renderBotCell(Character(name: "Tusk", controlPort: 41118, controlUp: true))
     check "Stop" in up
     check "/bots/stop?name=Tusk" in up
-    let human = renderBotCell(Shadow(name: "Murist", controlPort: 0))
+    let human = renderBotCell(Character(name: "Murist", controlPort: 0))
     check "Start" notin human
     check "Stop" notin human
 
-  test "lifecycle procs reject non-cast names without side effects":
+  test "lifecycle procs reject non-bot-seat names without side effects":
     let s = startBotSeat("Botwarrior")
     check not s{"ok"}.getBool(true)
     check "not a launchable" in s{"detail"}.getStr("")

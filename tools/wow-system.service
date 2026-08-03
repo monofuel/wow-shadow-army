@@ -1,0 +1,28 @@
+# Systemd user service for The System (wow-shadow-army dashboard + MCP).
+# Live copy: ~/.config/systemd/user/wow-system.service
+# Manage with:
+#   systemctl --user enable --now wow-system
+#   systemctl --user status wow-system
+#   journalctl --user -u wow-system -f
+#
+# Runs from the NFS checkout — the source of truth for all Softmax work.
+# Deploy = commit/pull on the NFS repo, `systemctl --user restart wow-system`
+# (`nim r` recompiles on every start). Works with the realm up or down; realm
+# lifecycle goes through the dashboard.
+
+[Unit]
+Description=The System — wow-shadow-army dashboard + MCP
+StartLimitBurst=5
+StartLimitIntervalSec=60
+
+[Service]
+Type=simple
+WorkingDirectory=/mnt/steel-chest/Monolab/Home/monofuel/Softmax/wow-shadow-army
+ExecStart=/mnt/steel-chest/Monolab/Home/monofuel/Softmax/wow-shadow-army/tools/run_system.sh
+Restart=always
+RestartSec=15
+Environment=PATH=/home/monofuel/bin:/etc/profiles/per-user/monofuel/bin:/run/wrappers/bin:/nix/var/nix/profiles/default/bin:/run/current-system/sw/bin
+Environment=HOME=/home/monofuel
+
+[Install]
+WantedBy=default.target

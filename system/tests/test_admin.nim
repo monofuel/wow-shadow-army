@@ -1,4 +1,4 @@
-## Unit tests for admin cast helpers (respawn command planning).
+## Unit tests for admin bot-seat helpers (respawn command planning).
 ## Run: nim r --hints:off --warnings:off system/tests/test_admin.nim
 ## No network, no docker, no realm — pure functions only.
 
@@ -6,17 +6,17 @@ import
   std/[json, strutils, unittest],
   ../system_server
 
-suite "shadow army cast":
-  test "fixed cast seats":
-    check ShadowArmyCast.len == 4
-    check isShadowArmyCastName("Shadowfel")
-    check isShadowArmyCastName("Igris")
-    check isShadowArmyCastName("Tusk")
-    check isShadowArmyCastName("Beru")
-    check not isShadowArmyCastName("Murist")
-    check not isShadowArmyCastName("shadowfel") # case-sensitive exact match
-    check not isShadowArmyCastName("")
-    check not isShadowArmyCastName("Shadowfel; revive all")
+suite "bot seats":
+  test "fixed bot seats":
+    check BotSeats.len == 4
+    check isBotSeatName("Shadowfel")
+    check isBotSeatName("Igris")
+    check isBotSeatName("Tusk")
+    check isBotSeatName("Beru")
+    check not isBotSeatName("Murist")
+    check not isBotSeatName("shadowfel") # case-sensitive exact match
+    check not isBotSeatName("")
+    check not isBotSeatName("Shadowfel; revive all")
 
   test "respawn commands are ordered revive → tele → repair":
     let cmds = respawnCommandsFor("Shadowfel")
@@ -26,7 +26,7 @@ suite "shadow army cast":
     check cmds[2] == "repairitems Shadowfel"
     check ShadowArmyRespawnTele == "Deathknell"
 
-  test "respawn commands reject non-cast names":
+  test "respawn commands reject non-bot-seat names":
     expect ValueError:
       discard respawnCommandsFor("Murist")
     expect ValueError:
@@ -59,7 +59,7 @@ suite "shadow army cast":
     check j{"action"}.getStr == "respawn_shadow_army"
     check j{"tele"}.getStr == "Deathknell"
     check j{"steps"}.len == 1
-    check j{"cast"}.len == 4
+    check j{"seats"}.len == 4
 
   test "render admin result marks failures":
     let r = AdminActionResult(

@@ -122,24 +122,24 @@ suite "classic 1.12 enums":
     check primaryPower(4, 0, 0, 80, 0) == (kind: "energy", cur: 80, max: 100)
     check primaryPower(9, 200, 0, 0, 300) == (kind: "mana", cur: 200, max: 300)
 
-  test "cast display order and seat ports":
-    check castSortRank("Murist") < castSortRank("Shadowfel")
-    check castSortRank("Shadowfel") < castSortRank("Igris")
-    check castSortRank("Igris") < castSortRank("Tusk")
-    check castSortRank("Tusk") < castSortRank("Beru")
-    check castSortRank("Beru") < castSortRank("Cowcam")
+  test "roster display order and seat ports":
+    check rosterSortRank("Murist") < rosterSortRank("Shadowfel")
+    check rosterSortRank("Shadowfel") < rosterSortRank("Igris")
+    check rosterSortRank("Igris") < rosterSortRank("Tusk")
+    check rosterSortRank("Tusk") < rosterSortRank("Beru")
+    check rosterSortRank("Beru") < rosterSortRank("Cowcam")
     check seatControlPort("Shadowfel") == 41116
     check seatControlPort("Igris") == 41117
     check seatControlPort("Tusk") == 41118
     check seatControlPort("Beru") == 41119
     check seatControlPort("Murist") == 0
     var mixed = @[
-      Shadow(name: "Beru", level: 1, life: "alive", online: true),
-      Shadow(name: "Murist", level: 7, life: "offline", online: false),
-      Shadow(name: "Igris", level: 1, life: "ghost", online: true),
-      Shadow(name: "Shadowfel", level: 4, life: "alive", online: true),
+      Character(name: "Beru", level: 1, life: "alive", online: true),
+      Character(name: "Murist", level: 7, life: "offline", online: false),
+      Character(name: "Igris", level: 1, life: "ghost", online: true),
+      Character(name: "Shadowfel", level: 4, life: "alive", online: true),
     ]
-    sortShadowsForDisplay(mixed)
+    sortCharactersForDisplay(mixed)
     check mixed[0].name == "Murist"
     check mixed[1].name == "Shadowfel"
     check mixed[2].name == "Igris"
@@ -169,13 +169,13 @@ suite "classic 1.12 enums":
     check not isFoundationSeat("Shadowfel")
     check not isFoundationSeat("Igris")
     let all = @[
-      Shadow(name: "Murist", level: 6),
-      Shadow(name: "Botmage", level: 30),
-      Shadow(name: "Nightsun", level: 30),
-      Shadow(name: "Igris", level: 1),
+      Character(name: "Murist", level: 6),
+      Character(name: "Botmage", level: 30),
+      Character(name: "Nightsun", level: 30),
+      Character(name: "Igris", level: 1),
     ]
-    let castOnly = filterShadows(all, includeFoundation = false)
-    check castOnly.len == 2
-    check castOnly[0].name == "Murist"
-    check castOnly[1].name == "Igris"
-    check filterShadows(all, includeFoundation = true).len == 4
+    let mainOnly = filterCharacters(all, includeFoundation = false)
+    check mainOnly.len == 2
+    check mainOnly[0].name == "Murist"
+    check mainOnly[1].name == "Igris"
+    check filterCharacters(all, includeFoundation = true).len == 4

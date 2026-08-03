@@ -1,6 +1,6 @@
 ## The System — management server for the shadow army.
 ##
-## One Nim binary, two faces on one mummy server:
+## One Nim binary, HTTP + MCP interfaces on one mummy server:
 ##   HTTP dashboard (htmx)  GET /  GET /roster  GET /events  GET /server
 ##                          POST /reload  POST /server/start  POST /server/stop
 ##                          GET /admin  POST /admin/respawn-shadow-army
@@ -8,7 +8,7 @@
 ##
 ## Critical design rule: one dispatch path. Each capability is one data/action
 ## proc; the htmx handlers render it and the MCP tools serialize it.
-##   listShadows()           — roster (SELECT via docker exec)
+##   listCharacters()           — roster (SELECT via docker exec)
 ##   recentEvents()          — addon Chat.log ring buffer
 ##   reloadAddon()           — SOAP announce <SYS> reload + wait for <SA> loaded
 ##   announceInGame()        — SOAP announce <text>
@@ -20,7 +20,7 @@
 ## offline note; the Admin tab's Server panel offers Start/Stop. The human
 ## only runs the client and this dashboard; realm lifecycle goes through here.
 ##
-## Admin faces (same procs): HTTP /admin, MCP tools, and human-seat addon
+## Admin interfaces (same procs): HTTP /admin, MCP tools, and human-seat addon
 ## chat (`<SA> admin <action>` from Murist → Chat.log tailer).
 
 import
@@ -44,7 +44,7 @@ const
   ## World DB (game_tele lives here; characters DB is separate).
   WorldDbName = "mangos"
   ## Scratch game_tele name: upserted to Murist's live coords, then used by
-  ## `tele name <cast> SA_MURIST_MEET`. Console SOAP cannot `go xyz` another player.
+  ## `tele name <seat> SA_MURIST_MEET`. Console SOAP cannot `go xyz` another player.
   MuristMeetTeleName* = "SA_MURIST_MEET"
   ## Dashboard + MCP share this port (not 8080 healthz / 8085 world / 3724 realmd).
   HttpPort = 7777
@@ -58,17 +58,17 @@ const
   DefaultGameContainer = "coworld-vmangos-coworld-game-1"
   ## VMaNGOS CHARACTER_FLAG_GHOST — set while spirit-running / unreleased corpse.
   CharacterFlagGhost = 0x2000
-  ## Fixed 5-man bot cast (party-army seats). Admin respawn only touches these.
+  ## Fixed bot seats (party-army seats). Admin respawn only touches these.
   ## Murist is the human leader and is intentionally not in this list.
-  ShadowArmyCast* = ["Shadowfel", "Igris", "Tusk", "Beru"]
+  BotSeats* = ["Shadowfel", "Igris", "Tusk", "Beru"]
   ## Display order for the Murist party (human first, then bot seats).
-  CastDisplayOrder* = ["Murist", "Shadowfel", "Igris", "Tusk", "Beru"]
+  RosterDisplayOrder* = ["Murist", "Shadowfel", "Igris", "Tusk", "Beru"]
   ## Named game_tele destination (mangos.game_tele / `lookup tele death`).
   ## Safe valley floor near Deathknell undead start — not NightWebsHollow.
   ShadowArmyRespawnTele* = "Deathknell"
   ## Base nim_control port: slot N listens on 41114 + N (docs/control-plane.md).
   NimControlBasePort = 41114
-  ## Bot seat launch map: cast name → Makefile seat target (slot = control
+  ## Bot seat launch map: seat name → Makefile seat target (slot = control
   ## port offset, matching seatControlPort). Murist is human — never listed.
   SeatMakeTargets* = [
     (name: "Shadowfel", target: "warlock-bot", slot: 2),
@@ -117,7 +117,7 @@ ORDER BY c.name"""
   ReloadStepMs = 200
 
 type
-  Shadow* = object
+  Character* = object
     ## One realm character as seen by The System (read-only observer).
     name*: string
     level*: int
@@ -354,8 +354,8 @@ proc primaryPower*(
     let mx = if baseMana > 0: baseMana else: 0
     result = (kind: "mana", cur: power1, max: mx)
 
-proc parseRosterTsv*(tsv: string): seq[Shadow] =
-  ## Parse mariadb -N -B TSV into Shadow rows.
+proc parseRosterTsv*(tsv: string): seq[Character] =
+  ## Parse mariadb -N -B TSV into Character rows.
   ## Columns (current, 21):
   ##   name level class race money online xp next_level_xp
   ##   character_flags health zone_id map_id zone_name
@@ -429,7 +429,7 @@ proc parseRosterTsv*(tsv: string): seq[Shadow] =
       if pow.max > 0: max(pow.max, pow.cur)
       elif pow.cur > 0: pow.cur
       else: 0
-    result.add(Shadow(
+    result.add(Character(
       name: cols[0],
       level: cols[1].parseInt(),
       classId: classId,
@@ -483,41 +483,41 @@ proc isTcpPortOpen*(host: string, port: int, timeoutMs = 80): bool =
     if sock != nil:
       sock.close()
 
-proc enrichControlPlane*(shadows: var seq[Shadow]) =
+proc enrichControlPlane*(characters: var seq[Character]) =
   ## Fill controlPort / controlUp for known bot seats (local sockets only).
-  for i in 0 ..< shadows.len:
-    let port = seatControlPort(shadows[i].name)
-    shadows[i].controlPort = port
+  for i in 0 ..< characters.len:
+    let port = seatControlPort(characters[i].name)
+    characters[i].controlPort = port
     if port > 0:
-      shadows[i].controlUp = isTcpPortOpen("127.0.0.1", port)
+      characters[i].controlUp = isTcpPortOpen("127.0.0.1", port)
     else:
-      shadows[i].controlUp = false
+      characters[i].controlUp = false
 
-proc castSortRank*(name: string): int =
+proc rosterSortRank*(name: string): int =
   ## Stable party order: Murist → Shadowfel → Igris → Tusk → Beru → rest A–Z.
-  for i, n in CastDisplayOrder:
+  for i, n in RosterDisplayOrder:
     if n == name:
       return i
-  result = 100 + name.len # keep non-cast stable-ish by name length then cmp
+  result = 100 + name.len # keep non-bot-seat stable-ish by name length then cmp
 
-proc sortShadowsForDisplay*(shadows: var seq[Shadow]) =
-  ## Cast-first ordering for the Status Window.
-  shadows.sort(proc (a, b: Shadow): int =
-    let ra = castSortRank(a.name)
-    let rb = castSortRank(b.name)
+proc sortCharactersForDisplay*(characters: var seq[Character]) =
+  ## Main characters first ordering for the Status Window.
+  characters.sort(proc (a, b: Character): int =
+    let ra = rosterSortRank(a.name)
+    let rb = rosterSortRank(b.name)
     if ra != rb:
       return cmp(ra, rb)
     return cmp(a.name, b.name)
   )
 
-proc listShadows*(): seq[Shadow] =
-  ## Single dispatch path: all faces (htmx + MCP) get roster data from here.
+proc listCharacters*(): seq[Character] =
+  ## Single dispatch path: HTTP + MCP interfaces get roster data from here.
   result = parseRosterTsv(fetchRosterTsv())
   enrichControlPlane(result)
-  sortShadowsForDisplay(result)
+  sortCharactersForDisplay(result)
 
 proc isFoundationSeat*(name: string): bool =
-  ## Pre-built coworld tournament / foundation seats (not the Murist cast).
+  ## Pre-built coworld tournament / foundation seats (not Murist + bot seats).
   ## Hide by default on the dashboard; toggle shows them again.
   let n = name.strip()
   if n.len == 0:
@@ -533,19 +533,19 @@ proc isFoundationSeat*(name: string): bool =
   else:
     return false
 
-proc filterShadows*(shadows: seq[Shadow], includeFoundation = false): seq[Shadow] =
-  ## Cast-first view: drop foundation seats unless includeFoundation.
+proc filterCharacters*(characters: seq[Character], includeFoundation = false): seq[Character] =
+  ## Main characters first view: drop foundation seats unless includeFoundation.
   if includeFoundation:
-    return shadows
+    return characters
   result = @[]
-  for s in shadows:
+  for s in characters:
     if not isFoundationSeat(s.name):
       result.add(s)
 
-proc shadowsToJson*(shadows: seq[Shadow]): JsonNode =
-  ## Serialize the roster for the MCP face (and any future JSON API).
+proc charactersToJson*(characters: seq[Character]): JsonNode =
+  ## Serialize the roster for the MCP JSON view (and any future JSON API).
   result = %*[]
-  for s in shadows:
+  for s in characters:
     result.add(%*{
       "name": s.name,
       "level": s.level,
@@ -877,7 +877,7 @@ proc startChatLogTailer() =
   ## Spawn the Chat.log tailer thread (call once from main before serve).
   createThread(gTailerThread, tailerLoop)
 
-# Defined with SOAP section; admin worker reuses the same faces.
+# Defined with SOAP section; admin worker reuses the same interfaces.
 proc respawnShadowArmy*(): AdminActionResult
 proc reloadAddon*(): JsonNode
 proc telePartyToMurist*(): AdminActionResult
@@ -1036,7 +1036,7 @@ proc stopServer*(): ServerStatus =
   result = serverStatus()
 
 proc serverStatusToJson*(s: ServerStatus): JsonNode =
-  ## Serialize lifecycle status for the MCP face.
+  ## Serialize lifecycle status for the MCP JSON view.
   result = %*{
     "running": s.running,
     "container": s.container,
@@ -1094,7 +1094,7 @@ proc armyRoot(): string =
   result = getCurrentDir()
 
 proc seatMakeTarget*(name: string): string =
-  ## Makefile seat target for a cast bot, or "" (human / unknown).
+  ## Makefile seat target for a bot seat, or "" (human / unknown).
   for seat in SeatMakeTargets:
     if seat.name == name:
       return seat.target
@@ -1113,7 +1113,7 @@ proc runShell(cmd: string): tuple[ok: bool, detail: string] =
     result = (ok: false, detail: e.msg)
 
 proc startBotSeat*(name: string): JsonNode =
-  ## Launch one cast bot seat: detached `make <seat>-bot` appending to its
+  ## Launch one bot seat: detached `make <seat>-bot` appending to its
   ## local_data log (the documented nohup pattern). Ready when the seat's
   ## nim_control socket (41114+slot) starts listening — the roster poll
   ## flips the button on its own.
@@ -1141,7 +1141,7 @@ proc startBotSeat*(name: string): JsonNode =
               "detail": &"launched make {target} (log: local_data/{target}.log; ctrl :{port} when ready)"}
 
 proc stopBotSeat*(name: string): JsonNode =
-  ## Stop one cast bot seat: TERM whoever holds the seat's nim_control port.
+  ## Stop one bot seat: TERM whoever holds the seat's nim_control port.
   ## The reference_player logs out; its parent make/nohup exits with it.
   let target = seatMakeTarget(name)
   if target.len == 0:
@@ -1247,18 +1247,18 @@ proc announceInGame*(text: string): string =
   ## Broadcast a system message to all players (`announce <text>`).
   result = gmCommand("announce " & text)
 
-proc isShadowArmyCastName*(name: string): bool =
-  ## True when `name` is exactly one of the fixed bot cast seats.
-  for n in ShadowArmyCast:
+proc isBotSeatName*(name: string): bool =
+  ## True when `name` is exactly one of the fixed bot seats.
+  for n in BotSeats:
     if n == name:
       return true
   result = false
 
 proc respawnCommandsFor*(name: string, teleDest: string = ShadowArmyRespawnTele): seq[string] =
-  ## Ordered SOAP commands to revive and place one cast member.
-  ## Names are fixed-cast only; callers must not pass free text.
-  if not isShadowArmyCastName(name):
-    raise newException(ValueError, &"not a shadow-army cast name: {name}")
+  ## Ordered SOAP commands to revive and place one bot seat.
+  ## Names are fixed bot seats only; callers must not pass free text.
+  if not isBotSeatName(name):
+    raise newException(ValueError, &"not a bot seat name: {name}")
   # teleDest is a fixed constant in production; reject path-ish junk in tests.
   if teleDest.len == 0 or ' ' in teleDest or '/' in teleDest or ';' in teleDest:
     raise newException(ValueError, &"invalid tele destination: {teleDest}")
@@ -1269,9 +1269,9 @@ proc respawnCommandsFor*(name: string, teleDest: string = ShadowArmyRespawnTele)
   ]
 
 proc teleToMuristCommandsFor*(name: string, teleDest: string = MuristMeetTeleName): seq[string] =
-  ## SOAP command to pull one cast seat to the Murist-meet game_tele pin.
-  if not isShadowArmyCastName(name):
-    raise newException(ValueError, &"not a shadow-army cast name: {name}")
+  ## SOAP command to pull one bot seat to the Murist-meet game_tele pin.
+  if not isBotSeatName(name):
+    raise newException(ValueError, &"not a bot seat name: {name}")
   if teleDest != MuristMeetTeleName:
     raise newException(ValueError, &"tele-to-murist only allows {MuristMeetTeleName}")
   result = @[&"tele name {name} {teleDest}"]
@@ -1290,12 +1290,12 @@ proc muristMeetInsertSql*(mapId: int, x, y, z: float): string =
   let zs = formatFloat(z, ffDecimal, 4)
   result = &"INSERT INTO game_tele (id, position_x, position_y, position_z, orientation, map, name) SELECT COALESCE(MAX(id),0)+1, {xs}, {ys}, {zs}, 0, {mapId}, '{MuristMeetTeleName}' FROM game_tele"
 
-proc findShadowByName*(shadows: seq[Shadow], name: string): Option[Shadow] =
+proc findCharacterByName*(characters: seq[Character], name: string): Option[Character] =
   ## Linear lookup by exact character name.
-  for s in shadows:
+  for s in characters:
     if s.name == name:
       return some(s)
-  result = none(Shadow)
+  result = none(Character)
 
 proc execMariadbSql*(db, sql: string) =
   ## Run one SQL statement via docker exec + mariadb (admin path; not policy).
@@ -1344,24 +1344,24 @@ proc adminActionToJson*(r: AdminActionResult): JsonNode =
     "action": r.action,
     "summary": r.summary,
     "steps": steps,
-    "cast": ShadowArmyCast,
+    "seats": BotSeats,
     "tele": ShadowArmyRespawnTele
   }
 
 proc respawnShadowArmy*(): AdminActionResult =
-  ## Ops escape hatch: SOAP-revive each bot cast seat and tele to Deathknell.
+  ## Ops escape hatch: SOAP-revive each bot seat and tele to Deathknell.
   ##
   ## This is **not** fair-play recovery. It is an admin-only testing reset when
   ## corpse runs stall (ghost masks, elevated death pockets, etc.). Policy
-  ## brains must never call this; only The System admin faces (HTTP / MCP /
+  ## brains must never call this; only The System admin interfaces (HTTP / MCP /
   ## human-seat `<SA> admin respawn_shadow_army`).
   result = AdminActionResult(ok: true, action: "respawn_shadow_army", steps: @[])
   recordAdmin(
     DefaultAuditPath,
     kind = "respawn_shadow_army_begin",
-    detail = "revive+tele+repair for cast seats"
+    detail = "revive+tele+repair for bot seats"
   )
-  for name in ShadowArmyCast:
+  for name in BotSeats:
     for cmd in respawnCommandsFor(name):
       var step = AdminStepResult(name: name, command: cmd, ok: true, detail: "")
       try:
@@ -1408,31 +1408,31 @@ proc respawnShadowArmy*(): AdminActionResult =
       inc okCount
   result.summary =
     if result.ok:
-      &"respawned {ShadowArmyCast.len} cast seats → {ShadowArmyRespawnTele} ({okCount} SOAP steps ok)"
+      &"respawned {BotSeats.len} bot seats → {ShadowArmyRespawnTele} ({okCount} SOAP steps ok)"
     else:
       &"respawn partial/fail ({okCount}/{result.steps.len} SOAP steps ok) — see steps"
 
 proc telePartyToMurist*(): AdminActionResult =
-  ## Ops escape hatch: pin game_tele to Murist's coords, reload, tele cast seats.
+  ## Ops escape hatch: pin game_tele to Murist's coords, reload, tele bot seats.
   ##
   ## Console SOAP only supports `tele name <player> <game_tele>` (not free xyz).
   ## So we upsert `SA_MURIST_MEET` in mangos.game_tele from characters.position_*,
-  ## `reload game_tele`, then `tele name` each fixed cast seat. Not fair-play.
+  ## `reload game_tele`, then `tele name` each fixed bot seat. Not fair-play.
   result = AdminActionResult(ok: true, action: "tele_party_to_murist", steps: @[])
   recordAdmin(
     DefaultAuditPath,
     kind = "tele_party_to_murist_begin",
-    detail = "pin SA_MURIST_MEET + tele cast seats"
+    detail = "pin SA_MURIST_MEET + tele bot seats"
   )
 
-  var muristOpt: Option[Shadow]
+  var muristOpt: Option[Character]
   try:
-    muristOpt = findShadowByName(listShadows(), AdminRequesterName)
+    muristOpt = findCharacterByName(listCharacters(), AdminRequesterName)
   except Exception as e:
     result.ok = false
     result.summary = "failed to read roster: " & e.msg
     result.steps.add(AdminStepResult(
-      name: AdminRequesterName, command: "listShadows", ok: false, detail: e.msg))
+      name: AdminRequesterName, command: "listCharacters", ok: false, detail: e.msg))
     return
 
   if muristOpt.isNone:
@@ -1490,8 +1490,8 @@ proc telePartyToMurist*(): AdminActionResult =
     result.summary = "reload game_tele failed: " & e.msg
     return
 
-  # 3) Tele each cast seat to the pin.
-  for name in ShadowArmyCast:
+  # 3) Tele each bot seat to the pin.
+  for name in BotSeats:
     for cmd in teleToMuristCommandsFor(name):
       var step = AdminStepResult(name: name, command: cmd, ok: true, detail: "")
       try:
@@ -1526,7 +1526,7 @@ proc telePartyToMurist*(): AdminActionResult =
       inc okCount
   result.summary =
     if result.ok:
-      &"teleported {ShadowArmyCast.len} cast seats → Murist {where} ({okCount} steps ok)"
+      &"teleported {BotSeats.len} bot seats → Murist {where} ({okCount} steps ok)"
     else:
       &"tele-to-murist partial/fail ({okCount}/{result.steps.len} steps ok) — see steps"
 
@@ -1555,7 +1555,7 @@ proc reloadAddon*(): JsonNode =
   }
 
 # ---------------------------------------------------------------------------
-# HTML faces
+# HTML rendering
 # ---------------------------------------------------------------------------
 
 proc kindClass(kind: string): string =
@@ -1646,7 +1646,7 @@ proc renderServerPanel*(s: ServerStatus): string =
     </div>
     {lastLine}"""
 
-proc renderXpCell*(s: Shadow): string =
+proc renderXpCell*(s: Character): string =
   ## Level progress cell: bar + "cur/need (N to go)".
   if s.nextLevelXp <= 0:
     return """<span class="xp-muted">—</span>"""
@@ -1663,7 +1663,7 @@ proc vitalsPct(cur, maxv: int): int =
     return 0
   result = max(0, min(100, (cur * 100) div maxv))
 
-proc renderVitalsCell*(s: Shadow): string =
+proc renderVitalsCell*(s: Character): string =
   ## HP + primary power (mana/rage/energy) with mini bars.
   let hpMaxLabel = if s.maxHealth > 0: $s.maxHealth else: "?"
   let hpPct = vitalsPct(s.health, s.maxHealth)
@@ -1703,7 +1703,7 @@ proc renderVitalsCell*(s: Shadow): string =
       {powerBlock}
     </div>"""
 
-proc renderPosCell*(s: Shadow): string =
+proc renderPosCell*(s: Character): string =
   ## Compact map position for corpse-run / regroup awareness.
   if abs(s.posX) + abs(s.posY) < 0.01:
     return """<span class="xp-muted">—</span>"""
@@ -1711,7 +1711,7 @@ proc renderPosCell*(s: Shadow): string =
   let title = &"map {s.mapId} · x={s.posX:.1f} y={s.posY:.1f} z={s.posZ:.1f}"
   result = &"""<span class="pos" title="{escapeHtml(title)}">{escapeHtml(label)}</span>"""
 
-proc renderSeatCell*(s: Shadow): string =
+proc renderSeatCell*(s: Character): string =
   ## Realm connection as a terse On/Off. Port/ctrl detail lives in the
   ## tooltip only — it blew out table rows and duplicated the Bot column.
   let net = if s.online: "On" else: "Off"
@@ -1725,8 +1725,8 @@ proc renderSeatCell*(s: Shadow): string =
       &"seat slot port {s.controlPort} (not listening)"
   result = &"""<span class="seat-net {netCls}" title="{escapeHtml(title)}">{escapeHtml(net)}</span>"""
 
-proc renderBotCell*(s: Shadow): string =
-  ## Per-seat Start/Stop button for launchable cast bots ("—" otherwise).
+proc renderBotCell*(s: Character): string =
+  ## Per-seat Start/Stop button for launchable bot seats ("—" otherwise).
   ## controlUp is the truth signal: socket up = seat process alive.
   if seatMakeTarget(s.name).len == 0:
     return """<span class="xp-muted">—</span>"""
@@ -1748,10 +1748,10 @@ proc renderBotCell*(s: Shadow): string =
         Start
       </button>"""
 
-proc armySummary*(shadows: seq[Shadow]): string =
-  ## One-line cast health strip for the roster panel head.
+proc armySummary*(characters: seq[Character]): string =
+  ## One-line army health strip for the roster panel head.
   var online, alive, ghost, dead, ctrlUp, ctrlKnown = 0
-  for s in shadows:
+  for s in characters:
     if s.online: inc online
     case s.life
     of "alive": inc alive
@@ -1765,12 +1765,12 @@ proc armySummary*(shadows: seq[Shadow]): string =
   if ctrlKnown > 0:
     result.add(&" · ctrl {ctrlUp}/{ctrlKnown}")
 
-proc renderRosterRows*(shadows: seq[Shadow]): string =
+proc renderRosterRows*(characters: seq[Character]): string =
   ## htmx partial: `<tr>` rows for the roster table body.
-  if shadows.len == 0:
+  if characters.len == 0:
     return """<tr><td colspan="11" class="empty">No characters in this view (toggle foundation seats, or empty realm).</td></tr>"""
   result = ""
-  for s in shadows:
+  for s in characters:
     let life = if s.life.len > 0: s.life else: (if s.online: "alive" else: "offline")
     let lifeText = lifeLabel(life)
     let zoneText = if s.zoneName.len > 0: s.zoneName else: "—"
@@ -1803,16 +1803,16 @@ proc renderRosterOfflineRow*(): string =
   result = """<tr><td colspan="11" class="empty">Realm is offline — start it from the <a href="/admin">Admin</a> tab and the roster will fill in here.</td></tr>"""
 
 proc renderRosterPage*(
-    shadows: seq[Shadow],
+    characters: seq[Character],
     events: seq[AddonEvent],
     includeFoundation = false,
     rosterOffline = false
 ): string =
   ## Full Status Window (htmx + auto-poll): roster + addon events.
   ## Realm lifecycle controls live on the Admin tab (renderAdminPage).
-  let rows = if rosterOffline: renderRosterOfflineRow() else: renderRosterRows(shadows)
+  let rows = if rosterOffline: renderRosterOfflineRow() else: renderRosterRows(characters)
   let eventRows = renderEventRows(events)
-  let summary = armySummary(shadows)
+  let summary = armySummary(characters)
   let stamped = now().format("yyyy-MM-dd HH:mm:ss")
   let rosterUrl = if includeFoundation: "/roster?all=1" else: "/roster"
   let checked = if includeFoundation: " checked" else: ""
@@ -2070,7 +2070,7 @@ proc renderRosterPage*(
       line-height: 1.45;
       margin: 0 0 1rem;
     }}
-    .admin-cast {{
+    .admin-seats {{
       font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
       font-size: 0.85rem;
       color: var(--text);
@@ -2096,7 +2096,7 @@ proc renderRosterPage*(
 <body>
   <header>
     <h1>THE SYSTEM</h1>
-    <p>Shadow army Status Window — local realm roster + addon telemetry</p>
+    <p>Character army Status Window — local realm roster + addon telemetry</p>
     <nav class="nav">
       <a class="active" href="/">Status</a>
       <a href="/admin">Admin</a>
@@ -2189,10 +2189,10 @@ proc renderRosterPage*(
   </main>
   <footer>
     One dispatch path per capability:
-    <code>listShadows()</code>, <code>recentEvents()</code>, <code>reloadAddon()</code>,
+    <code>listCharacters()</code>, <code>recentEvents()</code>, <code>reloadAddon()</code>,
     <code>respawnShadowArmy()</code>, <code>serverStatus()</code>,
     <code>startServer()</code>/<code>stopServer()</code>
-    feed both faces. MCP: <code>POST /mcp</code>.
+    feed both interfaces. MCP: <code>POST /mcp</code>.
     Write path: SOAP <code>announce</code> + admin revive/tele + realm lifecycle (local ops only).
   </footer>
 </body>
@@ -2214,7 +2214,7 @@ proc renderAdminResult*(r: AdminActionResult): string =
 
 proc renderAdminPage*(server: ServerStatus): string =
   ## Admin tab: realm lifecycle + ops escape hatches (not fair-play policy).
-  let castList = ShadowArmyCast.join(", ")
+  let seatList = BotSeats.join(", ")
   let stamped = now().format("yyyy-MM-dd HH:mm:ss")
   let serverPanel = renderServerPanel(server)
   result = &"""<!DOCTYPE html>
@@ -2259,7 +2259,7 @@ proc renderAdminPage*(server: ServerStatus): string =
     .panel-head h2 {{ margin: 0; font-size: 1rem; }}
     .panel-body {{ padding: 1rem; }}
     .admin-note {{ color: var(--muted); font-size: 0.9rem; line-height: 1.45; margin: 0 0 1rem; }}
-    .admin-cast {{
+    .admin-seats {{
       font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.85rem;
     }}
     button.admin {{
@@ -2329,7 +2329,7 @@ proc renderAdminPage*(server: ServerStatus): string =
       </div>
       <div class="panel-body">
         <p class="admin-note">
-          Hard-reset the bot cast when corpse runs stall (ghost move masks, elevated death
+          Hard-reset the bot seats when corpse runs stall (ghost move masks, elevated death
           pockets, frozen frames). Runs SOAP <code>revive</code> +
           <code>tele name … {escapeHtml(ShadowArmyRespawnTele)}</code> +
           <code>repairitems</code> per seat. <strong>Not</strong> fair-play recovery —
@@ -2338,8 +2338,8 @@ proc renderAdminPage*(server: ServerStatus): string =
           (Murist only: <code>&lt;SA&gt; admin respawn_shadow_army</code>).
         </p>
         <p class="admin-note">
-          Cast:
-          <span class="admin-cast">{escapeHtml(castList)}</span>
+          Seats:
+          <span class="admin-seats">{escapeHtml(seatList)}</span>
           → <code>{escapeHtml(ShadowArmyRespawnTele)}</code>
         </p>
         <button class="admin"
@@ -2358,17 +2358,17 @@ proc renderAdminPage*(server: ServerStatus): string =
       </div>
       <div class="panel-body">
         <p class="admin-note">
-          Pulls the bot cast to Murist's current DB position. Upserts
+          Pulls the bot seats to Murist's current DB position. Upserts
           <code>{escapeHtml(MuristMeetTeleName)}</code> in
           <code>game_tele</code>, reloads it, then
-          <code>tele name &lt;cast&gt; {escapeHtml(MuristMeetTeleName)}</code>.
+          <code>tele name &lt;seat&gt; {escapeHtml(MuristMeetTeleName)}</code>.
           <strong>Not</strong> fair-play. Same as MCP
           <code>tele_party_to_murist</code> and advisor
           <strong>Admin → Tele party to me</strong>.
         </p>
         <p class="admin-note">
-          Cast:
-          <span class="admin-cast">{escapeHtml(castList)}</span>
+          Seats:
+          <span class="admin-seats">{escapeHtml(seatList)}</span>
           → Murist live pos
         </p>
         <button class="admin"
@@ -2412,7 +2412,7 @@ proc indexHandler(request: Request) {.gcsafe.} =
   ## Renders with the realm DOWN too: roster degrades to an offline note and
   ## the Server panel offers Start (the whole point of the panel).
   try:
-    var shadows: seq[Shadow] = @[]
+    var characters: seq[Character] = @[]
     var events: seq[AddonEvent]
     var status: ServerStatus
     var rosterOffline = false
@@ -2421,7 +2421,7 @@ proc indexHandler(request: Request) {.gcsafe.} =
       status = serverStatus()
       if status.running:
         try:
-          shadows = filterShadows(listShadows(), includeFoundation = showAll)
+          characters = filterCharacters(listCharacters(), includeFoundation = showAll)
         except CatchableError:
           # Container up but DB not answering yet (mid-boot): offline view.
           rosterOffline = true
@@ -2429,7 +2429,7 @@ proc indexHandler(request: Request) {.gcsafe.} =
         rosterOffline = true
       events = recentEvents(limit = 30)
     request.respond(200, htmlHeaders(),
-      renderRosterPage(shadows, events,
+      renderRosterPage(characters, events,
         includeFoundation = showAll, rosterOffline = rosterOffline))
   except Exception as e:
     request.respond(500, htmlHeaders(),
@@ -2439,11 +2439,11 @@ proc rosterPartialHandler(request: Request) {.gcsafe.} =
   ## GET /roster — htmx fragment (table rows only). ?all=1 includes foundation.
   ## Realm down / DB unreachable → friendly offline row, not a red error.
   try:
-    var shadows: seq[Shadow]
+    var characters: seq[Character]
     let showAll = queryWantsAll(request)
     {.gcsafe.}:
-      shadows = filterShadows(listShadows(), includeFoundation = showAll)
-    request.respond(200, htmlHeaders(), renderRosterRows(shadows))
+      characters = filterCharacters(listCharacters(), includeFoundation = showAll)
+    request.respond(200, htmlHeaders(), renderRosterRows(characters))
   except Exception as e:
     var offline = false
     {.gcsafe.}:
@@ -2490,22 +2490,22 @@ proc serverStopHandler(request: Request) {.gcsafe.} =
 proc respondRosterRows(request: Request) {.gcsafe.} =
   ## Shared bot-handler response: fresh roster rows (offline row on failure).
   try:
-    var shadows: seq[Shadow]
+    var characters: seq[Character]
     {.gcsafe.}:
-      shadows = filterShadows(listShadows())
-    request.respond(200, htmlHeaders(), renderRosterRows(shadows))
+      characters = filterCharacters(listCharacters())
+    request.respond(200, htmlHeaders(), renderRosterRows(characters))
   except CatchableError:
     request.respond(200, htmlHeaders(), renderRosterOfflineRow())
 
 proc botStartHandler(request: Request) {.gcsafe.} =
-  ## POST /bots/start?name=<cast> — launch that seat, return roster rows.
+  ## POST /bots/start?name=<seat> — launch that seat, return roster rows.
   let name = request.queryParams["name"]
   {.gcsafe.}:
     discard startBotSeat(name)
   respondRosterRows(request)
 
 proc botStopHandler(request: Request) {.gcsafe.} =
-  ## POST /bots/stop?name=<cast> — stop that seat, return roster rows.
+  ## POST /bots/stop?name=<seat> — stop that seat, return roster rows.
   let name = request.queryParams["name"]
   {.gcsafe.}:
     discard stopBotSeat(name)
@@ -2545,7 +2545,7 @@ proc adminPageHandler(request: Request) {.gcsafe.} =
       &"<!DOCTYPE html><html><body><h1>Admin error</h1><pre>{escapeHtml(e.msg)}</pre></body></html>")
 
 proc respawnShadowArmyHandler(request: Request) {.gcsafe.} =
-  ## POST /admin/respawn-shadow-army — GM revive + tele the bot cast.
+  ## POST /admin/respawn-shadow-army — GM revive + tele the bot seats.
   try:
     var r: AdminActionResult
     {.gcsafe.}:
@@ -2557,7 +2557,7 @@ proc respawnShadowArmyHandler(request: Request) {.gcsafe.} =
       &"""<div class="admin-err">error: {escapeHtml(e.msg)}</div>""")
 
 proc telePartyToMuristHandler(request: Request) {.gcsafe.} =
-  ## POST /admin/tele-party-to-murist — pin game_tele to Murist + tele cast.
+  ## POST /admin/tele-party-to-murist — pin game_tele to Murist + tele bot seats.
   try:
     var r: AdminActionResult
     {.gcsafe.}:
@@ -2617,8 +2617,8 @@ proc serverInfoHandler(request: Request) {.gcsafe.} =
         "server_partial": "/server",
         "server_start": "/server/start",
         "server_stop": "/server/stop",
-        "bot_start": "/bots/start?name=<cast>",
-        "bot_stop": "/bots/stop?name=<cast>",
+        "bot_start": "/bots/start?name=<seat>",
+        "bot_stop": "/bots/stop?name=<seat>",
         "reload": "/reload",
         "respawn_shadow_army": "/admin/respawn-shadow-army",
         "tele_party_to_murist": "/admin/tele-party-to-murist",
@@ -2626,19 +2626,19 @@ proc serverInfoHandler(request: Request) {.gcsafe.} =
         "healthz": "/healthz"
       },
       "tools": [
-        "list_shadows", "addon_events", "reload_addon", "send_announce",
+        "list_characters", "addon_events", "reload_addon", "send_announce",
         "respawn_shadow_army", "tele_party_to_murist",
         "server_status", "start_server", "stop_server",
         "start_bot", "stop_bot"
       ],
-      "write_scope": "SOAP announce + admin revive/tele/tele-to-murist for fixed cast + realm lifecycle up/down + bot seat start/stop (local ops)"
+      "write_scope": "SOAP announce + admin revive/tele/tele-to-murist for fixed bot seats + realm lifecycle up/down + bot seat start/stop (local ops)"
     }
   request.respond(200, jsonHeaders(), $info)
 
 proc registerMcpTools(server: McpServer) =
   ## Register MCP tools. Handlers call the same dispatch procs as the dashboard.
   let listTool = McpTool(
-    name: "list_shadows",
+    name: "list_characters",
     description: "List characters on the local VMaNGOS realm (name, level, xp, class, race, gold, online, life/ghost, zone). Read-only. By default hides foundation seats (Bot*, Nightsun, Cowcam); set include_foundation=true for full realm roster.",
     inputSchema: %*{
       "type": "object",
@@ -2653,17 +2653,17 @@ proc registerMcpTools(server: McpServer) =
     }
   )
 
-  proc listShadowsHandler(arguments: JsonNode): ToolResult {.gcsafe.} =
+  proc listCharactersHandler(arguments: JsonNode): ToolResult {.gcsafe.} =
     ## Same roster as the dashboard; returned as text + structuredContent.
     var includeFoundation = false
     if arguments != nil and arguments.kind == JObject and arguments.hasKey("include_foundation"):
       includeFoundation = arguments["include_foundation"].getBool(false)
-    var shadows: seq[Shadow]
+    var characters: seq[Character]
     {.gcsafe.}:
-      shadows = filterShadows(listShadows(), includeFoundation = includeFoundation)
+      characters = filterCharacters(listCharacters(), includeFoundation = includeFoundation)
     # structuredContent must be a JObject per MCP/MCPort (not a bare array).
     let payload = %*{
-      "shadows": shadowsToJson(shadows),
+      "characters": charactersToJson(characters),
       "include_foundation": includeFoundation
     }
     result = ToolResult(
@@ -2896,7 +2896,7 @@ proc registerMcpTools(server: McpServer) =
     "properties": {
       "name": {
         "type": "string",
-        "description": "Cast bot seat name: Shadowfel, Igris, Tusk, or Beru"
+        "description": "Bot seat name: Shadowfel, Igris, Tusk, or Beru"
       }
     },
     "required": ["name"],
@@ -2906,7 +2906,7 @@ proc registerMcpTools(server: McpServer) =
 
   let startBotTool = McpTool(
     name: "start_bot",
-    description: "Launch one cast bot seat (detached `make <seat>-bot`). Seat is ready when its nim_control socket (41114+slot) listens; check list_shadows control_up.",
+    description: "Launch one bot seat (detached `make <seat>-bot`). Seat is ready when its nim_control socket (41114+slot) listens; check list_characters control_up.",
     inputSchema: botNameSchema
   )
 
@@ -2924,7 +2924,7 @@ proc registerMcpTools(server: McpServer) =
 
   let stopBotTool = McpTool(
     name: "stop_bot",
-    description: "Stop one cast bot seat (TERM the nim_control socket holder; the client logs out).",
+    description: "Stop one bot seat (TERM the nim_control socket holder; the client logs out).",
     inputSchema: botNameSchema
   )
 
@@ -2942,7 +2942,7 @@ proc registerMcpTools(server: McpServer) =
 
   # registerRichTool: plain registerTool only surfaces getStr() on JsonNode
   # (arrays become empty text). Monky uses the rich path for the same reason.
-  server.registerRichTool(listTool, listShadowsHandler)
+  server.registerRichTool(listTool, listCharactersHandler)
   server.registerRichTool(eventsTool, addonEventsHandler)
   server.registerRichTool(reloadTool, reloadAddonHandler)
   server.registerRichTool(announceTool, sendAnnounceHandler)

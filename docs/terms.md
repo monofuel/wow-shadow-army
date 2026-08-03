@@ -58,18 +58,11 @@ doc.
 - **The System** — our management server (`system/system_server.nim`), one Nim
   binary on `127.0.0.1:7777`: htmx dashboard + MCP endpoint + admin/lifecycle
   ops. Named for the solo-leveling system. See `system/README.md`.
-- **face** — one of the surfaces a capability is exposed through (dashboard
-  button, MCP tool, addon admin chat verb). Rule: one dispatch proc per
-  capability, every face calls that same proc — faces never diverge.
-- **seat** — one connected game client, human or bot. Bot seats expose a
-  `nim_control` socket on port `41114 + slot`.
-- **cast** — the named characters of the experiment: **Murist** (the human
-  seat, monofuel) plus the bot cast **Shadowfel, Igris, Tusk, Beru**
-  (solo-leveling shadow-soldier naming; personas in `docs/personas/`).
+- **seat** — one connected game client, human or bot. Bot seats are
+  **Shadowfel, Igris, Tusk, Beru**; **Murist** is the human seat (monofuel).
+  Bot seats expose a `nim_control` socket on port `41114 + slot`.
 - **foundation seats** — background/utility characters (`Bot*`, Nightsun,
-  Cowcam) hidden from the default roster view.
-- **shadow** — a roster entry / character as The System sees it (name, level,
-  vitals, zone, seat state).
+  Cowcam) that we ignore and filter out of dashboards by default.
 - **advisor** — the ShadowArmy vanilla-client addon (`addons/ShadowArmy/`) on
   the human seat: reduces monofuel's cognitive load in play. UI or fully
   automated; slash commands are a dev escape hatch, not the product. See

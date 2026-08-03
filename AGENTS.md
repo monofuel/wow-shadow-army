@@ -1,7 +1,7 @@
 # wow-shadow-army — agent rules
 
 **Vocabulary: `docs/terms.md` — read it first and use those terms
-consistently** (upstream, the fork, seats, cast, faces, fair play, …).
+consistently** (upstream, the fork, seats, foundation seats, fair play, …).
 
 ## Scope
 
