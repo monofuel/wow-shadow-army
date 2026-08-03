@@ -4,8 +4,9 @@ Management server for the wow-shadow-army: one Nim binary, many interfaces.
 
 | Interface | Path | Role |
 |---|---|---|
-| HTTP dashboard | `GET /` | htmx Status tab (roster + addon events; offline-safe) |
-| Admin tab | `GET /admin` | realm Server panel (Start/Stop) + ops escape hatches |
+| Army tab | `GET /` / `GET /army` | roster (offline-safe) |
+| Advisor tab | `GET /advisor` | addon event tail + reload |
+| Admin tab | `GET /admin` | realm Start/Stop + ops buttons |
 | Roster partial | `GET /roster` | htmx fragment (roster table rows) |
 | Events partial | `GET /events` | htmx fragment (addon event rows) |
 | Server partial | `GET /server` | htmx fragment (realm status + Start/Stop buttons) |
@@ -52,8 +53,8 @@ nim r system/system_server.nim
 Listens on **http://127.0.0.1:7777** (chosen to avoid realmd 3724, healthz 8080, world 8085, MariaDB 3307).
 
 Works with the realm **up or down**: when the game container is stopped the
-Status roster degrades to an offline note pointing at the Admin tab, where the
-Server panel offers **Start server** (operator `up` — same path as
+Army roster degrades to an offline note pointing at the Admin tab, where the
+Realm panel offers **Start server** (operator `up` — same path as
 `make start-server`, run by an async worker so the page never blocks). Human
 workflow: run the client + this dashboard; realm lifecycle goes through the
 dashboard. `make system` passes the Makefile's `UPSTREAM` as
@@ -72,15 +73,13 @@ Optional env:
 
 ## Dashboard
 
-Open http://127.0.0.1:7777/
+Open http://127.0.0.1:7777/ (aliases `/army`).
 
-Tabs in the header: **Status** | **Admin**.
+Tabs in the header: **Army** | **Advisor** | **Admin**.
 
-- **Realm server** (Admin, top panel) — realm pill (Running / Stopped / Starting… / Stopping…) + **Start server** / **Stop server** buttons. Lifecycle ops run the upstream operator (`up` / `down`) in a background worker; the panel polls `GET /server` and shows the last op's ok/FAIL with output tail on hover. Stop keeps DB volumes (characters/accounts persist).
-- **Bot column** (Status roster) — per-seat **Start**/**Stop** buttons for the launchable bot seats (Shadowfel/Igris/Tusk/Beru; Murist and foundation seats show —). Start runs `make <seat>-bot` detached, appending to `local_data/<seat>-bot.log`; the button flips to Stop when the seat's nim_control socket comes up. Stop TERMs the socket holder (clean client logout). Offline seats show a terse "Off" in the Seat column — detail lives in tooltips.
-- **Roster** (Status) — main characters view by default (hides foundation `Bot*` / Nightsun / Cowcam). Toggle **Show foundation seats** (or `?all=1`) for the full realm. Order: Murist → Shadowfel → Igris → Tusk → Beru, then others. Columns: name · level · XP · **HP/MP** · class · **zone** · **pos** · gold · **life** · **seat** (realm online + nim_control port up/down). Panel head shows army strip (`N online · alive/ghost/dead · ctrl k/n`). Polls `GET /roster` every few seconds via htmx. Zone from `characters.zone` → `area_template`; ghost = `character_flags & 0x2000`. HP/MP from health + class stats + power fields. Pos = `position_x/y`. Seat control probes `127.0.0.1:41114+slot` for bot seats.
-- **Addon events** (Status) — live ring of parsed `<SA>` / `<ShadowArmy>` lines from Chat.log. Table body polls `GET /events`. **Reload addon** posts to `POST /reload`.
-- **Admin** (`GET /admin`) — local ops only. **Respawn shadow army** runs SOAP `revive` + `tele name … Deathknell` + `repairitems` for Shadowfel, Igris, Tusk, Beru. This is **not** fair-play corpse recovery; use it when ghost/corpse runs stall in testing. Does not restart headless clients or brains. The vanilla advisor **Admin** panel requests the same action via `/say` (`<SA> admin respawn_shadow_army`); only **Murist** is accepted.
+- **Army** (`GET /army`) — roster only (hides foundation `Bot*` / Nightsun / Cowcam). Order: Murist → Shadowfel → Igris → Tusk → Beru, then others. Columns: name · level · XP · **HP/MP** · class · **zone** · **pos** · gold · **life** · **seat** · **bot** Start/Stop. Panel head shows army strip (`N online · alive/ghost/dead · ctrl k/n`). Polls `GET /roster` every few seconds via htmx. MCP `list_characters` still accepts `include_foundation=true` for the full realm.
+- **Advisor** (`GET /advisor`) — live ring of parsed `<SA>` / `<ShadowArmy>` lines from Chat.log. Table body polls `GET /events`. **Reload addon** posts to `POST /reload`.
+- **Admin** (`GET /admin`) — **Realm** panel (start/stop) + ops buttons (respawn army, tele party to Murist). Local ops only; not fair-play recovery.
 
 ## Reload loop
 

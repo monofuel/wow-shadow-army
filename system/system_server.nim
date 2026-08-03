@@ -1,9 +1,10 @@
 ## The System — management server for the shadow army.
 ##
 ## One Nim binary, HTTP + MCP interfaces on one mummy server:
-##   HTTP dashboard (htmx)  GET /  GET /roster  GET /events  GET /server
+##   HTTP dashboard (htmx)  GET /  GET /army  GET /advisor  GET /admin
+##                          GET /roster  GET /events  GET /server
 ##                          POST /reload  POST /server/start  POST /server/stop
-##                          GET /admin  POST /admin/respawn-shadow-army
+##                          POST /admin/respawn-shadow-army
 ##   MCP endpoint (MCPort)  POST /mcp
 ##
 ## Critical design rule: one dispatch path. Each capability is one data/action
@@ -16,9 +17,10 @@
 ##   serverStatus()          — realm container up/down + lifecycle op state
 ##   startServer()/stopServer() — queue operator `up`/`down` (async worker)
 ##
+## Tabs: Army (roster), Advisor (addon events + reload), Admin (realm + ops).
 ## The dashboard stays useful with the realm DOWN: roster degrades to an
-## offline note; the Admin tab's Server panel offers Start/Stop. The human
-## only runs the client and this dashboard; realm lifecycle goes through here.
+## offline note; Admin's Server panel offers Start/Stop. The human only runs
+## the client and this dashboard; realm lifecycle goes through here.
 ##
 ## Admin interfaces (same procs): HTTP /admin, MCP tools, and human-seat addon
 ## chat (`<SA> admin <action>` from Murist → Chat.log tailer).
@@ -1608,19 +1610,18 @@ proc renderServerPanel*(s: ServerStatus): string =
 
   var action: string
   if s.op.len > 0:
-    let verb = if s.op == "start": "compose up (image + db healthcheck)" else: "compose stop/rm"
-    action = &"""<span class="meta">operator {escapeHtml(s.op)} running — {escapeHtml(verb)}; this can take a few minutes</span>"""
+    action = """<span class="meta">in progress…</span>"""
   elif s.running:
-    action = &"""
+    action = """
       <button class="admin danger"
               hx-post="/server/stop"
               hx-target="#server-panel"
               hx-swap="innerHTML"
-              hx-confirm="Stop the realm? (compose stop/rm — characters and accounts persist)">
+              hx-confirm="Stop the realm?">
         Stop server
       </button>"""
   else:
-    action = &"""
+    action = """
       <button class="reload"
               hx-post="/server/start"
               hx-target="#server-panel"
@@ -1768,7 +1769,7 @@ proc armySummary*(characters: seq[Character]): string =
 proc renderRosterRows*(characters: seq[Character]): string =
   ## htmx partial: `<tr>` rows for the roster table body.
   if characters.len == 0:
-    return """<tr><td colspan="11" class="empty">No characters in this view (toggle foundation seats, or empty realm).</td></tr>"""
+    return """<tr><td colspan="11" class="empty">No characters (empty realm, or only foundation seats).</td></tr>"""
   result = ""
   for s in characters:
     let life = if s.life.len > 0: s.life else: (if s.online: "alive" else: "offline")
@@ -1802,318 +1803,227 @@ proc renderRosterOfflineRow*(): string =
   ## Roster body when the realm is down: friendly nudge, not a red error.
   result = """<tr><td colspan="11" class="empty">Realm is offline — start it from the <a href="/admin">Admin</a> tab and the roster will fill in here.</td></tr>"""
 
-proc renderRosterPage*(
-    characters: seq[Character],
-    events: seq[AddonEvent],
-    includeFoundation = false,
-    rosterOffline = false
-): string =
-  ## Full Status Window (htmx + auto-poll): roster + addon events.
-  ## Realm lifecycle controls live on the Admin tab (renderAdminPage).
-  let rows = if rosterOffline: renderRosterOfflineRow() else: renderRosterRows(characters)
-  let eventRows = renderEventRows(events)
-  let summary = armySummary(characters)
-  let stamped = now().format("yyyy-MM-dd HH:mm:ss")
-  let rosterUrl = if includeFoundation: "/roster?all=1" else: "/roster"
-  let checked = if includeFoundation: " checked" else: ""
-  result = &"""<!DOCTYPE html>
+## Shared dashboard CSS for Army / Advisor / Admin (plain string — no strformat braces).
+const DashboardCss = """
+    :root {
+      --bg: #0d1117; --panel: #161b22; --border: #30363d; --text: #e6edf3;
+      --muted: #8b949e; --accent: #58a6ff; --online: #3fb950; --offline: #6e7681;
+      --alive: #3fb950; --ghost: #a371f7; --dead: #f85149; --gold: #d4a017;
+      --err: #f85149; --loaded: #3fb950;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      background: var(--bg); color: var(--text); min-height: 100vh;
+    }
+    header {
+      padding: 1.25rem 1.5rem; border-bottom: 1px solid var(--border); background: var(--panel);
+    }
+    header h1 {
+      margin: 0; font-size: 1.25rem; letter-spacing: 0.04em; color: var(--accent);
+    }
+    .nav { display: flex; gap: 0.5rem; margin-top: 0.85rem; }
+    .nav a {
+      color: var(--muted); text-decoration: none; font-size: 0.85rem; font-weight: 600;
+      padding: 0.3rem 0.7rem; border-radius: 6px; border: 1px solid transparent;
+    }
+    .nav a:hover { color: var(--text); background: #21262d; }
+    .nav a.active {
+      color: var(--accent); border-color: var(--border); background: #21262d;
+    }
+    main { padding: 1.5rem; max-width: 1280px; margin: 0 auto; }
+    .panel {
+      background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+      overflow: hidden; margin-bottom: 1.25rem;
+    }
+    .table-scroll { overflow-x: auto; }
+    .panel-head {
+      display: flex; justify-content: space-between; align-items: center; gap: 0.75rem;
+      padding: 0.75rem 1rem; border-bottom: 1px solid var(--border); flex-wrap: wrap;
+    }
+    .panel-head h2 { margin: 0; font-size: 1rem; }
+    .panel-actions {
+      display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap;
+    }
+    .panel-body { padding: 1rem; }
+    .meta { color: var(--muted); font-size: 0.8rem; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td {
+      text-align: left; padding: 0.55rem 0.7rem; border-bottom: 1px solid var(--border);
+      font-size: 0.9rem;
+    }
+    th {
+      color: var(--muted); font-weight: 600; font-size: 0.8rem;
+      text-transform: uppercase; letter-spacing: 0.04em;
+    }
+    tr:last-child td { border-bottom: none; }
+    td.name { font-weight: 600; }
+    td.lvl { font-variant-numeric: tabular-nums; font-weight: 600; }
+    td.gold { color: var(--gold); font-variant-numeric: tabular-nums; }
+    td.zone { color: var(--text); font-size: 0.9rem; max-width: 10rem; }
+    td.conn { color: var(--muted); font-size: 0.8rem; font-variant-numeric: tabular-nums; }
+    td.payload {
+      color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 0.85rem;
+    }
+    td.xp-cell { min-width: 9.5rem; }
+    td.vitals-cell { min-width: 8rem; }
+    .xp-bar {
+      height: 6px; background: #21262d; border-radius: 999px; overflow: hidden;
+      margin-bottom: 0.25rem;
+    }
+    .xp-fill {
+      height: 100%; background: linear-gradient(90deg, #1f6feb, #58a6ff); border-radius: 999px;
+    }
+    .xp-meta { font-size: 0.75rem; font-variant-numeric: tabular-nums; color: var(--text); }
+    .xp-muted { color: var(--muted); font-weight: 400; }
+    .vitals { display: flex; flex-direction: column; gap: 0.2rem; }
+    .vitals-line {
+      display: grid; grid-template-columns: 2.4rem 1fr auto; align-items: center;
+      gap: 0.35rem; font-size: 0.72rem; font-variant-numeric: tabular-nums;
+    }
+    .vitals-tag { color: var(--muted); font-weight: 600; }
+    .vitals-bar { height: 5px; background: #21262d; border-radius: 999px; overflow: hidden; }
+    .vitals-fill { height: 100%; border-radius: 999px; }
+    .vitals-fill.hp { background: linear-gradient(90deg, #238636, #3fb950); }
+    .vitals-fill.hp.low { background: linear-gradient(90deg, #a40e26, #f85149); }
+    .vitals-fill.mana { background: linear-gradient(90deg, #1f6feb, #58a6ff); }
+    .vitals-fill.rage { background: linear-gradient(90deg, #a40e26, #f85149); }
+    .vitals-fill.energy { background: linear-gradient(90deg, #9e6a03, #d4a017); }
+    .vitals-num { color: var(--text); white-space: nowrap; }
+    .vitals-muted { color: var(--muted); }
+    td.pos-cell, .pos {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.8rem;
+      font-variant-numeric: tabular-nums; color: var(--muted); white-space: nowrap;
+    }
+    td.seat { font-size: 0.8rem; white-space: nowrap; }
+    td.bot-cell { white-space: nowrap; }
+    .bot-btn {
+      border: none; border-radius: 5px; padding: 0.2rem 0.55rem; font-size: 0.72rem;
+      font-weight: 600; cursor: pointer;
+    }
+    .bot-btn.start { background: var(--accent); color: #0d1117; }
+    .bot-btn.stop { background: color-mix(in srgb, var(--dead) 85%, #000); color: #fff; }
+    .bot-btn:hover { filter: brightness(1.1); }
+    .seat-net.online { color: var(--alive); font-weight: 600; }
+    .seat-net.offline { color: var(--offline); }
+    .seat-ctrl.ctrl-up { color: var(--accent); }
+    .seat-ctrl.ctrl-down { color: var(--err); }
+    tr.row-ghost { background: color-mix(in srgb, var(--ghost) 8%, transparent); }
+    tr.row-dead { background: color-mix(in srgb, var(--dead) 8%, transparent); }
+    .army-summary {
+      font-size: 0.8rem; color: var(--muted); font-variant-numeric: tabular-nums;
+    }
+    .status {
+      display: inline-block; padding: 0.15rem 0.5rem; border-radius: 999px;
+      font-size: 0.75rem; font-weight: 600;
+    }
+    .status.online, .status.alive {
+      background: color-mix(in srgb, var(--alive) 20%, transparent); color: var(--alive);
+    }
+    .status.offline {
+      background: color-mix(in srgb, var(--offline) 25%, transparent); color: var(--offline);
+    }
+    .status.busy {
+      background: color-mix(in srgb, var(--accent) 20%, transparent); color: var(--accent);
+    }
+    .status.ghost {
+      background: color-mix(in srgb, var(--ghost) 22%, transparent); color: var(--ghost);
+    }
+    .status.dead {
+      background: color-mix(in srgb, var(--dead) 20%, transparent); color: var(--dead);
+    }
+    .server-line { display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap; }
+    .server-label { font-weight: 600; font-size: 0.9rem; }
+    .server-container {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.75rem;
+    }
+    .server-action { margin-left: auto; }
+    .server-last { margin-top: 0.5rem; font-size: 0.8rem; }
+    .kind {
+      display: inline-block; padding: 0.15rem 0.5rem; border-radius: 999px;
+      font-size: 0.75rem; font-weight: 600;
+    }
+    .kind-err { background: color-mix(in srgb, var(--err) 20%, transparent); color: var(--err); }
+    .kind-loaded {
+      background: color-mix(in srgb, var(--loaded) 20%, transparent); color: var(--loaded);
+    }
+    .kind-muted {
+      background: color-mix(in srgb, var(--muted) 20%, transparent); color: var(--muted);
+    }
+    .empty { color: var(--muted); text-align: center; padding: 2rem; }
+    button.reload {
+      background: var(--accent); color: #0d1117; border: none; border-radius: 6px;
+      padding: 0.35rem 0.75rem; font-size: 0.8rem; font-weight: 600; cursor: pointer;
+    }
+    button.reload:hover { filter: brightness(1.08); }
+    button.admin {
+      background: #f85149; color: #fff; border: none; border-radius: 6px;
+      padding: 0.45rem 0.9rem; font-size: 0.85rem; font-weight: 600; cursor: pointer;
+    }
+    button.admin:hover { filter: brightness(1.08); }
+    button.admin.danger { background: #f85149; color: #fff; }
+    .reload-ok, .admin-ok { color: var(--loaded); font-size: 0.85rem; }
+    .reload-timeout, .admin-err { color: var(--err); font-size: 0.85rem; }
+    .admin-actions { display: flex; flex-wrap: wrap; gap: 0.75rem; align-items: center; }
+    .admin-steps {
+      margin-top: 0.75rem; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 0.8rem; color: var(--muted); white-space: pre-wrap;
+    }
+"""
+
+proc navTabClass(active, tab: string): string =
+  ## ` class="active"` when this tab is selected; empty otherwise.
+  if active == tab: " class=\"active\"" else: ""
+
+proc renderNav*(active: string): string =
+  ## Header nav: Army | Advisor | Admin.
+  let army = navTabClass(active, "army")
+  let advisor = navTabClass(active, "advisor")
+  let admin = navTabClass(active, "admin")
+  result = &"""
+    <nav class="nav">
+      <a{army} href="/army">Army</a>
+      <a{advisor} href="/advisor">Advisor</a>
+      <a{admin} href="/admin">Admin</a>
+    </nav>"""
+
+proc renderDashboard*(title, active, body: string): string =
+  ## Full HTML shell shared by Army / Advisor / Admin tabs.
+  result = """<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>The System — Roster</title>
+  <title>The System — """ & escapeHtml(title) & """</title>
   <script src="https://unpkg.com/htmx.org@2.0.4"></script>
   <style>
-    :root {{
-      --bg: #0d1117;
-      --panel: #161b22;
-      --border: #30363d;
-      --text: #e6edf3;
-      --muted: #8b949e;
-      --accent: #58a6ff;
-      --online: #3fb950;
-      --offline: #6e7681;
-      --alive: #3fb950;
-      --ghost: #a371f7;
-      --dead: #f85149;
-      --gold: #d4a017;
-      --err: #f85149;
-      --loaded: #3fb950;
-    }}
-    * {{ box-sizing: border-box; }}
-    body {{
-      margin: 0;
-      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
-      background: var(--bg);
-      color: var(--text);
-      min-height: 100vh;
-    }}
-    header {{
-      padding: 1.25rem 1.5rem;
-      border-bottom: 1px solid var(--border);
-      background: var(--panel);
-    }}
-    header h1 {{
-      margin: 0;
-      font-size: 1.25rem;
-      letter-spacing: 0.04em;
-      color: var(--accent);
-    }}
-    header p {{
-      margin: 0.35rem 0 0;
-      color: var(--muted);
-      font-size: 0.9rem;
-    }}
-    main {{ padding: 1.5rem; max-width: 1280px; margin: 0 auto; }}
-    .panel {{
-      background: var(--panel);
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      overflow: hidden;
-      margin-bottom: 1.25rem;
-    }}
-    .table-scroll {{ overflow-x: auto; }}
-    .panel-head {{
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      gap: 0.75rem;
-      padding: 0.75rem 1rem;
-      border-bottom: 1px solid var(--border);
-      flex-wrap: wrap;
-    }}
-    .panel-head h2 {{ margin: 0; font-size: 1rem; }}
-    .panel-actions {{
-      display: flex;
-      align-items: center;
-      gap: 0.75rem;
-      flex-wrap: wrap;
-    }}
-    .meta {{ color: var(--muted); font-size: 0.8rem; }}
-    table {{ width: 100%; border-collapse: collapse; }}
-    th, td {{
-      text-align: left;
-      padding: 0.55rem 0.7rem;
-      border-bottom: 1px solid var(--border);
-      font-size: 0.9rem;
-    }}
-    th {{ color: var(--muted); font-weight: 600; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.04em; }}
-    tr:last-child td {{ border-bottom: none; }}
-    td.name {{ font-weight: 600; }}
-    td.lvl {{ font-variant-numeric: tabular-nums; font-weight: 600; }}
-    td.gold {{ color: var(--gold); font-variant-numeric: tabular-nums; }}
-    td.zone {{ color: var(--text); font-size: 0.9rem; max-width: 10rem; }}
-    td.conn {{ color: var(--muted); font-size: 0.8rem; font-variant-numeric: tabular-nums; }}
-    td.payload {{ color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.85rem; }}
-    td.xp-cell {{ min-width: 9.5rem; }}
-    td.vitals-cell {{ min-width: 8rem; }}
-    .xp-bar {{
-      height: 6px;
-      background: #21262d;
-      border-radius: 999px;
-      overflow: hidden;
-      margin-bottom: 0.25rem;
-    }}
-    .xp-fill {{
-      height: 100%;
-      background: linear-gradient(90deg, #1f6feb, #58a6ff);
-      border-radius: 999px;
-    }}
-    .xp-meta {{
-      font-size: 0.75rem;
-      font-variant-numeric: tabular-nums;
-      color: var(--text);
-    }}
-    .xp-muted {{ color: var(--muted); font-weight: 400; }}
-    .vitals {{ display: flex; flex-direction: column; gap: 0.2rem; }}
-    .vitals-line {{
-      display: grid;
-      grid-template-columns: 2.4rem 1fr auto;
-      align-items: center;
-      gap: 0.35rem;
-      font-size: 0.72rem;
-      font-variant-numeric: tabular-nums;
-    }}
-    .vitals-tag {{ color: var(--muted); font-weight: 600; }}
-    .vitals-bar {{
-      height: 5px;
-      background: #21262d;
-      border-radius: 999px;
-      overflow: hidden;
-    }}
-    .vitals-fill {{ height: 100%; border-radius: 999px; }}
-    .vitals-fill.hp {{ background: linear-gradient(90deg, #238636, #3fb950); }}
-    .vitals-fill.hp.low {{ background: linear-gradient(90deg, #a40e26, #f85149); }}
-    .vitals-fill.mana {{ background: linear-gradient(90deg, #1f6feb, #58a6ff); }}
-    .vitals-fill.rage {{ background: linear-gradient(90deg, #a40e26, #f85149); }}
-    .vitals-fill.energy {{ background: linear-gradient(90deg, #9e6a03, #d4a017); }}
-    .vitals-num {{ color: var(--text); white-space: nowrap; }}
-    .vitals-muted {{ color: var(--muted); }}
-    td.pos-cell, .pos {{
-      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-      font-size: 0.8rem;
-      font-variant-numeric: tabular-nums;
-      color: var(--muted);
-      white-space: nowrap;
-    }}
-    td.seat {{ font-size: 0.8rem; white-space: nowrap; }}
-    td.bot-cell {{ white-space: nowrap; }}
-    .bot-btn {{
-      border: none;
-      border-radius: 5px;
-      padding: 0.2rem 0.55rem;
-      font-size: 0.72rem;
-      font-weight: 600;
-      cursor: pointer;
-    }}
-    .bot-btn.start {{ background: var(--accent); color: #0d1117; }}
-    .bot-btn.stop {{ background: color-mix(in srgb, var(--dead) 85%, #000); color: #fff; }}
-    .bot-btn:hover {{ filter: brightness(1.1); }}
-    .seat-net.online {{ color: var(--alive); font-weight: 600; }}
-    .seat-net.offline {{ color: var(--offline); }}
-    .seat-ctrl.ctrl-up {{ color: var(--accent); }}
-    .seat-ctrl.ctrl-down {{ color: var(--err); }}
-    tr.foundation td.name {{ color: var(--muted); }}
-    tr.row-ghost {{ background: color-mix(in srgb, var(--ghost) 8%, transparent); }}
-    tr.row-dead {{ background: color-mix(in srgb, var(--dead) 8%, transparent); }}
-    .army-summary {{
-      font-size: 0.8rem;
-      color: var(--muted);
-      font-variant-numeric: tabular-nums;
-    }}
-    .toggle {{
-      display: inline-flex;
-      align-items: center;
-      gap: 0.4rem;
-      font-size: 0.8rem;
-      color: var(--muted);
-      cursor: pointer;
-      user-select: none;
-    }}
-    .toggle input {{ accent-color: var(--accent); cursor: pointer; }}
-    .status {{
-      display: inline-block;
-      padding: 0.15rem 0.5rem;
-      border-radius: 999px;
-      font-size: 0.75rem;
-      font-weight: 600;
-    }}
-    .status.online, .status.alive {{ background: color-mix(in srgb, var(--alive) 20%, transparent); color: var(--alive); }}
-    .status.offline {{ background: color-mix(in srgb, var(--offline) 25%, transparent); color: var(--offline); }}
-    .status.busy {{ background: color-mix(in srgb, var(--accent) 20%, transparent); color: var(--accent); }}
-    .server-line {{
-      display: flex;
-      align-items: center;
-      gap: 0.75rem;
-      flex-wrap: wrap;
-    }}
-    .server-label {{ font-weight: 600; font-size: 0.9rem; }}
-    .server-container {{
-      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-      font-size: 0.75rem;
-    }}
-    .server-action {{ margin-left: auto; }}
-    .server-last {{ margin-top: 0.5rem; font-size: 0.8rem; }}
-    .status.ghost {{ background: color-mix(in srgb, var(--ghost) 22%, transparent); color: var(--ghost); }}
-    .status.dead {{ background: color-mix(in srgb, var(--dead) 20%, transparent); color: var(--dead); }}
-    .kind {{
-      display: inline-block;
-      padding: 0.15rem 0.5rem;
-      border-radius: 999px;
-      font-size: 0.75rem;
-      font-weight: 600;
-    }}
-    .kind-err {{ background: color-mix(in srgb, var(--err) 20%, transparent); color: var(--err); }}
-    .kind-loaded {{ background: color-mix(in srgb, var(--loaded) 20%, transparent); color: var(--loaded); }}
-    .kind-muted {{ background: color-mix(in srgb, var(--muted) 20%, transparent); color: var(--muted); }}
-    .empty {{ color: var(--muted); text-align: center; padding: 2rem; }}
-    button.reload, button.admin {{
-      background: var(--accent);
-      color: #0d1117;
-      border: none;
-      border-radius: 6px;
-      padding: 0.35rem 0.75rem;
-      font-size: 0.8rem;
-      font-weight: 600;
-      cursor: pointer;
-    }}
-    button.reload:hover, button.admin:hover {{ filter: brightness(1.08); }}
-    button.admin.danger {{
-      background: #f85149;
-      color: #fff;
-    }}
-    .reload-ok, .admin-ok {{ color: var(--loaded); font-size: 0.85rem; }}
-    .reload-timeout, .admin-err {{ color: var(--err); font-size: 0.85rem; }}
-    .nav {{
-      display: flex;
-      gap: 0.5rem;
-      margin-top: 0.85rem;
-    }}
-    .nav a {{
-      color: var(--muted);
-      text-decoration: none;
-      font-size: 0.85rem;
-      font-weight: 600;
-      padding: 0.3rem 0.7rem;
-      border-radius: 6px;
-      border: 1px solid transparent;
-    }}
-    .nav a:hover {{ color: var(--text); background: #21262d; }}
-    .nav a.active {{
-      color: var(--accent);
-      border-color: var(--border);
-      background: #21262d;
-    }}
-    .admin-note {{
-      color: var(--muted);
-      font-size: 0.9rem;
-      line-height: 1.45;
-      margin: 0 0 1rem;
-    }}
-    .admin-seats {{
-      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-      font-size: 0.85rem;
-      color: var(--text);
-    }}
-    .admin-steps {{
-      margin-top: 0.75rem;
-      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-      font-size: 0.8rem;
-      color: var(--muted);
-      white-space: pre-wrap;
-    }}
-    .panel-body {{ padding: 1rem; }}
-    footer {{
-      max-width: 1100px;
-      margin: 1rem auto;
-      padding: 0 1.5rem;
-      color: var(--muted);
-      font-size: 0.8rem;
-    }}
-    code {{ background: var(--panel); padding: 0.1rem 0.35rem; border-radius: 4px; }}
+""" & DashboardCss & """
   </style>
 </head>
 <body>
   <header>
     <h1>THE SYSTEM</h1>
-    <p>Character army Status Window — local realm roster + addon telemetry</p>
-    <nav class="nav">
-      <a class="active" href="/">Status</a>
-      <a href="/admin">Admin</a>
-    </nav>
+""" & renderNav(active) & """
   </header>
   <main>
+""" & body & """
+  </main>
+</body>
+</html>
+"""
+
+proc renderArmyPage*(characters: seq[Character], rosterOffline = false): string =
+  ## Army tab: roster only. Foundation seats always hidden.
+  let rows = if rosterOffline: renderRosterOfflineRow() else: renderRosterRows(characters)
+  let summary = armySummary(characters)
+  let body = &"""
     <div class="panel">
       <div class="panel-head">
         <h2>Roster</h2>
         <div class="panel-actions">
           <span class="army-summary" id="army-summary">{escapeHtml(summary)}</span>
-          <label class="toggle" title="Botmage/Botpriest/… and Nightsun/Cowcam">
-            <input type="checkbox" id="show-foundation"{checked}
-              onchange="window.sysSetFoundation(this.checked)">
-            Show foundation seats
-          </label>
-          <span class="meta" id="stamp">as of {escapeHtml(stamped)} · refresh every {PollSeconds}s</span>
         </div>
       </div>
       <div class="table-scroll">
@@ -2134,27 +2044,20 @@ proc renderRosterPage*(
           </tr>
         </thead>
         <tbody id="roster"
-               hx-get="{rosterUrl}"
+               hx-get="/roster"
                hx-trigger="every {PollSeconds}s"
                hx-swap="innerHTML">
 {rows}
         </tbody>
       </table>
       </div>
-    </div>
-    <script>
-      window.sysSetFoundation = function(on) {{
-        var tb = document.getElementById('roster');
-        if (!tb) return;
-        var url = on ? '/roster?all=1' : '/roster';
-        tb.setAttribute('hx-get', url);
-        if (window.htmx) {{
-          htmx.process(tb);
-          htmx.ajax('GET', url, {{target: '#roster', swap: 'innerHTML'}});
-        }}
-        try {{ history.replaceState(null, '', on ? '/?all=1' : '/'); }} catch (e) {{}}
-      }};
-    </script>
+    </div>"""
+  result = renderDashboard("Army", "army", body)
+
+proc renderAdvisorPage*(events: seq[AddonEvent]): string =
+  ## Advisor tab: addon event tail + reload control.
+  let eventRows = renderEventRows(events)
+  let body = &"""
     <div class="panel">
       <div class="panel-head">
         <h2>Addon events</h2>
@@ -2164,7 +2067,6 @@ proc renderRosterPage*(
                   hx-target="#reload-result"
                   hx-swap="innerHTML">Reload addon</button>
           <span id="reload-result" class="meta"></span>
-          <span class="meta">live tail · every {PollSeconds}s</span>
         </div>
       </div>
       <div class="table-scroll">
@@ -2185,19 +2087,8 @@ proc renderRosterPage*(
         </tbody>
       </table>
       </div>
-    </div>
-  </main>
-  <footer>
-    One dispatch path per capability:
-    <code>listCharacters()</code>, <code>recentEvents()</code>, <code>reloadAddon()</code>,
-    <code>respawnShadowArmy()</code>, <code>serverStatus()</code>,
-    <code>startServer()</code>/<code>stopServer()</code>
-    feed both interfaces. MCP: <code>POST /mcp</code>.
-    Write path: SOAP <code>announce</code> + admin revive/tele + realm lifecycle (local ops only).
-  </footer>
-</body>
-</html>
-"""
+    </div>"""
+  result = renderDashboard("Advisor", "advisor", body)
 
 proc renderAdminResult*(r: AdminActionResult): string =
   ## HTML fragment for an admin action outcome (htmx target).
@@ -2213,106 +2104,12 @@ proc renderAdminResult*(r: AdminActionResult): string =
 """
 
 proc renderAdminPage*(server: ServerStatus): string =
-  ## Admin tab: realm lifecycle + ops escape hatches (not fair-play policy).
-  let seatList = BotSeats.join(", ")
-  let stamped = now().format("yyyy-MM-dd HH:mm:ss")
+  ## Admin tab: realm lifecycle + ops buttons.
   let serverPanel = renderServerPanel(server)
-  result = &"""<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>The System — Admin</title>
-  <script src="https://unpkg.com/htmx.org@2.0.4"></script>
-  <style>
-    :root {{
-      --bg: #0d1117; --panel: #161b22; --border: #30363d; --text: #e6edf3;
-      --muted: #8b949e; --accent: #58a6ff; --loaded: #3fb950; --err: #f85149;
-    }}
-    * {{ box-sizing: border-box; }}
-    body {{
-      margin: 0;
-      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
-      background: var(--bg); color: var(--text); min-height: 100vh;
-    }}
-    header {{
-      padding: 1.25rem 1.5rem; border-bottom: 1px solid var(--border); background: var(--panel);
-    }}
-    header h1 {{ margin: 0; font-size: 1.25rem; letter-spacing: 0.04em; color: var(--accent); }}
-    header p {{ margin: 0.35rem 0 0; color: var(--muted); font-size: 0.9rem; }}
-    .nav {{ display: flex; gap: 0.5rem; margin-top: 0.85rem; }}
-    .nav a {{
-      color: var(--muted); text-decoration: none; font-size: 0.85rem; font-weight: 600;
-      padding: 0.3rem 0.7rem; border-radius: 6px; border: 1px solid transparent;
-    }}
-    .nav a:hover {{ color: var(--text); background: #21262d; }}
-    .nav a.active {{ color: var(--accent); border-color: var(--border); background: #21262d; }}
-    main {{ padding: 1.5rem; max-width: 1100px; margin: 0 auto; }}
-    .panel {{
-      background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
-      overflow: hidden; margin-bottom: 1.25rem;
-    }}
-    .panel-head {{
-      display: flex; justify-content: space-between; align-items: center; gap: 0.75rem;
-      padding: 0.75rem 1rem; border-bottom: 1px solid var(--border); flex-wrap: wrap;
-    }}
-    .panel-head h2 {{ margin: 0; font-size: 1rem; }}
-    .panel-body {{ padding: 1rem; }}
-    .admin-note {{ color: var(--muted); font-size: 0.9rem; line-height: 1.45; margin: 0 0 1rem; }}
-    .admin-seats {{
-      font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.85rem;
-    }}
-    button.admin {{
-      background: #f85149; color: #fff; border: none; border-radius: 6px;
-      padding: 0.45rem 0.9rem; font-size: 0.85rem; font-weight: 600; cursor: pointer;
-    }}
-    button.admin:hover {{ filter: brightness(1.08); }}
-    button.reload {{
-      background: var(--accent); color: #0d1117; border: none; border-radius: 6px;
-      padding: 0.45rem 0.9rem; font-size: 0.85rem; font-weight: 600; cursor: pointer;
-    }}
-    button.reload:hover {{ filter: brightness(1.08); }}
-    .status {{
-      display: inline-block; padding: 0.15rem 0.5rem; border-radius: 999px;
-      font-size: 0.75rem; font-weight: 600;
-    }}
-    .status.alive {{ background: color-mix(in srgb, var(--loaded) 20%, transparent); color: var(--loaded); }}
-    .status.offline {{ background: color-mix(in srgb, var(--muted) 25%, transparent); color: var(--muted); }}
-    .status.busy {{ background: color-mix(in srgb, var(--accent) 20%, transparent); color: var(--accent); }}
-    .server-line {{ display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap; }}
-    .server-label {{ font-weight: 600; font-size: 0.9rem; }}
-    .server-container {{
-      font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.75rem;
-    }}
-    .server-action {{ margin-left: auto; }}
-    .server-last {{ margin-top: 0.5rem; font-size: 0.8rem; }}
-    .admin-ok {{ color: var(--loaded); font-size: 0.85rem; }}
-    .admin-err {{ color: var(--err); font-size: 0.85rem; }}
-    .admin-steps {{
-      margin-top: 0.75rem; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-      font-size: 0.8rem; color: var(--muted); white-space: pre-wrap;
-    }}
-    .meta {{ color: var(--muted); font-size: 0.8rem; }}
-    footer {{
-      max-width: 1100px; margin: 1rem auto; padding: 0 1.5rem; color: var(--muted); font-size: 0.8rem;
-    }}
-    code {{ background: #21262d; padding: 0.1rem 0.35rem; border-radius: 4px; }}
-  </style>
-</head>
-<body>
-  <header>
-    <h1>THE SYSTEM</h1>
-    <p>Admin — local ops escape hatches (not fair-play policy)</p>
-    <nav class="nav">
-      <a href="/">Status</a>
-      <a class="active" href="/admin">Admin</a>
-    </nav>
-  </header>
-  <main>
+  let body = &"""
     <div class="panel">
       <div class="panel-head">
-        <h2>Realm server</h2>
-        <span class="meta">operator up/down · characters and accounts persist across stop</span>
+        <h2>Realm</h2>
       </div>
       <div class="panel-body"
            id="server-panel"
@@ -2324,73 +2121,29 @@ proc renderAdminPage*(server: ServerStatus): string =
     </div>
     <div class="panel">
       <div class="panel-head">
-        <h2>Respawn shadow army</h2>
-        <span class="meta">as of {escapeHtml(stamped)}</span>
+        <h2>Actions</h2>
       </div>
       <div class="panel-body">
-        <p class="admin-note">
-          Hard-reset the bot seats when corpse runs stall (ghost move masks, elevated death
-          pockets, frozen frames). Runs SOAP <code>revive</code> +
-          <code>tele name … {escapeHtml(ShadowArmyRespawnTele)}</code> +
-          <code>repairitems</code> per seat. <strong>Not</strong> fair-play recovery —
-          testing / ops only. Does not restart headless clients or brains.
-          Same action from in-game advisor <strong>Admin → Respawn army</strong>
-          (Murist only: <code>&lt;SA&gt; admin respawn_shadow_army</code>).
-        </p>
-        <p class="admin-note">
-          Seats:
-          <span class="admin-seats">{escapeHtml(seatList)}</span>
-          → <code>{escapeHtml(ShadowArmyRespawnTele)}</code>
-        </p>
-        <button class="admin"
-                hx-post="/admin/respawn-shadow-army"
-                hx-target="#admin-result"
-                hx-swap="innerHTML"
-                hx-confirm="Respawn Shadowfel, Igris, Tusk, Beru at Deathknell? (GM revive + tele)">
-          Respawn shadow army
-        </button>
-      </div>
-    </div>
-    <div class="panel" style="margin-top:1rem;">
-      <div class="panel-head">
-        <h2>Teleport party to Murist</h2>
-        <span class="meta">ops</span>
-      </div>
-      <div class="panel-body">
-        <p class="admin-note">
-          Pulls the bot seats to Murist's current DB position. Upserts
-          <code>{escapeHtml(MuristMeetTeleName)}</code> in
-          <code>game_tele</code>, reloads it, then
-          <code>tele name &lt;seat&gt; {escapeHtml(MuristMeetTeleName)}</code>.
-          <strong>Not</strong> fair-play. Same as MCP
-          <code>tele_party_to_murist</code> and advisor
-          <strong>Admin → Tele party to me</strong>.
-        </p>
-        <p class="admin-note">
-          Seats:
-          <span class="admin-seats">{escapeHtml(seatList)}</span>
-          → Murist live pos
-        </p>
-        <button class="admin"
-                hx-post="/admin/tele-party-to-murist"
-                hx-target="#admin-result"
-                hx-swap="innerHTML"
-                hx-confirm="Teleport Shadowfel, Igris, Tusk, Beru to Murist's position?">
-          Teleport party to Murist
-        </button>
+        <div class="admin-actions">
+          <button class="admin"
+                  hx-post="/admin/respawn-shadow-army"
+                  hx-target="#admin-result"
+                  hx-swap="innerHTML"
+                  hx-confirm="Respawn Shadowfel, Igris, Tusk, Beru at Deathknell?">
+            Respawn shadow army
+          </button>
+          <button class="admin"
+                  hx-post="/admin/tele-party-to-murist"
+                  hx-target="#admin-result"
+                  hx-swap="innerHTML"
+                  hx-confirm="Teleport Shadowfel, Igris, Tusk, Beru to Murist's position?">
+            Teleport party to Murist
+          </button>
+        </div>
         <div id="admin-result" style="margin-top:1rem;"></div>
       </div>
-    </div>
-  </main>
-  <footer>
-    Dispatch: <code>respawnShadowArmy()</code> /
-    <code>telePartyToMurist()</code>
-    · HTTP <code>/admin/*</code>
-    · MCP · Murist <code>&lt;SA&gt; admin …</code>
-  </footer>
-</body>
-</html>
-"""
+    </div>"""
+  result = renderDashboard("Admin", "admin", body)
 
 proc htmlHeaders(): mummyheaders.HttpHeaders =
   ## mummy/webby headers (not std/httpclient's HttpHeaders).
@@ -2402,47 +2155,47 @@ proc jsonHeaders(): mummyheaders.HttpHeaders =
   result = mummyheaders.emptyHttpHeaders()
   result["Content-Type"] = "application/json; charset=utf-8"
 
-proc queryWantsAll*(request: Request): bool =
-  ## True when ?all=1 / all=true is present (show foundation seats).
-  let v = request.queryParams["all"].toLowerAscii()
-  result = v == "1" or v == "true" or v == "yes"
-
-proc indexHandler(request: Request) {.gcsafe.} =
-  ## GET / — full Status Window (server panel + roster + addon events).
-  ## Renders with the realm DOWN too: roster degrades to an offline note and
-  ## the Server panel offers Start (the whole point of the panel).
+proc armyPageHandler(request: Request) {.gcsafe.} =
+  ## GET / and GET /army — Army tab (roster only).
+  ## Realm down: roster degrades to an offline note. Foundation seats hidden.
   try:
     var characters: seq[Character] = @[]
-    var events: seq[AddonEvent]
     var status: ServerStatus
     var rosterOffline = false
-    let showAll = queryWantsAll(request)
     {.gcsafe.}:
       status = serverStatus()
       if status.running:
         try:
-          characters = filterCharacters(listCharacters(), includeFoundation = showAll)
+          characters = filterCharacters(listCharacters())
         except CatchableError:
           # Container up but DB not answering yet (mid-boot): offline view.
           rosterOffline = true
       else:
         rosterOffline = true
-      events = recentEvents(limit = 30)
     request.respond(200, htmlHeaders(),
-      renderRosterPage(characters, events,
-        includeFoundation = showAll, rosterOffline = rosterOffline))
+      renderArmyPage(characters, rosterOffline = rosterOffline))
   except Exception as e:
     request.respond(500, htmlHeaders(),
-      &"<!DOCTYPE html><html><body><h1>Roster error</h1><pre>{escapeHtml(e.msg)}</pre></body></html>")
+      &"<!DOCTYPE html><html><body><h1>Army error</h1><pre>{escapeHtml(e.msg)}</pre></body></html>")
+
+proc advisorPageHandler(request: Request) {.gcsafe.} =
+  ## GET /advisor — Advisor tab (addon event tail + reload).
+  try:
+    var events: seq[AddonEvent]
+    {.gcsafe.}:
+      events = recentEvents(limit = 30)
+    request.respond(200, htmlHeaders(), renderAdvisorPage(events))
+  except Exception as e:
+    request.respond(500, htmlHeaders(),
+      &"<!DOCTYPE html><html><body><h1>Advisor error</h1><pre>{escapeHtml(e.msg)}</pre></body></html>")
 
 proc rosterPartialHandler(request: Request) {.gcsafe.} =
-  ## GET /roster — htmx fragment (table rows only). ?all=1 includes foundation.
+  ## GET /roster — htmx fragment (table rows only). Foundation seats hidden.
   ## Realm down / DB unreachable → friendly offline row, not a red error.
   try:
     var characters: seq[Character]
-    let showAll = queryWantsAll(request)
     {.gcsafe.}:
-      characters = filterCharacters(listCharacters(), includeFoundation = showAll)
+      characters = filterCharacters(listCharacters())
     request.respond(200, htmlHeaders(), renderRosterRows(characters))
   except Exception as e:
     var offline = false
@@ -2610,8 +2363,10 @@ proc serverInfoHandler(request: Request) {.gcsafe.} =
       "name": gMcpServer.serverInfo.name,
       "version": gMcpServer.serverInfo.version,
       "endpoints": {
-        "dashboard": "/",
+        "army": "/army",
+        "advisor": "/advisor",
         "admin": "/admin",
+        "dashboard": "/",
         "roster_partial": "/roster",
         "events_partial": "/events",
         "server_partial": "/server",
@@ -2963,7 +2718,9 @@ proc main() =
   startServerOpWorker()
 
   var router: Router
-  router.get("/", indexHandler)
+  router.get("/", armyPageHandler)
+  router.get("/army", armyPageHandler)
+  router.get("/advisor", advisorPageHandler)
   router.get("/admin", adminPageHandler)
   router.get("/roster", rosterPartialHandler)
   router.get("/events", eventsPartialHandler)
@@ -2981,7 +2738,8 @@ proc main() =
 
   let server = newServer(router)
   echo &"{ServerName} v{Version} listening on http://127.0.0.1:{HttpPort}"
-  echo &"  Status:      GET  http://127.0.0.1:{HttpPort}/"
+  echo &"  Army:        GET  http://127.0.0.1:{HttpPort}/army"
+  echo &"  Advisor:     GET  http://127.0.0.1:{HttpPort}/advisor"
   echo &"  Admin:       GET  http://127.0.0.1:{HttpPort}/admin"
   echo &"  Events:      GET  http://127.0.0.1:{HttpPort}/events"
   echo &"  Server:      GET  http://127.0.0.1:{HttpPort}/server (POST /server/start /server/stop)"
