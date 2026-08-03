@@ -128,8 +128,9 @@ ORDER BY FIELD(cq.status, 1, 3, 5), qt.QuestLevel, cq.quest"""
   DefaultChatLogRel = "../coworld-vanilla-wow/local_data/coworld-run/logs/Chat.log"
   ## Upstream checkout holding the compose operator (same as Makefile UPSTREAM).
   DefaultUpstreamRel = "../coworld-vanilla-wow"
-  ## Realm lifecycle operator, run with cwd = upstream (same as Makefile OPERATOR).
-  OperatorScriptRel = "server/scripts/docker_vmangos_server.py"
+  ## Shared realm lifecycle entry (discovers upstream operator + auto --build).
+  ## Single path for dashboard + Makefile so upstream layout churn is one fix.
+  RealmOpWrapperRel = "tools/realm_op.sh"
   ## Detached user unit for realm start/stop — NOT a child of wow-system, so
   ## dashboard restarts cannot kill a multi-minute image build / compose up.
   RealmOpUnit = "wow-realm-op"
@@ -1236,14 +1237,19 @@ proc stopRealmOpUnit() =
   discard runCmdCapture("systemctl", ["--user", "stop", RealmOpUnit])
   discard runCmdCapture("systemctl", ["--user", "reset-failed", RealmOpUnit])
 
+proc realmOpWrapperPath*(): string =
+  ## Absolute path to tools/realm_op.sh under the army checkout.
+  armyRoot() / RealmOpWrapperRel
+
 proc spawnDetachedRealmOperator(op: ServerLifecycleOp): tuple[ok: bool, detail: string] =
-  ## Launch operator in user unit `wow-realm-op` (independent of wow-system).
+  ## Launch realm_op.sh in user unit `wow-realm-op` (independent of wow-system).
+  ## Wrapper owns operator discovery + rebuild preflight; The System only queues.
   let verb = serverOpVerb(op)
-  let dir = upstreamDir()
-  let script = dir / OperatorScriptRel
-  if not fileExists(script):
+  let army = armyRoot()
+  let wrapper = realmOpWrapperPath()
+  if not fileExists(wrapper):
     return (ok: false,
-      detail: &"operator script missing: {script} — set SYSTEM_UPSTREAM_DIR")
+      detail: &"realm op wrapper missing: {wrapper} — set SYSTEM_ARMY_DIR")
   let logPath = realmOpLogPath()
   createDir(parentDir(logPath))
   try:
@@ -1253,9 +1259,12 @@ proc spawnDetachedRealmOperator(op: ServerLifecycleOp): tuple[ok: bool, detail: 
 
   stopRealmOpUnit()
   # bash wrapper: keep full log + exit marker for post-mortem after --collect.
+  # Pass SYSTEM_* so a detached unit inherits the same pins as wow-system.
   let shell = &"""
 set -o pipefail
-uv run python {OperatorScriptRel.quoteShell} {verb.quoteShell} >> {logPath.quoteShell} 2>&1
+export SYSTEM_ARMY_DIR={army.quoteShell}
+export SYSTEM_UPSTREAM_DIR={upstreamDir().quoteShell}
+{wrapper.quoteShell} {verb.quoteShell} >> {logPath.quoteShell} 2>&1
 ec=$?
 echo {RealmOpExitMarker}$ec >> {logPath.quoteShell}
 exit $ec
@@ -1263,7 +1272,7 @@ exit $ec
   let r = runCmdCapture("systemd-run", [
     "--user",
     &"--unit={RealmOpUnit}",
-    &"--working-directory={dir}",
+    &"--working-directory={army}",
     "--collect",
     "--",
     "bash", "-c", shell

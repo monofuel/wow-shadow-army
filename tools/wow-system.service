@@ -5,8 +5,8 @@
 #   systemctl --user status wow-system
 #   journalctl --user -u wow-system -f
 #
-# Runs from the NFS checkout — the source of truth for all Softmax work.
-# Deploy = commit/pull on the NFS repo, `systemctl --user restart wow-system`
+# Runs from the local Documents checkout (high-steel workspace).
+# Deploy = edit this repo, `systemctl --user restart wow-system`
 # (`nim r` recompiles on every start). Works with the realm up or down; realm
 # lifecycle goes through the dashboard.
 
@@ -17,8 +17,8 @@ StartLimitIntervalSec=60
 
 [Service]
 Type=simple
-WorkingDirectory=/mnt/steel-chest/Monolab/Home/monofuel/Softmax/wow-shadow-army
-ExecStart=/mnt/steel-chest/Monolab/Home/monofuel/Softmax/wow-shadow-army/tools/run_system.sh
+WorkingDirectory=/home/monofuel/Documents/Projects/Softmax/wow-shadow-army
+ExecStart=/home/monofuel/Documents/Projects/Softmax/wow-shadow-army/tools/run_system.sh
 Restart=always
 RestartSec=15
 Environment=PATH=/home/monofuel/bin:/etc/profiles/per-user/monofuel/bin:/run/wrappers/bin:/nix/var/nix/profiles/default/bin:/run/current-system/sw/bin

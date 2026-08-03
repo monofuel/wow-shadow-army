@@ -55,11 +55,15 @@ Listens on **http://127.0.0.1:7777** (chosen to avoid realmd 3724, healthz 8080,
 
 Works with the realm **up or down**: when the game container is stopped the
 Army roster degrades to an offline note pointing at the Admin tab, where the
-Realm panel offers **Start server** (operator `up` — same path as
-`make start-server`, run by an async worker so the page never blocks). Human
-workflow: run the client + this dashboard; realm lifecycle goes through the
-dashboard. `make system` passes the Makefile's `UPSTREAM` as
-`SYSTEM_UPSTREAM_DIR` so the operator checkout never depends on cwd guessing.
+Realm panel **Start server** / **Stop server** call `tools/realm_op.sh` (same
+entrypoint as `make start-server` / `make stop-server`), run by an async worker
+so the page never blocks. That wrapper discovers `docker_vmangos_server.py`
+under the upstream checkout and adds `--build` when the local game image is
+missing or lacks VMaNGOS feature-metadata labels — so upstream layout moves and
+image rebuilds do not require dashboard code edits. Human workflow: run the
+client + this dashboard; realm lifecycle goes through the dashboard.
+`make system` / `wow-system` pass `SYSTEM_UPSTREAM_DIR` so the checkout never
+depends on cwd guessing.
 
 Optional env:
 
