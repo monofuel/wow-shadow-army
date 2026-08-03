@@ -1,5 +1,24 @@
 # wow-shadow-army — agent rules
 
+**Vocabulary: `docs/terms.md` — read it first and use those terms
+consistently** (upstream, the fork, seats, cast, faces, fair play, …).
+
+## Scope
+
+This repo is home base for our **WoW coworld** experiments, and its rules
+govern how we work in the sibling wow repos too:
+
+- `../coworld-vanilla-wow` — **upstream** checkout (read-only, see hard rules).
+  Actively developed by other Softmax engineers; staying current with it is a
+  competition requirement.
+- `../coworld-vanilla-wow-fork` — **the fork**, where our changes live.
+  **Client customizations only — never touch server components** (take
+  upstream's server code verbatim). Sync upstream `main` regularly; merge
+  conflicts in client files are expected and get resolved, not avoided.
+- `../coworld-vanilla-wow-xr` — xr client-build testing checkout.
+- `../wow-classic-data` — canonical game data store (one copy; everything
+  else symlinks to it).
+
 ## Mission
 
 Build the solo-leveling bot army per `coworld-playbook/games/solo-leveling.md`:
@@ -52,7 +71,9 @@ upstream controller already owns.
   cheating: mark WONT FIX. Same rule as coworld-playbook/AGENTS.md.
 - **Upstream is read-only.** Never commit to `../coworld-vanilla-wow`, never
   vendor client source here. We consume it at the `upstream.lock` pin through
-  the `nim_control.v1` boundary. If an upstream bug blocks us, document it
+  the `nim_control.v1` boundary. Client changes we need go on **the fork**
+  (`../coworld-vanilla-wow-fork`) — client code only, never server components
+  (see Scope and `docs/terms.md`). If an upstream bug blocks us, document it
   and tell monofuel — he decides whether to report it.
 - **Respect the client/bot boundary.** Our layer sees typed frames and
   sends typed goals/actions. No database pokes for progress, no GM-command
