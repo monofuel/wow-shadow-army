@@ -28,17 +28,29 @@ Rules that stay fixed:
 
 ## Unit CI (wired)
 
-`.gitea/workflows/test.yml` job `lua-tests` on `monolab-builder`:
+`.gitea/workflows/test.yml` on `monolab-builder`, one job per language leg
+(doctrine: wall clock = slowest leg, and a dep problem in one language
+cannot hide a unit failure in another):
 
-1. checkout
-2. `apt-get install -y lua5.3` (same apt pattern as crewrift-prime-bots;
-   Makefile prefers `lua5.3` then `lua`)
-3. `make test`
+- **`lua-tests`**: checkout → `apt-get install -y lua5.3` (crewrift-prime-bots
+  pattern; also provides `luac5.3` for the parse smoke) →
+  `make test-lua test-smoke-lua`. Explicitly lua-only targets: the builder
+  image carries a dep-less nim, so plain `make test` would run the nim tier
+  without its packages and fail for the wrong reason (this exact failure
+  shipped red from the v0.10.0 push until 2026-08-03).
+- **`nim-tests`**: checkout → `treeform/setup-nim-action@v6` (nim 2.2.4,
+  ships nimby; Racha build.yml pattern) → cache `~/.nimble` + `~/.nimby`
+  keyed on `hashFiles('nimby.lock')` → `nimby sync -g nimby.lock` →
+  `make test-nim test-smoke-nim`. `nimby.lock` pins mummy/jsony/zippy/webby/
+  crunchy/nimsimd/MCPort/nimponents at the SHAs local dev runs; the lock-based
+  `-g` sync installs into `~/.nimby/pkgs` (the nim.cfg fallback paths) and is
+  the ONLY nimby invocation allowed near this repo — plain workspace-mode
+  `nimby sync` mutates Softmax sibling checkouts.
 
-No docker, no nix, no nim. Current tools have zero Lua module deps
-(no cjson/socket yet); add packages to the install step only when a unit
-test actually needs them. Unit job stays independent of integration so a
-mirror/token problem cannot hide a unit failure behind a single job.
+Current tools have zero Lua module deps (no cjson/socket yet); add packages
+to the lua install step only when a unit test actually needs them. Unit jobs
+stay independent of integration so a mirror/token problem cannot hide a unit
+failure behind a single job.
 
 ## Pin tier (CI job `pin-check` in `test.yml`)
 

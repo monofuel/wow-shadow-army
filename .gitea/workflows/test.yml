@@ -1,16 +1,21 @@
 name: Tests
 
-# Unit + pin CI. Unit stays first and cheap (green checkmark on every push).
-# Pin check needs the private Monolab/coworld-vanilla-wow mirror at the
-# upstream.lock pin as a sibling path (see docs/testing.md).
-# House style: crewrift-prime-bots/.gitea/workflows/test.yml (apt lua on
-# monolab-builder). Testing doctrine: racha_notes Programming/testing.md.
+# Unit + pin CI. One job per independent leg (lua / nim / pin) so the wall
+# clock is the slowest leg, not the sum, and a dep problem in one language
+# cannot hide a unit failure in another. Pin check needs the private
+# Monolab/coworld-vanilla-wow mirror at the upstream.lock pin as a sibling
+# path (see docs/testing.md). House styles: crewrift-prime-bots test.yml
+# (apt lua) + Racha build.yml (setup-nim-action + nimby.lock + cache).
+# Testing doctrine: racha_notes Programming/testing.md.
 
 on:
   push:
   workflow_dispatch:
 
 jobs:
+  # Lua leg: unit suites + parse smoke. Explicit lua-only targets — the
+  # builder image carries a dep-less nim, so `make test` here would run the
+  # nim tier without its packages and fail for the wrong reason.
   lua-tests:
     runs-on: monolab-builder
     steps:
@@ -19,8 +24,34 @@ jobs:
         run: |
           apt-get update
           apt-get install -y lua5.3
-      - name: Unit suite
-        run: make test
+      - name: Lua unit suite + parse smoke
+        run: make test-lua test-smoke-lua
+
+  # Nim leg: unit suites + compile smoke, deps pinned by nimby.lock
+  # (nimby sync -g installs into ~/.nimby/pkgs — the nim.cfg fallback paths;
+  # never workspace-mode sync). Cache keyed on the lock file.
+  nim-tests:
+    runs-on: monolab-builder
+    steps:
+      - uses: actions/checkout@v3
+      # treeform/setup-nim-action ships nim + nimby directly (Racha pattern);
+      # 2.2.4 pinned to match local dev.
+      - uses: treeform/setup-nim-action@v6
+        with:
+          nim-version: '2.2.4'
+      - name: Cache nim packages
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.nimble
+            ~/.nimby
+          key: ${{ runner.os }}-nimby-v1-${{ hashFiles('nimby.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-nimby-v1-
+      - name: Sync deps from lock
+        run: nimby sync -g nimby.lock
+      - name: Nim unit suite + compile smoke
+        run: make test-nim test-smoke-nim
 
   # Pin drift only (pure shell pin-check). No docker, no realm, no Python.
   # Needs the private mirror checkout as a sibling path.
