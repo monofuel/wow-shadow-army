@@ -11,7 +11,7 @@ we need without writing to Softmax GitHub. Upstream checkout
 | Web | https://gitea.solution-nine.monofuel.dev/Monolab/coworld-vanilla-wow |
 | Branch `main` | mirrors Metta-AI `main` (stock upstream, no local delta) |
 | Branch `shadow-army-fixes` | our carried commits, rebased on `main` |
-| Last synced upstream | `cc31b4da3` ("Advance Kobold Apologist farming bands") — 2026-07-31, 931 commits ahead of prior sync; `shadow-army-fixes` not yet rebased onto it |
+| Last synced upstream | `adbdd1497` ("Refresh current-main Coworld image set") — 2026-08-03, 730 commits past prior sync; pin `ec5bd2f9d` now 1661 behind main; `shadow-army-fixes` not yet rebased |
 
 ## Remotes (on the fork worktree)
 
