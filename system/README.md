@@ -5,6 +5,7 @@ Management server for the wow-shadow-army: one Nim binary, many interfaces.
 | Interface | Path | Role |
 |---|---|---|
 | Army tab | `GET /` / `GET /army` | roster (offline-safe) |
+| Murist tab | `GET /murist` | human seat metrics + Murist events |
 | Advisor tab | `GET /advisor` | addon event tail + reload |
 | Admin tab | `GET /admin` | realm Start/Stop + ops buttons |
 | Roster partial | `GET /roster` | htmx fragment (roster table rows) |
@@ -75,9 +76,10 @@ Optional env:
 
 Open http://127.0.0.1:7777/ (aliases `/army`).
 
-Tabs in the header: **Army** | **Advisor** | **Admin**.
+Tabs in the header: **Army** | **Murist** | **Advisor** | **Admin**.
 
 - **Army** (`GET /army`) — roster only (hides foundation `Bot*` / Nightsun / Cowcam). Order: Murist → Shadowfel → Igris → Tusk → Beru, then others. Columns: name · level · XP · **HP/MP** · class · **zone** · **pos** · gold · **life** · **seat** · **bot** Start/Stop. Panel head shows army strip (`N online · alive/ghost/dead · ctrl k/n`). Polls `GET /roster` every few seconds via htmx. MCP `list_characters` still accepts `include_foundation=true` for the full realm.
+- **Murist** (`GET /murist`) — human seat snapshot (level, class, race, gold, zone, pos, XP, vitals, life/online) + **quest log** (unrewarded: complete/active/failed + objective progress) + Murist-only addon events. Polls `GET /murist/status`, `GET /murist/quests`, `GET /murist/events`.
 - **Advisor** (`GET /advisor`) — live ring of parsed `<SA>` / `<ShadowArmy>` lines from Chat.log. Table body polls `GET /events`. **Reload addon** posts to `POST /reload`.
 - **Admin** (`GET /admin`) — **Realm** panel (start/stop) + ops buttons (respawn army, tele party to Murist). Local ops only; not fair-play recovery. Realm start/stop runs as a **detached user unit** (`wow-realm-op` via `systemd-run --user`), not as a child of `wow-system`, so restarting the dashboard does not kill a multi-minute image build. Progress is mirrored in `local_data/realm-op.json` + `local_data/realm-op.log`.
 

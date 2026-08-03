@@ -3,7 +3,7 @@
 ## No network, no docker, no realm — pure functions only.
 
 import
-  std/[json, strutils, unittest],
+  std/[json, options, strutils, unittest],
   ../system_server
 
 suite "server lifecycle ops":
@@ -13,6 +13,19 @@ suite "server lifecycle ops":
     check not parseDockerRunning("false\n")
     check not parseDockerRunning("")
     check not parseDockerRunning("Error: No such object: coworld-vmangos-coworld-game-1")
+
+  test "docker inspect probe + short id":
+    check shortContainerId("abcdef0123456789deadbeef") == "abcdef012345"
+    check shortContainerId("abc") == "abc"
+    check shortContainerId("") == ""
+    let up = parseDockerInspectProbe("true\tabcdef0123456789deadbeef\n")
+    check up.running
+    check up.id == "abcdef012345"
+    let down = parseDockerInspectProbe("false\tabcdef0123456789\n")
+    check not down.running
+    check down.id == "abcdef012345"
+    check not parseDockerInspectProbe("").running
+    check parseDockerInspectProbe("").id == ""
 
   test "op verb / label mapping":
     check serverOpVerb(sloStart) == "up"
@@ -43,10 +56,12 @@ suite "server status views":
   test "json view carries all lifecycle fields":
     let s = ServerStatus(
       running: true, container: "coworld-vmangos-coworld-game-1",
+      containerId: "abcdef012345",
       op: "", lastOp: "start", lastOpOk: true, lastOpDetail: "operator up ok")
     let j = serverStatusToJson(s)
     check j["running"].getBool()
     check j["container"].getStr() == "coworld-vmangos-coworld-game-1"
+    check j["container_id"].getStr() == "abcdef012345"
     check j["op"].getStr() == ""
     check j["last_op"].getStr() == "start"
     check j["last_op_ok"].getBool()
@@ -54,19 +69,21 @@ suite "server status views":
 
   test "panel offers Start when stopped and idle":
     let html = renderServerPanel(ServerStatus(
-      running: false, container: "c", op: ""))
+      running: false, container: "c", containerId: "", op: ""))
     check "Start server" in html
     check "/server/start" in html
     check "Stop server" notin html
     check "Stopped" in html
+    check "no id" in html
 
   test "panel offers Stop when running and idle":
     let html = renderServerPanel(ServerStatus(
-      running: true, container: "c", op: ""))
+      running: true, container: "c", containerId: "deadbeefcafe", op: ""))
     check "Stop server" in html
     check "/server/stop" in html
     check "Start server" notin html
     check "Running" in html
+    check "deadbeefcafe" in html
 
   test "panel shows progress (no buttons) during an op":
     let starting = renderServerPanel(ServerStatus(
@@ -95,6 +112,63 @@ suite "server status views":
     let row = renderRosterOfflineRow()
     check "/admin" in row
     check "error" notin row.toLowerAscii()
+
+  test "murist status panel is metrics-only":
+    let offline = renderMuristStatus(none(Character), realmOffline = true)
+    check "Realm offline" in offline
+    check "/admin" in offline
+    let missing = renderMuristStatus(none(Character), realmOffline = false)
+    check "not in characters" in missing
+    let c = Character(
+      name: "Murist", level: 12, className: "Warlock", raceName: "Undead",
+      gold: "1g 2s 3c", online: true, life: "alive", zoneName: "Tirisfal Glades",
+      posX: 1.0, posY: 2.0, posZ: 3.0, xp: 100, nextLevelXp: 1000, xpToLevel: 900, xpPct: 10,
+      health: 50, maxHealth: 100, power: 20, maxPower: 100, powerKind: "mana")
+    let html = renderMuristStatus(some(c), realmOffline = false)
+    check "level" in html
+    check "12" in html
+    check "Warlock" in html
+    check "Tirisfal" in html
+    check "online" in html
+    check "listCharacters" notin html
+
+  test "filter events by name":
+    let ev = @[
+      AddonEvent(id: 1, name: "Murist", kind: "loaded", payload: "rev=1"),
+      AddonEvent(id: 2, name: "Igris", kind: "loaded", payload: "rev=1"),
+      AddonEvent(id: 3, name: "Murist", kind: "err", payload: "boom"),
+    ]
+    let mine = filterEventsByName(ev, "Murist")
+    check mine.len == 2
+    check mine[0].kind == "loaded"
+    check mine[1].kind == "err"
+
+  test "quest status labels and progress format":
+    check questStatusLabel(1) == "complete"
+    check questStatusLabel(3) == "active"
+    check questStatusLabel(5) == "failed"
+    check isSafeSqlName("Murist")
+    check not isSafeSqlName("Mur'; DROP")
+    check not isSafeSqlName("")
+    check "Murist" in questLogSqlFor("Murist")
+    check "character_queststatus" in questLogSqlFor("Murist")
+    let prog = formatQuestProgress(
+      [3, 0, 0, 0], [10, 0, 0, 0],
+      [1, 2, 0, 0], [5, 5, 0, 0])
+    check prog == "3/10 · 1/5 · 2/5"
+    # TSV: quest status mob1-4 item1-4 title level reqMob1-4 reqItem1-4 obj1-4
+    let tsv = "365\t3\t0\t0\t0\t0\t3\t0\t0\t0\tFields of Grief\t7\t0\t0\t0\t0\t10\t0\t0\t0\t\t\t\t"
+    let qs = parseQuestLogTsv(tsv)
+    check qs.len == 1
+    check qs[0].questId == 365
+    check qs[0].status == "active"
+    check qs[0].title == "Fields of Grief"
+    check qs[0].level == 7
+    check qs[0].progress == "3/10"
+    let rows = renderQuestRows(qs)
+    check "Fields of Grief" in rows
+    check "active" in rows
+    check "3/10" in rows
 
 suite "seat cell":
   test "seat cell is always a terse On/Off (detail in tooltip only)":

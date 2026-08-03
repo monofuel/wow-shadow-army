@@ -1,8 +1,9 @@
 ## The System — management server for the shadow army.
 ##
 ## One Nim binary, HTTP + MCP interfaces on one mummy server:
-##   HTTP dashboard (htmx)  GET /  GET /army  GET /advisor  GET /admin
-##                          GET /roster  GET /events  GET /server
+##   HTTP dashboard (htmx)  GET /  GET /army  GET /murist  GET /advisor  GET /admin
+##                          GET /roster  GET /murist/status  GET /murist/quests
+##                          GET /murist/events  GET /events  GET /server
 ##                          POST /reload  POST /server/start  POST /server/stop
 ##                          POST /admin/respawn-shadow-army
 ##   MCP endpoint (MCPort)  POST /mcp
@@ -17,10 +18,10 @@
 ##   serverStatus()          — realm container up/down + lifecycle op state
 ##   startServer()/stopServer() — queue operator `up`/`down` (async worker)
 ##
-## Tabs: Army (roster), Advisor (addon events + reload), Admin (realm + ops).
-## The dashboard stays useful with the realm DOWN: roster degrades to an
-## offline note; Admin's Server panel offers Start/Stop. The human only runs
-## the client and this dashboard; realm lifecycle goes through here.
+## Tabs: Army (roster), Murist (human seat), Advisor (events + reload),
+## Admin (realm + ops). The dashboard stays useful with the realm DOWN:
+## roster/Murist degrade to offline notes; Admin's Server panel offers
+## Start/Stop. The human only runs the client and this dashboard.
 ##
 ## Admin interfaces (same procs): HTTP /admin, MCP tools, and human-seat addon
 ## chat (`<SA> admin <action>` from Murist → Chat.log tailer).
@@ -96,6 +97,27 @@ LEFT JOIN mangos.player_xp_for_level x ON x.lvl = c.level
 LEFT JOIN mangos.area_template a ON a.entry = c.zone
 LEFT JOIN mangos.player_classlevelstats s ON s.class = c.class AND s.level = c.level
 ORDER BY c.name"""
+  ## Active quest log for one character (unrewarded only).
+  ## VMaNGOS status: 1=complete (turn-in ready), 3=incomplete/active, 5=failed.
+  ## quest_template is multi-patch — take MAX(patch) per entry for Title/reqs.
+  ## Name is substituted safely by questLogSqlFor (alphanumeric only).
+  QuestLogSqlTemplate = """SELECT cq.quest, cq.status,
+cq.mob_count1, cq.mob_count2, cq.mob_count3, cq.mob_count4,
+cq.item_count1, cq.item_count2, cq.item_count3, cq.item_count4,
+COALESCE(NULLIF(qt.Title, ''), CONCAT('Quest#', cq.quest)),
+COALESCE(qt.QuestLevel, 0),
+COALESCE(qt.ReqCreatureOrGOCount1, 0), COALESCE(qt.ReqCreatureOrGOCount2, 0),
+COALESCE(qt.ReqCreatureOrGOCount3, 0), COALESCE(qt.ReqCreatureOrGOCount4, 0),
+COALESCE(qt.ReqItemCount1, 0), COALESCE(qt.ReqItemCount2, 0),
+COALESCE(qt.ReqItemCount3, 0), COALESCE(qt.ReqItemCount4, 0),
+COALESCE(qt.ObjectiveText1, ''), COALESCE(qt.ObjectiveText2, ''),
+COALESCE(qt.ObjectiveText3, ''), COALESCE(qt.ObjectiveText4, '')
+FROM character_queststatus cq
+INNER JOIN characters c ON c.guid = cq.guid AND c.name = '$$NAME$$'
+LEFT JOIN mangos.quest_template qt ON qt.entry = cq.quest
+  AND qt.patch = (SELECT MAX(p.patch) FROM mangos.quest_template p WHERE p.entry = cq.quest)
+WHERE cq.rewarded = 0 AND cq.status IN (1, 3, 5)
+ORDER BY FIELD(cq.status, 1, 3, 5), qt.QuestLevel, cq.quest"""
   ## Live addon events only; history stays in the log file.
   EventRingCap = 1000
   ## How often the Chat.log tailer polls for new bytes.
@@ -169,6 +191,15 @@ type
     payload*: string ## remainder of the message
     raw*: string ## full original line
 
+  QuestLogEntry* = object
+    ## One unrewarded quest on a character's log (read-only DB observer).
+    questId*: int
+    title*: string
+    level*: int
+    status*: string ## "complete" | "active" | "failed"
+    statusCode*: int ## raw VMaNGOS QuestStatus
+    progress*: string ## short objective progress ("3/10 · 1/5")
+
   AdminStepResult* = object
     ## One SOAP command outcome for an admin action.
     name*: string
@@ -199,7 +230,8 @@ type
   ServerStatus* = object
     ## Realm container + lifecycle state for the Server panel / MCP.
     running*: bool ## coworld-game container is up
-    container*: string
+    container*: string ## compose name (e.g. coworld-vmangos-coworld-game-1)
+    containerId*: string ## short docker id (12 hex), "" if missing
     op*: string ## "" | "start" | "stop" — queued or executing right now
     lastOp*: string ## "" until a lifecycle op has finished
     lastOpOk*: bool
@@ -283,16 +315,8 @@ proc chatLogPath*(): string =
     return absolutePath(env)
   result = absolutePath(DefaultChatLogRel)
 
-proc fetchRosterTsv(): string =
-  ## Read character roster via docker exec + mariadb (SELECT only).
-  ##
-  ## Choice: shell out to docker exec (same path as Makefile `account`), not a
-  ## native MySQL driver. Host has no mysql client; port 3307 is open but
-  ## docker exec is already proven and needs zero new deps.
-  ##
-  ## Args are passed without a shell so the SELECT string stays intact. stderr
-  ## is left alone (mariadb prints a "password on CLI" warning there) so TSV
-  ## stdout stays clean.
+proc dockerMariadbSelect(sql: string): string =
+  ## Run a SELECT via docker exec + mariadb (TSV stdout). SELECT-only path.
   let container = gameContainer()
   let process = startProcess(
     "docker",
@@ -303,7 +327,7 @@ proc fetchRosterTsv(): string =
       &"-p{DbPass}",
       DbName,
       "-N", "-B",
-      "-e", RosterSql
+      "-e", sql
     ],
     options = {poUsePath}
   )
@@ -313,8 +337,81 @@ proc fetchRosterTsv(): string =
   process.close()
   if exitCode != 0:
     raise newException(IOError,
-      &"roster query failed (exit {exitCode}) via docker exec {container}: {err}\n{output}")
+      &"mariadb query failed (exit {exitCode}) via docker exec {container}: {err}\n{output}")
   result = output
+
+proc fetchRosterTsv(): string =
+  ## Read character roster via docker exec + mariadb (SELECT only).
+  result = dockerMariadbSelect(RosterSql)
+
+proc isSafeSqlName*(name: string): bool =
+  ## Character names we embed in SQL: letters/digits only (classic names).
+  if name.len == 0 or name.len > 12:
+    return false
+  for c in name:
+    if c notin {'A'..'Z', 'a'..'z', '0'..'9'}:
+      return false
+  result = true
+
+proc questLogSqlFor*(name: string): string =
+  ## Quest-log SELECT for one character. Rejects unsafe names.
+  if not isSafeSqlName(name):
+    raise newException(ValueError, &"unsafe character name for quest log: {name}")
+  result = QuestLogSqlTemplate.replace("$$NAME$$", name)
+
+proc questStatusLabel*(status: int): string =
+  ## VMaNGOS QuestStatus → short dashboard label.
+  case status
+  of 1: "complete"
+  of 3: "active"
+  of 5: "failed"
+  else: "other"
+
+proc formatQuestProgress*(
+    mobCur, mobNeed, itemCur, itemNeed: array[4, int]
+): string =
+  ## Compact objective progress: "3/10 · 1/5" from mob/item slots with needs.
+  var bits: seq[string] = @[]
+  for i in 0 .. 3:
+    if mobNeed[i] > 0:
+      bits.add(&"{mobCur[i]}/{mobNeed[i]}")
+  for i in 0 .. 3:
+    if itemNeed[i] > 0:
+      bits.add(&"{itemCur[i]}/{itemNeed[i]}")
+  result = bits.join(" · ")
+
+proc parseQuestLogTsv*(tsv: string): seq[QuestLogEntry] =
+  ## Parse quest-log TSV rows (22 columns) into entries.
+  result = @[]
+  for line in tsv.splitLines():
+    if line.len == 0:
+      continue
+    let cols = line.split('\t')
+    if cols.len < 22:
+      continue
+    try:
+      let questId = parseInt(cols[0])
+      let statusCode = parseInt(cols[1])
+      var mobCur, mobNeed, itemCur, itemNeed: array[4, int]
+      for i in 0 .. 3:
+        mobCur[i] = parseInt(cols[2 + i])
+        itemCur[i] = parseInt(cols[6 + i])
+        mobNeed[i] = parseInt(cols[12 + i])
+        itemNeed[i] = parseInt(cols[16 + i])
+      result.add(QuestLogEntry(
+        questId: questId,
+        statusCode: statusCode,
+        status: questStatusLabel(statusCode),
+        title: cols[10],
+        level: parseInt(cols[11]),
+        progress: formatQuestProgress(mobCur, mobNeed, itemCur, itemNeed)
+      ))
+    except ValueError:
+      discard
+
+proc listCharacterQuests*(name: string): seq[QuestLogEntry] =
+  ## Active (unrewarded) quest log for one character. SELECT only.
+  result = parseQuestLogTsv(dockerMariadbSelect(questLogSqlFor(name)))
 
 proc xpProgress*(xp, nextLevelXp: int): tuple[toLevel, pct: int] =
   ## Derive remaining XP and 0..100 percent into the current level.
@@ -956,15 +1053,33 @@ proc parseDockerRunning*(output: string): bool =
   ## Interpret `docker inspect -f {{.State.Running}}` stdout.
   result = output.strip().toLowerAscii() == "true"
 
-proc containerRunning(): bool =
-  ## True when the coworld-game container exists and is running.
-  ## Missing container / docker error = down (that IS the stopped state:
-  ## the operator's `down` does compose rm, so the container disappears).
+proc shortContainerId*(fullId: string): string =
+  ## Docker short id: first 12 hex chars of the full Id.
+  let id = fullId.strip()
+  if id.len == 0:
+    return ""
+  result = if id.len >= 12: id[0 .. 11] else: id
+
+proc parseDockerInspectProbe*(output: string): tuple[running: bool, id: string] =
+  ## Parse `Running\\tId` from docker inspect -f. Missing/garbage → down, no id.
+  let line = output.strip()
+  if line.len == 0:
+    return (false, "")
+  let parts = line.split('\t')
+  if parts.len < 1:
+    return (false, "")
+  let running = parseDockerRunning(parts[0])
+  let id = if parts.len >= 2: shortContainerId(parts[1]) else: ""
+  result = (running, id)
+
+proc probeGameContainer(): tuple[running: bool, id: string] =
+  ## One docker inspect: running flag + short container id.
+  ## Missing container / docker error = down with empty id (compose rm).
   let container = gameContainer()
   try:
     let process = startProcess(
       "docker",
-      args = ["inspect", "-f", "{{.State.Running}}", container],
+      args = ["inspect", "-f", "{{.State.Running}}\t{{.Id}}", container],
       options = {poUsePath}
     )
     let output = process.outputStream.readAll()
@@ -972,10 +1087,14 @@ proc containerRunning(): bool =
     let exitCode = process.waitForExit()
     process.close()
     if exitCode != 0:
-      return false
-    result = parseDockerRunning(output)
+      return (false, "")
+    result = parseDockerInspectProbe(output)
   except CatchableError:
-    result = false
+    result = (false, "")
+
+proc containerRunning(): bool =
+  ## True when the coworld-game container exists and is running.
+  result = probeGameContainer().running
 
 proc serverOpVerb*(op: ServerLifecycleOp): string =
   ## Operator subcommand for a lifecycle op ("" for sloNone).
@@ -1213,8 +1332,10 @@ proc serverStatus*(): ServerStatus =
   ## Single dispatch path for realm lifecycle state (Server panel + MCP).
   {.gcsafe.}:
     refreshRealmOpState()
+  let probe = probeGameContainer()
   result.container = gameContainer()
-  result.running = containerRunning()
+  result.running = probe.running
+  result.containerId = probe.id
   withLock gServerOpLock:
     result.op = serverOpLabel(
       if gRunningServerOp != sloNone: gRunningServerOp else: gPendingServerOp)
@@ -1237,6 +1358,7 @@ proc serverStatusToJson*(s: ServerStatus): JsonNode =
   result = %*{
     "running": s.running,
     "container": s.container,
+    "container_id": s.containerId,
     "op": s.op,
     "last_op": s.lastOp,
     "last_op_ok": s.lastOpOk,
@@ -1826,10 +1948,17 @@ proc renderServerPanel*(s: ServerStatus): string =
         last {escapeHtml(s.lastOp)}: {mark}
       </div>"""
 
+  # Name once, short id once — no title that repeats the same id.
+  var containerLabel = escapeHtml(s.container)
+  if s.containerId.len > 0:
+    containerLabel.add(&""" <span class="server-id">{escapeHtml(s.containerId)}</span>""")
+  else:
+    containerLabel.add(""" <span class="server-id muted">no id</span>""")
+
   result = &"""
     <div class="server-line">
       {pill}
-      <span class="meta server-container">{escapeHtml(s.container)}</span>
+      <span class="meta server-container">{containerLabel}</span>
       <span class="server-action">{action}</span>
     </div>
     {lastLine}"""
@@ -2162,6 +2291,25 @@ const DashboardCss = """
       padding: 0.22rem 0.7rem; border-radius: 999px;
       border: 1px solid var(--border); background: var(--ink);
     }
+    .stat-row {
+      display: flex; flex-wrap: wrap; gap: 0.6rem; margin: 0 0 0.85rem;
+    }
+    .stat {
+      flex: 1 1 100px;
+      background: var(--ink);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 0.55rem 0.7rem;
+      min-width: 0;
+    }
+    .stat .n {
+      font-size: 1.15rem; font-weight: 700; color: var(--accent);
+      letter-spacing: 0.01em; font-variant-numeric: tabular-nums;
+    }
+    .stat .n.sm { font-size: 0.95rem; }
+    .stat .l { font-size: 0.7rem; color: var(--muted); margin-top: 0.1rem; }
+    .murist-bars { margin-top: 0.5rem; }
+    .murist-bars .xp-cell, .murist-bars .vitals-cell { display: block; margin-top: 0.45rem; }
     .pill {
       display: inline-flex; align-items: center; gap: 0.4rem;
       padding: 0.22rem 0.7rem; border-radius: 999px; font-size: 0.78rem;
@@ -2204,6 +2352,10 @@ const DashboardCss = """
       font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.75rem;
       color: var(--muted);
     }
+    .server-id {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      color: var(--accent2); font-size: 0.75rem; font-weight: 600;
+    }
     .server-action { margin-left: auto; }
     .server-last { margin-top: 0.55rem; font-size: 0.8rem; }
     .empty { color: var(--muted); text-align: center; padding: 2rem 1rem; font-size: 0.9rem; }
@@ -2237,13 +2389,15 @@ proc navTabClass(active, tab: string): string =
   if active == tab: " class=\"active\"" else: ""
 
 proc renderNav*(active: string): string =
-  ## Tab strip: Army | Advisor | Admin (server-side pages, short labels).
+  ## Tab strip: Army | Murist | Advisor | Admin (server-side pages, short labels).
   let army = navTabClass(active, "army")
+  let murist = navTabClass(active, "murist")
   let advisor = navTabClass(active, "advisor")
   let admin = navTabClass(active, "admin")
   result = &"""
 <nav class="tabs" role="tablist">
   <a{army} href="/army" role="tab">Army</a>
+  <a{murist} href="/murist" role="tab">Murist</a>
   <a{advisor} href="/advisor" role="tab">Advisor</a>
   <a{admin} href="/admin" role="tab">Admin</a>
 </nav>"""
@@ -2313,6 +2467,159 @@ proc renderArmyPage*(characters: seq[Character], rosterOffline = false): string 
       </div>
     </section>"""
   result = renderDashboard("Army", "army", body)
+
+proc filterEventsByName*(events: seq[AddonEvent], name: string): seq[AddonEvent] =
+  ## Keep events for one character name (case-sensitive DB/chat name).
+  result = @[]
+  for e in events:
+    if e.name == name:
+      result.add(e)
+
+proc renderMuristStatus*(murist: Option[Character], realmOffline = false): string =
+  ## Human-seat status panel body (metrics only).
+  if realmOffline:
+    return """
+    <p class="empty">Realm offline — start on <a href="/admin">Admin</a>.</p>"""
+  if murist.isNone:
+    return """
+    <p class="empty">Murist not in characters DB.</p>"""
+  let c = murist.get
+  let life = if c.life.len > 0: c.life else: (if c.online: "alive" else: "offline")
+  let lifeText = lifeLabel(life)
+  let zoneText = if c.zoneName.len > 0: c.zoneName else: "—"
+  let onlinePill =
+    if c.online:
+      """<span class="pill"><span class="dot on"></span> online</span>"""
+    else:
+      """<span class="pill"><span class="dot off"></span> offline</span>"""
+  result = &"""
+    <div class="panel-actions" style="margin-bottom:0.75rem">
+      {onlinePill}
+      <span class="status {escapeHtml(life)}">{escapeHtml(lifeText)}</span>
+    </div>
+    <div class="stat-row">
+      <div class="stat"><div class="n">{c.level}</div><div class="l">level</div></div>
+      <div class="stat"><div class="n sm">{escapeHtml(c.className)}</div><div class="l">class</div></div>
+      <div class="stat"><div class="n sm">{escapeHtml(c.raceName)}</div><div class="l">race</div></div>
+      <div class="stat"><div class="n sm">{escapeHtml(c.gold)}</div><div class="l">gold</div></div>
+      <div class="stat"><div class="n sm">{escapeHtml(zoneText)}</div><div class="l">zone</div></div>
+      <div class="stat"><div class="n sm">{renderPosCell(c)}</div><div class="l">pos</div></div>
+    </div>
+    <div class="murist-bars">
+      <div class="xp-cell">{renderXpCell(c)}</div>
+      <div class="vitals-cell">{renderVitalsCell(c)}</div>
+    </div>"""
+
+proc renderMuristEventRows*(events: seq[AddonEvent]): string =
+  ## Event rows for Murist only (same columns as Advisor).
+  let mine = filterEventsByName(events, AdminRequesterName)
+  if mine.len == 0:
+    return """<tr><td colspan="4" class="empty">No Murist addon events yet.</td></tr>"""
+  result = renderEventRows(mine)
+
+proc renderQuestRows*(quests: seq[QuestLogEntry], realmOffline = false): string =
+  ## Quest log table body (active / complete / failed, unrewarded only).
+  if realmOffline:
+    return """<tr><td colspan="5" class="empty">Realm offline — start on <a href="/admin">Admin</a>.</td></tr>"""
+  if quests.len == 0:
+    return """<tr><td colspan="5" class="empty">No active quests.</td></tr>"""
+  result = ""
+  for q in quests:
+    let statusCls =
+      case q.status
+      of "complete": "badge ok"
+      of "failed": "badge bad"
+      of "active": "badge accent"
+      else: "badge"
+    let progress = if q.progress.len > 0: escapeHtml(q.progress) else: "—"
+    result.add(&"""
+      <tr>
+        <td class="lvl">{q.level}</td>
+        <td class="name">{escapeHtml(q.title)}</td>
+        <td class="meta">#{q.questId}</td>
+        <td><span class="{statusCls}">{escapeHtml(q.status)}</span></td>
+        <td class="payload">{progress}</td>
+      </tr>
+""")
+
+proc renderMuristPage*(
+    murist: Option[Character],
+    events: seq[AddonEvent],
+    quests: seq[QuestLogEntry] = @[],
+    realmOffline = false
+): string =
+  ## Murist tab: human seat snapshot + quest log + addon events.
+  let statusBody = renderMuristStatus(murist, realmOffline = realmOffline)
+  let questRows = renderQuestRows(quests, realmOffline = realmOffline)
+  let eventRows = renderMuristEventRows(events)
+  let questSummary =
+    if realmOffline: ""
+    else: &"""<span class="army-summary">{quests.len} open</span>"""
+  let body = &"""
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Murist</h2>
+        <div class="panel-actions">
+          <span class="badge accent">human seat</span>
+        </div>
+      </div>
+      <div class="panel-body"
+           id="murist-status"
+           hx-get="/murist/status"
+           hx-trigger="every {PollSeconds}s"
+           hx-swap="innerHTML">
+{statusBody}
+      </div>
+    </section>
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Quests</h2>
+        <div class="panel-actions">{questSummary}</div>
+      </div>
+      <div class="table-scroll">
+      <table>
+        <thead>
+          <tr>
+            <th>Lvl</th>
+            <th>Title</th>
+            <th>Id</th>
+            <th>Status</th>
+            <th>Progress</th>
+          </tr>
+        </thead>
+        <tbody id="murist-quests"
+               hx-get="/murist/quests"
+               hx-trigger="every {PollSeconds}s"
+               hx-swap="innerHTML">
+{questRows}
+        </tbody>
+      </table>
+      </div>
+    </section>
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Addon events</h2>
+      </div>
+      <div class="table-scroll">
+      <table>
+        <thead>
+          <tr>
+            <th>Time</th>
+            <th>Character</th>
+            <th>Kind</th>
+            <th>Payload</th>
+          </tr>
+        </thead>
+        <tbody id="murist-events"
+               hx-get="/murist/events"
+               hx-trigger="every {PollSeconds}s"
+               hx-swap="innerHTML">
+{eventRows}
+        </tbody>
+      </table>
+      </div>
+    </section>"""
+  result = renderDashboard("Murist", "murist", body)
 
 proc renderAdvisorPage*(events: seq[AddonEvent]): string =
   ## Advisor tab: addon event tail + reload control.
@@ -2448,6 +2755,81 @@ proc advisorPageHandler(request: Request) {.gcsafe.} =
   except Exception as e:
     request.respond(500, htmlHeaders(),
       &"<!DOCTYPE html><html><body><h1>Advisor error</h1><pre>{escapeHtml(e.msg)}</pre></body></html>")
+
+proc muristPageHandler(request: Request) {.gcsafe.} =
+  ## GET /murist — human seat tab (status + quests + Murist addon events).
+  try:
+    var murist = none(Character)
+    var events: seq[AddonEvent] = @[]
+    var quests: seq[QuestLogEntry] = @[]
+    var realmOffline = false
+    {.gcsafe.}:
+      let status = serverStatus()
+      if status.running:
+        try:
+          murist = findCharacterByName(listCharacters(), AdminRequesterName)
+          quests = listCharacterQuests(AdminRequesterName)
+        except CatchableError:
+          realmOffline = true
+      else:
+        realmOffline = true
+      events = recentEvents(limit = 40)
+    request.respond(200, htmlHeaders(),
+      renderMuristPage(murist, events, quests, realmOffline = realmOffline))
+  except Exception as e:
+    request.respond(500, htmlHeaders(),
+      &"<!DOCTYPE html><html><body><h1>Murist error</h1><pre>{escapeHtml(e.msg)}</pre></body></html>")
+
+proc muristStatusHandler(request: Request) {.gcsafe.} =
+  ## GET /murist/status — htmx fragment for Murist metrics.
+  try:
+    var murist = none(Character)
+    var realmOffline = false
+    {.gcsafe.}:
+      let status = serverStatus()
+      if status.running:
+        try:
+          murist = findCharacterByName(listCharacters(), AdminRequesterName)
+        except CatchableError:
+          realmOffline = true
+      else:
+        realmOffline = true
+    request.respond(200, htmlHeaders(),
+      renderMuristStatus(murist, realmOffline = realmOffline))
+  except Exception as e:
+    request.respond(500, htmlHeaders(),
+      &"""<p class="empty">error: {escapeHtml(e.msg)}</p>""")
+
+proc muristQuestsHandler(request: Request) {.gcsafe.} =
+  ## GET /murist/quests — htmx fragment: Murist active quest log rows.
+  try:
+    var quests: seq[QuestLogEntry] = @[]
+    var realmOffline = false
+    {.gcsafe.}:
+      let status = serverStatus()
+      if status.running:
+        try:
+          quests = listCharacterQuests(AdminRequesterName)
+        except CatchableError:
+          realmOffline = true
+      else:
+        realmOffline = true
+    request.respond(200, htmlHeaders(),
+      renderQuestRows(quests, realmOffline = realmOffline))
+  except Exception as e:
+    request.respond(500, htmlHeaders(),
+      &"""<tr><td colspan="5" class="empty">error: {escapeHtml(e.msg)}</td></tr>""")
+
+proc muristEventsHandler(request: Request) {.gcsafe.} =
+  ## GET /murist/events — htmx fragment: Murist-only addon event rows.
+  try:
+    var events: seq[AddonEvent]
+    {.gcsafe.}:
+      events = recentEvents(limit = 40)
+    request.respond(200, htmlHeaders(), renderMuristEventRows(events))
+  except Exception as e:
+    request.respond(500, htmlHeaders(),
+      &"""<tr><td colspan="4" class="empty">error: {escapeHtml(e.msg)}</td></tr>""")
 
 proc rosterPartialHandler(request: Request) {.gcsafe.} =
   ## GET /roster — htmx fragment (table rows only). Foundation seats hidden.
@@ -2624,10 +3006,14 @@ proc serverInfoHandler(request: Request) {.gcsafe.} =
       "version": gMcpServer.serverInfo.version,
       "endpoints": {
         "army": "/army",
+        "murist": "/murist",
         "advisor": "/advisor",
         "admin": "/admin",
         "dashboard": "/",
         "roster_partial": "/roster",
+        "murist_status": "/murist/status",
+        "murist_quests": "/murist/quests",
+        "murist_events": "/murist/events",
         "events_partial": "/events",
         "server_partial": "/server",
         "server_start": "/server/start",
@@ -2980,6 +3366,10 @@ proc main() =
   var router: Router
   router.get("/", armyPageHandler)
   router.get("/army", armyPageHandler)
+  router.get("/murist", muristPageHandler)
+  router.get("/murist/status", muristStatusHandler)
+  router.get("/murist/quests", muristQuestsHandler)
+  router.get("/murist/events", muristEventsHandler)
   router.get("/advisor", advisorPageHandler)
   router.get("/admin", adminPageHandler)
   router.get("/roster", rosterPartialHandler)
@@ -2999,6 +3389,7 @@ proc main() =
   let server = newServer(router)
   echo &"{ServerName} v{Version} listening on http://127.0.0.1:{HttpPort}"
   echo &"  Army:        GET  http://127.0.0.1:{HttpPort}/army"
+  echo &"  Murist:      GET  http://127.0.0.1:{HttpPort}/murist"
   echo &"  Advisor:     GET  http://127.0.0.1:{HttpPort}/advisor"
   echo &"  Admin:       GET  http://127.0.0.1:{HttpPort}/admin"
   echo &"  Events:      GET  http://127.0.0.1:{HttpPort}/events"
