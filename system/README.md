@@ -170,9 +170,12 @@ Paths come from this repo's `nim.cfg` + Softmax parent `nim.cfg` (mummy, jsony, 
 
 ## Tests
 
-`make test` stays Lua-only (no nim required).
+`make test` = Lua unit suite + Nim unit tier + compile/parse smoke
+(`make test-smoke`: `luac -p` all addon/tool Lua, `nim check` all Nim
+entrypoints). Nim legs soft-skip on hosts without nim, so lua-only CI stays
+green.
 
-Optional Nim unit tests (no network, no docker, no realm):
+Nim unit tests directly (no network, no docker, no realm):
 
 ```sh
 for t in system/tests/test_*.nim; do nim r --hints:off --warnings:off "$t"; done

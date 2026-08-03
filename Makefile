@@ -8,6 +8,13 @@ RUN_LUA = nix shell nixpkgs\#lua5_3 --command lua
 else
 RUN_LUA = $(LUA)
 endif
+# luac for parse-only smoke checks (same PATH-then-nix pattern).
+LUAC := $(shell command -v luac5.3 2>/dev/null || command -v luac 2>/dev/null)
+ifeq ($(LUAC),)
+RUN_LUAC = nix shell nixpkgs\#lua5_3 --command luac
+else
+RUN_LUAC = $(LUAC)
+endif
 
 # Upstream coworld-vanilla-wow checkout (sibling; read-only — never write there).
 UPSTREAM := $(abspath ../coworld-vanilla-wow)
@@ -36,8 +43,43 @@ ACCOUNT_PASS := password
 
 # Unit tier: Lua tools + Nim host/system tests only (v2 DoD: no Python required
 # for bot correctness). If nim is missing, test-nim-soft skips rather than
-# failing bare CI hosts.
-test: test-lua test-nim-soft
+# failing bare CI hosts. Smoke tier parse/compile-checks code no unit test
+# executes (addon Lua, army_host) — doctrine: a cheap compile-check is a
+# legitimate leg for a binary with no unit tests yet.
+test: test-lua test-nim-soft test-smoke
+
+# Every Nim entrypoint/module must at least compile (`nim check`), even where
+# no unit suite imports it yet (army_host, msgpack_json).
+NIM_CHECK_FILES = system/system_server.nim tools/army_host.nim \
+	tools/fair_play_audit.nim tools/party_promote.nim tools/msgpack_json.nim
+
+.PHONY: test-smoke test-smoke-lua test-smoke-nim test-smoke-nim-soft
+test-smoke: test-smoke-lua test-smoke-nim-soft
+
+# Parse-only check of every non-test Lua file (addon files are Lua 5.0-style
+# but 5.3 luac still catches syntax errors; the addon itself is never run by
+# lua/tests, so this is its only automated gate).
+test-smoke-lua:
+	@rc=0; for f in addons/*/*.lua lua/*.lua lua/tools/*.lua; do \
+		[ -f "$$f" ] || continue; \
+		$(RUN_LUAC) -p "$$f" || { echo "PARSE FAIL: $$f"; rc=1; }; \
+	done; \
+	if [ $$rc -eq 0 ]; then echo "test-smoke-lua: all lua parses clean"; fi; \
+	exit $$rc
+
+test-smoke-nim:
+	@rc=0; for f in $(NIM_CHECK_FILES); do \
+		echo "== nim check $$f =="; \
+		nim check --hints:off --warnings:off "$$f" || rc=1; \
+	done; exit $$rc
+
+# Like test-nim-soft: skip (not fail) on hosts without nim (lua-only CI).
+test-smoke-nim-soft:
+	@if command -v nim >/dev/null 2>&1; then \
+		$(MAKE) test-smoke-nim; \
+	else \
+		echo "test-smoke-nim-soft: nim not on PATH — skip"; \
+	fi
 
 # Like test-nim but no-op when nim is unavailable (wired into `make test`).
 .PHONY: test-nim-soft

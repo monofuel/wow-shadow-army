@@ -8,7 +8,8 @@ shaped assertions). This file maps that doctrine onto **this** repo.
 
 | Tier | Make target | Required? | What it is here |
 |---|---|---|---|
-| **Unit** | `make test` | **YES — every push** | Lua tool library under `lua/tests/test_*.lua` + Nim tiers (`system/tests/`, `tools/tests/`; soft-skip when nim is missing). Instant: no network, no docker, no sleeps, no realm. No Python. |
+| **Unit** | `make test` | **YES — every push** | Lua tool library under `lua/tests/test_*.lua` + Nim tiers (`system/tests/`, `tools/tests/`; soft-skip when nim is missing) + the smoke tier below. Instant: no network, no docker, no sleeps, no realm. No Python. |
+| **Smoke** | `make test-smoke` (inside `make test`) | **YES — every push** | Parse/compile gate for code no unit test executes: `luac -p` every non-test Lua file (the addon's only automated gate) + `nim check` every Nim entrypoint (`NIM_CHECK_FILES`; army_host has no unit suite yet). Nim leg soft-skips like test-nim-soft. |
 | **Pin** | `make pin-check` | on upstream bumps | Pure shell: `git rev-parse HEAD` of `../coworld-vanilla-wow` equals the SHA in `upstream.lock`. |
 | **Live smoke** | `make escort-army` / `make grind` | before milestone claims | Real realm + seats on the Nim host. Evidence lands in `local_data/audit/fair-play.jsonl` + realm logs (LevelUp/Loot). |
 
