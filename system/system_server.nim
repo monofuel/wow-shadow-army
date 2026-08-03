@@ -108,6 +108,11 @@ ORDER BY c.name"""
   DefaultUpstreamRel = "../coworld-vanilla-wow"
   ## Realm lifecycle operator, run with cwd = upstream (same as Makefile OPERATOR).
   OperatorScriptRel = "server/scripts/docker_vmangos_server.py"
+  ## Detached user unit for realm start/stop — NOT a child of wow-system, so
+  ## dashboard restarts cannot kill a multi-minute image build / compose up.
+  RealmOpUnit = "wow-realm-op"
+  ## Marker line the detached wrapper appends so we can read exit after collect.
+  RealmOpExitMarker = "SYSTEM_REALM_OP_EXIT="
   ## Prefix the addon emits over /say (structured telemetry).
   SaPrefix = "<SA> "
   ## Older addon banner still seen in the wild.
@@ -917,7 +922,28 @@ proc startAdminWorker() =
 
 # ---------------------------------------------------------------------------
 # Realm lifecycle (Server panel): status + start/stop via the upstream operator
+#
+# Operator runs as a detached user systemd unit (wow-realm-op), not as a child
+# of system_server. Dashboard restarts must not kill multi-minute compose builds.
+# Op status is mirrored to local_data/realm-op.json so a restarted dashboard
+# still shows Starting… and can record the exit when the unit finishes.
 # ---------------------------------------------------------------------------
+
+proc armyRoot*(): string =
+  ## wow-shadow-army repo root holding the Makefile (SYSTEM_ARMY_DIR wins;
+  ## default cwd — `make system` / wow-system.service run from the repo root).
+  let env = getEnv("SYSTEM_ARMY_DIR", "")
+  if env.len > 0:
+    return absolutePath(env)
+  result = getCurrentDir()
+
+proc realmOpStatePath*(): string =
+  ## Durable lifecycle state (survives dashboard restart).
+  armyRoot() / "local_data" / "realm-op.json"
+
+proc realmOpLogPath*(): string =
+  ## Detached operator stdout/stderr + exit marker.
+  armyRoot() / "local_data" / "realm-op.log"
 
 proc upstreamDir*(): string =
   ## Upstream coworld-vanilla-wow checkout (SYSTEM_UPSTREAM_DIR wins).
@@ -965,6 +991,13 @@ proc serverOpLabel*(op: ServerLifecycleOp): string =
   of sloStop: "stop"
   of sloNone: ""
 
+proc serverOpFromLabel*(label: string): ServerLifecycleOp =
+  ## Inverse of serverOpLabel for disk state.
+  case label
+  of "start": sloStart
+  of "stop": sloStop
+  else: sloNone
+
 proc tailForDisplay*(s: string, maxLen = 600): string =
   ## Keep the tail of operator output (the interesting part) for status lines.
   let clean = s.strip()
@@ -972,30 +1005,186 @@ proc tailForDisplay*(s: string, maxLen = 600): string =
     return clean
   result = "…" & clean[clean.len - maxLen .. ^1]
 
-proc runServerOperator(op: ServerLifecycleOp): tuple[ok: bool, detail: string] =
-  ## Run the upstream compose operator (`up`/`down`) with cwd = upstream —
-  ## the exact path Makefile start-server / stop-server uses. Blocking; only
-  ## the server-op worker thread calls this.
-  let verb = serverOpVerb(op)
-  let dir = upstreamDir()
-  if not fileExists(dir / OperatorScriptRel):
-    return (ok: false,
-      detail: &"operator script missing: {dir / OperatorScriptRel} — set SYSTEM_UPSTREAM_DIR to a real coworld-vanilla-wow checkout")
+proc parseRealmOpExit*(logText: string): int =
+  ## Last SYSTEM_REALM_OP_EXIT=N in a log, or -1 if missing.
+  result = -1
+  for line in logText.splitLines():
+    let t = line.strip()
+    if t.startsWith(RealmOpExitMarker):
+      let raw = t[RealmOpExitMarker.len .. ^1].strip()
+      try:
+        result = parseInt(raw)
+      except ValueError:
+        discard
+
+proc runCmdCapture(cmd: string, args: openArray[string]): tuple[exitCode: int, output: string] =
+  ## Run a short command; capture combined stdout (stderr merged when possible).
   try:
     let process = startProcess(
-      "uv",
-      args = ["run", "python", OperatorScriptRel, verb],
-      workingDir = dir,
-      options = {poUsePath, poStdErrToStdOut}
-    )
+      cmd, args = @args, options = {poUsePath, poStdErrToStdOut})
     let output = process.outputStream.readAll()
     let exitCode = process.waitForExit()
     process.close()
-    if exitCode != 0:
-      return (ok: false, detail: &"operator {verb} exit {exitCode}: {tailForDisplay(output)}")
-    result = (ok: true, detail: tailForDisplay(output))
+    result = (exitCode, output)
   except CatchableError as e:
-    result = (ok: false, detail: &"operator {verb} failed to launch: {e.msg}")
+    result = (1, e.msg)
+
+proc realmOpUnitActive*(): bool =
+  ## True while the detached user unit is still running.
+  let r = runCmdCapture("systemctl", ["--user", "is-active", "--quiet", RealmOpUnit])
+  result = r.exitCode == 0
+
+proc writeRealmOpState(node: JsonNode) =
+  ## Persist lifecycle state under local_data/.
+  let path = realmOpStatePath()
+  createDir(parentDir(path))
+  writeFile(path, node.pretty())
+
+proc readRealmOpState(): JsonNode =
+  ## Load durable lifecycle state, or empty object.
+  let path = realmOpStatePath()
+  if not fileExists(path):
+    return newJObject()
+  try:
+    result = parseJson(readFile(path))
+  except CatchableError:
+    result = newJObject()
+
+proc readRealmOpLog(): string =
+  ## Full operator log text (may be empty).
+  let path = realmOpLogPath()
+  if not fileExists(path):
+    return ""
+  try:
+    result = readFile(path)
+  except CatchableError:
+    result = ""
+
+proc finalizeRealmOpFromDisk() =
+  ## Unit finished (or vanished): record last_op from log + state file.
+  let st = readRealmOpState()
+  if st{"status"}.getStr() != "running":
+    return
+  let opLabel = st{"op"}.getStr("")
+  if opLabel.len == 0:
+    return
+  let logText = readRealmOpLog()
+  let exitCode = parseRealmOpExit(logText)
+  let ok = exitCode == 0
+  let detail =
+    if exitCode >= 0:
+      &"operator {serverOpVerb(serverOpFromLabel(opLabel))} exit {exitCode}: {tailForDisplay(logText)}"
+    else:
+      &"operator finished (no exit marker): {tailForDisplay(logText)}"
+  let done = %*{
+    "status": "done",
+    "op": opLabel,
+    "ok": ok,
+    "detail": detail,
+    "finished_at": now().utc.format("yyyy-MM-dd'T'HH:mm:ss'Z'")
+  }
+  writeRealmOpState(done)
+  withLock gServerOpLock:
+    gRunningServerOp = sloNone
+    gLastServerOp = opLabel
+    gLastServerOpOk = ok
+    gLastServerOpDetail = detail
+
+proc refreshRealmOpState*() =
+  ## Reconcile memory + disk with the detached unit (call from status paths).
+  ## Survives dashboard restart: if unit still active, show Starting…/Stopping…
+  let st = readRealmOpState()
+  let status = st{"status"}.getStr("")
+  if status == "running":
+    if realmOpUnitActive():
+      let op = serverOpFromLabel(st{"op"}.getStr(""))
+      withLock gServerOpLock:
+        if gRunningServerOp == sloNone and gPendingServerOp == sloNone:
+          gRunningServerOp = op
+      return
+    # Unit gone while we were mid-op (or dashboard was down) → finalize.
+    finalizeRealmOpFromDisk()
+    return
+  if status == "done":
+    withLock gServerOpLock:
+      if gLastServerOp.len == 0:
+        gLastServerOp = st{"op"}.getStr("")
+        gLastServerOpOk = st{"ok"}.getBool(false)
+        gLastServerOpDetail = st{"detail"}.getStr("")
+
+proc stopRealmOpUnit() =
+  ## Best-effort clear of a leftover unit before starting a new one.
+  discard runCmdCapture("systemctl", ["--user", "stop", RealmOpUnit])
+  discard runCmdCapture("systemctl", ["--user", "reset-failed", RealmOpUnit])
+
+proc spawnDetachedRealmOperator(op: ServerLifecycleOp): tuple[ok: bool, detail: string] =
+  ## Launch operator in user unit `wow-realm-op` (independent of wow-system).
+  let verb = serverOpVerb(op)
+  let dir = upstreamDir()
+  let script = dir / OperatorScriptRel
+  if not fileExists(script):
+    return (ok: false,
+      detail: &"operator script missing: {script} — set SYSTEM_UPSTREAM_DIR")
+  let logPath = realmOpLogPath()
+  createDir(parentDir(logPath))
+  try:
+    writeFile(logPath, &"# realm op {serverOpLabel(op)} started {now().utc}\n")
+  except CatchableError as e:
+    return (ok: false, detail: &"cannot write op log: {e.msg}")
+
+  stopRealmOpUnit()
+  # bash wrapper: keep full log + exit marker for post-mortem after --collect.
+  let shell = &"""
+set -o pipefail
+uv run python {OperatorScriptRel.quoteShell} {verb.quoteShell} >> {logPath.quoteShell} 2>&1
+ec=$?
+echo {RealmOpExitMarker}$ec >> {logPath.quoteShell}
+exit $ec
+"""
+  let r = runCmdCapture("systemd-run", [
+    "--user",
+    &"--unit={RealmOpUnit}",
+    &"--working-directory={dir}",
+    "--collect",
+    "--",
+    "bash", "-c", shell
+  ])
+  if r.exitCode != 0:
+    return (ok: false,
+      detail: &"systemd-run failed (exit {r.exitCode}): {tailForDisplay(r.output)}")
+  writeRealmOpState(%*{
+    "status": "running",
+    "op": serverOpLabel(op),
+    "unit": RealmOpUnit,
+    "log": logPath,
+    "started_at": now().utc.format("yyyy-MM-dd'T'HH:mm:ss'Z'")
+  })
+  result = (ok: true, detail: &"detached unit {RealmOpUnit}")
+
+proc waitDetachedRealmOperator(): tuple[ok: bool, detail: string] =
+  ## Poll the user unit until it exits, then finalize from log.
+  while realmOpUnitActive():
+    sleep(500)
+  # Small grace so the wrapper can flush the exit marker.
+  sleep(200)
+  finalizeRealmOpFromDisk()
+  withLock gServerOpLock:
+    result = (ok: gLastServerOpOk, detail: gLastServerOpDetail)
+
+proc runServerOperator(op: ServerLifecycleOp): tuple[ok: bool, detail: string] =
+  ## Spawn detached operator unit, wait for it (worker thread only).
+  ## The operator process tree lives under user systemd, not wow-system.
+  let spawned = spawnDetachedRealmOperator(op)
+  if not spawned.ok:
+    writeRealmOpState(%*{
+      "status": "done",
+      "op": serverOpLabel(op),
+      "ok": false,
+      "detail": spawned.detail,
+      "finished_at": now().utc.format("yyyy-MM-dd'T'HH:mm:ss'Z'")
+    })
+    return spawned
+  result = waitDetachedRealmOperator()
 
 proc currentServerOp(): ServerLifecycleOp =
   ## Queued-or-executing lifecycle op (sloNone when idle).
@@ -1008,16 +1197,22 @@ proc requestServerOp*(op: ServerLifecycleOp): tuple[accepted: bool, reason: stri
   ## Queue a lifecycle op for the worker. One op at a time; busy = rejected.
   if op == sloNone:
     return (accepted: false, reason: "no-op")
+  {.gcsafe.}:
+    refreshRealmOpState()
   withLock gServerOpLock:
     if gRunningServerOp != sloNone or gPendingServerOp != sloNone:
       let busy = serverOpLabel(
         if gRunningServerOp != sloNone: gRunningServerOp else: gPendingServerOp)
       return (accepted: false, reason: &"busy: {busy} in progress")
+    if realmOpUnitActive():
+      return (accepted: false, reason: "busy: detached realm op still active")
     gPendingServerOp = op
     result = (accepted: true, reason: "")
 
 proc serverStatus*(): ServerStatus =
   ## Single dispatch path for realm lifecycle state (Server panel + MCP).
+  {.gcsafe.}:
+    refreshRealmOpState()
   result.container = gameContainer()
   result.running = containerRunning()
   withLock gServerOpLock:
@@ -1049,12 +1244,13 @@ proc serverStatusToJson*(s: ServerStatus): JsonNode =
   }
 
 proc serverOpWorkerLoop() {.thread.} =
-  ## Runs queued lifecycle ops. Same worker-thread pattern as adminWorkerLoop:
-  ## HTTP handlers stay fast; compose up/down (minutes) happens here.
+  ## Runs queued lifecycle ops. Spawns a detached user unit then waits;
+  ## the unit outlives this process if the dashboard restarts mid-op.
   while true:
     sleep(200)
     var op = sloNone
     {.gcsafe.}:
+      refreshRealmOpState()
       withLock gServerOpLock:
         if gPendingServerOp != sloNone and gRunningServerOp == sloNone:
           op = gPendingServerOp
@@ -1086,14 +1282,6 @@ proc startServerOpWorker() =
 # ---------------------------------------------------------------------------
 # Bot seat lifecycle: per-seat Start/Stop (roster buttons + MCP)
 # ---------------------------------------------------------------------------
-
-proc armyRoot(): string =
-  ## wow-shadow-army repo root holding the Makefile (SYSTEM_ARMY_DIR wins;
-  ## default cwd — `make system` runs from the repo root).
-  let env = getEnv("SYSTEM_ARMY_DIR", "")
-  if env.len > 0:
-    return absolutePath(env)
-  result = getCurrentDir()
 
 proc seatMakeTarget*(name: string): string =
   ## Makefile seat target for a bot seat, or "" (human / unknown).
@@ -1570,7 +1758,7 @@ proc kindClass(kind: string): string =
 proc renderEventRows*(events: seq[AddonEvent]): string =
   ## htmx partial: `<tr>` rows for the addon events table (newest first).
   if events.len == 0:
-    return """<tr><td colspan="4" class="empty">No addon events yet (tailing Chat.log live).</td></tr>"""
+    return """<tr><td colspan="4" class="empty">No addon events yet.</td></tr>"""
   result = ""
   for e in events:
     result.add(&"""
@@ -1600,20 +1788,20 @@ proc renderServerPanel*(s: ServerStatus): string =
   ## what keeps the dashboard useful with the server offline.
   var pill: string
   if s.op == "start":
-    pill = """<span class="status busy">Starting…</span>"""
+    pill = """<span class="pill"><span class="dot warn"></span> Starting…</span>"""
   elif s.op == "stop":
-    pill = """<span class="status busy">Stopping…</span>"""
+    pill = """<span class="pill"><span class="dot warn"></span> Stopping…</span>"""
   elif s.running:
-    pill = """<span class="status alive">Running</span>"""
+    pill = """<span class="pill"><span class="dot on"></span> Running</span>"""
   else:
-    pill = """<span class="status offline">Stopped</span>"""
+    pill = """<span class="pill"><span class="dot off"></span> Stopped</span>"""
 
   var action: string
   if s.op.len > 0:
     action = """<span class="meta">in progress…</span>"""
   elif s.running:
     action = """
-      <button class="admin danger"
+      <button class="btn danger"
               hx-post="/server/stop"
               hx-target="#server-panel"
               hx-swap="innerHTML"
@@ -1622,7 +1810,7 @@ proc renderServerPanel*(s: ServerStatus): string =
       </button>"""
   else:
     action = """
-      <button class="reload"
+      <button class="btn primary"
               hx-post="/server/start"
               hx-target="#server-panel"
               hx-swap="innerHTML">
@@ -1640,7 +1828,6 @@ proc renderServerPanel*(s: ServerStatus): string =
 
   result = &"""
     <div class="server-line">
-      <span class="server-label">Realm</span>
       {pill}
       <span class="meta server-container">{escapeHtml(s.container)}</span>
       <span class="server-action">{action}</span>
@@ -1769,7 +1956,7 @@ proc armySummary*(characters: seq[Character]): string =
 proc renderRosterRows*(characters: seq[Character]): string =
   ## htmx partial: `<tr>` rows for the roster table body.
   if characters.len == 0:
-    return """<tr><td colspan="11" class="empty">No characters (empty realm, or only foundation seats).</td></tr>"""
+    return """<tr><td colspan="11" class="empty">No characters.</td></tr>"""
   result = ""
   for s in characters:
     let life = if s.life.len > 0: s.life else: (if s.online: "alive" else: "offline")
@@ -1801,82 +1988,136 @@ proc renderRosterRows*(characters: seq[Character]): string =
 
 proc renderRosterOfflineRow*(): string =
   ## Roster body when the realm is down: friendly nudge, not a red error.
-  result = """<tr><td colspan="11" class="empty">Realm is offline — start it from the <a href="/admin">Admin</a> tab and the roster will fill in here.</td></tr>"""
+  result = """<tr><td colspan="11" class="empty">Realm offline — <a href="/admin">Admin</a> to start.</td></tr>"""
 
 ## Shared dashboard CSS for Army / Advisor / Admin (plain string — no strformat braces).
+## Visual language tracks the FFXIV Racha dashboard (navy/gold, sticky chrome, cards);
+## content rules stay autoresearch/docs/dashboard.md: metrics and buttons only.
 const DashboardCss = """
     :root {
-      --bg: #0d1117; --panel: #161b22; --border: #30363d; --text: #e6edf3;
-      --muted: #8b949e; --accent: #58a6ff; --online: #3fb950; --offline: #6e7681;
-      --alive: #3fb950; --ghost: #a371f7; --dead: #f85149; --gold: #d4a017;
-      --err: #f85149; --loaded: #3fb950;
+      --bg: #0a0c12;
+      --panel: #121826;
+      --panel2: #0e1320;
+      --border: #243049;
+      --text: #e8eef8;
+      --muted: #8b9bb4;
+      --accent: #d4af37;
+      --accent2: #6cb6ff;
+      --good: #3dd68c;
+      --warn: #f0c14b;
+      --bad: #ff6b6b;
+      --ghost: #c792ea;
+      --ink: #0a0f18;
+      --alive: var(--good);
+      --dead: var(--bad);
+      --err: var(--bad);
+      --loaded: var(--good);
+      --offline: #6e7681;
+      --gold: var(--accent);
     }
     * { box-sizing: border-box; }
     body {
       margin: 0;
-      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
-      background: var(--bg); color: var(--text); min-height: 100vh;
+      font-family: "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+      background:
+        radial-gradient(900px 480px at 8% -8%, #1c2744 0%, transparent 55%),
+        radial-gradient(700px 400px at 95% 0%, #2a1f12 0%, transparent 50%),
+        var(--bg);
+      color: var(--text);
+      min-height: 100vh;
     }
-    header {
-      padding: 1.25rem 1.5rem; border-bottom: 1px solid var(--border); background: var(--panel);
+    header.top {
+      display: flex; flex-wrap: wrap; align-items: center; gap: 0.75rem 1rem;
+      padding: 0.9rem 1.4rem;
+      border-bottom: 1px solid var(--border);
+      background: rgba(10,12,18,0.88);
+      backdrop-filter: blur(10px);
+      position: sticky; top: 0; z-index: 20;
     }
-    header h1 {
-      margin: 0; font-size: 1.25rem; letter-spacing: 0.04em; color: var(--accent);
+    header.top h1 {
+      margin: 0; font-size: 1.2rem; font-weight: 650; letter-spacing: 0.03em;
     }
-    .nav { display: flex; gap: 0.5rem; margin-top: 0.85rem; }
-    .nav a {
-      color: var(--muted); text-decoration: none; font-size: 0.85rem; font-weight: 600;
-      padding: 0.3rem 0.7rem; border-radius: 6px; border: 1px solid transparent;
+    header.top h1 span { color: var(--accent); }
+    nav.tabs {
+      display: flex; gap: 0.35rem; padding: 0.65rem 1.4rem 0;
+      border-bottom: 1px solid var(--border);
+      background: rgba(10,12,18,0.5);
     }
-    .nav a:hover { color: var(--text); background: #21262d; }
-    .nav a.active {
-      color: var(--accent); border-color: var(--border); background: #21262d;
+    nav.tabs a {
+      appearance: none; border: 1px solid transparent; border-bottom: none;
+      background: transparent; color: var(--muted); text-decoration: none;
+      padding: 0.55rem 1rem; border-radius: 10px 10px 0 0;
+      font-size: 0.85rem; font-weight: 600; letter-spacing: 0.04em;
+      text-transform: uppercase;
     }
-    main { padding: 1.5rem; max-width: 1280px; margin: 0 auto; }
+    nav.tabs a:hover { color: var(--text); background: rgba(108,182,255,0.06); }
+    nav.tabs a.active {
+      color: var(--accent); background: var(--panel);
+      border-color: var(--border); border-bottom-color: var(--panel);
+      margin-bottom: -1px;
+    }
+    main {
+      padding: 1rem 1.4rem 2.5rem;
+      max-width: 1400px; margin: 0 auto;
+      display: grid; gap: 1rem;
+    }
     .panel {
-      background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
-      overflow: hidden; margin-bottom: 1.25rem;
+      background: linear-gradient(180deg, var(--panel) 0%, var(--panel2) 100%);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      min-width: 0;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.22);
+      overflow: hidden;
     }
+    .htmx-request.panel,
+    .htmx-request { opacity: 0.72; transition: opacity 0.15s; }
     .table-scroll { overflow-x: auto; }
     .panel-head {
       display: flex; justify-content: space-between; align-items: center; gap: 0.75rem;
-      padding: 0.75rem 1rem; border-bottom: 1px solid var(--border); flex-wrap: wrap;
+      padding: 0.9rem 1.1rem 0.55rem; flex-wrap: wrap;
     }
-    .panel-head h2 { margin: 0; font-size: 1rem; }
+    .panel-head h2 {
+      margin: 0; font-size: 0.78rem; text-transform: uppercase;
+      letter-spacing: 0.09em; color: var(--muted); font-weight: 650;
+    }
     .panel-actions {
       display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap;
     }
-    .panel-body { padding: 1rem; }
+    .panel-body { padding: 0.75rem 1.1rem 1.1rem; }
     .meta { color: var(--muted); font-size: 0.8rem; }
-    table { width: 100%; border-collapse: collapse; }
+    .muted { color: var(--muted); font-size: 0.85rem; line-height: 1.45; }
+    a { color: var(--accent2); }
+    table { width: 100%; border-collapse: collapse; font-size: 0.84rem; }
     th, td {
-      text-align: left; padding: 0.55rem 0.7rem; border-bottom: 1px solid var(--border);
-      font-size: 0.9rem;
+      text-align: left; padding: 0.42rem 0.55rem;
+      border-bottom: 1px solid rgba(36,48,73,0.75);
     }
     th {
-      color: var(--muted); font-weight: 600; font-size: 0.8rem;
-      text-transform: uppercase; letter-spacing: 0.04em;
+      color: var(--muted); font-weight: 550; font-size: 0.72rem;
+      text-transform: uppercase; letter-spacing: 0.05em;
     }
+    tr:hover td { background: rgba(108,182,255,0.04); }
     tr:last-child td { border-bottom: none; }
     td.name { font-weight: 600; }
     td.lvl { font-variant-numeric: tabular-nums; font-weight: 600; }
-    td.gold { color: var(--gold); font-variant-numeric: tabular-nums; }
+    td.gold { color: var(--accent); font-variant-numeric: tabular-nums; font-weight: 650; }
     td.zone { color: var(--text); font-size: 0.9rem; max-width: 10rem; }
     td.conn { color: var(--muted); font-size: 0.8rem; font-variant-numeric: tabular-nums; }
     td.payload {
       color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-      font-size: 0.85rem;
+      font-size: 0.82rem;
     }
     td.xp-cell { min-width: 9.5rem; }
     td.vitals-cell { min-width: 8rem; }
     .xp-bar {
-      height: 6px; background: #21262d; border-radius: 999px; overflow: hidden;
-      margin-bottom: 0.25rem;
+      height: 7px; background: var(--ink); border-radius: 4px; overflow: hidden;
+      border: 1px solid var(--border); margin-bottom: 0.25rem;
     }
     .xp-fill {
-      height: 100%; background: linear-gradient(90deg, #1f6feb, #58a6ff); border-radius: 999px;
+      height: 100%; border-radius: 3px;
+      background: linear-gradient(90deg, var(--accent2), var(--good));
     }
-    .xp-meta { font-size: 0.75rem; font-variant-numeric: tabular-nums; color: var(--text); }
+    .xp-meta { font-size: 0.72rem; font-variant-numeric: tabular-nums; color: var(--text); }
     .xp-muted { color: var(--muted); font-weight: 400; }
     .vitals { display: flex; flex-direction: column; gap: 0.2rem; }
     .vitals-line {
@@ -1884,13 +2125,16 @@ const DashboardCss = """
       gap: 0.35rem; font-size: 0.72rem; font-variant-numeric: tabular-nums;
     }
     .vitals-tag { color: var(--muted); font-weight: 600; }
-    .vitals-bar { height: 5px; background: #21262d; border-radius: 999px; overflow: hidden; }
-    .vitals-fill { height: 100%; border-radius: 999px; }
-    .vitals-fill.hp { background: linear-gradient(90deg, #238636, #3fb950); }
-    .vitals-fill.hp.low { background: linear-gradient(90deg, #a40e26, #f85149); }
-    .vitals-fill.mana { background: linear-gradient(90deg, #1f6feb, #58a6ff); }
-    .vitals-fill.rage { background: linear-gradient(90deg, #a40e26, #f85149); }
-    .vitals-fill.energy { background: linear-gradient(90deg, #9e6a03, #d4a017); }
+    .vitals-bar {
+      height: 5px; background: var(--ink); border-radius: 4px; overflow: hidden;
+      border: 1px solid var(--border);
+    }
+    .vitals-fill { height: 100%; border-radius: 3px; }
+    .vitals-fill.hp { background: linear-gradient(90deg, #238636, var(--good)); }
+    .vitals-fill.hp.low { background: linear-gradient(90deg, #a40e26, var(--bad)); }
+    .vitals-fill.mana { background: linear-gradient(90deg, #1f6feb, var(--accent2)); }
+    .vitals-fill.rage { background: linear-gradient(90deg, #a40e26, var(--bad)); }
+    .vitals-fill.energy { background: linear-gradient(90deg, #9e6a03, var(--accent)); }
     .vitals-num { color: var(--text); white-space: nowrap; }
     .vitals-muted { color: var(--muted); }
     td.pos-cell, .pos {
@@ -1900,72 +2144,87 @@ const DashboardCss = """
     td.seat { font-size: 0.8rem; white-space: nowrap; }
     td.bot-cell { white-space: nowrap; }
     .bot-btn {
-      border: none; border-radius: 5px; padding: 0.2rem 0.55rem; font-size: 0.72rem;
-      font-weight: 600; cursor: pointer;
+      border: 1px solid var(--border); border-radius: 8px; padding: 0.2rem 0.55rem;
+      font-size: 0.72rem; font-weight: 600; cursor: pointer; background: var(--ink);
+      color: var(--accent2);
     }
-    .bot-btn.start { background: var(--accent); color: #0d1117; }
-    .bot-btn.stop { background: color-mix(in srgb, var(--dead) 85%, #000); color: #fff; }
-    .bot-btn:hover { filter: brightness(1.1); }
-    .seat-net.online { color: var(--alive); font-weight: 600; }
+    .bot-btn.start { color: var(--accent2); }
+    .bot-btn.stop { color: var(--bad); border-color: rgba(255,107,107,0.4); }
+    .bot-btn:hover { border-color: var(--accent2); }
+    .seat-net.online { color: var(--good); font-weight: 600; }
     .seat-net.offline { color: var(--offline); }
-    .seat-ctrl.ctrl-up { color: var(--accent); }
-    .seat-ctrl.ctrl-down { color: var(--err); }
+    .seat-ctrl.ctrl-up { color: var(--accent2); }
+    .seat-ctrl.ctrl-down { color: var(--bad); }
     tr.row-ghost { background: color-mix(in srgb, var(--ghost) 8%, transparent); }
-    tr.row-dead { background: color-mix(in srgb, var(--dead) 8%, transparent); }
+    tr.row-dead { background: color-mix(in srgb, var(--bad) 8%, transparent); }
     .army-summary {
-      font-size: 0.8rem; color: var(--muted); font-variant-numeric: tabular-nums;
+      font-size: 0.78rem; color: var(--muted); font-variant-numeric: tabular-nums;
+      padding: 0.22rem 0.7rem; border-radius: 999px;
+      border: 1px solid var(--border); background: var(--ink);
     }
-    .status {
-      display: inline-block; padding: 0.15rem 0.5rem; border-radius: 999px;
-      font-size: 0.75rem; font-weight: 600;
+    .pill {
+      display: inline-flex; align-items: center; gap: 0.4rem;
+      padding: 0.22rem 0.7rem; border-radius: 999px; font-size: 0.78rem;
+      border: 1px solid var(--border); background: var(--panel);
     }
-    .status.online, .status.alive {
-      background: color-mix(in srgb, var(--alive) 20%, transparent); color: var(--alive);
+    .dot {
+      width: 8px; height: 8px; border-radius: 50%;
+      background: var(--bad); box-shadow: 0 0 0 transparent; flex-shrink: 0;
     }
-    .status.offline {
-      background: color-mix(in srgb, var(--offline) 25%, transparent); color: var(--offline);
+    .dot.on { background: var(--good); box-shadow: 0 0 10px var(--good); }
+    .dot.warn { background: var(--warn); box-shadow: 0 0 8px var(--warn); }
+    .dot.off { background: var(--offline); }
+    .status, .kind, .badge {
+      display: inline-block; font-size: 0.68rem; font-weight: 600;
+      padding: 0.12rem 0.45rem; border-radius: 4px;
+      border: 1px solid var(--border); color: var(--muted); background: var(--ink);
+    }
+    .status.online, .status.alive, .kind-loaded, .badge.ok {
+      color: var(--good); border-color: rgba(61,214,140,0.35);
+    }
+    .status.offline, .kind-muted {
+      color: var(--muted); border-color: var(--border);
     }
     .status.busy {
-      background: color-mix(in srgb, var(--accent) 20%, transparent); color: var(--accent);
+      color: var(--accent2); border-color: rgba(108,182,255,0.35);
     }
     .status.ghost {
-      background: color-mix(in srgb, var(--ghost) 22%, transparent); color: var(--ghost);
+      color: var(--ghost); border-color: rgba(199,146,234,0.35);
     }
-    .status.dead {
-      background: color-mix(in srgb, var(--dead) 20%, transparent); color: var(--dead);
+    .status.dead, .kind-err, .badge.bad {
+      color: var(--bad); border-color: rgba(255,107,107,0.35);
     }
+    .badge.warn, .status.warn {
+      color: var(--warn); border-color: rgba(240,193,75,0.35);
+    }
+    .badge.accent { color: var(--accent); border-color: rgba(212,175,55,0.4); }
     .server-line { display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap; }
-    .server-label { font-weight: 600; font-size: 0.9rem; }
+    .server-label { font-weight: 650; font-size: 0.9rem; }
     .server-container {
       font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.75rem;
+      color: var(--muted);
     }
     .server-action { margin-left: auto; }
-    .server-last { margin-top: 0.5rem; font-size: 0.8rem; }
-    .kind {
-      display: inline-block; padding: 0.15rem 0.5rem; border-radius: 999px;
-      font-size: 0.75rem; font-weight: 600;
+    .server-last { margin-top: 0.55rem; font-size: 0.8rem; }
+    .empty { color: var(--muted); text-align: center; padding: 2rem 1rem; font-size: 0.9rem; }
+    button.btn, button.reload, button.admin {
+      display: inline-block; padding: 0.4rem 0.85rem; border-radius: 8px;
+      border: 1px solid var(--border); background: var(--ink); color: var(--accent2);
+      font-size: 0.8rem; font-weight: 600; cursor: pointer; font-family: inherit;
     }
-    .kind-err { background: color-mix(in srgb, var(--err) 20%, transparent); color: var(--err); }
-    .kind-loaded {
-      background: color-mix(in srgb, var(--loaded) 20%, transparent); color: var(--loaded);
+    button.btn:hover, button.reload:hover { border-color: var(--accent2); }
+    button.btn.primary, button.reload {
+      background: linear-gradient(180deg, #2a2410 0%, var(--ink) 100%);
+      color: var(--accent); border-color: rgba(212,175,55,0.45);
     }
-    .kind-muted {
-      background: color-mix(in srgb, var(--muted) 20%, transparent); color: var(--muted);
+    button.btn.primary:hover, button.reload:hover { border-color: var(--accent); }
+    button.btn.danger, button.admin, button.admin.danger {
+      color: var(--bad); border-color: rgba(255,107,107,0.45);
+      background: linear-gradient(180deg, #2a1414 0%, var(--ink) 100%);
     }
-    .empty { color: var(--muted); text-align: center; padding: 2rem; }
-    button.reload {
-      background: var(--accent); color: #0d1117; border: none; border-radius: 6px;
-      padding: 0.35rem 0.75rem; font-size: 0.8rem; font-weight: 600; cursor: pointer;
-    }
-    button.reload:hover { filter: brightness(1.08); }
-    button.admin {
-      background: #f85149; color: #fff; border: none; border-radius: 6px;
-      padding: 0.45rem 0.9rem; font-size: 0.85rem; font-weight: 600; cursor: pointer;
-    }
-    button.admin:hover { filter: brightness(1.08); }
-    button.admin.danger { background: #f85149; color: #fff; }
-    .reload-ok, .admin-ok { color: var(--loaded); font-size: 0.85rem; }
-    .reload-timeout, .admin-err { color: var(--err); font-size: 0.85rem; }
+    button.btn.danger:hover, button.admin:hover { border-color: var(--bad); }
+    .reload-ok, .admin-ok { color: var(--good); font-size: 0.85rem; }
+    .reload-timeout, .admin-err { color: var(--bad); font-size: 0.85rem; }
     .admin-actions { display: flex; flex-wrap: wrap; gap: 0.75rem; align-items: center; }
     .admin-steps {
       margin-top: 0.75rem; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
@@ -1978,19 +2237,20 @@ proc navTabClass(active, tab: string): string =
   if active == tab: " class=\"active\"" else: ""
 
 proc renderNav*(active: string): string =
-  ## Header nav: Army | Advisor | Admin.
+  ## Tab strip: Army | Advisor | Admin (server-side pages, short labels).
   let army = navTabClass(active, "army")
   let advisor = navTabClass(active, "advisor")
   let admin = navTabClass(active, "admin")
   result = &"""
-    <nav class="nav">
-      <a{army} href="/army">Army</a>
-      <a{advisor} href="/advisor">Advisor</a>
-      <a{admin} href="/admin">Admin</a>
-    </nav>"""
+<nav class="tabs" role="tablist">
+  <a{army} href="/army" role="tab">Army</a>
+  <a{advisor} href="/advisor" role="tab">Advisor</a>
+  <a{admin} href="/admin" role="tab">Admin</a>
+</nav>"""
 
 proc renderDashboard*(title, active, body: string): string =
   ## Full HTML shell shared by Army / Advisor / Admin tabs.
+  ## Metrics and buttons only — no tutorial or implementation copy.
   result = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -2003,10 +2263,10 @@ proc renderDashboard*(title, active, body: string): string =
   </style>
 </head>
 <body>
-  <header>
-    <h1>THE SYSTEM</h1>
-""" & renderNav(active) & """
+  <header class="top">
+    <h1>The System · <span>""" & escapeHtml(title) & """</span></h1>
   </header>
+""" & renderNav(active) & """
   <main>
 """ & body & """
   </main>
@@ -2019,7 +2279,7 @@ proc renderArmyPage*(characters: seq[Character], rosterOffline = false): string 
   let rows = if rosterOffline: renderRosterOfflineRow() else: renderRosterRows(characters)
   let summary = armySummary(characters)
   let body = &"""
-    <div class="panel">
+    <section class="panel">
       <div class="panel-head">
         <h2>Roster</h2>
         <div class="panel-actions">
@@ -2051,18 +2311,18 @@ proc renderArmyPage*(characters: seq[Character], rosterOffline = false): string 
         </tbody>
       </table>
       </div>
-    </div>"""
+    </section>"""
   result = renderDashboard("Army", "army", body)
 
 proc renderAdvisorPage*(events: seq[AddonEvent]): string =
   ## Advisor tab: addon event tail + reload control.
   let eventRows = renderEventRows(events)
   let body = &"""
-    <div class="panel">
+    <section class="panel">
       <div class="panel-head">
         <h2>Addon events</h2>
         <div class="panel-actions">
-          <button class="reload"
+          <button class="btn primary"
                   hx-post="/reload"
                   hx-target="#reload-result"
                   hx-swap="innerHTML">Reload addon</button>
@@ -2087,7 +2347,7 @@ proc renderAdvisorPage*(events: seq[AddonEvent]): string =
         </tbody>
       </table>
       </div>
-    </div>"""
+    </section>"""
   result = renderDashboard("Advisor", "advisor", body)
 
 proc renderAdminResult*(r: AdminActionResult): string =
@@ -2107,7 +2367,7 @@ proc renderAdminPage*(server: ServerStatus): string =
   ## Admin tab: realm lifecycle + ops buttons.
   let serverPanel = renderServerPanel(server)
   let body = &"""
-    <div class="panel">
+    <section class="panel">
       <div class="panel-head">
         <h2>Realm</h2>
       </div>
@@ -2118,21 +2378,21 @@ proc renderAdminPage*(server: ServerStatus): string =
            hx-swap="innerHTML">
 {serverPanel}
       </div>
-    </div>
-    <div class="panel">
+    </section>
+    <section class="panel">
       <div class="panel-head">
         <h2>Actions</h2>
       </div>
       <div class="panel-body">
         <div class="admin-actions">
-          <button class="admin"
+          <button class="btn danger"
                   hx-post="/admin/respawn-shadow-army"
                   hx-target="#admin-result"
                   hx-swap="innerHTML"
                   hx-confirm="Respawn Shadowfel, Igris, Tusk, Beru at Deathknell?">
             Respawn shadow army
           </button>
-          <button class="admin"
+          <button class="btn danger"
                   hx-post="/admin/tele-party-to-murist"
                   hx-target="#admin-result"
                   hx-swap="innerHTML"
@@ -2142,7 +2402,7 @@ proc renderAdminPage*(server: ServerStatus): string =
         </div>
         <div id="admin-result" style="margin-top:1rem;"></div>
       </div>
-    </div>"""
+    </section>"""
   result = renderDashboard("Admin", "admin", body)
 
 proc htmlHeaders(): mummyheaders.HttpHeaders =

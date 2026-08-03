@@ -30,6 +30,15 @@ suite "server lifecycle ops":
     check tail.startsWith("…")
     check tail.endsWith("THE END")
 
+  test "realm op exit marker parse":
+    check parseRealmOpExit("") == -1
+    check parseRealmOpExit("noise\n") == -1
+    check parseRealmOpExit("SYSTEM_REALM_OP_EXIT=0\n") == 0
+    check parseRealmOpExit("foo\nSYSTEM_REALM_OP_EXIT=1\nbar\nSYSTEM_REALM_OP_EXIT=0\n") == 0
+    check serverOpFromLabel("start") == sloStart
+    check serverOpFromLabel("stop") == sloStop
+    check serverOpFromLabel("") == sloNone
+
 suite "server status views":
   test "json view carries all lifecycle fields":
     let s = ServerStatus(
