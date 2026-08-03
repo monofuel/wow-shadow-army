@@ -31,6 +31,10 @@ layers only: **knowledgebase (`kb/`)** / **Lua tool library (`lua/`)** /
 **LLM planner** (later). Named intents in Lua; reflexes at the cadence the
 upstream controller already owns.
 
+Only **`lua/`** exists today. `kb/` is a reserved empty folder and the LLM
+planner is unbuilt — see "Docs vs knowledgebase" below before writing a
+markdown file anywhere.
+
 ## Hard rules
 
 - **NO PYTHON.** Do not write, extend, or land new Python for bots, policy,
@@ -44,7 +48,7 @@ upstream controller already owns.
 - **Rely on upstream as much as possible.** `../coworld-vanilla-wow` already
   owns perception, pathing, combat sequencing, looting, formation, recovery,
   and the `nim_control.v2` socket. Under v2 there is **no external action
-  selection** (`kb/nim-control-v2-external-select.md`): per-frame policy runs
+  selection** (`docs/nim-control-v2-external-select.md`): per-frame policy runs
   in-process upstream, configured by typed goals. Do not reimplement that
   stack here. If upstream is missing a capability, document the gap and
   tell monofuel — do not paper over it with a local policy brain.
@@ -88,9 +92,19 @@ upstream controller already owns.
 - **Naming.** Repo-internal personas use shadow-soldier names (igris,
   beru, tusk, kaisel, ...). One file per persona, one thesis per persona,
   each a pinned hypothesis (see solo-leveling.md persona section).
-- **Knowledgebase discipline.** Durable facts the bots learn (map facts,
-  tool reliability, postmortems) go in `kb/` as small markdown files the
-  planner/tools read — not into prompts or code comments.
+- **Docs vs knowledgebase.** Two different audiences — do not mix them.
+  **`docs/` is for humans and agents working on this repo**: architecture,
+  protocol notes, upstream pins and gaps, build/run steps, postmortems of our
+  own bugs, anything naming a file path, Nim flag, Makefile target, or packet.
+  **`kb/` is bot memory** — facts a seat could act on *in-game* (map and route
+  facts, quest giver/item/mob ids, tool reliability learned from play), small
+  and one per file, written for the LLM planner to read at play time.
+  The test: *would a bot mid-fight use this, or only an engineer at a
+  keyboard?* Commit hashes, branch names, and "run `make …`" are always
+  `docs/`. `kb/` is **empty on purpose** (see `kb/README.md`) — its only
+  claimed reader was the deleted Python `brain/`, so nine engineering docs
+  drifted in there and moved to `docs/` on 2026-08-03. Do not refill it to
+  make it look used; it stays empty until the planner exists to read it.
 - **Coupling isolation.** Version-specific facts (endpoints, protocol
   labels, thresholds tied to the upstream pin) live in one config module,
   not scattered through tools.
@@ -218,6 +232,6 @@ happy path — that is the escape hatch, not the product.
 ## Session protocol with monofuel
 
 He plays alongside the bots and reports issues in plain language; those
-land in `kb/postmortems/` or the playbook queue. Every play session opens
+land in `docs/postmortems/` or the playbook queue. Every play session opens
 by re-testing the previous session's complaints. Agents keep the bot/server
 stack healthy without asking him to run ops commands.

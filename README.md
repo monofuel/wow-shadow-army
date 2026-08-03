@@ -17,11 +17,11 @@ sole mutable out-of-process boundary, `vanilla_wow.nim_control.v2`:
 typed goals (leader/party/roster) + hold/resume/cancel directives in,
 control status + MessagePack environment frames out. **v2 has no external
 action selection** — per-frame policy runs in-process upstream
-(`kb/nim-control-v2-external-select.md`); our host installs goals, observes,
+(`docs/nim-control-v2-external-select.md`); our host installs goals, observes,
 watchdogs, and audits.
 
 ```
-knowledgebase (kb/)          <- what the army has learned
+knowledgebase (kb/)          <- bot memory: reserved, empty, unbuilt
 LLM planner (later)          <- goal selection, toolsmithing
 Lua tool library (lua/)      <- named intents (dormant until upstream re-exposes a select surface)
 Nim host (tools/army_host)   <- goal install + watchdogs + fair-play audit
@@ -42,10 +42,13 @@ against. The upstream checkout lives as a sibling:
 - `lua/tools/` — named-intent tool library (the LLM-facing language)
 - `lua/tests/` — fast unit tests, run by `make test` (must stay instant)
 - `tools/` — Nim host (`army_host.nim`), party promote, fair-play audit
-- `kb/` — the bot-readable/writable knowledgebase (map facts, tool notes,
-  postmortems)
-- `docs/` — design notes; start with `docs/v2.md` (`docs/control-plane.md`
-  is the v1-era design, kept as history)
+- `kb/` — bot memory for the future LLM planner (map facts, quest ids, tool
+  reliability). **Empty on purpose** — see `kb/README.md`
+- `docs/` — everything written for humans/agents on this repo: design notes,
+  protocol and upstream notes, postmortems (`docs/postmortems/`). Start with
+  `docs/interfaces.md` (the map of every boundary), then `docs/nim-client.md`
+  (the upstream client interface we code against), then `docs/v2.md`
+  (`docs/control-plane.md` is the v1-era design, kept as history)
 
 ## Human quickstart
 

@@ -1,5 +1,11 @@
 # Escort leader combat join (v2)
 
+> **STALE — written against upstream pin `ec5bd2f9d`.** The pin moved to
+> `93730fb97` on 2026-08-03 after a 1661-commit upstream restructure
+> (`client/` + `player/` → `environment/` + `bots/`), and the
+> `lua-external-policy` fork branch this describes was dropped. Nothing below
+> is verified against the new tree. See `docs/work-2026-08-03.md`.
+
 ## Problem
 OOC, follower `attack` kind is often **false** → `combat.attackable` empty →
 `join_leader_attack` never fires. Party frames also lag: Murist xy frozen and

@@ -33,7 +33,14 @@ export VANILLA_WOW_NAVMESH_HELPER := $(UPSTREAM)/tmp/vmangos-navmesh-helper
 # Sparse vmangos/core checkout supplying dep/recastnavigation + dep/include.
 VMANGOS_CORE_DIR := $(UPSTREAM)/local_data/reference/vmangos-core
 
-OPERATOR := uv run python server/scripts/docker_vmangos_server.py
+# Realm lifecycle: tools/realm_op.sh discovers the upstream operator script and
+# adds --build when the local image lacks feature metadata. Same path The System
+# uses (dashboard Start server). Override with SYSTEM_UPSTREAM_DIR if needed.
+export SYSTEM_UPSTREAM_DIR ?= $(UPSTREAM)
+export SYSTEM_ARMY_DIR ?= $(CURDIR)
+REALM_OP := $(CURDIR)/tools/realm_op.sh
+# Direct operator still used by server-logging (write-config / smoke flags).
+OPERATOR := $(REALM_OP)
 COMPOSE_FILE := infra/compose.vmangos.yml
 # Human playtest account (type at the GlueXML login screen).
 ACCOUNT_USER := monofuel
@@ -215,7 +222,7 @@ grind-army-nim: army-host-build
 
 # Single-seat mob grind, Lua-driven: lua/tools/grind_nearest decides every
 # tick and the host fires typed BotActions through the fork's execute_action
-# frame (kb/nim-control-v2-external-select.md). Requires the seat to run the
+# frame (docs/nim-control-v2-external-select.md). Requires the seat to run the
 # fork `lua-external-policy` build with an idle/held planner.
 #
 #   make grind SLOT=2 EXTRA='--max-seconds=600'
@@ -261,20 +268,19 @@ quest-data:
 # Bring up the local VMaNGOS/Coworld realm, then attach to container logs.
 # Operator `up` is detached (compose up -d). Ctrl-C only detaches from logs;
 # containers keep running. Use `make stop-server` to stop cleanly.
-# Idempotent when already up. No --build (use upstream rebuild workflows if
-# images are missing).
+# Idempotent when already up. realm_op.sh adds --build when the image needs it.
 start-server:
 	@set -e; \
 	if [ ! -d "$(UPSTREAM)" ]; then \
 		echo "error: upstream checkout missing: $(UPSTREAM)" >&2; exit 1; \
 	fi; \
-	cd "$(UPSTREAM)"; \
-	$(OPERATOR) up; \
+	"$(REALM_OP)" up; \
 	echo ""; \
 	echo "Realm up (detached). Attaching logs for coworld-game."; \
 	echo "Ctrl-C detaches logs only — containers keep running."; \
 	echo "Stop cleanly with: make stop-server"; \
 	echo ""; \
+	cd "$(UPSTREAM)"; \
 	docker compose -f "$(COMPOSE_FILE)" --profile coworld logs -f coworld-game
 
 # Stop the coworld-game service (compose rm --stop). Does not wipe volumes
@@ -284,8 +290,7 @@ stop-server:
 	if [ ! -d "$(UPSTREAM)" ]; then \
 		echo "error: upstream checkout missing: $(UPSTREAM)" >&2; exit 1; \
 	fi; \
-	cd "$(UPSTREAM)"; \
-	$(OPERATOR) down
+	"$(REALM_OP)" down
 
 # Server-side breadcrumb logging (see docs/breadcrumbs.md for the why of each
 # key). Writes vmangos.mangosd_config_overrides into the operator's config.json

@@ -1,5 +1,11 @@
 # Upstream pin `ec5bd2f9d` — nim_control.v2 break for external army_host
 
+> **STALE — written against upstream pin `ec5bd2f9d`.** The pin moved to
+> `93730fb97` on 2026-08-03 after a 1661-commit upstream restructure
+> (`client/` + `player/` → `environment/` + `bots/`), and the
+> `lua-external-policy` fork branch this describes was dropped. Nothing below
+> is verified against the new tree. See `docs/work-2026-08-03.md`.
+
 **Date:** 2026-07-27  
 **Pin:** `coworld-vanilla-wow ec5bd2f9dffd6685b94e0a6b10702906989c0b01`
 

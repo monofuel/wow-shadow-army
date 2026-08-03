@@ -41,9 +41,11 @@ doc.
 
 - **realm** — our local VMaNGOS 1.12 private server, run for testing via
   upstream's compose (`infra/compose.vmangos.yml`, project `coworld-vmangos`).
-- **operator** — upstream's `server/scripts/docker_vmangos_server.py`, the
-  script that brings the realm `up`/`down`. The System and `make
-  start-server` both call it; `SYSTEM_UPSTREAM_DIR` tells The System where the
+- **operator** — upstream's `docker_vmangos_server.py` (path discovered under
+  the checkout; currently `infra/mangos/vmangos/ops/…`), the script that
+  brings the realm `up`/`down`. The System and `make start-server` both go
+  through `tools/realm_op.sh` (auto `--build` when the image needs it);
+  `SYSTEM_UPSTREAM_DIR` tells them where the
   upstream checkout lives.
 - **local_data** — `wow-shadow-army/local_data/`, gitignored runtime state:
   bot logs, brain logs, nim runtime dirs. (Upstream repos have their own
@@ -53,22 +55,52 @@ doc.
   instance: a small shell of real files with all `Data/*.MPQ` symlinked into
   wow-classic-data. The pattern every client instance should follow.
 
+## Clients
+
+There are **two unrelated game clients**. Saying just "the client" is the most
+common source of confusion in this project — always qualify it. Detail and
+wiring: `docs/interfaces.md`.
+
+- **the nim client** — upstream's Nim game client (`environment/` + `player/`
+  in the upstream tree). **When a doc says "client" in a bot context, this is
+  what it means.** It is also playable by a human, so "someone on the nim
+  client" is a legitimate phrase — the term describes the *software*, not
+  whether a bot or a person is driving it. Bot seats run it headless. We put
+  **no code inside it**; we drive it from outside as an external policy over
+  `WS /env`.
+- **the vanilla client** — the real Blizzard 1.12 `WoW.exe` under wine,
+  launched by **`make play-classic`**. **This is what monofuel plays and tests
+  with.** It has an addon system (Lua 5.0, `Interface/AddOns/`), which the nim
+  client does not. Its thin instance layout is `local_classic` (see above).
+- **`play-classic`** — the Makefile target, and by extension the shorthand for
+  "the vanilla client session monofuel is playing in." `make play` is the nim
+  client instead; `make play-xr` is the xr checkout.
+- **the advisor** — our Lua addon **for the vanilla client**; defined under
+  "The System and seats" below.
+
 ## The System and seats
 
 - **The System** — our management server (`system/system_server.nim`), one Nim
   binary on `127.0.0.1:7777`: htmx dashboard + MCP endpoint + admin/lifecycle
   ops. Named for the solo-leveling system. See `system/README.md`.
 - **seat** — one connected game client, human or bot. Bot seats are
-  **Shadowfel, Igris, Tusk, Beru**; **Murist** is the human seat (monofuel).
-  Bot seats expose a `nim_control` socket on port `41114 + slot`.
+  **Shadowfel, Igris, Tusk, Beru** (slots 2–5), each running the **nim
+  client**; **Murist** is the human seat (monofuel) on the **vanilla client**.
+  One `army_host` process drives one bot seat — four in total, sharing no
+  state. Bot seats historically exposed a `nim_control` socket on
+  `41114 + slot`; as of pin `93730fb97` that protocol is gone and the port
+  survives only as a liveness probe (`docs/interfaces.md`).
 - **foundation seats** — background/utility characters (`Bot*`, Nightsun,
   Cowcam) that we ignore and filter out of dashboards by default.
-- **advisor** — the ShadowArmy vanilla-client addon (`addons/ShadowArmy/`) on
-  the human seat: reduces monofuel's cognitive load in play. UI or fully
-  automated; slash commands are a dev escape hatch, not the product. See
-  `docs/advisor.md`.
+- **advisor** — the ShadowArmy addon (`addons/ShadowArmy/`) for the **vanilla
+  client** (see "Clients"), on the human seat: reduces monofuel's cognitive
+  load in play. UI or fully automated; slash commands are a dev escape hatch,
+  not the product. It is **not part of the bot stack** — it never sees an
+  `AgentFrame` and never talks to `army_host`, and the nim client has no addon
+  system to host it. Our two bodies of Lua — `lua/tools/` (bot policy) and
+  `addons/ShadowArmy/` (advisor) — never meet. See `docs/advisor.md`.
 - **fair play** — seats play as strangers: cooperation only through the
   game's own typed contracts and live observations, no out-of-band collusion,
   no GM/DB shortcuts for progress. Anything a stranger client on the live
   realm couldn't do is cheating. See AGENTS.md hard rules and
-  `kb/fair-play-audit.md`.
+  `docs/fair-play-audit.md`.

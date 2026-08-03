@@ -1,5 +1,11 @@
 # nim_control.v2 external action selection — stock gap, fork surface
 
+> **STALE — written against upstream pin `ec5bd2f9d`.** The pin moved to
+> `93730fb97` on 2026-08-03 after a 1661-commit upstream restructure
+> (`client/` + `player/` → `environment/` + `bots/`), and the
+> `lua-external-policy` fork branch this describes was dropped. Nothing below
+> is verified against the new tree. See `docs/work-2026-08-03.md`.
+
 Stock upstream v2 (pin `ec5bd2f9d`) has **no external action selection**:
 the wire accepts goal request (1), control directive (2 — hold/resume/
 cancel), status request (4), and emits control status (5), environment

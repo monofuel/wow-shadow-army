@@ -118,7 +118,7 @@ it as the ladder.
 | `docs/advisor.md` | Original hypothesis / advice classes |
 | `docs/advisor-autopilot.md` (this file) | **Levels + product decision** |
 | `docs/advisor-unlock.md` | Unlock research notes — **not pursuing** for product |
-| `kb/advisor-sandbox-gates.md` | Probe measurements (why vanilla L1–4 stopped) |
+| `docs/advisor-sandbox-gates.md` | Probe measurements (why vanilla L1–4 stopped) |
 | `docs/the-system-loop.md` | SOAP / Chat.log / reload |
 | `docs/quest-data.md` | Waypoint data for L0 display |
 | `docs/v2.md` | Army architecture |

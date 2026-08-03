@@ -1,5 +1,11 @@
 # Quest accept discovery (external policy)
 
+> **STALE — written against upstream pin `ec5bd2f9d`.** The pin moved to
+> `93730fb97` on 2026-08-03 after a 1661-commit upstream restructure
+> (`client/` + `player/` → `environment/` + `bots/`), and the
+> `lua-external-policy` fork branch this describes was dropped. Nothing below
+> is verified against the new tree. See `docs/work-2026-08-03.md`.
+
 ## Wire facts
 
 - Factorized `quest` is a **1-based bindings.quests index**, not `quest_id`.

@@ -135,4 +135,4 @@ Graduation bar (session): full short quest walk with no babysitting; bots contri
 
 ## How to use this file
 
-Append dated bullets as the day goes. Promote durable lessons to `kb/postmortems/` or playbook when the session ends. Do not treat this as the permanent knowledgebase.
+Append dated bullets as the day goes. Promote durable lessons to `docs/postmortems/` or playbook when the session ends. Do not treat this as the permanent knowledgebase.

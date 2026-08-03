@@ -195,7 +195,7 @@ local function find_attackable_by_guid(attackable, guid)
   return nil
 end
 
--- Invite allowlist: fail-closed when empty (kb/nim-control-v2-no-select.md).
+-- Invite allowlist: fail-closed when empty (docs/nim-control-v2-external-select.md).
 local function invite_names(args, party)
   local list = args and (args.allowlist or args.invite_allowlist)
   if type(list) == "table" and #list > 0 then return list end
