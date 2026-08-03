@@ -112,6 +112,31 @@ upstream controller already owns.
   irreversible data loss, tournament-risking cheat), **state the decision
   and options** — do not dump a command list for the operator to type.
 
+## The System service (dashboard) — restart after changes
+
+The System (dashboard + MCP, `system/system_server.nim`) runs as the systemd
+**user** service `wow-system` from this repo checkout. `nim r` recompiles on
+every start, so **restarting the service is how a dashboard change goes
+live** — there is no separate build or deploy step.
+
+After editing `system/system_server.nim` (agent owns all of this):
+
+1. `make test` — must be green before restarting.
+2. `systemctl --user restart wow-system`
+3. Verify: `curl -sS http://127.0.0.1:7777/healthz` returns ok (allow a few
+   seconds for the recompile), and the change is visible on
+   `http://127.0.0.1:7777/`.
+4. Logs when something is wrong: `journalctl --user -u wow-system -f`
+   (compile errors land here — the service retries every 15s until the code
+   compiles again).
+
+Other commands: `systemctl --user status wow-system` (state),
+`systemctl --user stop wow-system` / `start wow-system` (lifecycle). The unit
+source lives at `tools/wow-system.service` (live copy in
+`~/.config/systemd/user/`); the launcher is `tools/run_system.sh`. Do not run
+`make system` or a stray `nim r system/system_server.nim` while the service
+is up — port 7777 is taken.
+
 ## Shadow Advisor — make monofuel's job easy
 
 The vanilla-client **ShadowArmy advisor** (`addons/ShadowArmy/`) is the
