@@ -13,7 +13,7 @@
 ## Critical design rule: one dispatch path. Each capability is one data/action
 ## proc; the htmx handlers render it and the MCP tools serialize it.
 ##   listCharacters()           — roster (SELECT via docker exec)
-##   traverseStatus()        — Kalimdor Traverse telemetry (SELECT-only)
+##   traverseStatus()        — Kalimdor Traverse telemetry (DB + live godview)
 ##   recentEvents()          — addon Chat.log ring buffer
 ##   reloadAddon()           — SOAP announce <SYS> reload + wait for <SA> loaded
 ##   announceInGame()        — SOAP announce <text>
@@ -72,6 +72,10 @@ const
   TraverseCourseYards* = 15874.333052
   ## docker ps name suffix for the traverse scenario game container.
   TraverseContainerSuffix* = "-traverse-coworld-game-1"
+  ## Host path under ~/.coworld for league runtime captures (godview JSONL).
+  TraverseCapturesRel* = ".coworld/player/launcher_units/runtime"
+  ## Tail window when reading the latest godview shard (live pos, not full history).
+  GodviewTailBytes* = 256 * 1024
   ## VMaNGOS CHARACTER_FLAG_GHOST — set while spirit-running / unreleased corpse.
   CharacterFlagGhost = 0x2000
   ## Fixed bot seats (party-army seats). Admin respawn only touches these.
@@ -246,6 +250,16 @@ type
     characterFound*: bool
     character*: TraverseCharacter
     score*: TraverseScore
+    ## True when pos/score used godview capture (not just characters DB).
+    livePos*: bool
+
+  TraverseLivePos* = object
+    ## One godview snapshot of the fixture character (in-world, not DB save).
+    x*, y*, z*: float
+    mapId*: int
+    level*: int
+    hasMap*: bool
+    hasLevel*: bool
 
   AdminStepResult* = object
     ## One SOAP command outcome for an admin action.
@@ -442,6 +456,137 @@ proc parseTraverseTsv*(tsv: string): Option[TraverseCharacter] =
     except ValueError:
       continue
 
+proc traverseUnitIdFromContainer*(containerName: string): string =
+  ## Extract launcher unit id from coworld-native-<unit>-traverse-coworld-game-1.
+  result = ""
+  const prefix = "coworld-native-"
+  if not containerName.startsWith(prefix):
+    return
+  if not containerName.endsWith(TraverseContainerSuffix):
+    return
+  let mid = containerName[prefix.len .. ^(TraverseContainerSuffix.len + 1)]
+  if mid.len == 0 or mid.contains('/'):
+    return
+  result = mid
+
+proc parseGodviewPlayerPos*(jsonlChunk, playerName: string): Option[TraverseLivePos] =
+  ## Last godview JSONL frame that contains playerName. Pure: chunk in, pos out.
+  result = none(TraverseLivePos)
+  if jsonlChunk.len == 0 or playerName.len == 0:
+    return
+  let lines = jsonlChunk.splitLines()
+  var i = lines.len - 1
+  while i >= 0:
+    let line = lines[i]
+    dec i
+    if line.len == 0 or playerName notin line:
+      continue
+    try:
+      let root = parseJson(line)
+      if root.kind != JObject or not root.hasKey("players"):
+        continue
+      let players = root["players"]
+      if players.kind != JArray:
+        continue
+      for p in players:
+        if p.kind != JObject:
+          continue
+        if p{"name"}.getStr() != playerName:
+          continue
+        if not p.hasKey("x") or not p.hasKey("y") or not p.hasKey("z"):
+          continue
+        var live = TraverseLivePos(
+          x: p["x"].getFloat(),
+          y: p["y"].getFloat(),
+          z: p["z"].getFloat(),
+          mapId: 0,
+          level: 0,
+          hasMap: false,
+          hasLevel: false
+        )
+        if root.hasKey("map") and root["map"].kind == JInt:
+          live.mapId = root["map"].getInt()
+          live.hasMap = true
+        if p.hasKey("level") and p["level"].kind == JInt:
+          live.level = p["level"].getInt()
+          live.hasLevel = true
+        return some(live)
+    except CatchableError:
+      continue
+
+proc readFileTail*(path: string, maxBytes: int): string =
+  ## Last maxBytes of a file (UTF-8 best-effort). Empty on error.
+  result = ""
+  if maxBytes <= 0 or path.len == 0 or not fileExists(path):
+    return
+  try:
+    var f = open(path, fmRead)
+    defer:
+      f.close()
+    let size = f.getFileSize()
+    if size <= 0:
+      return
+    if size <= maxBytes:
+      result = f.readAll()
+      return
+    f.setFilePos(size - maxBytes)
+    result = f.readAll()
+    let nl = result.find('\n')
+    if nl >= 0 and nl + 1 < result.len:
+      result = result[nl + 1 .. ^1]
+  except CatchableError:
+    result = ""
+
+proc latestGodviewFile*(capturesDir: string): string =
+  ## Newest godview_*.jsonl under capturesDir by filename (timestamp in name).
+  result = ""
+  if capturesDir.len == 0 or not dirExists(capturesDir):
+    return
+  var bestName = ""
+  for kind, path in walkDir(capturesDir):
+    if kind != pcFile:
+      continue
+    let base = path.extractFilename()
+    if not base.startsWith("godview_") or not base.endsWith(".jsonl"):
+      continue
+    if bestName.len == 0 or base > bestName:
+      bestName = base
+      result = path
+
+proc resolveTraverseCapturesDir*(containerName: string): string =
+  ## Host captures dir for a traverse container (SYSTEM_TRAVERSE_CAPTURES wins).
+  let env = getEnv("SYSTEM_TRAVERSE_CAPTURES", "").strip()
+  if env.len > 0:
+    return absolutePath(env)
+  let unit = traverseUnitIdFromContainer(containerName)
+  if unit.len == 0:
+    return ""
+  result = getHomeDir() / TraverseCapturesRel / unit / "leagues/traverse/captures"
+
+proc liveTraversePosFromCaptures*(
+    capturesDir: string, playerName = TraverseCharacterName
+): Option[TraverseLivePos] =
+  ## Live fixture position from the latest godview shard tail.
+  result = none(TraverseLivePos)
+  let path = latestGodviewFile(capturesDir)
+  if path.len == 0:
+    return
+  let chunk = readFileTail(path, GodviewTailBytes)
+  result = parseGodviewPlayerPos(chunk, playerName)
+
+proc applyLiveTraversePos*(
+    ch: var TraverseCharacter, live: TraverseLivePos
+) =
+  ## Overlay godview x/y/z (and map/level when present) onto a DB row.
+  ch.posX = live.x
+  ch.posY = live.y
+  ch.posZ = live.z
+  ch.hasPosition = true
+  if live.hasMap:
+    ch.mapId = live.mapId
+  if live.hasLevel and live.level > 0:
+    ch.level = live.level
+
 proc gameContainer(): string =
   ## Resolve the coworld-game MariaDB / world container name.
   result = getEnv("SYSTEM_MYSQL_CONTAINER", DefaultGameContainer)
@@ -511,13 +656,16 @@ proc resolveTraverseContainer*(): string =
   )
 
 proc traverseStatus*(): TraverseStatus =
-  ## Single dispatch path for Traverse tab telemetry (SELECT-only, no docker lifecycle).
+  ## Traverse tab telemetry: characters DB identity + godview live position.
+  ## VMaNGOS only flushes position_x on save/logout, so yard score must come
+  ## from the league godview capture while Northbound is online.
   result = TraverseStatus(
     containerFound: false,
     containerName: "",
     characterFound: false,
     character: TraverseCharacter(),
-    score: scoreTraverse(false, 0, 0, false, 0.0)
+    score: scoreTraverse(false, 0, 0, false, 0.0),
+    livePos: false
   )
   let container = resolveTraverseContainer()
   if container.len == 0:
@@ -534,8 +682,12 @@ proc traverseStatus*(): TraverseStatus =
   if chOpt.isNone:
     result.score = scoreTraverse(false, 0, 0, false, 0.0)
     return
-  let ch = chOpt.get
+  var ch = chOpt.get
   result.characterFound = true
+  let live = liveTraversePosFromCaptures(resolveTraverseCapturesDir(container))
+  if live.isSome:
+    applyLiveTraversePos(ch, live.get)
+    result.livePos = true
   result.character = ch
   result.score = scoreTraverse(
     true, ch.level, ch.mapId, ch.hasPosition, ch.posX
@@ -2906,11 +3058,17 @@ proc renderTraverseStatus*(st: TraverseStatus): string =
   let yardsText = formatTraverseYards(sc.northingYards)
   let pctText = formatTraversePct(sc.coursePct)
   let pctWidth = formatTraversePct(sc.coursePct)
+  let livePill =
+    if st.livePos:
+      """<span class="badge accent">live</span>"""
+    else:
+      """<span class="badge">db save</span>"""
   result = &"""
     <div class="panel-actions" style="margin-bottom:0.75rem">
       {containerPill}
       <span class="server-container">{containerLabel}</span>
       {onlinePill}
+      {livePill}
       {validityBadge}
     </div>
     <div class="stat-row">

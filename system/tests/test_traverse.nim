@@ -143,3 +143,67 @@ suite "traverse TSV parse":
     let html = renderTraverseStatus(st)
     check "Scenario not running" in html
     check "Northbound" notin html or "not found" in html
+
+suite "traverse godview live pos":
+  test "unit id from container name":
+    check traverseUnitIdFromContainer(
+      "coworld-native-54a06038d691-traverse-coworld-game-1"
+    ) == "54a06038d691"
+    check traverseUnitIdFromContainer("coworld-vmangos-coworld-game-1") == ""
+    check traverseUnitIdFromContainer("") == ""
+
+  test "parse last Northbound frame from chunk":
+    let older = """{"t":1,"map":1,"players":[{"name":"Northbound","x":-9187.0,"y":-2530.0,"z":14.0,"level":60}]}"""
+    let newer = """{"t":2,"map":1,"players":[{"name":"Northbound","x":-8891.55,"y":-2497.2,"z":11.8,"level":60}]}"""
+    let chunk = older & "\n" & newer & "\n"
+    let live = parseGodviewPlayerPos(chunk, "Northbound")
+    check live.isSome
+    let p = live.get
+    check abs(p.x - (-8891.55)) < 0.01
+    check abs(p.y - (-2497.2)) < 0.01
+    check abs(p.z - 11.8) < 0.01
+    check p.hasMap and p.mapId == 1
+    check p.hasLevel and p.level == 60
+    let yards = traverseNorthingYards(p.x)
+    check yards > 0.0
+    check abs(yards - 295.45) < 0.1
+
+  test "missing player yields none":
+    let chunk = """{"t":1,"map":1,"players":[{"name":"Other","x":1.0,"y":2.0,"z":3.0}]}"""
+    check parseGodviewPlayerPos(chunk, "Northbound").isNone
+    check parseGodviewPlayerPos("", "Northbound").isNone
+
+  test "applyLiveTraversePos overlays coords":
+    var ch = TraverseCharacter(
+      name: "Northbound", level: 60, mapId: 1, zoneId: 440,
+      posX: -9187.0, posY: -2530.0, posZ: 14.0, online: true, hasPosition: true
+    )
+    applyLiveTraversePos(ch, TraverseLivePos(
+      x: -8891.55, y: -2497.2, z: 11.8, mapId: 1, level: 60,
+      hasMap: true, hasLevel: true
+    ))
+    check abs(ch.posX - (-8891.55)) < 0.01
+    check ch.hasPosition
+    let sc = scoreTraverse(true, ch.level, ch.mapId, ch.hasPosition, ch.posX)
+    check sc.valid
+    check sc.northingYards > 0.0
+
+  test "live badge when livePos set":
+    var ch = TraverseCharacter(
+      name: "Northbound", level: 60, mapId: 1, zoneId: 440, zoneName: "Tanaris",
+      posX: -8891.55, posY: -2497.2, posZ: 11.8, online: true, hasPosition: true
+    )
+    let sc = scoreTraverse(true, 60, 1, true, ch.posX)
+    let st = TraverseStatus(
+      containerFound: true,
+      containerName: "coworld-native-test-traverse-coworld-game-1",
+      characterFound: true,
+      character: ch,
+      score: sc,
+      livePos: true
+    )
+    let html = renderTraverseStatus(st)
+    check "live" in html
+    check "northing yards" in html
+    check sc.northingYards > 1.0
+    check formatTraverseYards(sc.northingYards) in html
