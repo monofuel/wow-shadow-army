@@ -607,12 +607,29 @@ warlock-bot:
 	WOW_SDK_NIM_CONTROL_HOST=127.0.0.1 \
 	nim r player/reference_player/reference_player.nim --scenario=nim-control
 
-# Launch the native client for HUMAN play against the local realm.
-# --login-screen: land at GlueXML login (no auto world entry). Credentials are
-# omitted on purpose — with --login-screen the launcher does not forward
-# --username/--password to the player; without --login-screen a local realm
-# fills COWORLD/Nightsun for direct world entry. Type monofuel/password at
-# the door (see make account). Do not run unattended (opens a GUI).
+# Launch the native client for HUMAN play against OUR local persistent realm.
+#
+# The old --login-screen/--realm-host/--realm-port/--world-port flags are gone
+# from upstream's launcher (renderedSessionRoute, launch_nim_player.nim:300).
+# A bare launch now means "hosted persistent-practice gateway" and dies on DNS.
+# The local realm is reached by the direct-WebSocket route instead: set BOTH
+# VANILLA_WOW_LOGIN_WS_URL and VANILLA_WOW_GAME_WS_URL (setting one alone is a
+# hard error) and the launcher picks renderedDirectWebSockets, which also skips
+# the practice grant.
+#
+# The bridges are the canonical /tcp/realmd:3724 + /tcp/world:8085 proxies on
+# the realm's HTTP port (game/config.py:1357). Both take slot+token; the realm
+# ships a single token, so only slot 0 authenticates.
+#
+# --username/--password are not launcher options; they fall through to the
+# player runtime (launch_nim_player.nim:439, player_runtime.nim:102-103), which
+# logs in and stops at CharacterSelect — no character is forced, so we still
+# pick a seat by hand. Creds reuse ACCOUNT_USER/ACCOUNT_PASS (make account).
+# Do not run unattended (opens a GUI).
+PLAY_WS ?= ws://127.0.0.1:8080
+PLAY_SLOT ?= 0
+PLAY_TOKEN ?= token-0
+PLAY_OWNER ?= monofuel
 play:
 	@set -e; \
 	if [ ! -d "$(UPSTREAM)" ]; then \
@@ -623,11 +640,15 @@ play:
 	fi; \
 	cd "$(UPSTREAM)"; \
 	nix shell nixpkgs\#nginx --command sh -c \
-		'. "$(WOW_ENV)"; nim r tools/launch_nim_player.nim -- \
-			--login-screen \
-			--realm-host=127.0.0.1 \
-			--realm-port=3724 \
-			--world-port=8085'
+		'. "$(WOW_ENV)"; \
+		export VANILLA_WOW_LOGIN_WS_URL="$(PLAY_WS)/tcp/realmd?slot=$(PLAY_SLOT)&token=$(PLAY_TOKEN)"; \
+		export VANILLA_WOW_GAME_WS_URL="$(PLAY_WS)/tcp/world?slot=$(PLAY_SLOT)&token=$(PLAY_TOKEN)"; \
+		nim r tools/launch_nim_player.nim -- \
+			--controller=human \
+			--presentation=headed \
+			--owner=$(PLAY_OWNER) \
+			--username=$(ACCOUNT_USER) \
+			--password=$(ACCOUNT_PASS) $(EXTRA)'
 
 # Launch the traverse-wow league scenario for HUMAN play (docs/traverse_wow.md).
 # Unlike `play`, this does NOT use our local realm: --league=traverse makes the
