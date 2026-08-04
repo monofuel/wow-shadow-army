@@ -266,6 +266,18 @@ quest-data:
 	@python3 tools/gen_quest_data.py \
 		--dbc-dir "$(VANILLA_WOW_EXTRACTED_DATA_DIR)/dbc" $(QUEST_DATA_ARGS)
 
+# Dump realm DBs from the running game container into a dated dir with a
+# restore manifest. Optional label: make backup-server LABEL=faction-bug-repro
+.PHONY: backup-server
+backup-server:
+	@tools/backup_server.sh $(LABEL)
+
+# Restore realm state from a backup dir (name under backups/ or full path).
+# DESTRUCTIVE — replaces current realm DB. make restore-server BACKUP=<name>
+.PHONY: restore-server
+restore-server:
+	@tools/restore_server.sh $(BACKUP) --yes
+
 # Bring up the local VMaNGOS/Coworld realm, then attach to container logs.
 # Operator `up` is detached (compose up -d). Ctrl-C only detaches from logs;
 # containers keep running. Use `make stop-server` to stop cleanly.
