@@ -46,7 +46,7 @@ COMPOSE_FILE := infra/compose.vmangos.yml
 ACCOUNT_USER := monofuel
 ACCOUNT_PASS := password
 
-.PHONY: test test-lua test-nim system pin-check start-server stop-server server-logging logs account soap-account play play-classic play-classic-netlog play-xr escort escort-army grind quest-data warlock-account warlock-bot botwarrior-bot tusk-account tusk-bot beru-account beru-bot party-army navmesh-helper navmesh-status
+.PHONY: test test-lua test-nim system pin-check start-server stop-server server-logging logs account soap-account play play-classic play-classic-netlog play-xr traverse escort escort-army grind quest-data warlock-account warlock-bot botwarrior-bot tusk-account tusk-bot beru-account beru-bot party-army navmesh-helper navmesh-status
 
 # Unit tier: Lua tools + Nim host/system tests only (v2 DoD: no Python required
 # for bot correctness). If nim is missing, test-nim-soft skips rather than
@@ -628,6 +628,30 @@ play:
 			--realm-host=127.0.0.1 \
 			--realm-port=3724 \
 			--world-port=8085'
+
+# Launch the traverse-wow league scenario for HUMAN play (docs/traverse_wow.md).
+# Unlike `play`, this does NOT use our local realm: --league=traverse makes the
+# launcher provision upstream's own Docker scenario with the level-60 Tanaris
+# fixture, so no --realm-host/--world-port. --bot is rejected with
+# --controller=human. First run builds the client and the backend image (slow);
+# the launcher also claims the GUI seat lease under OWNER. Do not run
+# unattended (opens a GUI).
+TRAVERSE_OWNER ?= monofuel
+traverse:
+	@set -e; \
+	if [ ! -d "$(UPSTREAM)" ]; then \
+		echo "error: upstream checkout missing: $(UPSTREAM)" >&2; exit 1; \
+	fi; \
+	if [ ! -f "$(WOW_ENV)" ]; then \
+		echo "error: missing $(WOW_ENV)" >&2; exit 1; \
+	fi; \
+	cd "$(UPSTREAM)"; \
+	nix shell nixpkgs\#nginx --command sh -c \
+		'. "$(WOW_ENV)"; nim r tools/launch_nim_player.nim -- \
+			--league=traverse \
+			--controller=human \
+			--presentation=headed \
+			--owner=$(TRAVERSE_OWNER) $(EXTRA)'
 
 # Launch the GENUINE 1.12.1 client under wine against the local realm
 # (see docs/play-classic.md). First run assembles local_classic/ (Data/

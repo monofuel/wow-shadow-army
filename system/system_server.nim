@@ -1,9 +1,11 @@
 ## The System — management server for the shadow army.
 ##
 ## One Nim binary, HTTP + MCP interfaces on one mummy server:
-##   HTTP dashboard (htmx)  GET /  GET /army  GET /murist  GET /advisor  GET /admin
+##   HTTP dashboard (htmx)  GET /  GET /army  GET /murist  GET /advisor
+##                          GET /traverse  GET /admin
 ##                          GET /roster  GET /murist/status  GET /murist/quests
-##                          GET /murist/events  GET /events  GET /server
+##                          GET /murist/events  GET /traverse/status
+##                          GET /events  GET /server
 ##                          POST /reload  POST /server/start  POST /server/stop
 ##                          POST /admin/respawn-shadow-army
 ##   MCP endpoint (MCPort)  POST /mcp
@@ -11,6 +13,7 @@
 ## Critical design rule: one dispatch path. Each capability is one data/action
 ## proc; the htmx handlers render it and the MCP tools serialize it.
 ##   listCharacters()           — roster (SELECT via docker exec)
+##   traverseStatus()        — Kalimdor Traverse telemetry (SELECT-only)
 ##   recentEvents()          — addon Chat.log ring buffer
 ##   reloadAddon()           — SOAP announce <SYS> reload + wait for <SA> loaded
 ##   announceInGame()        — SOAP announce <text>
@@ -19,9 +22,10 @@
 ##   startServer()/stopServer() — queue operator `up`/`down` (async worker)
 ##
 ## Tabs: Army (roster), Murist (human seat), Advisor (events + reload),
-## Admin (realm + ops). The dashboard stays useful with the realm DOWN:
-## roster/Murist degrade to offline notes; Admin's Server panel offers
-## Start/Stop. The human only runs the client and this dashboard.
+## Traverse (league telemetry), Admin (realm + ops). The dashboard stays
+## useful with the realm DOWN: roster/Murist degrade to offline notes;
+## Admin's Server panel offers Start/Stop. The human only runs the client
+## and this dashboard.
 ##
 ## Admin interfaces (same procs): HTTP /admin, MCP tools, and human-seat addon
 ## chat (`<SA> admin <action>` from Murist → Chat.log tailer).
@@ -38,7 +42,7 @@ import
   ../tools/fair_play_audit
 
 const
-  Version = "0.10.0"
+  Version = "0.11.0"
   ServerName = "TheSystem"
   ## Only this character may request admin actions via `<SA> admin …` (human seat).
   AdminRequesterName* = "Murist"
@@ -59,6 +63,15 @@ const
   DbName = "characters"
   ## Default compose container name for coworld-game. Override with SYSTEM_MYSQL_CONTAINER.
   DefaultGameContainer = "coworld-vmangos-coworld-game-1"
+  ## Kalimdor Traverse fixture character (docs/traverse_wow.md).
+  TraverseCharacterName* = "Northbound"
+  ## Course anchors from upstream game/scoring.py (X is north/south).
+  TraverseStartWorldX* = -9187.0
+  TraverseGoalWorldX* = 6687.333052
+  ## goal - start; full course length in yards.
+  TraverseCourseYards* = 15874.333052
+  ## docker ps name suffix for the traverse scenario game container.
+  TraverseContainerSuffix* = "-traverse-coworld-game-1"
   ## VMaNGOS CHARACTER_FLAG_GHOST — set while spirit-running / unreleased corpse.
   CharacterFlagGhost = 0x2000
   ## Fixed bot seats (party-army seats). Admin respawn only touches these.
@@ -97,6 +110,13 @@ LEFT JOIN mangos.player_xp_for_level x ON x.lvl = c.level
 LEFT JOIN mangos.area_template a ON a.entry = c.zone
 LEFT JOIN mangos.player_classlevelstats s ON s.class = c.class AND s.level = c.level
 ORDER BY c.name"""
+  ## Kalimdor Traverse fixture row + zone display name (same area_template join).
+  TraverseSql = """SELECT c.name, c.level, c.map, c.zone,
+c.position_x, c.position_y, c.position_z, c.online,
+COALESCE(NULLIF(a.name, ''), CONCAT('Zone#', c.zone))
+FROM characters c
+LEFT JOIN mangos.area_template a ON a.entry = c.zone
+WHERE c.name='Northbound'"""
   ## Active quest log for one character (unrewarded only).
   ## VMaNGOS status: 1=complete (turn-in ready), 3=incomplete/active, 5=failed.
   ## quest_template is multi-patch — take MAX(patch) per entry for Title/reqs.
@@ -200,6 +220,32 @@ type
     status*: string ## "complete" | "active" | "failed"
     statusCode*: int ## raw VMaNGOS QuestStatus
     progress*: string ## short objective progress ("3/10 · 1/5")
+
+  TraverseCharacter* = object
+    ## Northbound fixture row from the traverse scenario characters DB.
+    name*: string
+    level*: int
+    mapId*: int
+    zoneId*: int
+    zoneName*: string
+    posX*, posY*, posZ*: float
+    online*: bool
+    hasPosition*: bool ## false when x/y/z could not be parsed
+
+  TraverseScore* = object
+    ## Upstream scoring.py northing result for the traverse course.
+    northingYards*: float
+    coursePct*: float ## 0..100 of TraverseCourseYards
+    valid*: bool
+    invalidReason*: string ## empty when valid; else scoring reason code
+
+  TraverseStatus* = object
+    ## Dashboard snapshot for the Traverse tab (read-only telemetry).
+    containerFound*: bool
+    containerName*: string
+    characterFound*: bool
+    character*: TraverseCharacter
+    score*: TraverseScore
 
   AdminStepResult* = object
     ## One SOAP command outcome for an admin action.
@@ -305,6 +351,97 @@ proc formatGold*(copper: int): string =
   let c = copper mod 100
   result = &"{g}g {s}s {c}c"
 
+proc traverseNorthingYards*(worldX: float): float =
+  ## Yards of northing along the Kalimdor course (X is north/south).
+  result = max(0.0, min(worldX, TraverseGoalWorldX) - TraverseStartWorldX)
+
+proc traverseCoursePct*(northingYards: float): float =
+  ## Percent of the traverse course completed (0..100).
+  if TraverseCourseYards <= 0.0:
+    return 0.0
+  let pct = (northingYards / TraverseCourseYards) * 100.0
+  result = max(0.0, min(pct, 100.0))
+
+proc traverseInvalidReason*(
+    found: bool, level: int, mapId: int, hasPosition: bool
+): string =
+  ## Upstream invalid_reason codes; empty string means a valid result.
+  if not found:
+    return "character_not_found"
+  if level != 60:
+    return "character_not_level_60"
+  if mapId != 1:
+    return "character_left_kalimdor"
+  if not hasPosition:
+    return "character_position_unavailable"
+  result = ""
+
+proc scoreTraverse*(
+    found: bool, level: int, mapId: int, hasPosition: bool, worldX: float
+): TraverseScore =
+  ## Score one fixture snapshot; invalid runs get score 0 and a reason.
+  let reason = traverseInvalidReason(found, level, mapId, hasPosition)
+  if reason.len > 0:
+    return TraverseScore(
+      northingYards: 0.0,
+      coursePct: 0.0,
+      valid: false,
+      invalidReason: reason
+    )
+  let yards = traverseNorthingYards(worldX)
+  result = TraverseScore(
+    northingYards: yards,
+    coursePct: traverseCoursePct(yards),
+    valid: true,
+    invalidReason: ""
+  )
+
+proc findTraverseContainerName*(
+    dockerPsOutput: string, envOverride = ""
+): string =
+  ## Pick *-traverse-coworld-game-1 from docker ps names, or env override.
+  let env = envOverride.strip()
+  if env.len > 0:
+    return env
+  for line in dockerPsOutput.splitLines():
+    let name = line.strip()
+    if name.len == 0:
+      continue
+    if name.endsWith(TraverseContainerSuffix):
+      return name
+  result = ""
+
+proc parseTraverseTsv*(tsv: string): Option[TraverseCharacter] =
+  ## Parse one Northbound TSV row (9 cols with zone name, or 8 without).
+  result = none(TraverseCharacter)
+  for line in tsv.splitLines():
+    if line.len == 0:
+      continue
+    let cols = line.split('\t')
+    if cols.len < 8:
+      continue
+    try:
+      var ch: TraverseCharacter
+      ch.name = cols[0]
+      ch.level = parseInt(cols[1])
+      ch.mapId = parseInt(cols[2])
+      ch.zoneId = parseInt(cols[3])
+      ch.online = cols[7] == "1"
+      ch.hasPosition = true
+      try:
+        ch.posX = parseFloat(cols[4])
+        ch.posY = parseFloat(cols[5])
+        ch.posZ = parseFloat(cols[6])
+      except ValueError:
+        ch.hasPosition = false
+      if cols.len >= 9 and cols[8].len > 0:
+        ch.zoneName = cols[8]
+      elif ch.zoneId > 0:
+        ch.zoneName = &"Zone#{ch.zoneId}"
+      return some(ch)
+    except ValueError:
+      continue
+
 proc gameContainer(): string =
   ## Resolve the coworld-game MariaDB / world container name.
   result = getEnv("SYSTEM_MYSQL_CONTAINER", DefaultGameContainer)
@@ -316,9 +453,8 @@ proc chatLogPath*(): string =
     return absolutePath(env)
   result = absolutePath(DefaultChatLogRel)
 
-proc dockerMariadbSelect(sql: string): string =
-  ## Run a SELECT via docker exec + mariadb (TSV stdout). SELECT-only path.
-  let container = gameContainer()
+proc dockerMariadbSelectIn(container, sql: string): string =
+  ## Run a SELECT via docker exec + mariadb on a named container (TSV).
   let process = startProcess(
     "docker",
     args = [
@@ -341,9 +477,69 @@ proc dockerMariadbSelect(sql: string): string =
       &"mariadb query failed (exit {exitCode}) via docker exec {container}: {err}\n{output}")
   result = output
 
+proc dockerMariadbSelect(sql: string): string =
+  ## Run a SELECT via docker exec + mariadb (TSV stdout). SELECT-only path.
+  result = dockerMariadbSelectIn(gameContainer(), sql)
+
 proc fetchRosterTsv(): string =
   ## Read character roster via docker exec + mariadb (SELECT only).
   result = dockerMariadbSelect(RosterSql)
+
+proc listDockerContainerNames(): string =
+  ## docker ps names (one per line). Empty on error — never raises.
+  try:
+    let process = startProcess(
+      "docker",
+      args = ["ps", "--format", "{{.Names}}"],
+      options = {poUsePath}
+    )
+    let output = process.outputStream.readAll()
+    discard process.errorStream.readAll()
+    let exitCode = process.waitForExit()
+    process.close()
+    if exitCode != 0:
+      return ""
+    result = output
+  except CatchableError:
+    result = ""
+
+proc resolveTraverseContainer*(): string =
+  ## Live discovery: SYSTEM_TRAVERSE_CONTAINER or docker ps suffix match.
+  result = findTraverseContainerName(
+    listDockerContainerNames(),
+    getEnv("SYSTEM_TRAVERSE_CONTAINER", "")
+  )
+
+proc traverseStatus*(): TraverseStatus =
+  ## Single dispatch path for Traverse tab telemetry (SELECT-only, no docker lifecycle).
+  result = TraverseStatus(
+    containerFound: false,
+    containerName: "",
+    characterFound: false,
+    character: TraverseCharacter(),
+    score: scoreTraverse(false, 0, 0, false, 0.0)
+  )
+  let container = resolveTraverseContainer()
+  if container.len == 0:
+    return
+  result.containerFound = true
+  result.containerName = container
+  var tsv = ""
+  try:
+    tsv = dockerMariadbSelectIn(container, TraverseSql)
+  except CatchableError:
+    # Container listed but DB unreachable — keep found=true, no character.
+    return
+  let chOpt = parseTraverseTsv(tsv)
+  if chOpt.isNone:
+    result.score = scoreTraverse(false, 0, 0, false, 0.0)
+    return
+  let ch = chOpt.get
+  result.characterFound = true
+  result.character = ch
+  result.score = scoreTraverse(
+    true, ch.level, ch.mapId, ch.hasPosition, ch.posX
+  )
 
 proc isSafeSqlName*(name: string): bool =
   ## Character names we embed in SQL: letters/digits only (classic names).
@@ -2432,16 +2628,18 @@ proc navTabClass(active, tab: string): string =
   if active == tab: " class=\"active\"" else: ""
 
 proc renderNav*(active: string): string =
-  ## Tab strip: Army | Murist | Advisor | Admin (server-side pages, short labels).
+  ## Tab strip: Army | Murist | Advisor | Traverse | Admin.
   let army = navTabClass(active, "army")
   let murist = navTabClass(active, "murist")
   let advisor = navTabClass(active, "advisor")
+  let traverse = navTabClass(active, "traverse")
   let admin = navTabClass(active, "admin")
   result = &"""
 <nav class="tabs" role="tablist">
   <a{army} href="/army" role="tab">Army</a>
   <a{murist} href="/murist" role="tab">Murist</a>
   <a{advisor} href="/advisor" role="tab">Advisor</a>
+  <a{traverse} href="/traverse" role="tab">Traverse</a>
   <a{admin} href="/admin" role="tab">Admin</a>
 </nav>"""
 
@@ -2664,6 +2862,98 @@ proc renderMuristPage*(
     </section>"""
   result = renderDashboard("Murist", "murist", body)
 
+proc formatTraverseYards*(yards: float): string =
+  ## Compact yard display for the Traverse panel.
+  result = &"{yards:.1f}"
+
+proc formatTraversePct*(pct: float): string =
+  ## Course percent with one decimal place.
+  result = &"{pct:.1f}"
+
+proc renderTraverseStatus*(st: TraverseStatus): string =
+  ## Traverse panel body: container + Northbound telemetry + score bar.
+  if not st.containerFound:
+    return """
+    <p class="empty">Scenario not running — no *-traverse-coworld-game-1 container.</p>"""
+  let containerPill =
+    """<span class="pill"><span class="dot on"></span> running</span>"""
+  let containerLabel = escapeHtml(st.containerName)
+  if not st.characterFound:
+    return &"""
+    <div class="panel-actions" style="margin-bottom:0.75rem">
+      {containerPill}
+      <span class="server-container">{containerLabel}</span>
+    </div>
+    <p class="empty">Character {escapeHtml(TraverseCharacterName)} not found in scenario DB.</p>"""
+  let ch = st.character
+  let sc = st.score
+  let onlinePill =
+    if ch.online:
+      """<span class="pill"><span class="dot on"></span> online</span>"""
+    else:
+      """<span class="pill"><span class="dot off"></span> offline</span>"""
+  let validityBadge =
+    if sc.valid:
+      """<span class="badge ok">valid</span>"""
+    else:
+      &"""<span class="badge bad">invalid</span> <span class="meta">{escapeHtml(sc.invalidReason)}</span>"""
+  let zoneText = if ch.zoneName.len > 0: ch.zoneName else: "—"
+  let posText =
+    if ch.hasPosition:
+      &"{ch.posX:.1f}, {ch.posY:.1f}, {ch.posZ:.1f}"
+    else:
+      "—"
+  let yardsText = formatTraverseYards(sc.northingYards)
+  let pctText = formatTraversePct(sc.coursePct)
+  let pctWidth = formatTraversePct(sc.coursePct)
+  result = &"""
+    <div class="panel-actions" style="margin-bottom:0.75rem">
+      {containerPill}
+      <span class="server-container">{containerLabel}</span>
+      {onlinePill}
+      {validityBadge}
+    </div>
+    <div class="stat-row">
+      <div class="stat"><div class="n sm">{escapeHtml(ch.name)}</div><div class="l">character</div></div>
+      <div class="stat"><div class="n">{ch.level}</div><div class="l">level</div></div>
+      <div class="stat"><div class="n sm">{ch.mapId}</div><div class="l">map</div></div>
+      <div class="stat"><div class="n sm">{escapeHtml(zoneText)}</div><div class="l">zone ({ch.zoneId})</div></div>
+      <div class="stat"><div class="n sm pos">{escapeHtml(posText)}</div><div class="l">pos x / y / z</div></div>
+    </div>
+    <div class="stat-row">
+      <div class="stat"><div class="n">{escapeHtml(yardsText)}</div><div class="l">northing yards</div></div>
+      <div class="stat"><div class="n">{escapeHtml(pctText)}%</div><div class="l">course</div></div>
+    </div>
+    <div class="murist-bars">
+      <div class="xp-cell">
+        <div class="xp" title="{escapeHtml(yardsText)} yd · {escapeHtml(pctText)}% of {formatTraverseYards(TraverseCourseYards)} yd">
+          <div class="xp-bar"><div class="xp-fill" style="width:{pctWidth}%"></div></div>
+          <div class="xp-meta">{escapeHtml(yardsText)} <span class="xp-muted">yd · {escapeHtml(pctText)}%</span></div>
+        </div>
+      </div>
+    </div>"""
+
+proc renderTraversePage*(st: TraverseStatus): string =
+  ## Traverse tab: league telemetry only (no viewport, no launch controls).
+  let statusBody = renderTraverseStatus(st)
+  let body = &"""
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Kalimdor Traverse</h2>
+        <div class="panel-actions">
+          <span class="badge accent">telemetry</span>
+        </div>
+      </div>
+      <div class="panel-body"
+           id="traverse-status"
+           hx-get="/traverse/status"
+           hx-trigger="every {PollSeconds}s"
+           hx-swap="innerHTML settle:0s swap:0s">
+{statusBody}
+      </div>
+    </section>"""
+  result = renderDashboard("Traverse", "traverse", body)
+
 proc renderAdvisorPage*(events: seq[AddonEvent]): string =
   ## Advisor tab: addon event tail + reload control.
   let eventRows = renderEventRows(events)
@@ -2874,6 +3164,36 @@ proc muristEventsHandler(request: Request) {.gcsafe.} =
     request.respond(500, htmlHeaders(),
       &"""<tr><td colspan="4" class="empty">error: {escapeHtml(e.msg)}</td></tr>""")
 
+proc traversePageHandler(request: Request) {.gcsafe.} =
+  ## GET /traverse — Traverse tab (Kalimdor course telemetry).
+  try:
+    var st: TraverseStatus
+    {.gcsafe.}:
+      st = traverseStatus()
+    request.respond(200, htmlHeaders(), renderTraversePage(st))
+  except Exception as e:
+    # Never surface a hard failure for a missing scenario — soft empty page.
+    try:
+      let soft = TraverseStatus(
+        containerFound: false,
+        score: scoreTraverse(false, 0, 0, false, 0.0)
+      )
+      request.respond(200, htmlHeaders(), renderTraversePage(soft))
+    except Exception:
+      request.respond(500, htmlHeaders(),
+        &"<!DOCTYPE html><html><body><h1>Traverse error</h1><pre>{escapeHtml(e.msg)}</pre></body></html>")
+
+proc traverseStatusHandler(request: Request) {.gcsafe.} =
+  ## GET /traverse/status — htmx fragment for Traverse metrics.
+  try:
+    var st: TraverseStatus
+    {.gcsafe.}:
+      st = traverseStatus()
+    request.respond(200, htmlHeaders(), renderTraverseStatus(st))
+  except Exception:
+    request.respond(200, htmlHeaders(),
+      """<p class="empty">Scenario not running — no *-traverse-coworld-game-1 container.</p>""")
+
 proc rosterPartialHandler(request: Request) {.gcsafe.} =
   ## GET /roster — htmx fragment (table rows only). Foundation seats hidden.
   ## Realm down / DB unreachable → friendly offline row, not a red error.
@@ -3051,12 +3371,14 @@ proc serverInfoHandler(request: Request) {.gcsafe.} =
         "army": "/army",
         "murist": "/murist",
         "advisor": "/advisor",
+        "traverse": "/traverse",
         "admin": "/admin",
         "dashboard": "/",
         "roster_partial": "/roster",
         "murist_status": "/murist/status",
         "murist_quests": "/murist/quests",
         "murist_events": "/murist/events",
+        "traverse_status": "/traverse/status",
         "events_partial": "/events",
         "server_partial": "/server",
         "server_start": "/server/start",
@@ -3414,6 +3736,8 @@ proc main() =
   router.get("/murist/quests", muristQuestsHandler)
   router.get("/murist/events", muristEventsHandler)
   router.get("/advisor", advisorPageHandler)
+  router.get("/traverse", traversePageHandler)
+  router.get("/traverse/status", traverseStatusHandler)
   router.get("/admin", adminPageHandler)
   router.get("/roster", rosterPartialHandler)
   router.get("/events", eventsPartialHandler)
@@ -3434,6 +3758,7 @@ proc main() =
   echo &"  Army:        GET  http://127.0.0.1:{HttpPort}/army"
   echo &"  Murist:      GET  http://127.0.0.1:{HttpPort}/murist"
   echo &"  Advisor:     GET  http://127.0.0.1:{HttpPort}/advisor"
+  echo &"  Traverse:    GET  http://127.0.0.1:{HttpPort}/traverse"
   echo &"  Admin:       GET  http://127.0.0.1:{HttpPort}/admin"
   echo &"  Events:      GET  http://127.0.0.1:{HttpPort}/events"
   echo &"  Server:      GET  http://127.0.0.1:{HttpPort}/server (POST /server/start /server/stop)"
@@ -3442,6 +3767,7 @@ proc main() =
   echo &"  Tele party:  POST http://127.0.0.1:{HttpPort}/admin/tele-party-to-murist"
   echo &"  MCP:         POST http://127.0.0.1:{HttpPort}/mcp"
   echo &"  container:   {gameContainer()} (SYSTEM_MYSQL_CONTAINER to override)"
+  echo &"  traverse:    {resolveTraverseContainer()} (SYSTEM_TRAVERSE_CONTAINER to override)"
   echo &"  Chat.log:    {chatLogPath()} (SYSTEM_CHAT_LOG to override)"
   echo &"  upstream:    {upstreamDir()} (SYSTEM_UPSTREAM_DIR to override)"
   echo "  DB access:   docker exec + mariadb SELECT (read-only)"
