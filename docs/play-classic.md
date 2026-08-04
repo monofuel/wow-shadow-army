@@ -29,6 +29,27 @@ clients either way.
   change video options.
 - Login at the door: `monofuel` / `password` (`make account` if missing).
 
+## netlog — capture the wire while you play
+
+`make play-classic-netlog` is `play-classic` plus a tcpdump on loopback:
+realm (3724) and world (8085) traffic is written to
+`captures/play-classic-<timestamp>.pcap` (gitignored) for offline protocol
+analysis — the vanilla 5875 client is the ground truth for wire-format
+correctness (docs/wow-version.md). Capture needs CAP_NET_RAW, so sudo
+prompts once before launch; tcpdump flushes per-packet (`-U`) so the tail
+of the capture survives a client crash.
+
+A pcap alone is a time-bomb: world (8085) packet headers are encrypted with
+the session key (bodies are plaintext in vanilla), the packet size field
+lives in that encrypted header, and the server overwrites
+`account.sessionkey` on every login — so an unkeyed capture becomes
+undecodable the moment the account logs in again. The wrapper therefore
+snapshots all accounts' session keys to `<capture>.sessionkey` next to the
+pcap when the session ends (bots share these ports, so every key is kept).
+Heed the WARNING if the snapshot fails — that capture's world traffic has a
+shelf life of one login. How to actually decode a capture (framing, header
+cipher, key byte-order gotcha): docs/netlog-pcap-analysis.md.
+
 ## Addons
 
 Drop addons into `local_classic/client/Interface/AddOns/<Name>/` with a

@@ -87,16 +87,23 @@ resolve_game_image() {
 
 image_needs_build() {
   # Exit 0 when operator `up` should include --build.
+  # The feature *key* must exist on the image. An empty value is still valid
+  # metadata (upstream may build with no optional features selected); docker
+  # `index` returns "" for both missing and empty, so check JSON keys.
   local image="$1"
   if ! docker image inspect "$image" >/dev/null 2>&1; then
     return 0
   fi
-  local label
-  label="$(
-    docker image inspect "$image" \
-      --format "{{index .Config.Labels \"$FEATURES_LABEL\"}}" 2>/dev/null || true
+  local has_key
+  has_key="$(
+    docker image inspect "$image" --format '{{json .Config.Labels}}' 2>/dev/null \
+      | python3 -c "
+import json,sys
+labs=json.load(sys.stdin) or {}
+print('yes' if sys.argv[1] in labs else 'no')
+" "$FEATURES_LABEL" 2>/dev/null || echo no
   )"
-  if [[ -z "$label" || "$label" == "<no value>" ]]; then
+  if [[ "$has_key" != "yes" ]]; then
     return 0
   fi
   return 1

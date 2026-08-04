@@ -46,7 +46,7 @@ COMPOSE_FILE := infra/compose.vmangos.yml
 ACCOUNT_USER := monofuel
 ACCOUNT_PASS := password
 
-.PHONY: test test-lua test-nim system pin-check start-server stop-server server-logging logs account soap-account play play-classic play-xr escort escort-army grind quest-data warlock-account warlock-bot botwarrior-bot tusk-account tusk-bot beru-account beru-bot party-army navmesh-helper navmesh-status
+.PHONY: test test-lua test-nim system pin-check start-server stop-server server-logging logs account soap-account play play-classic play-classic-netlog play-xr escort escort-army grind quest-data warlock-account warlock-bot botwarrior-bot tusk-account tusk-bot beru-account beru-bot party-army navmesh-helper navmesh-status
 
 # Unit tier: Lua tools + Nim host/system tests only (v2 DoD: no Python required
 # for bot correctness). If nim is missing, test-nim-soft skips rather than
@@ -58,7 +58,8 @@ test: test-lua test-nim-soft test-smoke
 # Every Nim entrypoint/module must at least compile (`nim check`), even where
 # no unit suite imports it yet (army_host, msgpack_json).
 NIM_CHECK_FILES = system/system_server.nim tools/army_host.nim \
-	tools/fair_play_audit.nim tools/party_promote.nim tools/msgpack_json.nim
+	tools/fair_play_audit.nim tools/party_promote.nim tools/msgpack_json.nim \
+	tools/env_transport.nim tools/env_smoke.nim
 
 .PHONY: test-smoke test-smoke-lua test-smoke-nim test-smoke-nim-soft
 test-smoke: test-smoke-lua test-smoke-nim-soft
@@ -566,6 +567,13 @@ play:
 # prefix. Login monofuel / password. Do not run unattended (opens a GUI).
 play-classic:
 	@nix develop --command tools/play_classic.sh
+
+# play-classic with a loopback packet capture: realm (3724) + world (8085)
+# traffic is saved to captures/play-classic-<timestamp>.pcap for offline
+# protocol analysis (see docs/play-classic.md). Capture needs CAP_NET_RAW,
+# so sudo prompts once up front. Do not run unattended (opens a GUI).
+play-classic-netlog:
+	@nix develop --command tools/play_classic_netlog.sh
 
 # Launch the native client from the XR fork checkout in VR (OpenXR PoC,
 # branch monofuel/xr). Quick play on purpose: no --login-screen, so the

@@ -1259,14 +1259,18 @@ proc spawnDetachedRealmOperator(op: ServerLifecycleOp): tuple[ok: bool, detail: 
 
   stopRealmOpUnit()
   # bash wrapper: keep full log + exit marker for post-mortem after --collect.
+  # trap EXIT so a SIGTERM (dashboard stop / manual kill) still leaves a marker
+  # instead of a sticky "no exit marker" FAIL on the panel.
   # Pass SYSTEM_* so a detached unit inherits the same pins as wow-system.
   let shell = &"""
 set -o pipefail
 export SYSTEM_ARMY_DIR={army.quoteShell}
 export SYSTEM_UPSTREAM_DIR={upstreamDir().quoteShell}
+ec=1
+on_exit() {{ echo {RealmOpExitMarker}$ec >> {logPath.quoteShell}; }}
+trap on_exit EXIT
 {wrapper.quoteShell} {verb.quoteShell} >> {logPath.quoteShell} 2>&1
 ec=$?
-echo {RealmOpExitMarker}$ec >> {logPath.quoteShell}
 exit $ec
 """
   let r = runCmdCapture("systemd-run", [
@@ -1354,13 +1358,31 @@ proc serverStatus*(): ServerStatus =
 
 proc startServer*(): ServerStatus =
   ## Queue realm start (operator `up`). Returns fresh status either way.
-  discard requestServerOp(sloStart)
+  ## If rejected (busy / leftover unit), surface that on last_op so the panel
+  ## does not look like a no-op.
+  let req = requestServerOp(sloStart)
   result = serverStatus()
+  if not req.accepted:
+    result.lastOp = "start"
+    result.lastOpOk = false
+    result.lastOpDetail = req.reason
+    withLock gServerOpLock:
+      gLastServerOp = "start"
+      gLastServerOpOk = false
+      gLastServerOpDetail = req.reason
 
 proc stopServer*(): ServerStatus =
   ## Queue realm stop (operator `down` — compose rm, volumes kept).
-  discard requestServerOp(sloStop)
+  let req = requestServerOp(sloStop)
   result = serverStatus()
+  if not req.accepted:
+    result.lastOp = "stop"
+    result.lastOpOk = false
+    result.lastOpDetail = req.reason
+    withLock gServerOpLock:
+      gLastServerOp = "stop"
+      gLastServerOpOk = false
+      gLastServerOpDetail = req.reason
 
 proc serverStatusToJson*(s: ServerStatus): JsonNode =
   ## Serialize lifecycle status for the MCP JSON view.
@@ -1925,7 +1947,12 @@ proc renderServerPanel*(s: ServerStatus): string =
   elif s.running:
     pill = """<span class="pill"><span class="dot on"></span> Running</span>"""
   else:
-    pill = """<span class="pill"><span class="dot off"></span> Stopped</span>"""
+    # Exited containers still have a docker id — call that out so "Stopped + id"
+    # is not misread as a live instance.
+    if s.containerId.len > 0:
+      pill = """<span class="pill"><span class="dot off"></span> Stopped (exited)</span>"""
+    else:
+      pill = """<span class="pill"><span class="dot off"></span> Stopped</span>"""
 
   var action: string
   if s.op.len > 0:
@@ -1957,12 +1984,17 @@ proc renderServerPanel*(s: ServerStatus): string =
         last {escapeHtml(s.lastOp)}: {mark}
       </div>"""
 
-  # Name once, short id once — no title that repeats the same id.
+  # Name + short id. When not running, label the id as exited so it is not
+  # mistaken for a live handle (docker keeps the container object after crash).
   var containerLabel = escapeHtml(s.container)
   if s.containerId.len > 0:
-    containerLabel.add(&""" <span class="server-id">{escapeHtml(s.containerId)}</span>""")
+    if s.running or s.op.len > 0:
+      containerLabel.add(&""" <span class="server-id">{escapeHtml(s.containerId)}</span>""")
+    else:
+      containerLabel.add(
+        &""" <span class="server-id muted">exited {escapeHtml(s.containerId)}</span>""")
   else:
-    containerLabel.add(""" <span class="server-id muted">no id</span>""")
+    containerLabel.add(""" <span class="server-id muted">no container</span>""")
 
   result = &"""
     <div class="server-line">
@@ -2207,8 +2239,10 @@ const DashboardCss = """
       box-shadow: 0 10px 30px rgba(0,0,0,0.22);
       overflow: hidden;
     }
-    .htmx-request.panel,
-    .htmx-request { opacity: 0.72; transition: opacity 0.15s; }
+    /* Polls must not dim/flicker. Only intentional button actions show a
+       load cue; htmx settle/swap classes stay fully opaque. */
+    .htmx-swapping, .htmx-settling { opacity: 1 !important; }
+    .btn.htmx-request { opacity: 0.72; transition: opacity 0.12s ease; }
     .table-scroll { overflow-x: auto; }
     .panel-head {
       display: flex; justify-content: space-between; align-items: center; gap: 0.75rem;
@@ -2469,7 +2503,7 @@ proc renderArmyPage*(characters: seq[Character], rosterOffline = false): string 
         <tbody id="roster"
                hx-get="/roster"
                hx-trigger="every {PollSeconds}s"
-               hx-swap="innerHTML">
+               hx-swap="innerHTML settle:0s swap:0s">
 {rows}
         </tbody>
       </table>
@@ -2576,7 +2610,7 @@ proc renderMuristPage*(
            id="murist-status"
            hx-get="/murist/status"
            hx-trigger="every {PollSeconds}s"
-           hx-swap="innerHTML">
+           hx-swap="innerHTML settle:0s swap:0s">
 {statusBody}
       </div>
     </section>
@@ -2599,7 +2633,7 @@ proc renderMuristPage*(
         <tbody id="murist-quests"
                hx-get="/murist/quests"
                hx-trigger="every {PollSeconds}s"
-               hx-swap="innerHTML">
+               hx-swap="innerHTML settle:0s swap:0s">
 {questRows}
         </tbody>
       </table>
@@ -2622,7 +2656,7 @@ proc renderMuristPage*(
         <tbody id="murist-events"
                hx-get="/murist/events"
                hx-trigger="every {PollSeconds}s"
-               hx-swap="innerHTML">
+               hx-swap="innerHTML settle:0s swap:0s">
 {eventRows}
         </tbody>
       </table>
@@ -2658,7 +2692,7 @@ proc renderAdvisorPage*(events: seq[AddonEvent]): string =
         <tbody id="events"
                hx-get="/events"
                hx-trigger="every {PollSeconds}s"
-               hx-swap="innerHTML">
+               hx-swap="innerHTML settle:0s swap:0s">
 {eventRows}
         </tbody>
       </table>
@@ -2691,7 +2725,7 @@ proc renderAdminPage*(server: ServerStatus): string =
            id="server-panel"
            hx-get="/server"
            hx-trigger="every {PollSeconds}s"
-           hx-swap="innerHTML">
+           hx-swap="innerHTML settle:0s swap:0s">
 {serverPanel}
       </div>
     </section>

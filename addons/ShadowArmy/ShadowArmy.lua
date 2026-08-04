@@ -11,7 +11,7 @@ local F = {}
 
 -- Bump on every edit. The System watches Chat.log for "<SA> loaded rev=..."
 -- after sending a reload — a new rev proves the edit actually loaded.
-local REV = "r31"
+local REV = "r32"
 
 -- Log window (r16): every F.say()/F.emit() line also lands here with a
 -- timestamp, so errors survive chat scroll-off and can be reviewed in-game.
@@ -143,7 +143,7 @@ end
 
 local panel = CreateFrame("Frame", "ShadowArmyPanel", UIParent)
 panel:SetWidth(210)
-panel:SetHeight(216) -- +24 third button row (Probe)
+panel:SetHeight(300) -- r32: room for quest checklist under grind lines
 panel:SetPoint("RIGHT", UIParent, "RIGHT", -40, 60)
 panel:SetFrameStrata("HIGH")
 panel:SetBackdrop({
@@ -189,7 +189,17 @@ local line2 = F.makeLine(line1)
 local line3 = F.makeLine(line2)
 local line4 = F.makeLine(line3)
 local line5 = F.makeLine(line4, -6) -- buff watch / warnings
-local line6 = F.makeLine(line5, -6) -- r18: nearest quest objective
+-- r32: multi-line quest checklist (quest identity + objectives). line6 is
+-- slot 1 so corpse-run can still steal the first row while ghosting.
+local QUEST_PANEL_LINES = 8
+local questLines = {}
+questLines[1] = F.makeLine(line5, -6)
+local _qli = 2
+while _qli <= QUEST_PANEL_LINES do
+  questLines[_qli] = F.makeLine(questLines[_qli - 1], -2)
+  _qli = _qli + 1
+end
+local line6 = questLines[1]
 
 -- (v0.1 had Nearest-foe/Attack buttons; removed — they duplicated Tab and
 -- the T auto-attack keybind. Rule: a button earns its place only by doing
@@ -2114,12 +2124,17 @@ end
 tinsert(UISpecialFrames, "ShadowBagsFrame")
 
 --------------------------------------------------------------------------
--- QUEST HELPER (r18): "where do I go next" — a nearest-objective line in the
--- advisor panel, dots on the minimap, dots on the world map. Everything here
--- is driven by QuestData.lua (global ShadowArmyQuestData, keyed by the EXACT
--- quest title). 1.12 does not expose quest IDs to addons at all, so the title
--- STRING is the only join between the live quest log and mined coordinates —
--- that is why the data file is shaped the way it is, not a stylistic choice.
+-- QUEST HELPER (r18, r32 checklist): "where do I go next" — quest-identity
+-- checklist in the advisor panel, color-matched dots on minimap + world map.
+-- Everything here is driven by QuestData.lua (global ShadowArmyQuestData,
+-- keyed by the EXACT quest title). 1.12 does not expose quest IDs to addons
+-- at all, so the title STRING is the only join between the live quest log and
+-- mined coordinates — that is why the data file is shaped the way it is, not
+-- a stylistic choice.
+--
+-- r32 identity rule: one color + one number per QUEST (not per objective, not
+-- kill-vs-turnin). Gold soup is gone. Panel lists quests with nested objective
+-- progress; pins use that quest's color so multi-quest zones are readable.
 --
 -- If the data file is absent the whole feature no-ops after exactly one
 -- `err quest data missing` line. Nothing below may ever depend on it existing.
@@ -2161,6 +2176,21 @@ local QUEST_MARKER_EVERY = 0.2 -- WORLD_MAP_UPDATE repaint throttle
 local QUEST_MAX_CAND = 60      -- bound on waypoints considered per scan
 local QUEST_MAX_BLIPS = 8      -- minimap dots (created once, reused forever)
 local QUEST_MAX_MARKERS = 30   -- world map dots
+local QUEST_MAX_LIST = 6       -- max quests on the checklist
+local QUEST_MAX_OBJ_LINES = 3  -- max objective rows under one quest header
+
+-- Distinct hues per quest (cycled). Identity is the quest, not kill/turn-in.
+local QUEST_COLORS = {
+  {0.85, 0.40, 1.00}, -- purple
+  {0.20, 0.90, 1.00}, -- cyan
+  {1.00, 0.55, 0.12}, -- orange
+  {1.00, 0.88, 0.20}, -- yellow
+  {1.00, 0.40, 0.65}, -- pink
+  {0.35, 0.65, 1.00}, -- blue
+  {0.35, 1.00, 0.50}, -- mint
+  {1.00, 0.40, 0.35}, -- coral
+}
+local QUEST_N_COLORS = 8
 
 -- Zone dimensions are NOT exposed in 1.12 (no zone size API, and no world
 -- coordinates for anything but yourself), so a percentage delta cannot be
@@ -2197,8 +2227,10 @@ local quest = {
   nextMarkerAt = 0,
   nextMapFix = 0,
   logSig = "",          -- change detector for the debug-only log trace
-  target = nil,         -- the waypoint the panel line is pointing at
-  spots = {},           -- every drawable waypoint, nearest first
+  target = nil,         -- nearest "go here" waypoint (tracked wins)
+  spots = {},           -- drawable waypoints (blip-priority order)
+  list = {},            -- checklist: {num,title,r,g,b,tracked,objs={...}}
+  status = nil,         -- idle reason string when list is empty
   learned = {},         -- zone id -> zone name, or false once poisoned
   zoneName = "",
   px = 0, py = 0, posOK = false,
@@ -2329,20 +2361,199 @@ function F.questMatchBoard(boards, nb, label, idx)
   return nil
 end
 
--- Strict TOTAL order: table.sort in 5.0 is unstable and raises "invalid order
+-- Strict total order: table.sort in 5.0 is unstable and raises "invalid order
 -- function" on a sloppy comparator (the same lesson the bag sort learned).
 function F.questCandCmp(a, b)
   if a.dist ~= b.dist then return a.dist < b.dist end
+  if a.qNum ~= b.qNum then return a.qNum < b.qNum end
   return a.idx < b.idx
+end
+
+function F.questListCmp(a, b)
+  if a.tracked ~= b.tracked then return a.tracked end
+  if a.minDist ~= b.minDist then return a.minDist < b.minDist end
+  return a.num < b.num
+end
+
+function F.questObjCmp(a, b)
+  if a.dist ~= b.dist then return a.dist < b.dist end
+  return (a.label or "") < (b.label or "")
+end
+
+function F.questHex(r, g, b)
+  local R = math.floor((r or 1) * 255 + 0.5)
+  local G = math.floor((g or 1) * 255 + 0.5)
+  local B = math.floor((b or 1) * 255 + 0.5)
+  if R < 0 then R = 0 elseif R > 255 then R = 255 end
+  if G < 0 then G = 0 elseif G > 255 then G = 255 end
+  if B < 0 then B = 0 elseif B > 255 then B = 255 end
+  return string.format("FF%02X%02X%02X", R, G, B)
+end
+
+function F.questShort(title, maxLen)
+  maxLen = maxLen or 22
+  if not title or title == "" then return "?" end
+  if string.len(title) <= maxLen then return title end
+  return string.sub(title, 1, maxLen - 1) .. "+"
+end
+
+-- Ensure a quest meta row exists; colors/numbers are stable for the scan.
+function F.questMeta(byTitle, order, title, tracked)
+  local m = byTitle[title]
+  if m then
+    if tracked then m.tracked = true end
+    return m
+  end
+  local n = table.getn(order) + 1
+  local col = QUEST_COLORS[((n - 1) - math.floor((n - 1) / QUEST_N_COLORS) * QUEST_N_COLORS) + 1]
+  m = {
+    num = n, title = title, tracked = tracked and true or false,
+    r = col[1], g = col[2], b = col[3],
+    minDist = 1e9, objs = {},
+  }
+  byTitle[title] = m
+  order[n] = title
+  return m
+end
+
+function F.questNoteObj(meta, label, have, need, turnIn, dist, dx, dy)
+  local key = turnIn and ("<<:" .. (label or "?")) or (label or "?")
+  local o = meta.objs[key]
+  if not o then
+    o = {
+      label = label or "?", have = have, need = need,
+      turnIn = turnIn and true or false,
+      dist = dist, dx = dx, dy = dy, key = key,
+    }
+    meta.objs[key] = o
+  elseif dist < o.dist then
+    o.dist, o.dx, o.dy = dist, dx, dy
+    o.have, o.need = have, need
+  else
+    if have then o.have = have end
+    if need then o.need = need end
+  end
+  if dist < meta.minDist then meta.minDist = dist end
+end
+
+-- Prefer at least one pin per quest, then fill by distance.
+function F.questPickSpots(cand, nc, maxN)
+  local out, nOut = {}, 0
+  local used = {}
+  local seenQ = {}
+  local k = 1
+  while k <= nc and nOut < maxN do
+    local c = cand[k]
+    if c and not seenQ[c.qNum] then
+      nOut = nOut + 1
+      out[nOut] = c
+      used[k] = true
+      seenQ[c.qNum] = true
+    end
+    k = k + 1
+  end
+  k = 1
+  while k <= nc and nOut < maxN do
+    if not used[k] then
+      nOut = nOut + 1
+      out[nOut] = cand[k]
+    end
+    k = k + 1
+  end
+  return out
+end
+
+function F.questBuildList(byTitle, order)
+  local tmp, nt = {}, 0
+  local i = 1
+  local nOrder = table.getn(order)
+  while i <= nOrder do
+    local m = byTitle[order[i]]
+    if m then
+      local objs, no = {}, 0
+      local key, o = next(m.objs, nil)
+      while key do
+        no = no + 1
+        objs[no] = o
+        key, o = next(m.objs, key)
+      end
+      if no > 1 then table.sort(objs, F.questObjCmp) end
+      if no > QUEST_MAX_OBJ_LINES then
+        local cut = {}
+        local j = 1
+        while j <= QUEST_MAX_OBJ_LINES do
+          cut[j] = objs[j]
+          j = j + 1
+        end
+        objs, no = cut, QUEST_MAX_OBJ_LINES
+      end
+      if no > 0 then
+        nt = nt + 1
+        tmp[nt] = {
+          num = m.num, title = m.title, tracked = m.tracked,
+          r = m.r, g = m.g, b = m.b, minDist = m.minDist, objs = objs,
+        }
+      end
+    end
+    i = i + 1
+  end
+  if nt > 1 then table.sort(tmp, F.questListCmp) end
+  if nt > QUEST_MAX_LIST then
+    local cut = {}
+    i = 1
+    while i <= QUEST_MAX_LIST do
+      cut[i] = tmp[i]
+      i = i + 1
+    end
+    tmp, nt = cut, QUEST_MAX_LIST
+  end
+  -- Re-number 1..N in display order so checklist and map share the same ids.
+  i = 1
+  while i <= nt do
+    tmp[i].num = i
+    i = i + 1
+  end
+  return tmp
+end
+
+-- After list renumber, stamp qNum/color from display list onto every spot.
+function F.questStampSpots(spots, list)
+  local byTitle = {}
+  local i = 1
+  local nList = table.getn(list)
+  while i <= nList do
+    local e = list[i]
+    byTitle[e.title] = e
+    i = i + 1
+  end
+  i = 1
+  local nSpots = table.getn(spots)
+  while i <= nSpots do
+    local s = spots[i]
+    local e = byTitle[s.title]
+    if e then
+      s.qNum, s.r, s.g, s.b = e.num, e.r, e.g, e.b
+    end
+    i = i + 1
+  end
 end
 
 function F.questScan()
   local data = F.questData()
   local zone = GetRealZoneText() or ""
   quest.zoneName = zone
-  if not data or not quest.posOK then
+  if not data then
     quest.spots = {}
     quest.target = nil
+    quest.list = {}
+    quest.status = "quests: no data file"
+    return
+  end
+  if not quest.posOK then
+    quest.spots = {}
+    quest.target = nil
+    quest.list = {}
+    quest.status = "quests: map is off-zone"
     return
   end
   -- Quest log open: keep the previous scan rather than reach into the
@@ -2353,7 +2564,7 @@ function F.questScan()
   local sel = 0
   if GetQuestLogSelection then sel = GetQuestLogSelection() or 0 end
 
-  -- Watched (tracked) quests own the panel line when there are any.
+  -- Watched (tracked) quests win the "go" target when present.
   local watched = {}
   local nw = GetNumQuestWatches and GetNumQuestWatches() or 0
   local wi = 1
@@ -2364,6 +2575,7 @@ function F.questScan()
   end
 
   local cand, nc = {}, 0
+  local byTitle, order = {}, {}
   local sig = ""
   local header = ""
   local nEntries = GetNumQuestLogEntries()
@@ -2379,21 +2591,30 @@ function F.questScan()
       if q then
         local headerMatch = (header == zone)
         if headerMatch then F.questLearn(q.zone, zone) end
+        local isTracked = watched[i] and true or false
         sig = sig .. title .. (isComplete and "!" or "-")
         if isComplete then
           -- Objectives are done: the only useful waypoint is the turn-in NPC.
           local w = q.turnIn
           if w and w.x and w.y and F.questSpotHere(q, w.zone, headerMatch, zone) then
+            local meta = F.questMeta(byTitle, order, title, isTracked)
+            local dx = w.x - quest.px
+            local dy = w.y - quest.py
+            local dist = F.questYards(dx, dy)
             nc = nc + 1
             cand[nc] = {
-              label = w.label or title, x = w.x, y = w.y,
-              turnIn = true, tracked = watched[i] and true or false, idx = nc,
+              title = title, label = w.label or title,
+              x = w.x, y = w.y, dx = dx, dy = dy, dist = dist,
+              turnIn = true, tracked = isTracked, idx = nc,
+              qNum = meta.num, r = meta.r, g = meta.g, b = meta.b,
             }
+            F.questNoteObj(meta, w.label or title, nil, nil, true, dist, dx, dy)
           end
         elseif q.objectives then
           local boards, nb = F.questBoards(i)
           local nObj = table.getn(q.objectives)
           local oi = 1
+          local meta = nil
           while oi <= nObj and nc < QUEST_MAX_CAND do
             local obj = q.objectives[oi]
             local b = F.questMatchBoard(boards, nb, obj.label, oi)
@@ -2401,20 +2622,36 @@ function F.questScan()
             local need = (b and b.need) or obj.count or 0
             local done = b and (b.done or (need > 0 and have >= need))
             if not done and obj.spots then
+              if not meta then
+                meta = F.questMeta(byTitle, order, title, isTracked)
+              end
               sig = sig .. ":" .. have
               local nSpots = table.getn(obj.spots)
               local si = 1
+              local bestDist, bestDx, bestDy = nil, 0, 0
               while si <= nSpots and nc < QUEST_MAX_CAND do
                 local s = obj.spots[si]
                 if s.x and s.y and F.questSpotHere(q, s.zone, headerMatch, zone) then
+                  local dx = s.x - quest.px
+                  local dy = s.y - quest.py
+                  local dist = F.questYards(dx, dy)
                   nc = nc + 1
                   cand[nc] = {
-                    label = obj.label or title, have = have, need = need,
-                    x = s.x, y = s.y,
-                    tracked = watched[i] and true or false, idx = nc,
+                    title = title, label = obj.label or title,
+                    have = have, need = need,
+                    x = s.x, y = s.y, dx = dx, dy = dy, dist = dist,
+                    turnIn = false, tracked = isTracked, idx = nc,
+                    qNum = meta.num, r = meta.r, g = meta.g, b = meta.b,
                   }
+                  if (not bestDist) or dist < bestDist then
+                    bestDist, bestDx, bestDy = dist, dx, dy
+                  end
                 end
                 si = si + 1
+              end
+              if bestDist then
+                F.questNoteObj(meta, obj.label or title, have, need, false,
+                  bestDist, bestDx, bestDy)
               end
             end
             oi = oi + 1
@@ -2427,34 +2664,53 @@ function F.questScan()
   -- Put the human's selection back before anything can redraw the log.
   if sel > 0 then SelectQuestLogEntry(sel) end
 
+  table.sort(cand, F.questCandCmp)
+
+  local list = F.questBuildList(byTitle, order)
+  F.questStampSpots(cand, list)
+
+  -- Drop pins for quests that did not make the checklist (color ids would collide).
+  local allow = {}
+  local li = 1
+  local nList = table.getn(list)
+  while li <= nList do
+    allow[list[li].title] = true
+    li = li + 1
+  end
+  local kept, nk = {}, 0
   local k = 1
   while k <= nc do
-    local c = cand[k]
-    c.dx = c.x - quest.px
-    c.dy = c.y - quest.py
-    c.dist = F.questYards(c.dx, c.dy)
+    if allow[cand[k].title] then
+      nk = nk + 1
+      kept[nk] = cand[k]
+    end
     k = k + 1
   end
-  table.sort(cand, F.questCandCmp)
-  quest.spots = cand
 
-  -- Tracked quests win the panel LINE outright; the blips still show
-  -- everything nearby, because the map is more useful than the line.
+  -- One nearest pin per quest first, then fill by distance.
+  quest.spots = F.questPickSpots(kept, nk, QUEST_MAX_MARKERS)
   local pick = nil
   k = 1
-  while k <= nc do
-    if cand[k].tracked then
-      pick = cand[k]
+  while k <= nk do
+    if kept[k].tracked then
+      pick = kept[k]
       break
     end
     k = k + 1
   end
-  if not pick then pick = cand[1] end
+  if not pick then pick = kept[1] end
   quest.target = pick
+  quest.list = list
+  if nk == 0 then
+    quest.status = "quests: nothing mapped here"
+  else
+    quest.status = nil
+  end
 
   if sig ~= quest.logSig then
     quest.logSig = sig
-    F.dtrace("quest " .. nc .. " waypoint(s) in " .. zone)
+    F.dtrace("quest " .. nk .. " waypoint(s) / " .. nList
+      .. " quest(s) in " .. zone)
   end
 end
 
@@ -2462,7 +2718,7 @@ end
 -- Drawing. Textures are created once and parked (1.12 frames and their
 -- regions cannot be destroyed), and SetTexture is called with COLOR numbers
 -- rather than an art path — a solid dot cannot 404 on a private-server build
--- the way a guessed Interface\\ path can.
+-- the way a guessed Interface\\ path can. Color = quest identity (r32).
 --------------------------------------------------------------------------
 
 local questBlips = {}
@@ -2470,8 +2726,8 @@ function F.questBlip(i)
   local t = questBlips[i]
   if t then return t end
   t = Minimap:CreateTexture(nil, "OVERLAY")
-  t:SetWidth(7)
-  t:SetHeight(7)
+  t:SetWidth(8)
+  t:SetHeight(8)
   t:Hide()
   questBlips[i] = t
   return t
@@ -2500,11 +2756,13 @@ function F.questDrawBlips()
       end
       t:ClearAllPoints() -- SetPoint ACCUMULATES anchors in 1.12
       t:SetPoint("CENTER", Minimap, "CENTER", ox, oy)
-      if s.turnIn then
-        t:SetTexture(0.20, 1.00, 0.20, 0.90)
-      else
-        t:SetTexture(1.00, 0.82, 0.00, 0.90)
-      end
+      local go = quest.target and s.x == quest.target.x and s.y == quest.target.y
+        and s.title == quest.target.title
+      local sz = go and 11 or (s.turnIn and 9 or 8)
+      t:SetWidth(sz)
+      t:SetHeight(sz)
+      local a = s.turnIn and 1.0 or 0.92
+      t:SetTexture(s.r or 1, s.g or 0.82, s.b or 0, a)
       t:Show()
     else
       t:Hide()
@@ -2521,6 +2779,11 @@ function F.questMarker(i)
   t:SetWidth(10)
   t:SetHeight(10)
   t:Hide()
+  -- Number badge: same quest id as the checklist row.
+  local fs = WorldMapDetailFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+  fs:SetText("")
+  fs:Hide()
+  t.label = fs
   questMarkers[i] = t
   return t
 end
@@ -2539,43 +2802,122 @@ function F.questDrawMarkers()
   while i <= QUEST_MAX_MARKERS do
     local s = quest.spots[i]
     local t = F.questMarker(i)
+    local fs = t.label
     if show and s then
+      local px = s.x / 100 * w
+      local py = -(s.y / 100 * h)
       t:ClearAllPoints()
-      t:SetPoint("CENTER", WorldMapDetailFrame, "TOPLEFT",
-        s.x / 100 * w, -(s.y / 100 * h))
-      if s.turnIn then
-        t:SetTexture(0.20, 1.00, 0.20, 0.95)
-      else
-        t:SetTexture(1.00, 0.82, 0.00, 0.95)
-      end
+      t:SetPoint("CENTER", WorldMapDetailFrame, "TOPLEFT", px, py)
+      local go = quest.target and s.x == quest.target.x and s.y == quest.target.y
+        and s.title == quest.target.title
+      local sz = go and 14 or (s.turnIn and 12 or 10)
+      t:SetWidth(sz)
+      t:SetHeight(sz)
+      t:SetTexture(s.r or 1, s.g or 0.82, s.b or 0, 0.95)
       t:Show()
+      if fs then
+        fs:ClearAllPoints()
+        fs:SetPoint("BOTTOMLEFT", WorldMapDetailFrame, "TOPLEFT", px + 4, py + 2)
+        fs:SetText(tostring(s.qNum or "?"))
+        fs:SetTextColor(s.r or 1, s.g or 1, s.b or 1)
+        fs:Show()
+      end
     else
       t:Hide()
+      if fs then fs:Hide() end
     end
     i = i + 1
   end
 end
 
--- The advisor panel's quest line. Every state says WHY it has nothing to
--- show; a blank line reads as a broken addon.
-function F.questLineText()
-  if not quest.enabled then return "" end
-  if not ShadowArmyQuestData then return "|cFF777777quests: no data file|r" end
-  if not quest.posOK then return "|cFF777777quests: map is off-zone|r" end
-  local t = quest.target
-  if not t then return "|cFF777777quests: nothing mapped here|r" end
-  local dir = F.questBearing(t.dx, t.dy)
-  local yards = math.floor(t.dist + 0.5)
-  if t.turnIn then
-    return string.format("|cFF44FF44%s %s|r |cFFAAAAAA%s ~%dy %s|r",
-      QUEST_MARK_TURNIN, t.label, "\194\183", yards, dir)
+-- Paint the multi-line quest checklist into questLines[]. Corpse compass
+-- overrides the whole block while ghosting.
+function F.questClearLines()
+  local i = 1
+  while i <= QUEST_PANEL_LINES do
+    if questLines[i] then questLines[i]:SetText("") end
+    i = i + 1
   end
-  local prog = ""
-  if t.need and t.need > 0 then
-    prog = string.format(" %d/%d", t.have or 0, t.need)
+end
+
+function F.questPaintLines(rows)
+  F.questClearLines()
+  if not rows then return end
+  local i = 1
+  local n = table.getn(rows)
+  while i <= n and i <= QUEST_PANEL_LINES do
+    questLines[i]:SetText(rows[i] or "")
+    i = i + 1
   end
-  return string.format("|cFFFFD200%s %s%s|r |cFFAAAAAA%s ~%dy %s|r",
-    QUEST_MARK_GO, t.label, prog, "\194\183", yards, dir)
+end
+
+function F.questChecklistRows()
+  local rows, nr = {}, 0
+  if not quest.enabled then return rows end
+  if quest.status then
+    rows[1] = "|cFF777777" .. quest.status .. "|r"
+    return rows
+  end
+  local list = quest.list
+  local nList = table.getn(list)
+  if nList == 0 then
+    rows[1] = "|cFF777777quests: nothing mapped here|r"
+    return rows
+  end
+  local goTitle = quest.target and quest.target.title
+  local goLabel = quest.target and quest.target.label
+  local goTurn = quest.target and quest.target.turnIn
+  local qi = 1
+  while qi <= nList and nr < QUEST_PANEL_LINES do
+    local e = list[qi]
+    local hex = F.questHex(e.r, e.g, e.b)
+    nr = nr + 1
+    rows[nr] = string.format("|c%s%d. %s|r", hex, e.num, F.questShort(e.title, 22))
+    local oi = 1
+    local nObj = table.getn(e.objs)
+    while oi <= nObj and nr < QUEST_PANEL_LINES do
+      local o = e.objs[oi]
+      local dir = F.questBearing(o.dx, o.dy)
+      local yards = math.floor(o.dist + 0.5)
+      local isGo = (e.title == goTitle)
+        and ((goTurn and o.turnIn) or ((not goTurn) and (not o.turnIn)
+          and o.label == goLabel))
+      local prog = ""
+      if (not o.turnIn) and o.need and o.need > 0 then
+        prog = string.format(" %d/%d", o.have or 0, o.need)
+      end
+      local lab = F.questShort(o.label, 16)
+      if o.turnIn then
+        -- mark is >>/<< only for the active "go" row; otherwise a space.
+        local prefix = isGo and QUEST_MARK_TURNIN or ("  " .. QUEST_MARK_TURNIN)
+        nr = nr + 1
+        rows[nr] = string.format(
+          "|c%s  %s %s|r |cFFAAAAAA~%dy %s|r",
+          hex, prefix, lab, yards, dir)
+      else
+        nr = nr + 1
+        rows[nr] = string.format(
+          "|c%s  %s%s%s|r |cFFAAAAAA~%dy %s|r",
+          hex, isGo and (QUEST_MARK_GO .. " ") or "  ", lab, prog, yards, dir)
+      end
+      oi = oi + 1
+    end
+    qi = qi + 1
+  end
+  return rows
+end
+
+function F.questRefreshPanel()
+  local corpseLine = F.corpseLineText and F.corpseLineText() or nil
+  if corpseLine then
+    F.questPaintLines({ corpseLine })
+    return
+  end
+  if not quest.enabled then
+    F.questClearLines()
+    return
+  end
+  F.questPaintLines(F.questChecklistRows())
 end
 
 function F.questTick()
@@ -2600,8 +2942,11 @@ function F.questSetEnabled(on)
   else
     quest.spots = {}
     quest.target = nil
+    quest.list = {}
+    quest.status = nil
     pcall(F.questDrawBlips)
     pcall(F.questDrawMarkers)
+    pcall(F.questClearLines)
   end
 end
 
@@ -3046,9 +3391,11 @@ panel:SetScript("OnUpdate", function()
   line3:SetText(t1)
   line4:SetText(t2)
   line5:SetText(F.buffWatchLine())
-  -- Corpse-run compass wins the quest line while ghosting.
-  local corpseLine = F.corpseLineText()
-  line6:SetText(corpseLine or F.questLineText())
+  -- r32: multi-line quest checklist (corpse compass overrides while ghosting).
+  local ok, err = pcall(F.questRefreshPanel)
+  if not ok then
+    line6:SetText("|cFFFF6666quest panel: " .. tostring(err) .. "|r")
+  end
 end)
 
 --------------------------------------------------------------------------

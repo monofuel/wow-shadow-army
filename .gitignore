@@ -11,6 +11,7 @@ __pycache__/
 *.a
 nimcache/
 local_classic/
+captures/
 
 # Built binaries (compile with `make army-host-build` / nim c)
 tools/army_host

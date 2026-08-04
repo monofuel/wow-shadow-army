@@ -18,6 +18,9 @@
         packages = [
           # WoW 1.12 is a 32-bit exe; wineWowPackages ships both arches.
           pkgs.wineWowPackages.stable
+          # Loopback capture for make play-classic-netlog (run under sudo —
+          # the store binary carries no CAP_NET_RAW file capability).
+          pkgs.tcpdump
         ];
       };
     };

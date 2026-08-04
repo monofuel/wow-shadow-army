@@ -128,8 +128,23 @@ proc jstrNode(n: JsonNode; def = ""): string =
   of JInt: $n.getInt
   else: def
 
+proc observationRoot(frame: JsonNode): JsonNode =
+  ## Flat AgentFrame (new) or legacy `{observation: ...}` wrapper (old).
+  if frame.isNil:
+    return nil
+  let wrapped = frame{"observation"}
+  if not wrapped.isNil and wrapped.kind == JObject and frame{"location"}.isNil:
+    return wrapped
+  # Flat AgentFrame has identity fields at top level.
+  if not frame{"name"}.isNil or not frame{"known_spells"}.isNil or
+      not frame{"accepted_quests"}.isNil:
+    return frame
+  if not wrapped.isNil:
+    return wrapped
+  frame
+
 proc extractSnapshot*(frame: JsonNode; slot: int): FrameSnapshot =
-  ## Pull quest / item / spell bits from a nim_control environment frame.
+  ## Pull quest / item / spell bits from an AgentFrame (flat or wrapped).
   result = FrameSnapshot(slot: slot)
   result.questLog = initHashSet[int]()
   result.completed = initHashSet[int]()
@@ -138,7 +153,7 @@ proc extractSnapshot*(frame: JsonNode; slot: int): FrameSnapshot =
   result.knownSpells = initHashSet[int]()
   if frame.isNil:
     return
-  let obs = frame{"observation"}
+  let obs = observationRoot(frame)
   if obs.isNil:
     return
   result.character = jstrNode(obs{"name"})
@@ -161,7 +176,7 @@ proc extractSnapshot*(frame: JsonNode; slot: int): FrameSnapshot =
   if not known.isNil and known.kind == JArray:
     for sid in known:
       result.knownSpells.incl jintNode(sid)
-  # Settlement dedup from previous_transition
+  # Settlement dedup: legacy previous_transition or ActionState on the frame.
   let pt = frame{"previous_transition"}
   if not pt.isNil and jstrNode(pt{"type"}) == "action_settled":
     let kind = jstrNode(pt{"action_kind"})
@@ -174,6 +189,16 @@ proc extractSnapshot*(frame: JsonNode; slot: int): FrameSnapshot =
     else:
       result.lastSettledKey =
         kind & "|" & $jintNode(pt{"settled_tick"}) & "|" & jstrNode(pt{"message"})
+  else:
+    let ast = frame{"action_state"}
+    if not ast.isNil and ast.kind == JObject:
+      let st = jstrNode(ast{"status"})
+      if st in ["succeeded", "failed", "timed_out", "cancelled", "rejected"]:
+        let act = ast{"action"}
+        let kind = if act.isNil: "" else: jstrNode(act{"kind"})
+        result.lastSettledKey =
+          kind & "|" & $jintNode(ast{"completion_frame_id"}) & "|" &
+            jstrNode(ast{"detail"})
 
 const MilestoneKinds = [
   "accept_quest", "turn_in_quest", "loot", "cast", "interact"

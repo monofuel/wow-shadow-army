@@ -43,13 +43,6 @@ for f in "$SNAPSHOT/Data"/*; do
   base="$(basename "$f")"
   [ -e "$CLIENT/Data/$base" ] || ln -s "$f" "$CLIENT/Data/$base"
 done
-# Mute ONLY the quest-complete fanfare: the client crashes reproducibly the
-# moment this one-shot stream spins up (2026-07-25, survived the WINMM
-# switch). A zero-length loose file shadows the MPQ copy and silences it —
-# doubles as the diagnostic: if turn-ins still crash with this in place,
-# the sound path is exonerated and the addon quest-panel hooks are next.
-mkdir -p "$CLIENT/Data/Sound/interface"
-: > "$CLIENT/Data/Sound/interface/iQuestComplete.wav"
 for item in WTF Interface WoW.exe dbghelp.dll fmod.dll ijl15.dll unicows.dll DivxDecoder.dll; do
   if [ ! -e "$CLIENT/$item" ] && [ -e "$SNAPSHOT/$item" ]; then
     cp -r "$SNAPSHOT/$item" "$CLIENT/$item"

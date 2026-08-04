@@ -1,57 +1,53 @@
-## Nim army host — goal installer + fair-play audit for nim_control.v2.
+## Nim army host — Lua external policy over WS /env (AgentFrame → AgentAction).
 ##
-## Upstream v2 runs policy **in-process** (step(observation)). External hosts
-## install leveling goals with leader/party (escort) and observe frames; they
-## do **not** select factorized actions. Watchdogs may reinstall goals when a
-## seat thrashes (e.g. warlock selected_target_guid == active_pet_guid).
-## Never send control_directive cancel for thrash — live v2 seats exit on it.
+## Transport: tools/env_transport.nim. Default is direct TCP to the host-local
+## env host (127.0.0.1:41113 + kind-11 attach). `--ws` uses the game relay
+## at :8080 when it is alive. Policy loop: agent_frame → projectV2 (frozen Lua
+## shape) → lua/tools/<tool>.decide → mapIntentV2 → action_submission.
 ##
-##   nim r tools/army_host.nim --slot:2 --leader:Murist
+##   nim r tools/army_host.nim --slot:2 --leader:Murist --character:Igris
 ##
-## Cadence defaults 1.0s (status/audit + thrash watch). Audit: --audit-path.
+## Cadence defaults from hello.action_deadline_seconds; `--cadence` overrides.
 
 import
   std/[
-    endians, json, math, options, os, osproc, parseopt, sets, strformat, strutils,
-    streams, net, times
+    json, math, options, os, osproc, parseopt, random, strformat, strutils,
+    times
   ],
-  msgpack_json, party_promote, fair_play_audit
+  env_transport, msgpack_json, fair_play_audit
 
 const
-  Protocol = "vanilla_wow.nim_control.v2"
-  Magic = 0x44524E4Bu32
-  Version = 2'u16
-  FrameGoal = 1'u16
-  FrameDirective = 2'u16
-  FrameStatusReq = 4'u16
-  FrameControlStatus = 5'u16
-  FrameEnv = 6'u16
-  FrameErr = 8'u16
-  ## Fork extension (lua-external-policy branch): one typed BotAction per
-  ## request while the in-process planner is held/idle.
-  FrameExecAction = 7'u16
-  FrameActionResult = 9'u16
-  BasePort = 41114
+  EnvProtocol = "vanilla_wow.environment.v1"
+  DefaultHost = "127.0.0.1"
+  DefaultDirectPort = 41113
+  DefaultWsPort = 8080
+  DefaultGameUrl = "http://127.0.0.1:8080"
+  DefaultToken = "token-0"
+  DefaultAccount = "coworld"
+  DefaultPassword = "coworld"
 
 type
   HostConfig = object
     slot: int
     tool: string
     leader: string
-    ## Control slot for the human leader (default 0 = Murist :41114). Used to
-    ## overlay live xy/combat onto party projection when party packets lag.
-    leaderSlot: int
     party: seq[string]
-    goalId: string
-    cadence: float
+    cadence: float          ## 0 = use hello.action_deadline_seconds
+    cadenceOverride: bool
     acceptFrom: string
     maxSeconds: float
     quiet: bool
-    ## Append-only fair-play milestone log (empty = disabled).
     auditPath: string
-    ## External policy mode: hold the in-process planner and drive the seat
-    ## from lua/tools/<tool>.decide via the fork's execute_action frame.
-    external: bool
+    host: string
+    port: int               ## 0 = mode default
+    direct: bool            ## true = TCP env host; false = WS relay
+    account: string
+    password: string
+    character: string
+    gameUrl: string
+    token: string
+
+# ---------- JSON helpers ----------
 
 proc jget(n: JsonNode; keys: varargs[string]): JsonNode =
   result = n
@@ -96,179 +92,43 @@ proc jint(n: JsonNode; def = 0): int =
     except: def
   else: def
 
-proc sendFrame(s: Socket; frameType: uint16; reqId: uint32; payload: string) =
-  var header = newString(16)
-  var magic = Magic
-  var ver = Version
-  var ft = frameType
-  var rid = reqId
-  var plen = uint32(payload.len)
-  littleEndian32(addr header[0], addr magic)
-  littleEndian16(addr header[4], addr ver)
-  littleEndian16(addr header[6], addr ft)
-  littleEndian32(addr header[8], addr rid)
-  littleEndian32(addr header[12], addr plen)
-  let data = header & payload
-  var sent = 0
-  while sent < data.len:
-    let n = s.send(data[sent].addr, data.len - sent)
-    if n <= 0:
-      raise newException(IOError, "send failed")
-    sent += n
-
-proc recvExact(s: Socket; n: int): string =
-  result = newString(n)
-  var got = 0
-  while got < n:
-    let k = s.recv(addr result[got], n - got)
-    if k <= 0:
-      raise newException(IOError, "socket closed")
-    got += k
-
-proc recvFrame(s: Socket): tuple[ft: uint16, rid: uint32, payload: string] =
-  let h = s.recvExact(16)
-  var magic, rid, plen: uint32
-  var ver, ft: uint16
-  littleEndian32(addr magic, addr h[0])
-  littleEndian16(addr ver, addr h[4])
-  littleEndian16(addr ft, addr h[6])
-  littleEndian32(addr rid, addr h[8])
-  littleEndian32(addr plen, addr h[12])
-  if magic != Magic:
-    raise newException(IOError, "bad magic")
-  (ft, rid, s.recvExact(int(plen)))
-
-type
-  ControlClient = ref object
-    sock: Socket
-    slot: int
-    reqId: uint32
-
-proc connectClient(slot: int): ControlClient =
-  result = ControlClient(slot: slot, reqId: 0)
-  result.sock = newSocket()
-  result.sock.connect("127.0.0.1", Port(BasePort + slot))
-  # Let the server's accept handler reach its first await before the first
-  # frame lands (fast local connect+send raced it on fork builds).
-  sleep(250)
-
-proc close(c: ControlClient) =
-  if c.sock != nil:
-    try: c.sock.close()
-    except: discard
-    c.sock = nil
-
-proc request(c: ControlClient; frameType: uint16; body: JsonNode):
-    tuple[ft: uint16, node: JsonNode, raw: string] =
-  if c.sock.isNil:
-    raise newException(IOError, "socket closed")
-  inc c.reqId
-  let payload = $body
-  c.sock.sendFrame(frameType, c.reqId, payload)
-  let (ft, rid, raw) = c.sock.recvFrame()
-  if rid != c.reqId:
-    raise newException(IOError, "request id mismatch")
-  if ft == FrameErr:
-    raise newException(IOError, "control error: " & raw)
-  if ft == FrameEnv:
-    return (ft, unpackJson(raw), raw)
-  return (ft, parseJson(raw), raw)
-
-proc statusJson(c: ControlClient): JsonNode =
-  let body = %*{
-    "protocol": Protocol,
-    "type": "status_request",
-    "expected_slot": c.slot,
-    "include_environment_frame": false
-  }
-  let (ft, node, _) = c.request(FrameStatusReq, body)
-  if ft != FrameControlStatus:
-    raise newException(IOError, "expected control_status")
-  node
-
-proc envFrame(c: ControlClient): JsonNode =
-  let body = %*{
-    "protocol": Protocol,
-    "type": "status_request",
-    "expected_slot": c.slot,
-    "include_environment_frame": true
-  }
-  let (ft, node, _) = c.request(FrameStatusReq, body)
-  if ft != FrameEnv:
-    raise newException(IOError, "expected environment_frame got " & $ft)
-  node
-
-proc submitGoal(c: ControlClient; goalId, leader: string; party: seq[string];
-    revision: int; botId = "relh-roam"; stopLevel = 0) =
-  ## Install an in-process leveling goal. Escort uses leader_name + party_members;
-  ## the client policy steps follow/assist/grind autonomously (nim_control.v2).
-  let body = %*{
-    "protocol": Protocol,
-    "type": "goal_request",
-    "goal_id": goalId,
-    "goal_kind": "leveling",
-    "bot_id": botId,
-    "profile_id": "",
-    "task_id": "",
-    "role": "",
-    "leader_name": leader,
-    "party_members": party,
-    "stop_level": stopLevel,
-    "expected_slot": c.slot,
-    "expected_revision": revision,
-    "practice_reset": false,
-    "rfc_launch": false
-  }
-  discard c.request(FrameGoal, body)
-
-proc sendDirective(c: ControlClient; directive: string; revision: int) =
-  ## hold | resume | cancel — v2 control plane (no factorized SELECT).
-  let body = %*{
-    "protocol": Protocol,
-    "type": "control_directive",
-    "directive": directive,
-    "expected_slot": c.slot,
-    "expected_revision": revision
-  }
-  discard c.request(FrameDirective, body)
-
-proc executeAction(c: ControlClient; action: JsonNode; revision: int): JsonNode =
-  ## Fire one typed BotAction through the fork's execute_action frame.
-  ## Blocks until the executor settles (moves walk their corridor first).
-  let body = %*{
-    "protocol": Protocol,
-    "type": "execute_action",
-    "expected_slot": c.slot,
-    "expected_revision": revision,
-    "action": action
-  }
-  let (ft, node, _) = c.request(FrameExecAction, body)
-  if ft != FrameActionResult:
-    raise newException(IOError, "expected action_result got " & $ft)
-  node
-
-proc isStaleRevisionError(msg: string): bool =
-  msg.contains("stale controller revision") or msg.contains("stale revision")
-
 proc guidNonzero(s: string): bool =
   s.len > 0 and s != "0"
 
-proc swingingAtOwnPet(obs: JsonNode): bool =
-  ## Real thrash: policy AA-swings the imp (attack/stop_attack forever).
-  ## Mere selected_target == pet is normal OOC (feed/pet-command) — do NOT
-  ## treat that as thrash (live false positive on Igris every pull).
-  if obs.isNil: return false
-  let pet = jstr(jget(obs, "active_pet_guid"))
+proc closeMessage(code: int; reason: string): string =
+  ## Distinct human-readable line per WS close code (and direct-TCP errors).
+  case code
+  of 1008:
+    result = "close 1008: bad token or slot already attached"
+  of 1011:
+    result = "close 1011: internal error or session ended before hello"
+  of 1002:
+    result = "close 1002: protocol error"
+  of 1000:
+    result = "close 1000: normal closure"
+  of 1001:
+    result = "close 1001: going away"
+  else:
+    result = "close " & $code
+  if reason.len > 0:
+    result.add " (" & reason & ")"
+
+# ---------- Safety heuristics (inputs ported to flat AgentFrame) ----------
+
+proc swingingAtOwnPet(frame: JsonNode): bool =
+  ## Real thrash: auto-attack locked on the active pet guid.
+  if frame.isNil: return false
+  let pet = jstr(jget(frame, "active_pet_guid"))
   if not guidNonzero(pet): return false
-  let aa = jstr(jget(obs, "auto_attack_guid"))
+  let aa = jstr(jget(frame, "auto_attack_guid"))
   aa == pet
 
-proc stuckCombatFollowOnly(frame, obs: JsonNode): bool =
-  ## In combat, leveling reports no progress, and the only recommended
-  ## actions are movement (follow leader) — not cast/attack. Live Shadowfel:
-  ## sticky AA on a 60yd mob while only move→Murist for 20+s.
-  if obs.isNil or frame.isNil: return false
-  if not jbool(jget(obs, "in_combat")): return false
+proc stuckCombatFollowOnly(frame: JsonNode): bool =
+  ## Goal-era helper: in combat, no progress, only move/follow recommended.
+  ## AgentFrame has no recommended `actions` / leveling_lifecycle — returns
+  ## false when those fields are absent (external policy path).
+  if frame.isNil: return false
+  if not jbool(jget(frame, "in_combat")): return false
   let nop = jnum(jget(frame, "leveling_lifecycle", "no_progress_seconds"))
   if nop < 15.0: return false
   let acts = jget(frame, "actions")
@@ -279,11 +139,10 @@ proc stuckCombatFollowOnly(frame, obs: JsonNode): bool =
       return false
   true
 
-proc moveActionFarDest(frame, obs: JsonNode; minDist = 25.0): bool =
-  ## True when recommended action is a move whose destination is still far
-  ## from self (not micro-reposition / in-formation hold).
-  if obs.isNil or frame.isNil: return false
-  let loc = jget(obs, "location")
+proc moveActionFarDest(frame: JsonNode; minDist = 25.0): bool =
+  ## Goal-era helper: recommended move destination still far from self.
+  if frame.isNil: return false
+  let loc = jget(frame, "location")
   if loc.isNil: return false
   let sx = jnum(jget(loc, "x"))
   let sy = jnum(jget(loc, "y"))
@@ -335,16 +194,54 @@ proc toLua(n: JsonNode): string =
       parts.add "[" & luaEscape(k) & "] = " & toLua(v)
     "{" & parts.join(", ") & "}"
 
-# ---------- v2 projection (observation → plain Lua table) ----------
+# ---------- Phase 2 — projection (AgentFrame flat → frozen Lua shape) ----------
 #
-# The v2 environment frame has no action_space/action_mask/bindings — those
-# died with the v1 select protocol. Units carry real guids (uint64, may not
-# fit a Lua double), so tools see dense 1-based ids and the host resolves
-# id → guid on the way back out.
+# Inbound AgentFrame is FLAT (no observation wrapper). Output table is frozen:
+# self_unit / leader_unit / combat / spells / death / party (+ guids side table).
 
-proc projectV2(frame: JsonNode; preferLeaderName = ""):
+proc unitIsAlive(u: JsonNode): bool =
+  ## Prefer death_known/is_dead; fall back to health when known or bare.
+  if jbool(jget(u, "death_known")):
+    return not jbool(jget(u, "is_dead"))
+  if jbool(jget(u, "health_known"), jget(u, "health") != nil):
+    return jint(jget(u, "health")) > 0
+  # Unknown → treat as not attackable/lootable classifiable; caller filters.
+  false
+
+proc unitIsDead(u: JsonNode): bool =
+  if jbool(jget(u, "death_known")):
+    return jbool(jget(u, "is_dead"))
+  if jbool(jget(u, "health_known"), jget(u, "health") != nil):
+    return jint(jget(u, "health")) <= 0
+  false
+
+proc unitIsLootable(u: JsonNode): bool =
+  ## lootable_known false → unknown → not lootable (absent).
+  if jget(u, "lootable_known") != nil and not jbool(jget(u, "lootable_known")):
+    return false
+  jbool(jget(u, "is_lootable"))
+
+proc unitLosBlocked(u: JsonNode): bool =
+  ## line_of_sight_known false → unknown → not blocked (old missing default).
+  if jget(u, "line_of_sight_known") != nil and
+      not jbool(jget(u, "line_of_sight_known")):
+    return false
+  jbool(jget(u, "line_of_sight_blocked"))
+
+proc projectV2*(frame: JsonNode; preferLeaderName = ""):
     tuple[proj: JsonNode, guids: seq[string]] =
-  let obs = jget(frame, "observation")
+  ## Project a flat AgentFrame (or legacy wrapped frame) into the frozen Lua table.
+  ##
+  ## Accepts either top-level AgentFrame keys or the old `{observation: ...}`
+  ## wrapper so unit tests and any residual wrapped dumps still work.
+  let obs =
+    if frame.isNil: nil
+    elif jget(frame, "observation") != nil and
+        jget(frame, "observation").kind == JObject and
+        jget(frame, "location") == nil:
+      jget(frame, "observation")
+    else:
+      frame
   let loc = jget(obs, "location")
   var guids: seq[string] = @[]
   let selfUnit = %*{
@@ -355,15 +252,22 @@ proc projectV2(frame: JsonNode; preferLeaderName = ""):
     "class_id": jint(jget(obs, "class_id")),
     "level": jint(jget(obs, "level"))
   }
-  let maxHp = max(1.0, jnum(jget(obs, "max_health"), 1.0))
-  let hpPct = jnum(jget(obs, "health"), maxHp) / maxHp * 100.0
+
+  var hpPct = 100.0
+  if jbool(jget(obs, "health_known"), true):
+    let maxHp = max(1.0, jnum(jget(obs, "max_health"), 1.0))
+    hpPct = jnum(jget(obs, "health"), maxHp) / maxHp * 100.0
   # Mana from pool 0 — active_power_type latches onto pet focus (old
   # grind_policy lesson, still true on live warlock frames).
   var manaPct = 100.0
   var mana = 0
   let powers = jget(obs, "powers")
   let maxPowers = jget(obs, "max_powers")
-  if not powers.isNil and powers.kind == JArray and powers.len > 0 and
+  let powerKnown = jget(obs, "power_known")
+  var pool0Known = true
+  if not powerKnown.isNil and powerKnown.kind == JArray and powerKnown.len > 0:
+    pool0Known = jbool(powerKnown[0], true)
+  if pool0Known and not powers.isNil and powers.kind == JArray and powers.len > 0 and
       not maxPowers.isNil and maxPowers.kind == JArray and maxPowers.len > 0:
     mana = jint(powers[0])
     let mm = max(1, jint(maxPowers[0]))
@@ -381,9 +285,12 @@ proc projectV2(frame: JsonNode; preferLeaderName = ""):
       let uloc = jget(u, "location")
       if uloc.isNil: continue
       let hostile = jstr(jget(u, "reaction")) == "hostile"
-      let alive = jint(jget(u, "health")) > 0
-      let isLoot = jbool(jget(u, "is_lootable"))
+      let alive = unitIsAlive(u)
+      let dead = unitIsDead(u)
+      let isLoot = unitIsLootable(u)
       if not hostile and not isLoot: continue
+      # Skip when death/health truth is fully unknown (neither flag usable).
+      if not alive and not dead and not isLoot: continue
       guids.add g
       let id = guids.len
       let row = %*{
@@ -395,10 +302,10 @@ proc projectV2(frame: JsonNode; preferLeaderName = ""):
         "entry": jint(jget(u, "entry")),
         "level": jint(jget(u, "level")),
         "distance": jnum(jget(u, "distance")),
-        "los_blocked": jbool(jget(u, "line_of_sight_blocked")),
-        "lootable": isLoot and not alive
+        "los_blocked": unitLosBlocked(u),
+        "lootable": isLoot and dead
       }
-      if isLoot and not alive:
+      if isLoot and dead:
         lootable.add row
       elif hostile and alive:
         attackable.add row
@@ -452,6 +359,7 @@ proc projectV2(frame: JsonNode; preferLeaderName = ""):
         }
         break
 
+  # corpse_known false → null corpse (unknown, not zero coords).
   let corpseKnown = jbool(jget(obs, "corpse_known"))
   let corpseLoc = jget(obs, "corpse_location")
   var corpse = newJNull()
@@ -510,18 +418,37 @@ proc projectV2(frame: JsonNode; preferLeaderName = ""):
   }
   (proj, guids)
 
-proc guidFor(guids: seq[string]; unitId: int): string =
+proc guidFor*(guids: seq[string]; unitId: int): string =
   if unitId >= 1 and unitId <= guids.len:
     return guids[unitId - 1]
   ""
 
-proc mapIntentV2(intent: JsonNode; guids: seq[string]): Option[JsonNode] =
-  ## Lua intent → typed BotAction JSON for the fork's execute_action frame.
+# ---------- Phase 3 — mapIntentV2 (Lua intent → AgentAction JSON) ----------
+
+proc moveIntentName(intent: JsonNode): string =
+  ## navigation_mode / intent string → AgentMoveIntent wire name.
+  let raw = jstr(jget(intent, "intent"))
+  let nav = if raw.len > 0: raw else: jstr(jget(intent, "navigation_mode"))
+  case nav.toLowerAscii
+  of "", "travel", "goal": "travel"
+  of "approach", "local": "approach"
+  of "retreat": "retreat"
+  of "explore": "explore"
+  else: "travel"
+
+proc targetZKnownFromIntent(intent: JsonNode): bool =
+  ## Polarity flip: destination_z_unknown → target_z_known = not unknown.
+  ## Default when the flag is absent: known (matches action_json optionalBool true).
+  not jbool(jget(intent, "destination_z_unknown"), false)
+
+proc mapIntentV2*(intent: JsonNode; guids: seq[string]): Option[JsonNode] =
+  ## Lua intent → typed AgentAction JSON body (no submission envelope).
   if intent.isNil or intent.kind != JObject: return none(JsonNode)
   let kind = jstr(jget(intent, "kind"))
   let uid = jint(jget(intent, "unit_id"))
   let guid = guidFor(guids, uid)
-  proc dest(arrival: float): JsonNode =
+  proc destMove(arrival: float): JsonNode =
+    ## aakMove with inverted Z polarity and moveIntent enum on the wire.
     %*{
       "kind": "move",
       "destination": {
@@ -531,20 +458,22 @@ proc mapIntentV2(intent: JsonNode; guids: seq[string]): Option[JsonNode] =
         "z": jnum(jget(intent, "z")),
         "orientation": 0.0
       },
-      "arrival_radius": arrival
+      "arrival_radius": arrival,
+      "target_z_known": targetZKnownFromIntent(intent),
+      "intent": moveIntentName(intent)
     }
   case kind
   of "hold", "":
     none(JsonNode)
   of "move_to_unit":
     if jget(intent, "x") != nil and jget(intent, "y") != nil:
-      some(dest(4.0))
+      some(destMove(4.0))
     elif guid.len > 0:
       some(%*{"kind": "follow", "target_guid": guid})
     else:
       none(JsonNode)
   of "move_to_corpse":
-    some(dest(6.0))
+    some(destMove(6.0))
   of "follow_unit":
     if guid.len == 0: none(JsonNode)
     else: some(%*{"kind": "follow", "target_guid": guid})
@@ -559,7 +488,11 @@ proc mapIntentV2(intent: JsonNode; guids: seq[string]): Option[JsonNode] =
     if spell <= 0: none(JsonNode)
     else:
       var a = %*{"kind": "cast", "spell_id": spell}
-      if guid.len > 0: a["target_guid"] = %guid
+      if guid.len > 0:
+        a["target_guid"] = %guid
+      else:
+        # Cast requires exactly one target mode (action_json.nim).
+        a["cast_without_target"] = %true
       some(a)
   of "stop_attack":
     some(%*{"kind": "stop_attack"})
@@ -574,6 +507,11 @@ proc mapIntentV2(intent: JsonNode; guids: seq[string]): Option[JsonNode] =
   of "promote_party":
     if guid.len == 0: none(JsonNode)
     else: some(%*{"kind": "promote_party", "target_guid": guid})
+  of "remove_party":
+    if guid.len == 0: none(JsonNode)
+    else: some(%*{"kind": "remove_party", "target_guid": guid})
+  of "ready_check":
+    some(%*{"kind": "ready_check"})
   of "accept_quest":
     if guid.len == 0: none(JsonNode)
     else:
@@ -587,7 +525,7 @@ proc mapIntentV2(intent: JsonNode; guids: seq[string]): Option[JsonNode] =
       some(%*{
         "kind": "turn_in_quest", "target_guid": guid,
         "quest_id": jint(jget(intent, "quest_id")),
-        "quest_reward_choice": jint(jget(intent, "reward_choice"))
+        "reward_choice": jint(jget(intent, "reward_choice"))
       })
   of "release_spirit":
     some(%*{"kind": "release_spirit"})
@@ -596,7 +534,35 @@ proc mapIntentV2(intent: JsonNode; guids: seq[string]): Option[JsonNode] =
   else:
     none(JsonNode)
 
+proc actionSubmissionPayload*(
+  action: JsonNode;
+  expectedFrameId: int;
+  expectedSlot: int
+): string =
+  ## Kind-9 JSON envelope (control_json.nim environmentActionSubmissionFromJson).
+  $(%*{
+    "protocol": EnvProtocol,
+    "type": "action_submission",
+    "action": action,
+    "expected_frame_id": expectedFrameId,
+    "expected_slot": expectedSlot
+  })
+
+proc actionStateStatus(frame: JsonNode): string =
+  ## Wire status string from action_state, or "" when idle/null.
+  let st = jget(frame, "action_state")
+  if st.isNil or st.kind != JObject:
+    return ""
+  jstr(jget(st, "status"))
+
+proc actionIsPending(frame: JsonNode): bool =
+  actionStateStatus(frame) == "pending"
+
+proc actionIsRejected(frame: JsonNode): bool =
+  actionStateStatus(frame) == "rejected"
+
 proc runDecide(tool: string; proj: JsonNode): JsonNode =
+  ## Run lua/tools/<tool>.decide(proj) in a subprocess; return intent JSON.
   let repo = getCurrentDir()
   let script = """
 package.path = [[$1/lua/?.lua;$1/lua/tools/?.lua;;]]
@@ -639,7 +605,6 @@ print(enc(intent))
   if bin.len == 0:
     bin = findExe("lua")
   if bin.len == 0:
-    # Match Makefile RUN_LUA fallback.
     let (nixOut, nixCode) = execCmdEx(
       "nix shell nixpkgs#lua5_3 --command which lua"
     )
@@ -654,19 +619,28 @@ print(enc(intent))
   let line = outp.strip().splitLines()[^1]
   parseJson(line)
 
+# ---------- Config / connect ----------
+
 proc parseConfig(): HostConfig =
   result = HostConfig(
     slot: 2,
     tool: "escort_leader",
     leader: "Murist",
-    leaderSlot: 0,
     party: @["Murist", "Shadowfel", "Igris", "Tusk", "Beru"],
-    goalId: "army-slot-2",
-    cadence: 1.0,
+    cadence: 0.0,
+    cadenceOverride: false,
     acceptFrom: "Murist",
     maxSeconds: 0.0,
     quiet: true,
-    auditPath: DefaultAuditPath
+    auditPath: DefaultAuditPath,
+    host: DefaultHost,
+    port: 0,
+    direct: true,
+    account: DefaultAccount,
+    password: DefaultPassword,
+    character: "",
+    gameUrl: DefaultGameUrl,
+    token: DefaultToken
   )
   for kind, key, val in getopt():
     case kind
@@ -675,275 +649,265 @@ proc parseConfig(): HostConfig =
       of "slot": result.slot = parseInt(val)
       of "tool": result.tool = val
       of "leader": result.leader = val
-      of "leader-slot": result.leaderSlot = parseInt(val)
       of "party": result.party = val.split(',')
-      of "goal-id": result.goalId = val
-      of "cadence": result.cadence = parseFloat(val)
+      of "cadence":
+        result.cadence = parseFloat(val)
+        result.cadenceOverride = true
       of "accept-from": result.acceptFrom = val
       of "max-seconds": result.maxSeconds = parseFloat(val)
       of "verbose": result.quiet = false
       of "audit-path": result.auditPath = val
       of "no-audit": result.auditPath = ""
-      of "external": result.external = true
+      of "host", "h": result.host = val
+      of "port", "p": result.port = parseInt(val)
+      of "direct": result.direct = true
+      of "ws": result.direct = false
+      of "account": result.account = val
+      of "password": result.password = val
+      of "character": result.character = val
+      of "game-url": result.gameUrl = val
+      of "token", "t": result.token = val
+      # Dead goal-era flags: accepted and ignored so old Makefiles still parse.
+      of "goal-id", "leader-slot", "external": discard
       else: discard
     else: discard
-  if result.goalId == "army-slot-2":
-    result.goalId = "army-slot-" & $result.slot
+  if result.character.len == 0:
+    # Sensible default when Makefile only passes --slot.
+    result.character = "Slot" & $result.slot
 
-proc log(c: HostConfig; msg: string) =
-  if not c.quiet:
-    echo msg
+proc attachPayload(cfg: HostConfig): string =
+  ## Mirror of env_smoke / game relay env_attach_payload for direct TCP.
+  randomize()
+  var sid = ""
+  for _ in 0 ..< 32:
+    sid.add "0123456789abcdef"[rand(15)]
+  let q = "?slot=" & $cfg.slot & "&token=" & cfg.token
+  $(%*{
+    "protocol": "vanilla_wow.env.attach.v1",
+    "type": "attach",
+    "session_id": sid,
+    "slot": cfg.slot,
+    "account_username": cfg.account,
+    "account_password": cfg.password,
+    "character_name": cfg.character,
+    "character_creation": nil,
+    "simulation_time_scale": 1,
+    "class_deck_enabled": false,
+    "assets_base_url": cfg.gameUrl & "/player/assets" & q,
+    "navmesh_service_url": cfg.gameUrl & "/player/navigation" & q
+  })
+
+proc connectHost(cfg: HostConfig): EnvClient =
+  ## Direct (default) or WS relay attach. Does not receive hello.
+  let port =
+    if cfg.port != 0: cfg.port
+    elif cfg.direct: DefaultDirectPort
+    else: DefaultWsPort
+  if cfg.direct:
+    result = connectEnvDirect(cfg.host, port)
+    result.sendAttach(attachPayload(cfg))
   else:
-    # failures always? only print if FAIL in msg
-    if msg.contains("FAIL") or msg.contains("fatal") or msg.contains("goal"):
-      echo msg
+    result = connectEnv(cfg.host, port, cfg.slot, cfg.token)
 
 proc say(msg: string) =
   echo msg
   flushFile(stdout)
 
-proc runExternal(cfg: var HostConfig) =
-  ## Lua drives the seat: hold the in-process planner, then each tick
-  ## project the env frame, run lua/tools/<tool>.decide, and fire the intent
-  ## through the fork's execute_action frame. Fair-play audit still runs;
-  ## the client also appends every action to action-results.jsonl.
-  echo &"[army_host] EXTERNAL lua policy slot={cfg.slot} tool={cfg.tool} leader={cfg.leader}"
+# ---------- Main policy loop ----------
+
+proc main() =
+  var cfg = parseConfig()
+  let mode = if cfg.direct: "direct" else: "ws"
+  echo &"[army_host] env policy slot={cfg.slot} tool={cfg.tool} " &
+    &"leader={cfg.leader} mode={mode} character={cfg.character}"
+  if cfg.auditPath.len > 0:
+    echo &"[army_host] fair-play audit → {cfg.auditPath}"
+
   var audit = AuditState(path: cfg.auditPath, slot: cfg.slot, tool: cfg.tool)
-  var client = connectClient(cfg.slot)
-  defer: client.close()
-  proc ensureHeld(): int =
-    ## The execute frame is only legal while the planner cannot step.
-    let st = client.statusJson()
-    var rev = jint(jget(st, "revision"))
-    if jstr(jget(st, "phase")) == "running":
-      client.sendDirective("hold", rev)
-      rev = jint(jget(client.statusJson(), "revision"))
-      echo &"[army_host] planner held (rev={rev})"
-    rev
-  var rev = ensureHeld()
+  var client: EnvClient
+  try:
+    client = connectHost(cfg)
+  except EnvTransportError as e:
+    echo closeMessage(e.closeCode, e.closeReason)
+    if e.closeCode == 0:
+      echo "[army_host] connect failed: ", e.msg
+    quit 1
+  except CatchableError as e:
+    echo "[army_host] connect failed: ", e.msg
+    quit 1
+  defer:
+    try: client.close()
+    except CatchableError: discard
+
+  # Hello (kind 12).
+  var sessionId = ""
+  var helloSlot = cfg.slot
+  var actionDeadline = 5.0
+  var detachedSteps = 0
+  try:
+    let hello = client.recvControlFrame()
+    if hello.kind != FrameEnvHello:
+      echo &"[army_host] expected hello kind {FrameEnvHello}, got {hello.kind}"
+      quit 1
+    let hnode = parseJson(hello.payload)
+    sessionId = jstr(jget(hnode, "session_id"))
+    helloSlot = jint(jget(hnode, "slot"), cfg.slot)
+    actionDeadline = jnum(jget(hnode, "action_deadline_seconds"), 5.0)
+    detachedSteps = jint(jget(hnode, "detached_steps"))
+    if detachedSteps > 0:
+      echo &"[army_host] resumed session_id={sessionId} slot={helloSlot} " &
+        &"detached_steps={detachedSteps}"
+    else:
+      echo &"[army_host] hello session_id={sessionId} slot={helloSlot} " &
+        &"action_deadline_seconds={actionDeadline}"
+  except EnvTransportError as e:
+    echo closeMessage(e.closeCode, e.closeReason)
+    quit 1
+  except CatchableError as e:
+    echo "[army_host] hello failed: ", e.msg
+    quit 1
+
+  let loopCadence =
+    if cfg.cadenceOverride: cfg.cadence
+    elif actionDeadline > 0: actionDeadline
+    else: 1.0
+
+  var reqId: uint32 = 0
+  var pendingAction = false   ## ONE pending action at a time (enforcement point).
+  var lastSubmittedFrameId = -1
   let t0 = epochTime()
   var i = 0
   var lastHeartbeatAt = 0.0
   var lastIntent = ""
   const HeartbeatSec = 15.0
-  while true:
-    if cfg.maxSeconds > 0 and epochTime() - t0 > cfg.maxSeconds:
-      echo "[army_host] max-seconds"
-      break
-    inc i
-    try:
-      let frame = client.envFrame()
-      discard processFrame(audit, frame)
-      let obs = jget(frame, "observation")
-      let name = jstr(jget(obs, "name"))
-      let (proj, guids) = projectV2(frame, cfg.leader)
-      var intentDesc = "hold"
-      try:
-        let intent = runDecide(cfg.tool, proj)
-        if not cfg.quiet:
-          say "[external] intent " & $intent
-        let action = mapIntentV2(intent, guids)
-        intentDesc = jstr(jget(intent, "kind"), "hold") & ":" &
-          jstr(jget(intent, "reason"))
-        if action.isSome:
-          try:
-            let res = client.executeAction(action.get, rev)
-            if not jbool(jget(res, "success")):
-              echo "[army_host] action FAIL ", intentDesc, " → ",
-                jstr(jget(res, "message"))
-            rev = jint(jget(res, "revision"), rev)
-          except:
-            let msg = getCurrentExceptionMsg()
-            if isStaleRevisionError(msg):
-              rev = ensureHeld()
-            else:
-              raise
-      except:
-        echo "[army_host] decide FAIL: ", getCurrentExceptionMsg()
-      if intentDesc != lastIntent or
-          epochTime() - lastHeartbeatAt >= HeartbeatSec:
-        lastHeartbeatAt = epochTime()
-        lastIntent = intentDesc
-        let loc = jget(obs, "location")
-        echo "[army_host] #", i, " ", name,
-          " intent=", intentDesc,
-          " pos=(",
-          jnum(jget(loc, "x")).formatFloat(ffDecimal, 0), ",",
-          jnum(jget(loc, "y")).formatFloat(ffDecimal, 0), ")",
-          " hp=", jnum(jget(proj, "combat", "health_pct")).formatFloat(ffDecimal, 0)
-    except:
-      let msg = getCurrentExceptionMsg()
-      echo "[army_host] loop error: ", msg
-      if msg.contains("socket") or msg.contains("closed") or
-          msg.contains("send failed"):
-        try: client.close()
-        except: discard
-        sleep(1000)
-        try:
-          client = connectClient(cfg.slot)
-          rev = ensureHeld()
-          echo "[army_host] reconnected slot=", cfg.slot
-        except:
-          echo "[army_host] reconnect failed: ", getCurrentExceptionMsg()
-    sleep(int(cfg.cadence * 1000))
 
-proc main() =
-  var cfg = parseConfig()
-  if cfg.external:
-    runExternal(cfg)
-    return
-  echo &"[army_host] v2 goal-host slot={cfg.slot} leader={cfg.leader} party={cfg.party}"
-  if cfg.auditPath.len > 0:
-    echo &"[army_host] fair-play audit → {cfg.auditPath}"
-  var audit = AuditState(
-    path: cfg.auditPath,
-    slot: cfg.slot,
-    tool: cfg.tool
-  )
-  var client = connectClient(cfg.slot)
-  defer: client.close()
-  proc installEscortGoal() =
-    let st = client.statusJson()
-    let rev = jint(jget(st, "revision"))
-    let phase = jstr(jget(st, "phase"))
-    client.submitGoal(cfg.goalId, cfg.leader, cfg.party, rev)
-    echo &"[army_host] goal {cfg.goalId} submitted (was phase={phase} rev={rev})"
-  installEscortGoal()
-  let t0 = epochTime()
-  var i = 0
-  var lastHeartbeatAt = 0.0
-  var petTargetStreak = 0
-  var stuckCombatStreak = 0
-  var zeroDispStreak = 0
-  var lastPosX = 0.0
-  var lastPosY = 0.0
-  var haveLastPos = false
-  var lastUnstickAt = 0.0
-  const HeartbeatSec = 15.0
-  ## Cadence is often 0.35s (escort-army). Need multi-second confirmation.
-  const PetTargetStreakLimit = 20   ## ~7s at 0.35s cadence, OOC only
-  const StuckCombatStreakLimit = 8  ## ~3s of no-progress combat frames
-  ## Moves "succeed" but body does not move (Brill freeze 2026-07-27).
-  const ZeroDispStreakLimit = 25    ## ~9s @0.35 / 25s @1.0
-  ## Cooldown between goal-id bumps so we do not thrash installs.
-  const UnstickCooldownSec = 60.0
-  proc unstickGoal(reason, name: string) =
-    ## Bump goal_id so the controller drops sticky combat/target memory.
-    ## Never send control_directive cancel — it exits the seat on this pin.
-    if epochTime() - lastUnstickAt < UnstickCooldownSec:
-      return
-    let stU = client.statusJson()
-    let freshId = cfg.goalId & "-u" & $int(epochTime())
-    client.submitGoal(
-      freshId, cfg.leader, cfg.party, jint(jget(stU, "revision"))
-    )
-    cfg.goalId = freshId
-    lastUnstickAt = epochTime()
-    petTargetStreak = 0
-    stuckCombatStreak = 0
-    zeroDispStreak = 0
-    echo "[army_host] FAIL unstuck ", reason, " name=", name,
-      " slot=", cfg.slot, " goal=", freshId
   while true:
     if cfg.maxSeconds > 0 and epochTime() - t0 > cfg.maxSeconds:
       echo "[army_host] max-seconds"
       break
     inc i
     try:
-      let st = client.statusJson()
-      let phase = jstr(jget(st, "phase"))
-      let rev = jint(jget(st, "revision"))
-      # Re-install only when the controller dropped the goal. Periodic re-submit
-      # resets policy memory and thrash-glitches movement.
-      if phase in ["idle", "failed", "complete"]:
+      let frame = client.recvControlFrame()
+      case frame.kind
+      of FrameAgentFrame:
+        var node: JsonNode
         try:
-          client.submitGoal(cfg.goalId, cfg.leader, cfg.party, rev)
-          echo &"[army_host] re-installed goal (phase was {phase})"
-        except:
-          let msg = getCurrentExceptionMsg()
-          if isStaleRevisionError(msg):
-            let st2 = client.statusJson()
-            client.submitGoal(
-              cfg.goalId, cfg.leader, cfg.party, jint(jget(st2, "revision"))
+          node = unpackJson(frame.payload)
+        except CatchableError as e:
+          echo &"[army_host] msgpack error: {e.msg} bytes={frame.payload.len}"
+          continue
+
+        discard processFrame(audit, node)
+
+        let frameId = jint(jget(node, "frame_id"))
+        let name = jstr(jget(node, "name"))
+        let loc = jget(node, "location")
+
+        # ActionState settlement tracking.
+        let st = actionStateStatus(node)
+        if pendingAction:
+          case st
+          of "pending":
+            discard  # still waiting
+          of "rejected":
+            # Recompute from this frame — do not resend the old body.
+            pendingAction = false
+            lastSubmittedFrameId = -1
+            if not cfg.quiet:
+              say &"[army_host] action rejected frame={frameId} " &
+                jstr(jget(node, "action_state", "detail"))
+          of "succeeded", "failed", "timed_out", "cancelled", "":
+            pendingAction = false
+            lastSubmittedFrameId = -1
+          else:
+            pendingAction = false
+            lastSubmittedFrameId = -1
+
+        if swingingAtOwnPet(node):
+          echo "[army_host] warn aa-on-own-pet name=", name, " frame=", frameId
+
+        let (proj, guids) = projectV2(node, cfg.leader)
+        var intentDesc = "hold"
+        try:
+          let intent = runDecide(cfg.tool, proj)
+          if not cfg.quiet:
+            say "[policy] intent " & $intent
+          intentDesc = jstr(jget(intent, "kind"), "hold") & ":" &
+            jstr(jget(intent, "reason"))
+          let action = mapIntentV2(intent, guids)
+          # ONE pending action at a time — skip submit while prior is pending.
+          if action.isSome and not pendingAction:
+            inc reqId
+            let payload = actionSubmissionPayload(action.get, frameId, helloSlot)
+            client.sendActionSubmission(reqId, payload)
+            pendingAction = true
+            lastSubmittedFrameId = frameId
+            recordSelect(
+              audit, name, jstr(jget(action.get, "kind")), intent, true
             )
-          else:
-            raise
-      try:
-        let frame = client.envFrame()
-        discard processFrame(audit, frame)
-        let obs = jget(frame, "observation")
-        let name = jstr(jget(obs, "name"))
-        let loc = jget(obs, "location")
-        let party = jget(obs, "party")
-        # AA on own pet (true thrash). Selected-pet alone is normal OOC.
-        if swingingAtOwnPet(obs):
-          inc petTargetStreak
-        else:
-          petTargetStreak = 0
-        if petTargetStreak >= PetTargetStreakLimit:
-          try:
-            unstickGoal("aa-on-own-pet thrash", name)
-          except:
-            echo "[army_host] FAIL pet-unstick: ", getCurrentExceptionMsg()
-        # Combat + no progress + only move/follow recommended (sticky far target).
-        if stuckCombatFollowOnly(frame, obs):
-          inc stuckCombatStreak
-        else:
-          stuckCombatStreak = 0
-        if stuckCombatStreak >= StuckCombatStreakLimit:
-          try:
-            unstickGoal("stuck-combat follow-only", name)
-          except:
-            echo "[army_host] FAIL combat-unstick: ", getCurrentExceptionMsg()
-        # Zero-displacement move thrash: far dest, body not moving.
-        let px = jnum(jget(loc, "x"))
-        let py = jnum(jget(loc, "y"))
-        if haveLastPos and moveActionFarDest(frame, obs):
-          let ddx = px - lastPosX
-          let ddy = py - lastPosY
-          if ddx * ddx + ddy * ddy < 0.6 * 0.6:
-            inc zeroDispStreak
-          else:
-            zeroDispStreak = 0
-        else:
-          zeroDispStreak = 0
-        if not (px == 0.0 and py == 0.0):
-          lastPosX = px
-          lastPosY = py
-          haveLastPos = true
-        if zeroDispStreak >= ZeroDispStreakLimit:
-          try:
-            unstickGoal("zero-displacement move", name)
-          except:
-            echo "[army_host] FAIL zero-disp-unstick: ", getCurrentExceptionMsg()
-        if epochTime() - lastHeartbeatAt >= HeartbeatSec or not cfg.quiet:
+          elif action.isSome and pendingAction and not cfg.quiet:
+            say &"[army_host] skip submit (pending) frame={frameId}"
+        except CatchableError as e:
+          echo "[army_host] decide FAIL: ", e.msg
+
+        if intentDesc != lastIntent or
+            epochTime() - lastHeartbeatAt >= HeartbeatSec:
           lastHeartbeatAt = epochTime()
-          echo "[army_host] heartbeat #", i,
-            " name=", name,
-            " phase=", phase,
+          lastIntent = intentDesc
+          echo "[army_host] #", i, " ", name,
+            " intent=", intentDesc,
+            " frame=", frameId,
+            " pending=", pendingAction,
             " pos=(",
             jnum(jget(loc, "x")).formatFloat(ffDecimal, 0), ",",
             jnum(jget(loc, "y")).formatFloat(ffDecimal, 0), ")",
-            " party=", jbool(jget(party, "in_group")),
-            " leader=", jstr(jget(party, "leader_name"))
-      except:
-        # Frame optional if only status works
+            " hp=", jnum(jget(proj, "combat", "health_pct")).formatFloat(
+              ffDecimal, 0)
+
+      of FrameControlError:
+        echo "[army_host] control_error request_id=", frame.requestId, " ",
+          frame.payload
+      of FrameEnvClose:
+        echo "[army_host] env_close: ", frame.payload
+        break
+      of FrameEnvHello:
+        echo "[army_host] hello(re): ", frame.payload
+      else:
         if not cfg.quiet:
-          echo "[army_host] frame skip: ", getCurrentExceptionMsg()
-    except:
-      let msg = getCurrentExceptionMsg()
-      echo "[army_host] loop error: ", msg
-      if msg.contains("socket") or msg.contains("closed") or msg.contains("send failed"):
-        try: client.close()
-        except: discard
-        sleep(1000)
-        try:
-          client = connectClient(cfg.slot)
-          installEscortGoal()
-          echo "[army_host] reconnected slot=", cfg.slot
-        except:
-          echo "[army_host] reconnect failed: ", getCurrentExceptionMsg()
-    sleep(int(cfg.cadence * 1000))
+          echo &"[army_host] frame kind={frame.kind} rid={frame.requestId} " &
+            &"bytes={frame.payload.len}"
+
+    except EnvTransportError as e:
+      echo closeMessage(e.closeCode, e.closeReason)
+      if e.closeCode == 0:
+        echo "[army_host] loop error: ", e.msg
+      # Soft reconnect for operator-run sessions only (not during tests).
+      try: client.close()
+      except CatchableError: discard
+      sleep(1000)
+      try:
+        client = connectHost(cfg)
+        let hello = client.recvControlFrame()
+        if hello.kind == FrameEnvHello:
+          let hnode = parseJson(hello.payload)
+          detachedSteps = jint(jget(hnode, "detached_steps"))
+          sessionId = jstr(jget(hnode, "session_id"))
+          echo &"[army_host] reconnected session_id={sessionId} " &
+            &"detached_steps={detachedSteps}"
+          pendingAction = false
+        else:
+          echo "[army_host] reconnect: unexpected frame ", hello.kind
+          break
+      except CatchableError as e2:
+        echo "[army_host] reconnect failed: ", e2.msg
+        break
+    except CatchableError as e:
+      echo "[army_host] loop error: ", e.msg
+
+    # Cadence is a soft sleep between frames when the host is quiet; most
+    # agent frames arrive pushed. Keep it small when deadline-driven.
+    if loopCadence > 0 and loopCadence < 60:
+      sleep(int(min(loopCadence, 0.25) * 1000))
 
 when isMainModule:
   main()

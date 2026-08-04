@@ -74,7 +74,14 @@ suite "server status views":
     check "/server/start" in html
     check "Stop server" notin html
     check "Stopped" in html
-    check "no id" in html
+    check "no container" in html
+
+  test "panel labels exited container id when stopped":
+    let html = renderServerPanel(ServerStatus(
+      running: false, container: "c", containerId: "deadbeefcafe", op: ""))
+    check "Stopped (exited)" in html
+    check "exited deadbeefcafe" in html
+    check "Start server" in html
 
   test "panel offers Stop when running and idle":
     let html = renderServerPanel(ServerStatus(
@@ -84,6 +91,7 @@ suite "server status views":
     check "Start server" notin html
     check "Running" in html
     check "deadbeefcafe" in html
+    check "exited" notin html
 
   test "panel shows progress (no buttons) during an op":
     let starting = renderServerPanel(ServerStatus(
