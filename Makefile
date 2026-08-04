@@ -169,20 +169,72 @@ ESCORT_ACCEPT_FROM ?= Murist
 # Prefer fork SDK when the fork checkout exists (matches igris/warlock-bot-fork seats).
 ESCORT_UPSTREAM ?= $(shell if [ -d "$(abspath ../coworld-vanilla-wow-fork)" ]; then echo $(abspath ../coworld-vanilla-wow-fork); else echo $(UPSTREAM); fi)
 
+# Seat identity map (docs/work-2026-08-04.md). Under the new interface, attach
+# CREATES the session: army_host logs into realmd itself with these credentials
+# instead of dialing a seat process that already logged in. Without them the
+# host falls back to its own defaults (coworld/coworld, character "Slot<N>"),
+# which is not a real seat.
+#
+# Recursive `=` is deliberate — the per-seat vars live with the seat targets
+# further down this file and would be empty under `:=` here.
+SEAT_2_ACCOUNT = $(WARLOCK_ACCOUNT)
+SEAT_2_PASS = $(WARLOCK_PASS)
+SEAT_2_CHARACTER = $(WARLOCK_CHARACTER)
+SEAT_3_ACCOUNT = $(IGRIS_ACCOUNT)
+SEAT_3_PASS = $(IGRIS_PASS)
+SEAT_3_CHARACTER = $(IGRIS_CHARACTER)
+SEAT_4_ACCOUNT = $(TUSK_ACCOUNT)
+SEAT_4_PASS = $(TUSK_PASS)
+SEAT_4_CHARACTER = $(TUSK_CHARACTER)
+SEAT_5_ACCOUNT = $(BERU_ACCOUNT)
+SEAT_5_PASS = $(BERU_PASS)
+SEAT_5_CHARACTER = $(BERU_CHARACTER)
+
+# Credential flags for whichever SLOT a single-seat target was invoked with.
+# Unmapped slots (0/1) emit nothing and keep the host defaults.
+SEAT_CREDS = $(if $(SEAT_$(SLOT)_ACCOUNT),--account=$(SEAT_$(SLOT)_ACCOUNT) \
+	--password=$(SEAT_$(SLOT)_PASS) --character=$(SEAT_$(SLOT)_CHARACTER))
+
+# Same map for the shell `for s in 2 3 4 5` loops below.
+define seat_creds_case
+case $$s in \
+  2) acct=$(SEAT_2_ACCOUNT); pass=$(SEAT_2_PASS); char=$(SEAT_2_CHARACTER) ;; \
+  3) acct=$(SEAT_3_ACCOUNT); pass=$(SEAT_3_PASS); char=$(SEAT_3_CHARACTER) ;; \
+  4) acct=$(SEAT_4_ACCOUNT); pass=$(SEAT_4_PASS); char=$(SEAT_4_CHARACTER) ;; \
+  5) acct=$(SEAT_5_ACCOUNT); pass=$(SEAT_5_PASS); char=$(SEAT_5_CHARACTER) ;; \
+  *) echo "no seat mapping for slot $$s" >&2; exit 1 ;; \
+esac
+endef
+
+# Native environment host on 127.0.0.1:41113. Required before any seat can
+# attach: the local realm image omits /usr/local/bin/vanilla-wow-env-host, so
+# the game's WS /env relay is dead and direct TCP is the only path
+# (docs/work-2026-08-04.md). Rebuilds itself when upstream source is newer;
+# use FORCE_BUILD=1 after an upstream jump.
+.PHONY: env-host env-host-stop env-host-status
+env-host:
+	@tools/env_host.sh start
+
+env-host-stop:
+	@tools/env_host.sh stop
+
+env-host-status:
+	@tools/env_host.sh status
+
 # Nim army host (no Python decide loop). Binary: tools/army_host
 .PHONY: army-host army-host-build escort-army-nim grind-army-nim escort escort-army
 army-host-build:
 	@nim c --hints:off -o:tools/army_host tools/army_host.nim
 
 army-host: army-host-build
-	@./tools/army_host --slot=$(SLOT) --tool=$(or $(TOOL),escort_leader) --leader=$(or $(ESCORT_LEADER),Murist) \
-		--party=$(or $(ESCORT_PARTY),Murist,Shadowfel,Igris,Tusk,Beru) --goal-id=army-slot-$(SLOT) \
+	@./tools/army_host --slot=$(SLOT) $(SEAT_CREDS) --tool=$(or $(TOOL),escort_leader) --leader=$(or $(ESCORT_LEADER),Murist) \
+		--party=$(or $(ESCORT_PARTY),Murist,Shadowfel,Igris,Tusk,Beru) \
 		--cadence=$(or $(CADENCE),0.35) --accept-from=$(or $(ESCORT_ACCEPT_FROM),Murist) $(EXTRA)
 
 # Single-seat escort (default standing path: Nim + Lua).
 escort: army-host-build
-	@./tools/army_host --slot=$(SLOT) --tool=escort_leader --leader=$(or $(ESCORT_LEADER),Murist) \
-		--party=$(or $(ESCORT_PARTY),Murist,Shadowfel,Igris,Tusk,Beru) --goal-id=army-slot-$(SLOT) \
+	@./tools/army_host --slot=$(SLOT) $(SEAT_CREDS) --tool=escort_leader --leader=$(or $(ESCORT_LEADER),Murist) \
+		--party=$(or $(ESCORT_PARTY),Murist,Shadowfel,Igris,Tusk,Beru) \
 		--cadence=$(or $(CADENCE),0.35) --accept-from=$(or $(ESCORT_ACCEPT_FROM),Murist) $(EXTRA)
 
 # Standing army on Nim host (kills legacy python shadows first).
@@ -193,8 +245,10 @@ escort-army-nim: army-host-build
 	@-pkill -f 'tools/army_host --slot' 2>/dev/null || true
 	@sleep 1
 	@for s in 2 3 4 5; do \
-		nohup ./tools/army_host --slot=$$s --tool=escort_leader --leader=$(or $(ESCORT_LEADER),Murist) \
-			--party=Murist,Shadowfel,Igris,Tusk,Beru --goal-id=army-slot-$$s --cadence=0.35 \
+		$(seat_creds_case); \
+		nohup ./tools/army_host --slot=$$s --account=$$acct --password=$$pass --character=$$char \
+			--tool=escort_leader --leader=$(or $(ESCORT_LEADER),Murist) \
+			--party=Murist,Shadowfel,Igris,Tusk,Beru --cadence=0.35 \
 			--accept-from=$(or $(ESCORT_ACCEPT_FROM),Murist) \
 			--audit-path=local_data/audit/fair-play.jsonl \
 			> local_data/brain-logs/army-slot$$s.log 2>&1 & \
@@ -213,22 +267,24 @@ grind-army-nim: army-host-build
 	@-pkill -f 'brain.shadow --slot [2345]' 2>/dev/null || true
 	@sleep 1
 	@for s in 2 3 4 5; do \
-		nohup ./tools/army_host --slot=$$s --tool=grind_nearest --leader=$(or $(ESCORT_LEADER),Murist) \
-			--party=Murist,Shadowfel,Igris,Tusk,Beru --goal-id=grind-slot-$$s --cadence=0.3 \
+		$(seat_creds_case); \
+		nohup ./tools/army_host --slot=$$s --account=$$acct --password=$$pass --character=$$char \
+			--tool=grind_nearest --leader=$(or $(ESCORT_LEADER),Murist) \
+			--party=Murist,Shadowfel,Igris,Tusk,Beru --cadence=0.3 \
 			--audit-path=local_data/audit/fair-play.jsonl \
 			> local_data/brain-logs/grind-slot$$s.log 2>&1 & \
 		echo $$! > local_data/brain-logs/grind-slot$$s.pid; \
 	done; \
 	echo "grind army started (audit: local_data/audit/fair-play.jsonl)"
 
-# Single-seat mob grind, Lua-driven: lua/tools/grind_nearest decides every
-# tick and the host fires typed BotActions through the fork's execute_action
-# frame (docs/nim-control-v2-external-select.md). Requires the seat to run the
-# fork `lua-external-policy` build with an idle/held planner.
+# Single-seat mob grind, Lua-driven: lua/tools/grind_nearest decides every tick
+# and the host submits the resulting intent as an AgentAction over the stock
+# external-policy contract (docs/work-2026-08-04.md). No fork build needed —
+# attach creates the session from SEAT_CREDS.
 #
 #   make grind SLOT=2 EXTRA='--max-seconds=600'
 grind: army-host-build
-	@./tools/army_host --slot=$(SLOT) --tool=grind_nearest --external \
+	@./tools/army_host --slot=$(SLOT) $(SEAT_CREDS) --tool=grind_nearest \
 		--leader=$(or $(ESCORT_LEADER),Murist) \
 		--cadence=$(or $(CADENCE),1.0) --audit-path=local_data/audit/fair-play.jsonl $(EXTRA)
 

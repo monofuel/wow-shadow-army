@@ -25,6 +25,11 @@ const
   DefaultToken = "token-0"
   DefaultAccount = "coworld"
   DefaultPassword = "coworld"
+  # The game validates assets/navmesh HTTP with `config.tokens[slot] == token`
+  # (game/config.py slot_token_valid). The local realm ships exactly one token,
+  # so only slot 0 authenticates — while the ATTACH slot is whatever seat we
+  # are. These are independent: attach on 2-5, fetch assets as slot 0.
+  DefaultAssetSlot = 0
 
 type
   HostConfig = object
@@ -46,6 +51,7 @@ type
     character: string
     gameUrl: string
     token: string
+    assetSlot: int          ## slot used in assets/navmesh URLs, NOT the attach slot
 
 # ---------- JSON helpers ----------
 
@@ -640,7 +646,8 @@ proc parseConfig(): HostConfig =
     password: DefaultPassword,
     character: "",
     gameUrl: DefaultGameUrl,
-    token: DefaultToken
+    token: DefaultToken,
+    assetSlot: DefaultAssetSlot
   )
   for kind, key, val in getopt():
     case kind
@@ -667,6 +674,7 @@ proc parseConfig(): HostConfig =
       of "character": result.character = val
       of "game-url": result.gameUrl = val
       of "token", "t": result.token = val
+      of "asset-slot": result.assetSlot = parseInt(val)
       # Dead goal-era flags: accepted and ignored so old Makefiles still parse.
       of "goal-id", "leader-slot", "external": discard
       else: discard
@@ -681,7 +689,7 @@ proc attachPayload(cfg: HostConfig): string =
   var sid = ""
   for _ in 0 ..< 32:
     sid.add "0123456789abcdef"[rand(15)]
-  let q = "?slot=" & $cfg.slot & "&token=" & cfg.token
+  let q = "?slot=" & $cfg.assetSlot & "&token=" & cfg.token
   $(%*{
     "protocol": "vanilla_wow.env.attach.v1",
     "type": "attach",

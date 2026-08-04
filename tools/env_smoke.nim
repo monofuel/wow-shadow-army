@@ -23,6 +23,8 @@ type
     password: string
     character: string
     gameUrl: string     # base for assets/navmesh URLs in the attach payload
+    assetSlot: int      # slot in the assets/navmesh query — NOT the attach slot;
+                        # only tokens[slot] pairs authenticate (slot_token_valid)
 
 proc usage() =
   echo "usage: env_smoke [--host=127.0.0.1] [--port=8080] [--slot=0] " &
@@ -43,7 +45,8 @@ proc parseArgs(): SmokeConfig =
     account: "coworld",
     password: "coworld",
     character: "Nightsun",
-    gameUrl: "http://127.0.0.1:8080"
+    gameUrl: "http://127.0.0.1:8080",
+    assetSlot: 0
   )
   for kind, key, val in getopt():
     case kind
@@ -71,6 +74,8 @@ proc parseArgs(): SmokeConfig =
         result.character = val
       of "game-url":
         result.gameUrl = val
+      of "asset-slot":
+        result.assetSlot = parseInt(val)
       of "help":
         usage()
       else:
@@ -165,7 +170,7 @@ proc attachPayload(cfg: SmokeConfig): string =
   var sid = ""
   for _ in 0 ..< 32:
     sid.add "0123456789abcdef"[rand(15)]
-  let q = "?slot=" & $cfg.slot & "&token=" & cfg.token
+  let q = "?slot=" & $cfg.assetSlot & "&token=" & cfg.token
   $(%*{
     "protocol": "vanilla_wow.env.attach.v1",
     "type": "attach",
