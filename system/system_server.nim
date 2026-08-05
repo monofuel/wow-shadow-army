@@ -2011,17 +2011,21 @@ proc isTraversePolProcess*(pid: int): bool =
     ("army_host" in cmd and "mode=traverse" in cmd)
 
 proc isTraverseWatchProcess*(pid: int): bool =
-  ## True when pid is the watch launcher tree (uv/python or its nix-shell wrapper).
+  ## True when pid is the watch launcher tree or the native viewer it started.
   let cmd = pidCmdline(pid)
   if cmd.len == 0:
     return false
-  # Require watch_bots.py in the argv so agent shells that only mention the
-  # string in a long pipeline are less likely to match.
+  # Live admin viewer (path under watch-bots/) with a live-pov URL.
+  if "global-viewer" in cmd and "live-pov=" in cmd:
+    return true
+  if "watch-bots/live-pov" in cmd or ("live-pov" in cmd and "--capture-dir=" in cmd):
+    return true
+  # uv/python watch_bots.py (or nix develop wrapper that still has the path).
   if "watch_bots.py" notin cmd:
     return false
   result =
-    ("uv" in cmd) or ("python" in cmd) or ("nix-shell" in cmd) or
-    ("nix" in cmd and "shell" in cmd)
+    ("uv" in cmd) or ("python" in cmd) or ("nix develop" in cmd) or
+    ("nix" in cmd)
 
 proc findProcessByMarker*(marker: string): int =
   ## Scan /proc for a cmdline containing marker; return first pid or 0.
@@ -2066,8 +2070,12 @@ proc traverseOpsStatus*(): TraverseOpsStatus =
     result.watchRunning = true
     result.watchPid = watchPid
   else:
-    let found = findProcessByMarker("watch_bots.py")
-    if found > 0:
+    var found = findProcessByMarker("watch_bots.py")
+    if found == 0:
+      found = findProcessByMarker("global-viewer")
+    if found == 0:
+      found = findProcessByMarker("watch-bots/live-pov")
+    if found > 0 and isTraverseWatchProcess(found):
       result.watchRunning = true
       result.watchPid = found
     elif watchPid > 0:
@@ -2254,15 +2262,27 @@ proc startTraverseWatch*(): TraverseOpsStatus =
     return
   let pid = readPidFile(pidPath)
   let pyPid = findProcessByMarker("watch_bots.py")
-  if pidAlive(pid) or pyPid > 0:
+  let viewerPid = findProcessByMarker("global-viewer")
+  let livePid = findProcessByMarker("watch-bots/live-pov")
+  if pidAlive(pid) or pyPid > 0 or
+      (viewerPid > 0 and isTraverseWatchProcess(viewerPid)) or
+      (livePid > 0 and isTraverseWatchProcess(livePid)):
     let tail = logFileTail(logPath, 12)
-    if pyPid == 0 and "error:" in tail.toLowerAscii:
+    # Hard fail only when nothing is left alive and the log shows an error.
+    let anyAlive =
+      pidAlive(pid) or pyPid > 0 or viewerPid > 0 or livePid > 0
+    if not anyAlive and "error:" in tail.toLowerAscii:
       result.watchRunning = false
       result.lastOk = false
       result.lastDetail = tail
       return
     result.watchRunning = true
-    result.watchPid = if pyPid > 0: pyPid elif pidAlive(pid): pid else: 0
+    result.watchPid =
+      if pyPid > 0: pyPid
+      elif viewerPid > 0: viewerPid
+      elif livePid > 0: livePid
+      elif pidAlive(pid): pid
+      else: 0
     result.lastOk = true
     result.lastDetail = &"started (log {TraverseWatchLogRel})"
     return
