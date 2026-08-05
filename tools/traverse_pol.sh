@@ -7,8 +7,10 @@
 #      is vmangos_local_runtime and does not ship env-host; WS /env 1011s without it)
 #   3) attach army_host --mode=traverse over WS /env
 #   4) pass when path_yards >= MIN_YARDS (default 50) within max-seconds
+#      OR when TRAVERSE_POL_GOAL_RADIUS>0 and within goal (desert checkpoint)
 #
 # Wall time is minutes, not 45m. Needs docker, uv, sudo (nsenter netns).
+# Desert MVP: TRAVERSE_POL_GOAL_* set → stop at checkpoint, do not wait 45m.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -18,8 +20,19 @@ RESULT="${TRAVERSE_POL_RESULT:-$ROOT/local_data/traverse-pol-prepare.json}"
 LOG="${TRAVERSE_POL_LOG:-$ROOT/local_data/brain-logs/traverse-pol.log}"
 ENV_LOG="${TRAVERSE_POL_ENV_LOG:-$ROOT/local_data/env-host-traverse.log}"
 ENV_PIDFILE="${TRAVERSE_POL_ENV_PID:-$ROOT/local_data/env-host-traverse.pid}"
-MAX_SECONDS="${TRAVERSE_POL_MAX_SECONDS:-180}"
-MIN_YARDS="${TRAVERSE_POL_MIN_YARDS:-50}"
+# Desert checkpoint (planar). When radius>0, army_host exits 0 at goal (not 45m).
+GOAL_X="${TRAVERSE_POL_GOAL_X:--7033.0}"
+GOAL_Y="${TRAVERSE_POL_GOAL_Y:--3681.1}"
+GOAL_RADIUS="${TRAVERSE_POL_GOAL_RADIUS:-0}"
+if awk "BEGIN{exit !($GOAL_RADIUS > 0)}"; then
+  # Checkpoint MVP: default 15m fail budget; path-yards bar off unless set.
+  # ~2.4k yd in form is often ~12–18m; budget headroom, still << 45m.
+  MAX_SECONDS="${TRAVERSE_POL_MAX_SECONDS:-1200}"
+  MIN_YARDS="${TRAVERSE_POL_MIN_YARDS:-0}"
+else
+  MAX_SECONDS="${TRAVERSE_POL_MAX_SECONDS:-180}"
+  MIN_YARDS="${TRAVERSE_POL_MIN_YARDS:-50}"
+fi
 CLEANUP="${TRAVERSE_POL_CLEANUP:-1}"
 CONTAINER_SUFFIX="-traverse-coworld-game-1"
 
@@ -120,6 +133,16 @@ if ! kill -0 "$(cat "$ENV_PIDFILE")" 2>/dev/null; then
   exit 1
 fi
 
+GOAL_ARGS=()
+if awk "BEGIN{exit !($GOAL_RADIUS > 0)}"; then
+  GOAL_ARGS=(
+    --pol-goal-x="$GOAL_X"
+    --pol-goal-y="$GOAL_Y"
+    --pol-goal-radius="$GOAL_RADIUS"
+  )
+  echo "[traverse-pol] desert goal=($GOAL_X,$GOAL_Y) radius=$GOAL_RADIUS max_seconds=$MAX_SECONDS (stop on checkpoint)"
+fi
+
 echo "[traverse-pol] army_host mode=traverse ws://$TRAVERSE_POL_HOST:$TRAVERSE_POL_PORT/env slot=$TRAVERSE_POL_SLOT"
 cd "$ROOT"
 set +e
@@ -138,6 +161,7 @@ set +e
   --max-seconds="$MAX_SECONDS" \
   --pol-min-yards="$MIN_YARDS" \
   --pol-require-move \
+  "${GOAL_ARGS[@]}" \
   --no-audit \
   --verbose \
   >"$LOG" 2>&1

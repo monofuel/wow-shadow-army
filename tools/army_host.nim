@@ -60,6 +60,10 @@ type
     assetSlot: int          ## slot used in assets/navmesh URLs, NOT the attach slot
     polMinYards: float      ## >0: exit 0 after path yards reach this (PoL)
     polRequireMove: bool    ## require at least one accepted move action
+    ## Desert checkpoint (planar): exit 0 when within goalRadius of (goalX, goalY).
+    goalX: float
+    goalY: float
+    goalRadius: float       ## 0 = disabled
 
 # ---------- JSON helpers ----------
 
@@ -742,7 +746,10 @@ proc parseConfig(): HostConfig =
     token: DefaultToken,
     assetSlot: DefaultAssetSlot,
     polMinYards: 0.0,
-    polRequireMove: false
+    polRequireMove: false,
+    goalX: 0.0,
+    goalY: 0.0,
+    goalRadius: 0.0
   )
   # Hosted tournament injects this before CLI flags (CLI can still override).
   result.applyCoworldPlayerWsUrl()
@@ -781,6 +788,9 @@ proc parseConfig(): HostConfig =
       of "asset-slot": result.assetSlot = parseInt(val)
       of "pol-min-yards": result.polMinYards = parseFloat(val)
       of "pol-require-move": result.polRequireMove = true
+      of "pol-goal-x": result.goalX = parseFloat(val)
+      of "pol-goal-y": result.goalY = parseFloat(val)
+      of "pol-goal-radius": result.goalRadius = parseFloat(val)
       # Dead goal-era flags: accepted and ignored so old Makefiles still parse.
       of "goal-id", "leader-slot", "external": discard
       else: discard
@@ -843,6 +853,10 @@ proc main() =
     echo &"[army_host] fair-play audit → {cfg.auditPath}"
   if cfg.polMinYards > 0:
     echo &"[army_host] pol-min-yards={cfg.polMinYards}"
+  if cfg.goalRadius > 0:
+    echo &"[army_host] pol-goal=({cfg.goalX.formatFloat(ffDecimal, 1)}," &
+      &"{cfg.goalY.formatFloat(ffDecimal, 1)}) radius=" &
+      cfg.goalRadius.formatFloat(ffDecimal, 1)
 
   let auditTool =
     if cfg.mode.len > 0: "mode:" & cfg.mode
@@ -1002,6 +1016,15 @@ proc main() =
         if swingingAtOwnPet(node):
           echo "[army_host] warn aa-on-own-pet name=", name, " frame=", frameId
 
+        # Desert / PoL: do not thrash form casts while corpse (exit fail).
+        if cfg.goalRadius > 0 and
+            (jbool(jget(node, "is_dead")) or jbool(jget(node, "is_ghost"))):
+          echo "[army_host] pol FAIL dead/ghost at pos=(",
+            px.formatFloat(ffDecimal, 1), ",",
+            py.formatFloat(ffDecimal, 1), ") path_yd=",
+            pathYards.formatFloat(ffDecimal, 1)
+          quit 1
+
         let (proj, guids) = projectV2(node, cfg.leader)
         var intentDesc = "hold"
         try:
@@ -1037,16 +1060,37 @@ proc main() =
             polPassed = true
             break
 
+        # Desert checkpoint: stop as soon as we are within radius (not 45m).
+        if cfg.goalRadius > 0 and haveLastPos:
+          let gdx = px - cfg.goalX
+          let gdy = py - cfg.goalY
+          let goalDist = sqrt(gdx * gdx + gdy * gdy)
+          if goalDist <= cfg.goalRadius:
+            echo "[army_host] pol PASS goal_dist=",
+              goalDist.formatFloat(ffDecimal, 1),
+              " pos=(", px.formatFloat(ffDecimal, 1), ",",
+              py.formatFloat(ffDecimal, 1), ")",
+              " path_yd=", pathYards.formatFloat(ffDecimal, 1)
+            polPassed = true
+            break
+
         if intentDesc != lastIntent or
             epochTime() - lastHeartbeatAt >= HeartbeatSec:
           lastHeartbeatAt = epochTime()
           lastIntent = intentDesc
+          var goalBit = ""
+          if cfg.goalRadius > 0 and haveLastPos:
+            let gdx = px - cfg.goalX
+            let gdy = py - cfg.goalY
+            goalBit = " goal_d=" &
+              sqrt(gdx * gdx + gdy * gdy).formatFloat(ffDecimal, 1)
           echo "[army_host] #", i, " ", name,
             " intent=", intentDesc,
             " frame=", frameId,
             " pending=", pendingAction,
             " astate=", st,
             " path_yd=", pathYards.formatFloat(ffDecimal, 1),
+            goalBit,
             " moves=", acceptedMoves,
             " pos=(",
             px.formatFloat(ffDecimal, 0), ",",
@@ -1071,8 +1115,8 @@ proc main() =
       echo closeMessage(e.closeCode, e.closeReason)
       if e.closeCode == 0:
         echo "[army_host] loop error: ", e.msg
-      # PoL runs must not soft-reconnect into a stale pending session.
-      if cfg.polMinYards > 0:
+      # PoL / desert-checkpoint runs must not soft-reconnect into a stale session.
+      if cfg.polMinYards > 0 or cfg.goalRadius > 0:
         break
       # Soft reconnect for operator-run sessions only.
       try: client.close()
@@ -1103,13 +1147,21 @@ proc main() =
     if loopCadence > 0 and loopCadence < 60:
       sleep(int(min(loopCadence, 0.25) * 1000))
 
+  if polPassed:
+    quit 0
   if cfg.polMinYards > 0:
-    if polPassed:
-      quit 0
     echo "[army_host] pol FAIL path_yards=",
       pathYards.formatFloat(ffDecimal, 1),
       " accepted_moves=", acceptedMoves,
       " need>=", cfg.polMinYards.formatFloat(ffDecimal, 1)
+    quit 1
+  if cfg.goalRadius > 0:
+    echo "[army_host] pol FAIL goal not reached path_yards=",
+      pathYards.formatFloat(ffDecimal, 1),
+      " accepted_moves=", acceptedMoves,
+      " need within ", cfg.goalRadius.formatFloat(ffDecimal, 1),
+      " of (", cfg.goalX.formatFloat(ffDecimal, 1), ",",
+      cfg.goalY.formatFloat(ffDecimal, 1), ")"
     quit 1
 
 when isMainModule:

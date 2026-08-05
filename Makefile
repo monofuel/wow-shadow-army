@@ -46,7 +46,7 @@ COMPOSE_FILE := infra/compose.vmangos.yml
 ACCOUNT_USER := monofuel
 ACCOUNT_PASS := password
 
-.PHONY: test test-lua test-nim system pin-check start-server stop-server server-logging logs account soap-account play play-classic play-classic-netlog play-xr traverse traverse-pol escort escort-army grind quest-data warlock-account warlock-bot botwarrior-bot tusk-account tusk-bot beru-account beru-bot party-army navmesh-helper navmesh-status
+.PHONY: test test-lua test-nim system pin-check start-server stop-server server-logging logs account soap-account play play-classic play-classic-netlog play-xr traverse traverse-pol traverse-desert escort escort-army grind quest-data warlock-account warlock-bot botwarrior-bot tusk-account tusk-bot beru-account beru-bot party-army navmesh-helper navmesh-status
 
 # Unit tier: Lua tools + Nim host/system tests only (v2 DoD: no Python required
 # for bot correctness). If nim is missing, test-nim-soft skips rather than
@@ -652,6 +652,12 @@ play:
 # Not stock RPB --proof-of-life (that only drives RealPlayerBot).
 traverse-pol:
 	@tools/traverse_pol.sh
+
+# V1 desert checkpoint (~Gadgetzan). Stops as soon as within 50 yd — not 45m.
+# Override: TRAVERSE_POL_GOAL_*, TRAVERSE_POL_MAX_SECONDS, TRAVERSE_POL_CLEANUP=0.
+traverse-desert:
+	@TRAVERSE_POL_GOAL_RADIUS=50 TRAVERSE_POL_LOG=local_data/brain-logs/traverse-desert.log \
+		tools/traverse_pol.sh
 
 # Launch the traverse-wow league scenario for HUMAN play (docs/traverse_wow.md).
 # Unlike `play`, this does NOT use our local realm: --league=traverse makes the
