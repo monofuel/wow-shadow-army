@@ -6,6 +6,41 @@ import
   std/[options, strutils, unittest],
   ../system_server
 
+suite "traverse episode clock":
+  test "docker StartedAt prefix parses to epoch":
+    let ep = parseDockerStartedAtEpoch("2026-08-04T20:51:41.181349148Z")
+    check ep.isSome
+    # 2026-08-04 20:51:41 UTC
+    check ep.get == 1785876701
+
+  test "bad StartedAt is none":
+    check parseDockerStartedAtEpoch("").isNone
+    check parseDockerStartedAtEpoch("not-a-timestamp").isNone
+
+  test "remaining counts down to zero":
+    let c = traverseClockAt(1000, 100, TraverseEpisodeLimitSeconds)
+    check c.known
+    check c.elapsedSec == 900
+    check c.remainingSec == TraverseEpisodeLimitSeconds - 900
+    check not c.expired
+    let done = traverseClockAt(100 + TraverseEpisodeLimitSeconds + 5, 100)
+    check done.expired
+    check done.remainingSec == 0
+    check done.elapsedSec == TraverseEpisodeLimitSeconds + 5
+
+  test "formatTraverseClock":
+    check formatTraverseClock(0) == "0:00"
+    check formatTraverseClock(65) == "1:05"
+    check formatTraverseClock(45 * 60) == "45:00"
+    check formatTraverseClock(3661) == "1:01:01"
+
+  test "render shows remaining and limit":
+    let clock = traverseClockAt(1000, 100, TraverseEpisodeLimitSeconds)
+    let html = renderTraverseClockBlock(clock)
+    check "remaining" in html
+    check formatTraverseClock(clock.remainingSec) in html
+    check formatTraverseClock(TraverseEpisodeLimitSeconds) in html
+
 suite "traverse scoring":
   test "northing at start is zero":
     check abs(traverseNorthingYards(TraverseStartWorldX) - 0.0) < 0.001

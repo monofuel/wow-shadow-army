@@ -70,6 +70,8 @@ const
   TraverseGoalWorldX* = 6687.333052
   ## goal - start; full course length in yards.
   TraverseCourseYards* = 15874.333052
+  ## League wall clock: max_ticks 27000 / tick_rate 10 → 2700s (45 minutes).
+  TraverseEpisodeLimitSeconds* = 45 * 60
   ## docker ps name suffix for the traverse scenario game container.
   TraverseContainerSuffix* = "-traverse-coworld-game-1"
   ## Host path under ~/.coworld for league runtime captures (godview JSONL).
@@ -243,6 +245,14 @@ type
     valid*: bool
     invalidReason*: string ## empty when valid; else scoring reason code
 
+  TraverseClock* = object
+    ## Wall-clock progress against the 45-minute traverse episode limit.
+    known*: bool
+    elapsedSec*: int
+    limitSec*: int
+    remainingSec*: int
+    expired*: bool
+
   TraverseStatus* = object
     ## Dashboard snapshot for the Traverse tab (read-only telemetry).
     containerFound*: bool
@@ -252,6 +262,7 @@ type
     score*: TraverseScore
     ## True when pos/score used godview capture (not just characters DB).
     livePos*: bool
+    clock*: TraverseClock
 
   TraverseLivePos* = object
     ## One godview snapshot of the fixture character (in-world, not DB save).
@@ -364,6 +375,47 @@ proc formatGold*(copper: int): string =
   let s = (copper mod 10000) div 100
   let c = copper mod 100
   result = &"{g}g {s}s {c}c"
+
+proc parseDockerStartedAtEpoch*(s: string): Option[int64] =
+  ## Parse docker inspect StartedAt (RFC3339; fractional seconds optional).
+  ## Returns UTC unix seconds, or none when the prefix is not parseable.
+  result = none(int64)
+  let t = s.strip()
+  if t.len < 19:
+    return
+  try:
+    let core = t[0 .. 18] # yyyy-MM-ddTHH:mm:ss
+    let dt = parse(core, "yyyy-MM-dd'T'HH:mm:ss", utc())
+    result = some(dt.toTime.toUnix)
+  except TimeParseError, ValueError:
+    result = none(int64)
+
+proc traverseClockAt*(
+    nowUnix, startUnix: int64,
+    limitSec = TraverseEpisodeLimitSeconds
+): TraverseClock =
+  ## Build clock state from wall-clock epochs (pure; testable).
+  let limit = max(1, limitSec)
+  let elapsed = max(0, int(nowUnix - startUnix))
+  let remaining = max(0, limit - elapsed)
+  result = TraverseClock(
+    known: true,
+    elapsedSec: elapsed,
+    limitSec: limit,
+    remainingSec: remaining,
+    expired: elapsed >= limit
+  )
+
+proc formatTraverseClock*(sec: int): string =
+  ## Compact mm:ss (or h:mm:ss when ≥ 1 hour).
+  let s = max(0, sec)
+  let h = s div 3600
+  let m = (s mod 3600) div 60
+  let r = s mod 60
+  if h > 0:
+    result = &"{h}:{m:02}:{r:02}"
+  else:
+    result = &"{m}:{r:02}"
 
 proc traverseNorthingYards*(worldX: float): float =
   ## Yards of northing along the Kalimdor course (X is north/south).
@@ -655,6 +707,35 @@ proc resolveTraverseContainer*(): string =
     getEnv("SYSTEM_TRAVERSE_CONTAINER", "")
   )
 
+proc dockerContainerStartedAt*(container: string): string =
+  ## docker inspect StartedAt for one container. Empty on error.
+  result = ""
+  if container.len == 0:
+    return
+  try:
+    let process = startProcess(
+      "docker",
+      args = ["inspect", "--format", "{{.State.StartedAt}}", container],
+      options = {poUsePath}
+    )
+    let output = process.outputStream.readAll().strip()
+    discard process.errorStream.readAll()
+    let exitCode = process.waitForExit()
+    process.close()
+    if exitCode != 0:
+      return ""
+    result = output
+  except CatchableError:
+    result = ""
+
+proc traverseClockForContainer*(container: string, nowUnix: int64): TraverseClock =
+  ## Episode wall clock from container start → now (league 45:00 limit).
+  result = TraverseClock(known: false, limitSec: TraverseEpisodeLimitSeconds)
+  let started = parseDockerStartedAtEpoch(dockerContainerStartedAt(container))
+  if started.isNone:
+    return
+  result = traverseClockAt(nowUnix, started.get, TraverseEpisodeLimitSeconds)
+
 proc traverseStatus*(): TraverseStatus =
   ## Traverse tab telemetry: characters DB identity + godview live position.
   ## VMaNGOS only flushes position_x on save/logout, so yard score must come
@@ -665,13 +746,15 @@ proc traverseStatus*(): TraverseStatus =
     characterFound: false,
     character: TraverseCharacter(),
     score: scoreTraverse(false, 0, 0, false, 0.0),
-    livePos: false
+    livePos: false,
+    clock: TraverseClock(known: false, limitSec: TraverseEpisodeLimitSeconds)
   )
   let container = resolveTraverseContainer()
   if container.len == 0:
     return
   result.containerFound = true
   result.containerName = container
+  result.clock = traverseClockForContainer(container, getTime().toUnix)
   var tsv = ""
   try:
     tsv = dockerMariadbSelectIn(container, TraverseSql)
@@ -3022,6 +3105,41 @@ proc formatTraversePct*(pct: float): string =
   ## Course percent with one decimal place.
   result = &"{pct:.1f}"
 
+proc renderTraverseClockBlock*(clock: TraverseClock): string =
+  ## Elapsed / remaining stats + thin time bar (empty when unknown).
+  if not clock.known:
+    return ""
+  let remText = formatTraverseClock(clock.remainingSec)
+  let elText = formatTraverseClock(clock.elapsedSec)
+  let limText = formatTraverseClock(clock.limitSec)
+  let usedPct =
+    if clock.limitSec <= 0: 0.0
+    else: min(100.0, (clock.elapsedSec.float * 100.0) / clock.limitSec.float)
+  let usedPctText = formatTraversePct(usedPct)
+  let timeBadge =
+    if clock.expired:
+      """<span class="badge bad">time up</span>"""
+    elif clock.remainingSec <= 5 * 60:
+      """<span class="badge bad">≤5 min</span>"""
+    elif clock.remainingSec <= 10 * 60:
+      """<span class="badge accent">≤10 min</span>"""
+    else:
+      ""
+  result = &"""
+    <div class="stat-row">
+      <div class="stat"><div class="n">{escapeHtml(remText)}</div><div class="l">remaining / {escapeHtml(limText)}</div></div>
+      <div class="stat"><div class="n sm">{escapeHtml(elText)}</div><div class="l">elapsed</div></div>
+      <div class="stat">{timeBadge}<div class="l">episode clock</div></div>
+    </div>
+    <div class="murist-bars" style="margin-bottom:0.75rem">
+      <div class="xp-cell">
+        <div class="xp" title="{escapeHtml(elText)} elapsed · {escapeHtml(remText)} left of {escapeHtml(limText)}">
+          <div class="xp-bar"><div class="xp-fill" style="width:{usedPctText}%"></div></div>
+          <div class="xp-meta">{escapeHtml(elText)} <span class="xp-muted">/ {escapeHtml(limText)} · {escapeHtml(remText)} left</span></div>
+        </div>
+      </div>
+    </div>"""
+
 proc renderTraverseStatus*(st: TraverseStatus): string =
   ## Traverse panel body: container + Northbound telemetry + score bar.
   if not st.containerFound:
@@ -3030,12 +3148,14 @@ proc renderTraverseStatus*(st: TraverseStatus): string =
   let containerPill =
     """<span class="pill"><span class="dot on"></span> running</span>"""
   let containerLabel = escapeHtml(st.containerName)
+  let clockBlock = renderTraverseClockBlock(st.clock)
   if not st.characterFound:
     return &"""
     <div class="panel-actions" style="margin-bottom:0.75rem">
       {containerPill}
       <span class="server-container">{containerLabel}</span>
     </div>
+{clockBlock}
     <p class="empty">Character {escapeHtml(TraverseCharacterName)} not found in scenario DB.</p>"""
   let ch = st.character
   let sc = st.score
@@ -3071,6 +3191,7 @@ proc renderTraverseStatus*(st: TraverseStatus): string =
       {livePill}
       {validityBadge}
     </div>
+{clockBlock}
     <div class="stat-row">
       <div class="stat"><div class="n sm">{escapeHtml(ch.name)}</div><div class="l">character</div></div>
       <div class="stat"><div class="n">{ch.level}</div><div class="l">level</div></div>
