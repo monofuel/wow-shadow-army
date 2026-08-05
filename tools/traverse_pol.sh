@@ -49,8 +49,8 @@ need_army=0
 if [[ ! -x tools/army_host ]]; then
   need_army=1
 else
-  for src in tools/army_host.nim tools/env_transport.nim tools/msgpack_json.nim \
-             tools/fair_play_audit.nim; do
+  for src in tools/army_host.nim tools/army_debug.nim tools/env_transport.nim \
+             tools/msgpack_json.nim tools/fair_play_audit.nim; do
     if [[ -f "$src" && "$src" -nt tools/army_host ]]; then
       need_army=1
       break
@@ -58,8 +58,8 @@ else
   done
 fi
 if [[ "$need_army" == "1" ]]; then
-  echo "[traverse-pol] building army_host…"
-  nim c --hints:off -o:tools/army_host tools/army_host.nim
+  echo "[traverse-pol] building army_host (threads for debug admin)…"
+  nim c --hints:off --threads:on -o:tools/army_host tools/army_host.nim
 else
   echo "[traverse-pol] army_host up to date — skip rebuild"
 fi
@@ -82,8 +82,20 @@ stop_env_host() {
   fi
 }
 
+pack_replay() {
+  # Official game.server only writes replay.json.z on full episode finish.
+  # We exit army_host early then tear down — pack captures offline so
+  # make traverse-replay opens *this* run, not a stale scored episode.
+  if [[ "${TRAVERSE_POL_PACK_REPLAY:-1}" == "1" ]]; then
+    echo "[traverse-pol] packing replay from captures…"
+    "$ROOT/tools/pack_traverse_replay.sh" || echo "[traverse-pol] pack replay failed (non-fatal)" >&2
+  fi
+}
+
 cleanup_all() {
   stop_env_host
+  # Pack while the unit still exists (captures already on host bind mounts).
+  pack_replay
   if [[ "$CLEANUP" == "1" ]]; then
     echo "[traverse-pol] cleanup traverse backend…"
     (cd "$UPSTREAM" && uv run python -m player.launch.native_support cleanup --league=traverse) || true
@@ -165,6 +177,9 @@ if awk "BEGIN{exit !($GOAL_RADIUS > 0)}"; then
 fi
 
 echo "[traverse-pol] army_host mode=traverse ws://$TRAVERSE_POL_HOST:$TRAVERSE_POL_PORT/env slot=$TRAVERSE_POL_SLOT"
+if [[ -n "${ARMY_DEBUG_PORT:-}" && "${ARMY_DEBUG_PORT}" != "0" ]]; then
+  echo "[traverse-pol] debug admin http://127.0.0.1:${ARMY_DEBUG_PORT}/  (ARMY_DEBUG_PORT)"
+fi
 cd "$ROOT"
 set +e
 ./tools/army_host \
@@ -185,6 +200,8 @@ set +e
   "${GOAL_ARGS[@]}" \
   --no-audit \
   --verbose \
+  ${ARMY_DEBUG_PORT:+--debug-port="$ARMY_DEBUG_PORT"} \
+  ${ARMY_DEBUG_TOKEN:+--debug-token="$ARMY_DEBUG_TOKEN"} \
   >"$LOG" 2>&1
 rc=$?
 set -e

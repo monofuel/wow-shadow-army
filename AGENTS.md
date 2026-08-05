@@ -135,6 +135,14 @@ Our tools need to be fast and robust. we only have a week for each coworld compe
 - a dashboard is for buttons, metrics, and dashboard like stuff
 - a dashboard is NOT documentation, a tutorial, or a conversation. DO NOT include instructions, comments, implementation details, or explanations on a dashboard unless directly requested. 
 
+- the system dashboard should be as automated as possible. don't make the user do tons of work, they want a dashboard that works at a glance.
+  - things should auto refresh
+  - NEVER expect the user to run one-off bash scripts or make targets to refresh data, that is stupid.
+  - AVOID 'refresh' buttons unless the user asks for it (eg: if data is very slow or heavy to fetch)
+
+- dashboards need to give useful data at a glance to the user. they are juggling dozens of tasks, they don't need to manually fiddle with stupid refresh tools to get things lined up.
+  - presenting stale data to the user and lieing to them that it's fresh is BAD.
+
 ## The System service (dashboard) — restart after changes
 
 The System (dashboard + MCP, `system/system_server.nim`) runs as the systemd

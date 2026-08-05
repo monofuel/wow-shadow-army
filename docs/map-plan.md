@@ -1,9 +1,8 @@
 # World map browser + waypoint tool — plan
 
-Status: **phase 1 done** (World → continent → zone drill + zoom out). Goal:
-a Nim-headed map visualization tool in this repo that approximates a coworker
-tool — hierarchical vanilla world-map art with zoom levels, full
-(non-fog-of-war) zone detail on continents, and click-to-draw waypoints.
+Status: **phase 3d zone view in** — World → continent → zone 2D → bird's-eye
+3D terrain (`map_browser_3d` / fork `runMapViewer`). Goal: hierarchical
+vanilla world-map art, full zone reveal, 3D bird's-eye, then waypoints.
 
 Terms: `docs/terms.md`. Client imports come from **the fork**
 (`../coworld-vanilla-wow-fork`, on `main`) — this tool builds on client
@@ -51,26 +50,35 @@ every compile/run step.
 - [x] Exit for zone drill: zone map shows full labels/terrain (Teldrassil/
       Durotar verified with overlayCount=11)
 
-### Phase 3 — waypoints
+### Phase 3 — 3D bird's-eye zone view
+
+- [x] Zone drill from continent opens 3D terrain over zone bounds
+- [x] Overhead scaled from WorldMapArea span (bird's-eye)
+- [x] Free camera: WASD / mouse / scroll (stock map viewer)
+- [x] Esc/Q closes 3D and returns to 2D; Enter/Space/3 re-opens from zone 2D
+- [x] Entry: `src/tools/map_browser_3d.nim` + `src/map_browser/view3d.nim`
+- [ ] Optional: in-process 3D (no child process) for smoother window flow
+
+### Phase 4 — waypoints
 
 - [ ] Click → world coords (`worldMapSurfaceLocation`)
 - [ ] Draw points / polyline (`projectWorldMapPoint`)
 - [ ] Select / delete waypoint
 - [ ] Exit: placement feels correct on a known zone (e.g. Durotar)
 
-### Phase 4 — I/O
+### Phase 5 — I/O
 
 - [ ] JSON schema for a route (`map_id`, `x`, `y`, optional `z`)
 - [ ] Save / load file (CLI path or `local_data/waypoints/`)
 - [ ] Round-trip test (no network, no sleeps)
 - [ ] Exit: reload restores the same route
 
-### Phase 5 — polish (optional)
+### Phase 6 — polish (optional)
 
-- [ ] Zone / area hover labels
-- [ ] Pan within surface
+- [x] Breadcrumbs + thin hover outline
+- [ ] Pan within 2D surface
 - [ ] Continuous zoom / LOD only if discrete drill is not enough
-- [ ] Makefile target: `make map-browser` → `nix develop --command nim r …`
+- [x] Makefile: `map-browser`, `map-browser-once`, `map-browser-3d`
 
 ### Hard rules (do not skip)
 

@@ -11,5 +11,7 @@ export TRAVERSE_POL_GOAL_RADIUS="${TRAVERSE_POL_GOAL_RADIUS:-50}"
 export TRAVERSE_POL_GOAL_X="${TRAVERSE_POL_GOAL_X:--6784.5}"
 export TRAVERSE_POL_GOAL_Y="${TRAVERSE_POL_GOAL_Y:--4833.9}"
 export TRAVERSE_POL_LOG="${TRAVERSE_POL_LOG:-$ROOT/local_data/brain-logs/traverse-pol.log}"
+# Local debug admin (HTTP+WS) — see docs/traverse/army-debug.md
+export ARMY_DEBUG_PORT="${ARMY_DEBUG_PORT:-7788}"
 cd "$ROOT"
 exec make traverse-pol

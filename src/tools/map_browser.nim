@@ -1,14 +1,17 @@
-## Map browser: stock World map surfaces with discrete drill
-## (World → continent → zone). Phase 0+1.
+## Map browser: World → continent → zone (2D) → bird's-eye 3D terrain.
 ##
 ##   nix develop --command nim r src/tools/map_browser.nim
 ##   make map-browser
+##
+## Zone drill opens a 3D bird's-eye view (map_browser_3d). Esc/Q closes 3D
+## and returns here. Enter/Space on a zone 2D map re-opens 3D.
 ##
 ## Optional:
 ##   MAP_BROWSER_WORLD_MAP_DIR=/path/to/worldmap_or_surface
 ##   MAP_BROWSER_ZMP_DIR=/path/to/zmp_folder
 ##   MAP_BROWSER_ONCE=1          # compose current surface PNG and exit
 ##   MAP_BROWSER_OUT=local_data/map_browser_world.png
+##   MAP_BROWSER_NO_3D=1         # skip auto 3D on zone drill
 ##   VANILLA_WOW_EXTRACTED_DATA_DIR=…/vmangos-5875-data
 
 import
@@ -16,7 +19,7 @@ import
   chroma, pixie, silky, vmath,
   environment/client/world_catalogs,
   environment/client/world_catalogs/model,
-  map_browser/[assets, surface]
+  map_browser/[assets, surface, view3d]
 
 const
   WindowTitle = "map browser"
@@ -34,6 +37,56 @@ type
     packed: Table[string, bool]
     mapLayout: tuple[pos, size: Vec2]
     statusLine: string
+
+proc auto3dEnabled(): bool =
+  getEnv("MAP_BROWSER_NO_3D").strip() notin ["1", "true", "yes"]
+
+proc launchZone3d*(focus: BirdseyeFocus) =
+  ## Blocks in a child map_browser_3d process (fork runMapViewer).
+  discard ensureForkPlayerAssets()
+  # Child inherits env; fill dead defaults so MPQ/extract paths resolve.
+  if getEnv("VANILLA_WOW_CLIENT_DATA_DIR").strip().len == 0:
+    let client = resolveClientDataDir()
+    if client.len > 0:
+      putEnv("VANILLA_WOW_CLIENT_DATA_DIR", client)
+  if getEnv("VANILLA_WOW_EXTRACTED_DATA_DIR").strip().len == 0:
+    let extracted =
+      siblingCoworld("coworld-vanilla-wow") / "local_data" / "vmangos-5875-data"
+    if dirExists(extracted):
+      putEnv("VANILLA_WOW_EXTRACTED_DATA_DIR", extracted)
+  let
+    root = repoRoot()
+    tool = root / "src" / "tools" / "map_browser_3d.nim"
+  var args = @[
+    "develop", "--command", "nim", "r", "--hints:off", tool, "--"
+  ]
+  args.add focus.birdseyeCliArgs()
+  echo "map_browser: 3D bird's-eye ", focus.label,
+    " map=", focus.mapId,
+    " @(", focus.x, ", ", focus.y, ", ", focus.z, ")",
+    " overhead=", focus.overhead
+  echo "map_browser: CLIENT_DATA=", getEnv("VANILLA_WOW_CLIENT_DATA_DIR")
+  echo "map_browser: EXTRACTED=", getEnv("VANILLA_WOW_EXTRACTED_DATA_DIR")
+  let p = startProcess(
+    command = "nix",
+    args = args,
+    workingDir = root,
+    options = {poParentStreams, poUsePath}
+  )
+  let code = p.waitForExit()
+  if code != 0:
+    echo "map_browser: 3D viewer exited with code ", code
+  p.close()
+
+proc openZone3d(b: var Browser; state: SurfaceState) =
+  if state.level != MapLevelZone or not state.surface.found:
+    return
+  let focus = state.birdseyeFocus()
+  if focus.overhead < 1.0'f32:
+    echo "map_browser: no 3D focus for ", state.label
+    return
+  b.statusLine = "3D: " & focus.label & "  ·  Esc/Q returns"
+  launchZone3d(focus)
 
 proc fitRect(content, viewport: Vec2): tuple[pos, size: Vec2] =
   if content.x <= 0 or content.y <= 0 or viewport.x <= 0 or viewport.y <= 0:
@@ -175,7 +228,7 @@ proc drawHeader(
     vec2(pad + 8, pad + 5),
     HeaderText
   )
-  let hint = "click drill  ·  Esc / right-click zoom out"
+  let hint = "click drill  ·  zone→3D  ·  Esc zoom out"
   let hintSize = sk.getTextSize(sk.textStyle, hint)
   discard sk.drawText(
     sk.textStyle,
@@ -227,6 +280,10 @@ proc main() =
         echo "map_browser: sample hover found=", hover.found,
           " label=", hover.label,
           " rect=", hover.highlightUvPos, " ", hover.highlightUvSize
+        let focus = sampleZone.birdseyeFocus()
+        echo "map_browser: 3D focus map=", focus.mapId,
+          " pos=(", focus.x, ", ", focus.y, ", ", focus.z, ")",
+          " overhead=", focus.overhead, " label=", focus.label
     return
 
   let fontPath = resolveUiFont()
@@ -251,6 +308,12 @@ proc main() =
     if window.buttonPressed[KeyEscape] or window.buttonPressed[MouseRight] or
         window.buttonPressed[KeyBackspace]:
       b.setSurface(b.catalog.zoomOut(b.state))
+
+    # Re-enter bird's-eye 3D while already on a zone 2D map.
+    if b.state.level == MapLevelZone and
+        (window.buttonPressed[KeyEnter] or window.buttonPressed[KeySpace] or
+          window.buttonPressed[Key3]):
+      b.openZone3d(b.state)
 
     sk.beginUi(window, window.size)
     sk.clearScreen(rgbx(12, 14, 20, 255))
@@ -280,19 +343,25 @@ proc main() =
         sk.drawHoverHint(b.mapLayout.pos, b.mapLayout.size, hover)
 
     if window.buttonPressed[MouseLeft] and hit.ok:
-      b.setSurface(b.catalog.drillIn(b.state, hit.uv))
+      let next = b.catalog.drillIn(b.state, hit.uv)
+      b.setSurface(next)
+      if next.level == MapLevelZone and auto3dEnabled():
+        # Pack 2D first so returning from 3D shows the zone art immediately.
+        b.openZone3d(next)
 
     let crumbs = b.catalog.breadcrumb(b.state)
     let hoverName =
       if hover.found and hover.label.len > 0 and
           b.state.level != MapLevelZone:
         hover.label
+      elif b.state.level == MapLevelZone:
+        "Enter/Space/3 · bird's-eye 3D"
       else:
         ""
     sk.drawHeader(pad, crumbs, hoverName)
 
     window.title = WindowTitle & " — " & crumbs
-    if hoverName.len > 0:
+    if hoverName.len > 0 and b.state.level != MapLevelZone:
       window.title = window.title & " / " & hoverName
 
     sk.endUi()

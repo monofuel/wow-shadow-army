@@ -46,7 +46,7 @@ COMPOSE_FILE := infra/compose.vmangos.yml
 ACCOUNT_USER := monofuel
 ACCOUNT_PASS := password
 
-.PHONY: test test-lua test-nim system pin-check start-server stop-server server-logging logs account soap-account play play-classic play-classic-netlog play-xr traverse traverse-pol traverse-desert traverse-field traverse-replay escort escort-army grind quest-data warlock-account warlock-bot botwarrior-bot tusk-account tusk-bot beru-account beru-bot party-army navmesh-helper navmesh-status map-browser map-browser-once
+.PHONY: test test-lua test-nim system pin-check start-server stop-server server-logging logs account soap-account play play-classic play-classic-netlog play-xr traverse traverse-pol traverse-desert traverse-field traverse-replay traverse-pack-replay army-debug-status army-debug-reload army-debug-hold army-debug-resume escort escort-army grind quest-data warlock-account warlock-bot botwarrior-bot tusk-account tusk-bot beru-account beru-bot party-army navmesh-helper navmesh-status map-browser map-browser-once map-browser-3d
 
 # Unit tier: Lua tools + Nim host/system tests only (v2 DoD: no Python required
 # for bot correctness). If nim is missing, test-nim-soft skips rather than
@@ -57,10 +57,10 @@ test: test-lua test-nim-soft test-smoke
 
 # Every Nim entrypoint/module must at least compile (`nim check`), even where
 # no unit suite imports it yet (army_host, msgpack_json).
-NIM_CHECK_FILES = system/system_server.nim tools/army_host.nim \
+NIM_CHECK_FILES = system/system_server.nim tools/army_host.nim tools/army_debug.nim \
 	tools/fair_play_audit.nim tools/party_promote.nim tools/msgpack_json.nim \
 	tools/env_transport.nim tools/env_smoke.nim \
-	src/tools/map_browser.nim
+	src/tools/map_browser.nim src/tools/map_browser_3d.nim
 
 .PHONY: test-smoke test-smoke-lua test-smoke-nim test-smoke-nim-soft
 test-smoke: test-smoke-lua test-smoke-nim-soft
@@ -136,17 +136,37 @@ system:
 		SYSTEM_ARMY_DIR="$${SYSTEM_ARMY_DIR:-$$(pwd)}" \
 		nix develop --command nim r system/system_server.nim
 
-# Map browser (docs/map-plan.md). World → continent → zone drill (phase 1).
+# Classic client Data for 3D ADT extract / MPQ (override if needed).
+CLASSIC_CLIENT := $(abspath ../wow-classic-data/Coworld-WoW-Classic/client)
+ifeq ($(wildcard $(CLASSIC_CLIENT)/Data),)
+  CLASSIC_CLIENT := $(abspath ../coworld-vanilla-wow/local_data/coworld-bundle/Coworld-WoW-Classic/client)
+endif
+ifeq ($(wildcard $(CLASSIC_CLIENT)/Data),)
+  CLASSIC_CLIENT := $(abspath local_classic/client)
+endif
+
+# Map browser (docs/map-plan.md). World → continent → zone 2D → bird's-eye 3D.
 # Assets: prepared BLPs under coworld-vanilla-wow player/assets (or MAP_BROWSER_WORLD_MAP_DIR).
 # DBC/ZMP: VANILLA_WOW_EXTRACTED_DATA_DIR + player/assets client_assets worldmap *.zmp.
+# 3D: fork player/tmp/client_assets must see prepared ADTs (auto-symlinked to
+# upstream's tmp/client_assets → coworld-local-data player-cache).
 map-browser:
 	VANILLA_WOW_EXTRACTED_DATA_DIR="$(VANILLA_WOW_EXTRACTED_DATA_DIR)" \
+	VANILLA_WOW_CLIENT_DATA_DIR="$${VANILLA_WOW_CLIENT_DATA_DIR:-$(CLASSIC_CLIENT)}" \
 		nix develop --command nim r src/tools/map_browser.nim
 
-# Headless smoke: compose World PNG + sample catalog drill (no GUI).
+# Headless smoke: compose World PNG + sample catalog drill (no GUI/3D).
 map-browser-once:
 	VANILLA_WOW_EXTRACTED_DATA_DIR="$(VANILLA_WOW_EXTRACTED_DATA_DIR)" \
-		MAP_BROWSER_ONCE=1 nix develop --command nim r src/tools/map_browser.nim
+		MAP_BROWSER_ONCE=1 MAP_BROWSER_NO_3D=1 \
+		nix develop --command nim r src/tools/map_browser.nim
+
+# Direct 3D bird's-eye (args after --): --map:1 --x:… --y:… --z:… --overhead:… --label:…
+map-browser-3d:
+	VANILLA_WOW_EXTRACTED_DATA_DIR="$(VANILLA_WOW_EXTRACTED_DATA_DIR)" \
+	VANILLA_WOW_CLIENT_DATA_DIR="$${VANILLA_WOW_CLIENT_DATA_DIR:-$(CLASSIC_CLIENT)}" \
+		nix develop --command nim r src/tools/map_browser_3d.nim -- \
+		--map:1 --x:-2372 --y:-1940 --z:96 --overhead:1400 --label:Barrens
 
 # Pin-drift only: HEAD of ../coworld-vanilla-wow must match upstream.lock.
 # Pure shell — no Python. Format of upstream.lock: "<name> <sha>".
@@ -231,9 +251,22 @@ env-host-status:
 	@tools/env_host.sh status
 
 # Nim army host (no Python decide loop). Binary: tools/army_host
-.PHONY: army-host army-host-build escort-army-nim grind-army-nim escort escort-army
+# --threads:on required for local debug admin (mummy HTTP+WS).
+.PHONY: army-host army-host-build escort-army-nim grind-army-nim escort escort-army \
+	army-debug-status army-debug-reload army-debug-hold army-debug-resume
 army-host-build:
-	@nim c --hints:off -o:tools/army_host tools/army_host.nim
+	@nim c --hints:off --threads:on -o:tools/army_host tools/army_host.nim
+
+# Local army_host debug admin (docs/traverse/army-debug.md).
+ARMY_DEBUG_PORT ?= 7788
+army-debug-status:
+	@curl -sS "http://127.0.0.1:$(ARMY_DEBUG_PORT)/status" | python3 -m json.tool
+army-debug-reload:
+	@curl -sS -X POST "http://127.0.0.1:$(ARMY_DEBUG_PORT)/lua/reload" | python3 -m json.tool
+army-debug-hold:
+	@curl -sS -X POST "http://127.0.0.1:$(ARMY_DEBUG_PORT)/hold" | python3 -m json.tool
+army-debug-resume:
+	@curl -sS -X POST "http://127.0.0.1:$(ARMY_DEBUG_PORT)/resume" | python3 -m json.tool
 
 army-host: army-host-build
 	@./tools/army_host --slot=$(SLOT) $(SEAT_CREDS) --tool=$(or $(TOOL),escort_leader) --leader=$(or $(ESCORT_LEADER),Murist) \
@@ -665,10 +698,14 @@ traverse-field:
 	@tools/pull_traverse_field.sh
 
 # Open the latest local traverse league replay (headed native viewer).
-# Finds newest ~/.coworld/.../leagues/traverse/run/replay.json.z
+# Finds newest run/replay.json.z or run/history/replay-*.json.z (from pack).
 # Override: TRAVERSE_REPLAY=/path TRAVERSE_REPLAY_WATCH=Northbound
 traverse-replay:
 	@tools/traverse_replay.sh
+
+# Pack latest traverse godview/worldwire → run/replay.json.z (also auto on pol EXIT).
+traverse-pack-replay:
+	@tools/pack_traverse_replay.sh
 
 # Lua traverse proof-of-life (docs/traverse/traverse-2026-08-04.md): short local smoke.
 # Starts upstream local --league=traverse backend, attaches army_host

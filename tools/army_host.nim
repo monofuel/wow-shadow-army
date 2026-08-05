@@ -17,7 +17,7 @@ import
     json, math, options, os, osproc, parseopt, random, strformat, strutils,
     times, uri
   ],
-  env_transport, msgpack_json, fair_play_audit
+  env_transport, msgpack_json, fair_play_audit, army_debug
 
 const
   EnvProtocol = "vanilla_wow.environment.v1"
@@ -64,6 +64,8 @@ type
     goalX: float
     goalY: float
     goalRadius: float       ## 0 = disabled
+    debugPort: int          ## 0 = off; local admin HTTP+WS (127.0.0.1)
+    debugToken: string
 
 # ---------- JSON helpers ----------
 
@@ -750,7 +752,9 @@ proc parseConfig(): HostConfig =
     polRequireMove: false,
     goalX: 0.0,
     goalY: 0.0,
-    goalRadius: 0.0
+    goalRadius: 0.0,
+    debugPort: 0,
+    debugToken: ""
   )
   # Hosted tournament injects this before CLI flags (CLI can still override).
   result.applyCoworldPlayerWsUrl()
@@ -758,6 +762,14 @@ proc parseConfig(): HostConfig =
     let modeEnv = getEnv("ARMY_MODE").strip()
     if modeEnv.len > 0:
       result.mode = modeEnv
+  # Local debug admin (side quest). Env first; CLI can override.
+  let debugPortEnv = getEnv("ARMY_DEBUG_PORT").strip()
+  if debugPortEnv.len > 0:
+    try:
+      result.debugPort = parseInt(debugPortEnv)
+    except CatchableError:
+      discard
+  result.debugToken = getEnv("ARMY_DEBUG_TOKEN").strip()
   for kind, key, val in getopt():
     case kind
     of cmdLongOption, cmdShortOption:
@@ -792,6 +804,8 @@ proc parseConfig(): HostConfig =
       of "pol-goal-x": result.goalX = parseFloat(val)
       of "pol-goal-y": result.goalY = parseFloat(val)
       of "pol-goal-radius": result.goalRadius = parseFloat(val)
+      of "debug-port": result.debugPort = parseInt(val)
+      of "debug-token": result.debugToken = val
       # Dead goal-era flags: accepted and ignored so old Makefiles still parse.
       of "goal-id", "leader-slot", "external": discard
       else: discard
@@ -858,6 +872,11 @@ proc main() =
     echo &"[army_host] pol-goal=({cfg.goalX.formatFloat(ffDecimal, 1)}," &
       &"{cfg.goalY.formatFloat(ffDecimal, 1)}) radius=" &
       cfg.goalRadius.formatFloat(ffDecimal, 1)
+
+  configureMeta(
+    cfg.mode, cfg.tool, cfg.character, transport, cfg.slot, getCurrentDir())
+  if cfg.debugPort > 0:
+    discard startDebugServer(cfg.debugPort, cfg.debugToken)
 
   let auditTool =
     if cfg.mode.len > 0: "mode:" & cfg.mode
@@ -1028,29 +1047,72 @@ proc main() =
 
         let (proj, guids) = projectV2(node, cfg.leader)
         var intentDesc = "hold"
+        var lastIntentNode = newJObject()
         try:
-          let intent = runDecide(cfg, proj)
-          if not cfg.quiet:
-            say "[policy] intent " & $intent
-          intentDesc = jstr(jget(intent, "kind"), "hold") & ":" &
-            jstr(jget(intent, "reason"))
-          let action = mapIntentV2(intent, guids)
-          # ONE pending action at a time — skip submit while prior is pending.
-          if action.isSome and not pendingAction:
-            inc reqId
-            let payload = actionSubmissionPayload(action.get, frameId, helloSlot)
-            client.sendActionSubmission(reqId, payload)
-            pendingAction = true
-            pendingSince = epochTime()
-            lastSubmittedFrameId = frameId
-            lastSubmittedWasMove = jstr(jget(action.get, "kind")) == "move"
-            recordSelect(
-              audit, name, jstr(jget(action.get, "kind")), intent, true
-            )
-          elif action.isSome and pendingAction and not cfg.quiet:
-            say &"[army_host] skip submit (pending) frame={frameId}"
+          if isHeld():
+            intentDesc = "hold:admin"
+            lastIntentNode = %*{"kind": "hold", "reason": "admin"}
+          else:
+            let intent = runDecide(cfg, proj)
+            lastIntentNode = intent
+            if not cfg.quiet:
+              say "[policy] intent " & $intent
+            pushLog(llInfo, "policy", "intent " & $intent)
+            intentDesc = jstr(jget(intent, "kind"), "hold") & ":" &
+              jstr(jget(intent, "reason"))
+            let action = mapIntentV2(intent, guids)
+            # ONE pending action at a time — skip submit while prior is pending.
+            if action.isSome and not pendingAction:
+              inc reqId
+              let payload = actionSubmissionPayload(action.get, frameId, helloSlot)
+              client.sendActionSubmission(reqId, payload)
+              pendingAction = true
+              pendingSince = epochTime()
+              lastSubmittedFrameId = frameId
+              lastSubmittedWasMove = jstr(jget(action.get, "kind")) == "move"
+              recordSelect(
+                audit, name, jstr(jget(action.get, "kind")), intent, true
+              )
+            elif action.isSome and pendingAction and not cfg.quiet:
+              say &"[army_host] skip submit (pending) frame={frameId}"
         except CatchableError as e:
           echo "[army_host] decide FAIL: ", e.msg
+          pushLog(llError, "host", "decide FAIL: " & e.msg)
+
+        # Live admin snapshot (HTTP /status + WS stream).
+        let su = jget(proj, "self_unit")
+        let dbgSelf = DebugSelf(
+          x: jnum(jget(su, "x")),
+          y: jnum(jget(su, "y")),
+          z: jnum(jget(su, "z")),
+          mapId: jint(jget(su, "map_id")),
+          hpPct: jnum(jget(proj, "combat", "health_pct"), 100.0),
+          formId: jint(jget(su, "shapeshift_form_id")),
+          formSpellId: jint(jget(su, "shapeshift_form_spell_id")),
+          isSwimming: jbool(jget(su, "is_swimming")),
+          hasPos: su != nil and jget(su, "x") != nil
+        )
+        var dbgIntent = DebugIntent(
+          kind: jstr(jget(lastIntentNode, "kind"), "hold"),
+          reason: jstr(jget(lastIntentNode, "reason")),
+          spell: jint(jget(lastIntentNode, "spell")),
+          x: jnum(jget(lastIntentNode, "x")),
+          y: jnum(jget(lastIntentNode, "y")),
+          z: jnum(jget(lastIntentNode, "z")),
+          hasXy: jget(lastIntentNode, "x") != nil
+        )
+        var gDist = 0.0
+        if cfg.goalRadius > 0 and haveLastPos:
+          let gdx = px - cfg.goalX
+          let gdy = py - cfg.goalY
+          gDist = sqrt(gdx * gdx + gdy * gdy)
+        updateLoop(
+          dbgSelf, dbgIntent, pathYards, acceptedMoves,
+          cfg.goalX, cfg.goalY, cfg.goalRadius, gDist,
+          cfg.goalRadius > 0, frameId, pendingAction, st)
+        updateSession(true)
+        if cfg.debugPort > 0:
+          broadcastStatusIfNeeded()
 
         if cfg.polMinYards > 0 and pathYards >= cfg.polMinYards:
           let moveOk = (not cfg.polRequireMove) or acceptedMoves > 0

@@ -32,10 +32,13 @@ find_latest_replay() {
   if [[ ! -d "$root" ]]; then
     return 1
   fi
+  # Official path + harness history (pack_traverse_replay writes both).
   # Portable: no GNU -printf required.
-  find "$root" -type f -path '*/leagues/traverse/run/replay.json.z' 2>/dev/null \
-    | while IFS= read -r f; do
-        # mtime epoch + path
+  {
+    find "$root" -type f -path '*/leagues/traverse/run/replay.json.z' 2>/dev/null
+    find "$root" -type f -path '*/leagues/traverse/run/history/replay-*.json.z' 2>/dev/null
+  } | while IFS= read -r f; do
+        [[ -n "$f" ]] || continue
         printf '%s\t%s\n' "$(stat -c '%Y' "$f" 2>/dev/null || stat -f '%m' "$f")" "$f"
       done \
     | sort -nr \
