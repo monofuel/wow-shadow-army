@@ -1,0 +1,15 @@
+.git
+local_data
+local_classic
+system
+docs
+kb
+sessions
+captures
+breadcrumbs
+addons
+*.log
+.nimcache
+nimcache
+**/.nimcache
+**/nimcache

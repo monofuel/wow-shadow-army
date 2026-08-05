@@ -15,7 +15,7 @@
 import
   std/[
     json, math, options, os, osproc, parseopt, random, strformat, strutils,
-    times
+    times, uri
   ],
   env_transport, msgpack_json, fair_play_audit
 
@@ -50,6 +50,8 @@ type
     host: string
     port: int               ## 0 = mode default
     direct: bool            ## true = TCP env host; false = WS relay
+    useSsl: bool            ## wss:// (hosted Softmax)
+    wsPath: string          ## WS path; hosted: /env derived from /player
     account: string
     password: string
     character: string
@@ -658,6 +660,63 @@ print(enc(intent))
 
 # ---------- Config / connect ----------
 
+proc applyCoworldPlayerWsUrl(cfg: var HostConfig) =
+  ## Hosted handoff: COWORLD_PLAYER_WS_URL → WS /env (manifest protocol text).
+  ## Replace `/player` with `/env`; keep origin + slot/token query.
+  let raw = getEnv("COWORLD_PLAYER_WS_URL").strip()
+  if raw.len == 0:
+    return
+  let u = parseUri(raw)
+  if u.scheme != "ws" and u.scheme != "wss":
+    echo "[army_host] ignore COWORLD_PLAYER_WS_URL (need ws/wss): ", raw
+    return
+  cfg.direct = false
+  cfg.useSsl = u.scheme == "wss"
+  cfg.host = u.hostname
+  if u.port.len > 0:
+    cfg.port = parseInt(u.port)
+  elif cfg.useSsl:
+    cfg.port = 443
+  else:
+    cfg.port = 80
+  var path = if u.path.len > 0: u.path else: "/player"
+  if path.endsWith("/player"):
+    path = path[0 ..< path.len - 7] & "/env"
+  elif path == "player" or path == "/player":
+    path = "/env"
+  else:
+    path = "/env"
+  cfg.wsPath = path
+  for pair in u.query.split('&'):
+    if pair.len == 0:
+      continue
+    let eq = pair.find('=')
+    if eq < 0:
+      continue
+    let k = pair[0 ..< eq]
+    let v = decodeUrl(pair[eq + 1 .. ^1])
+    case k
+    of "slot":
+      try: cfg.slot = parseInt(v)
+      except CatchableError: discard
+    of "token":
+      cfg.token = v
+    else: discard
+  if cfg.mode.len == 0:
+    let modeEnv = getEnv("ARMY_MODE").strip()
+    if modeEnv.len > 0:
+      cfg.mode = modeEnv
+  let scheme = if cfg.useSsl: "https" else: "http"
+  let originPort =
+    if (cfg.useSsl and cfg.port == 443) or (not cfg.useSsl and cfg.port == 80):
+      ""
+    else:
+      ":" & $cfg.port
+  cfg.gameUrl = scheme & "://" & cfg.host & originPort
+  echo &"[army_host] COWORLD_PLAYER_WS_URL → " &
+    (if cfg.useSsl: "wss" else: "ws") & "://" & cfg.host & ":" & $cfg.port &
+    cfg.wsPath & "?slot=" & $cfg.slot
+
 proc parseConfig(): HostConfig =
   result = HostConfig(
     slot: 2,
@@ -674,6 +733,8 @@ proc parseConfig(): HostConfig =
     host: DefaultHost,
     port: 0,
     direct: true,
+    useSsl: false,
+    wsPath: "/env",
     account: DefaultAccount,
     password: DefaultPassword,
     character: "",
@@ -683,6 +744,12 @@ proc parseConfig(): HostConfig =
     polMinYards: 0.0,
     polRequireMove: false
   )
+  # Hosted tournament injects this before CLI flags (CLI can still override).
+  result.applyCoworldPlayerWsUrl()
+  if result.mode.len == 0:
+    let modeEnv = getEnv("ARMY_MODE").strip()
+    if modeEnv.len > 0:
+      result.mode = modeEnv
   for kind, key, val in getopt():
     case kind
     of cmdLongOption, cmdShortOption:
@@ -704,6 +771,8 @@ proc parseConfig(): HostConfig =
       of "port", "p": result.port = parseInt(val)
       of "direct": result.direct = true
       of "ws": result.direct = false
+      of "ssl", "wss": result.useSsl = true
+      of "ws-path": result.wsPath = val
       of "account": result.account = val
       of "password": result.password = val
       of "character": result.character = val
@@ -752,7 +821,9 @@ proc connectHost(cfg: HostConfig): EnvClient =
     result = connectEnvDirect(cfg.host, port)
     result.sendAttach(attachPayload(cfg))
   else:
-    result = connectEnv(cfg.host, port, cfg.slot, cfg.token)
+    result = connectEnv(
+      cfg.host, port, cfg.slot, cfg.token, cfg.wsPath, cfg.useSsl
+    )
 
 proc say(msg: string) =
   echo msg

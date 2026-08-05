@@ -487,12 +487,21 @@ proc connectEnv*(
   port: int;
   slot: int;
   token: string;
-  path = "/env"
+  path = "/env";
+  useSsl = false
 ): EnvClient =
-  ## TCP connect + RFC 6455 client handshake to `ws://host:port/path?slot&token`.
+  ## TCP (or TLS) connect + RFC 6455 client handshake to `ws[s]://host:port/path`.
+  ## Hosted Softmax injects `COWORLD_PLAYER_WS_URL`; rewrite `/player` → `/env`.
   randomize()
   result = EnvClient(host: host, port: Port(port), closed: false)
   result.sock = newSocket(buffered = false)
+  when defined(ssl):
+    if useSsl:
+      let ctx = newContext(verifyMode = CVerifyPeer)
+      ctx.wrapSocket(result.sock)
+  else:
+    if useSsl:
+      raiseTransport("wss requested but binary was not built with -d:ssl")
   result.sock.connect(host, Port(port))
   let key = randomSecWebSocketKey()
   let q = "slot=" & encodeUrl($slot) & "&token=" & encodeUrl(token)
