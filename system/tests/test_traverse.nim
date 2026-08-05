@@ -299,3 +299,20 @@ suite "traverse docker port parse":
     let t = logFileTail(tmp, 3)
     check "c" in t and "d" in t and "e" in t
     removeFile(tmp)
+
+suite "traverse live capture probe":
+  test "latestGodviewHasCharacter finds Northbound and ignores empty tail":
+    let dir = getTempDir() / "traverse-godview-probe"
+    createDir(dir)
+    let path = dir / "godview_test.jsonl"
+    writeFile(
+      path,
+      """{"t":1,"map":1,"instance":0,"players":[{"name":"Northbound","raw_guid":1000000}]}
+{"t":2,"map":1,"instance":0,"players":[]}
+"""
+    )
+    check latestGodviewHasCharacter(dir, "Northbound", 3600.0)
+    check not latestGodviewHasCharacter(dir, "SomeoneElse", 3600.0)
+    check not latestGodviewHasCharacter(dir, "Northbound", 0.0)
+    removeFile(path)
+    removeDir(dir)

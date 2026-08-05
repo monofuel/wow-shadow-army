@@ -85,6 +85,13 @@ const
   TraversePolPidRel* = "local_data/brain-logs/traverse-pol.pid"
   TraverseWatchLogRel* = "local_data/brain-logs/traverse-watch.log"
   TraverseWatchPidRel* = "local_data/brain-logs/traverse-watch.pid"
+  ## Observer needs a live army_host session (PoL exits after 50 yd).
+  ## Long run: full episode wall clock, no pol-min-yards early exit.
+  TraverseWatchAgentMaxSeconds* = TraverseEpisodeLimitSeconds
+  ## Godview must show Northbound within this age for follow to work.
+  TraverseWatchCaptureMaxAgeSec* = 20.0
+  ## How long Start observer waits for Northbound to appear in godview.
+  TraverseWatchCaptureWaitMs* = 90_000
   ## Tail window when reading the latest godview shard (live pos, not full history).
   GodviewTailBytes* = 256 * 1024
   ## VMaNGOS CHARACTER_FLAG_GHOST — set while spirit-running / unreleased corpse.
@@ -2147,6 +2154,19 @@ proc stopTraversePol*(): TraverseOpsStatus =
 proc stopTraverseWatch*(): TraverseOpsStatus =
   ## TERM the watch_bots observer process tree (and leftover live-pov/viewer).
   var bits: seq[string] = @[]
+  let root = armyRoot()
+  let upstream = upstreamDir()
+  let owner = getEnv("USER", "monofuel")
+  # Official stop path releases unit record + leases when possible.
+  if fileExists(upstream / "observe" / "watch_bots.py"):
+    let stopInner =
+      &"cd {quoteShell(upstream)} && " &
+      &"uv run python observe/watch_bots.py --stop || true; " &
+      &"uv run python agents/agent_lease.py release seat --owner {quoteShell(owner)} || true; " &
+      &"uv run python agents/agent_lease.py release backend --owner {quoteShell(owner)} || true"
+    discard runShell(
+      &"bash -lc {quoteShell(nixDevelopCmd(root, stopInner))} >/dev/null 2>&1 || true")
+    bits.add("watch_bots --stop + lease release")
   let pid = readPidFile(traverseWatchPidPath())
   if pid > 0 and pidAlive(pid):
     discard runShell(&"kill -TERM -{pid} 2>/dev/null || kill {pid} 2>/dev/null || true")
@@ -2170,8 +2190,65 @@ proc stopTraverseWatch*(): TraverseOpsStatus =
   result.lastOk = true
   result.lastDetail = if bits.len > 0: bits.join("; ") else: "nothing to stop"
 
-proc startTraversePol*(): TraverseOpsStatus =
-  ## Detached `make traverse-pol` under `nix develop` (CLEANUP=0 for watch).
+proc latestGodviewHasCharacter*(
+    capturesDir, character: string; maxAgeSec: float): bool =
+  ## True when the newest godview shard was written recently and names the character.
+  if capturesDir.len == 0 or not dirExists(capturesDir):
+    return false
+  var bestPath = ""
+  var bestMtime = 0.0
+  try:
+    for kind, path in walkDir(capturesDir):
+      if kind != pcFile:
+        continue
+      let base = path.extractFilename
+      if not base.startsWith("godview_") or not base.endsWith(".jsonl"):
+        continue
+      let mt = getLastModificationTime(path).toUnixFloat()
+      if mt >= bestMtime:
+        bestMtime = mt
+        bestPath = path
+  except CatchableError:
+    return false
+  if bestPath.len == 0:
+    return false
+  let age = epochTime() - bestMtime
+  if age > maxAgeSec:
+    return false
+  let want = character.toLowerAscii()
+  try:
+    let raw = readFile(bestPath)
+    let lines = raw.strip().splitLines()
+    # Scan last frames first; empty final frame (disconnect) must not win alone.
+    var i = lines.len - 1
+    while i >= 0 and i >= lines.len - 40:
+      let line = lines[i].strip()
+      dec i
+      if line.len == 0:
+        continue
+      try:
+        let node = parseJson(line)
+        if node.kind != JObject or not node.hasKey("players"):
+          continue
+        let players = node["players"]
+        if players.kind != JArray:
+          continue
+        for p in players:
+          if p.kind != JObject or not p.hasKey("name"):
+            continue
+          if p["name"].getStr().toLowerAscii() == want:
+            return true
+      except CatchableError:
+        continue
+  except CatchableError:
+    return false
+  result = false
+
+proc startTraverseAgentSession*(
+    minYards: float; maxSeconds: int; detailPrefix: string
+): TraverseOpsStatus =
+  ## Detached `make traverse-pol` under nix develop. minYards=0 keeps army_host
+  ## alive for maxSeconds (observer needs a live Northbound session).
   result = traverseOpsStatus()
   if result.polRunning:
     result.lastOk = true
@@ -2185,8 +2262,16 @@ proc startTraversePol*(): TraverseOpsStatus =
   let logPath = traversePolLogPath()
   let pidPath = traversePolPidPath()
   createDir(parentDir(logPath))
+  try:
+    writeFile(logPath, "")
+  except CatchableError:
+    discard
+  let minYardsStr = minYards.formatFloat(ffDecimal, 1)
   let inner =
-    &"export TRAVERSE_POL_CLEANUP=0 TRAVERSE_POL_LOG={quoteShell(logPath)}; " &
+    &"export TRAVERSE_POL_CLEANUP=0 " &
+    &"TRAVERSE_POL_MIN_YARDS={minYardsStr} " &
+    &"TRAVERSE_POL_MAX_SECONDS={maxSeconds} " &
+    &"TRAVERSE_POL_LOG={quoteShell(logPath)}; " &
     &"exec make -C {quoteShell(root)} traverse-pol"
   let cmd =
     &"mkdir -p {quoteShell(parentDir(logPath))} && (" &
@@ -2197,16 +2282,75 @@ proc startTraversePol*(): TraverseOpsStatus =
   result = traverseOpsStatus()
   result.lastOk = r.ok
   result.lastDetail =
-    if r.ok: &"started (log {TraversePolLogRel})"
+    if r.ok: &"{detailPrefix} (log {TraversePolLogRel})"
     else: r.detail
+
+proc startTraversePol*(): TraverseOpsStatus =
+  ## Detached short PoL: pass at >=50 path yards (CLEANUP=0 so captures stay).
+  startTraverseAgentSession(
+    minYards = 50.0,
+    maxSeconds = 180,
+    detailPrefix = "started"
+  )
+
+proc ensureTraverseAgentForWatch*(capturesDir: string): TraverseOpsStatus =
+  ## Observer follow needs live godview for Northbound. Short PoL exits too soon;
+  ## start a full-episode army_host when nothing is producing captures.
+  result = traverseOpsStatus()
+  if latestGodviewHasCharacter(
+      capturesDir, TraverseCharacterName, TraverseWatchCaptureMaxAgeSec):
+    result.lastOk = true
+    result.lastDetail = "live capture"
+    return
+  if not result.polRunning:
+    result = startTraverseAgentSession(
+      minYards = 0.0,
+      maxSeconds = TraverseWatchAgentMaxSeconds,
+      detailPrefix = "agent started"
+    )
+    if not result.lastOk:
+      return
+  # Wait for Northbound to appear in a fresh godview shard.
+  let deadline = epochTime() + (TraverseWatchCaptureWaitMs.float / 1000.0)
+  while epochTime() < deadline:
+    if latestGodviewHasCharacter(
+        capturesDir, TraverseCharacterName, TraverseWatchCaptureMaxAgeSec):
+      result = traverseOpsStatus()
+      result.lastOk = true
+      result.lastDetail = "live capture"
+      return
+    if not traverseOpsStatus().polRunning and
+        epochTime() + 2.0 < deadline:
+      # Agent died early; one restart attempt.
+      let again = startTraverseAgentSession(
+        minYards = 0.0,
+        maxSeconds = TraverseWatchAgentMaxSeconds,
+        detailPrefix = "agent restarted"
+      )
+      if not again.lastOk:
+        result = again
+        return
+    sleep(1000)
+  result = traverseOpsStatus()
+  result.lastOk = false
+  result.lastDetail =
+    &"no live {TraverseCharacterName} capture under {capturesDir}"
+
+proc graphicalSessionEnvExports*(): string =
+  ## DISPLAY / XAUTHORITY / WAYLAND for systemd-launched GUI children.
+  let display = getEnv("DISPLAY", ":0")
+  let xauth = getEnv("XAUTHORITY", "")
+  let wayland = getEnv("WAYLAND_DISPLAY", "")
+  result = &"export DISPLAY={quoteShell(display)}; "
+  if xauth.len > 0:
+    result.add &"export XAUTHORITY={quoteShell(xauth)}; "
+  if wayland.len > 0:
+    result.add &"export WAYLAND_DISPLAY={quoteShell(wayland)}; "
 
 proc startTraverseWatch*(): TraverseOpsStatus =
   ## Detached watch_bots live POV under `nix develop` (openssl/nginx/uv in flake).
+  ## Ensures a long-running traverse agent so live-pov can follow Northbound.
   result = traverseOpsStatus()
-  if result.watchRunning:
-    result.lastOk = true
-    result.lastDetail = "already running"
-    return
   let root = armyRoot()
   let upstream = upstreamDir()
   let watchPy = upstream / "observe" / "watch_bots.py"
@@ -2230,7 +2374,22 @@ proc startTraverseWatch*(): TraverseOpsStatus =
     result.lastOk = false
     result.lastDetail = "realm/world ports unmapped"
     return
+  let existingViewer = findProcessByMarker("global-viewer")
+  let liveCapture = latestGodviewHasCharacter(
+    captures, TraverseCharacterName, TraverseWatchCaptureMaxAgeSec)
+  if result.watchRunning and existingViewer > 0 and
+      isTraverseWatchProcess(existingViewer) and liveCapture:
+    result.lastOk = true
+    result.lastDetail = "already running"
+    return
+  # Clear prior watch unit + stale seat lease. watch_bots will NOT open a
+  # window if seat.json is still held (even by the same monofuel owner).
   discard stopTraverseWatch()
+  let agent = ensureTraverseAgentForWatch(captures)
+  if not agent.lastOk:
+    result = agent
+    result.watchRunning = false
+    return
   let logPath = traverseWatchLogPath()
   let pidPath = traverseWatchPidPath()
   createDir(parentDir(logPath))
@@ -2238,14 +2397,18 @@ proc startTraverseWatch*(): TraverseOpsStatus =
     writeFile(logPath, "")
   except CatchableError:
     discard
-  let display = getEnv("DISPLAY", ":0")
-  # Inside flake shell: uv + openssl + nginx. Workdir = upstream for watch_bots.
+  let owner = getEnv("USER", "monofuel")
+  # Inside flake shell: uv + openssl + nginx. Pre-release seat so the native
+  # viewer can claim the GUI seat and actually open a window.
   let watchInner =
-    &"export DISPLAY={quoteShell(display)}; " &
+    graphicalSessionEnvExports() &
     &"export VMANGOS_CAPTURES_DIR={quoteShell(captures)}; " &
     &"cd {quoteShell(upstream)}; " &
+    &"uv run python agents/agent_lease.py release seat --owner {quoteShell(owner)} || true; " &
+    &"uv run python agents/agent_lease.py release backend --owner {quoteShell(owner)} || true; " &
     &"exec uv run python observe/watch_bots.py " &
     &"--watch {TraverseCharacterName} " &
+    &"--owner {quoteShell(owner)} " &
     &"--no-bring-up --no-provision " &
     &"--realm-host 127.0.0.1 --realm-port {realmPort} --world-port {worldPort}"
   let cmd =
@@ -2254,39 +2417,53 @@ proc startTraverseWatch*(): TraverseOpsStatus =
     &">> {quoteShell(logPath)} 2>&1 < /dev/null & " &
     &"echo $! > {quoteShell(pidPath)} )"
   let r = runShell(cmd)
-  sleep(5000)
+  sleep(8000)
   result = traverseOpsStatus()
   if not r.ok:
     result.lastOk = false
     result.lastDetail = r.detail
     return
+  let tail = logFileTail(logPath, 14)
+  # watch_bots prints the viewer command even when the seat blocks the window.
+  if "window is blocked" in tail:
+    result.watchRunning = false
+    result.lastOk = false
+    result.lastDetail = "GUI seat blocked — click Stop observer then Start again"
+    return
   let pid = readPidFile(pidPath)
   let pyPid = findProcessByMarker("watch_bots.py")
   let viewerPid = findProcessByMarker("global-viewer")
   let livePid = findProcessByMarker("watch-bots/live-pov")
-  if pidAlive(pid) or pyPid > 0 or
-      (viewerPid > 0 and isTraverseWatchProcess(viewerPid)) or
-      (livePid > 0 and isTraverseWatchProcess(livePid)):
-    let tail = logFileTail(logPath, 12)
-    # Hard fail only when nothing is left alive and the log shows an error.
-    let anyAlive =
-      pidAlive(pid) or pyPid > 0 or viewerPid > 0 or livePid > 0
-    if not anyAlive and "error:" in tail.toLowerAscii:
+  let stillLive = latestGodviewHasCharacter(
+    captures, TraverseCharacterName, TraverseWatchCaptureMaxAgeSec)
+  # Success requires the native viewer process, not only live-pov / broker.
+  if viewerPid > 0 and isTraverseWatchProcess(viewerPid):
+    result.watchRunning = true
+    result.watchPid = viewerPid
+    result.lastOk = stillLive
+    result.lastDetail =
+      if stillLive: &"started following {TraverseCharacterName}"
+      else: &"viewer up but no live {TraverseCharacterName} capture"
+    return
+  if pidAlive(pid) or pyPid > 0 or livePid > 0:
+    # Still starting, or failed to open window — treat missing viewer as fail
+    # once the log has finished the "starting native live admin viewer" step.
+    if "starting native live admin viewer" in tail and viewerPid == 0:
       result.watchRunning = false
       result.lastOk = false
-      result.lastDetail = tail
+      result.lastDetail =
+        if tail.len > 0: tail
+        else: "viewer did not open"
       return
     result.watchRunning = true
     result.watchPid =
       if pyPid > 0: pyPid
-      elif viewerPid > 0: viewerPid
       elif livePid > 0: livePid
       elif pidAlive(pid): pid
       else: 0
     result.lastOk = true
-    result.lastDetail = &"started (log {TraverseWatchLogRel})"
+    result.lastDetail = &"starting (log {TraverseWatchLogRel})"
     return
-  let tail = logFileTail(logPath, 10)
   result.lastOk = false
   result.lastDetail =
     if tail.len > 0: tail
