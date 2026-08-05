@@ -5,11 +5,12 @@
 ##                          GET /traverse  GET /admin
 ##                          GET /roster  GET /murist/status  GET /murist/quests
 ##                          GET /murist/events  GET /traverse/status
-##                          GET /traverse/ops
+##                          GET /traverse/ops  GET /traverse/replays
 ##                          GET /events  GET /server
 ##                          POST /reload  POST /server/start  POST /server/stop
 ##                          POST /traverse/pol/start|/stop
 ##                          POST /traverse/watch/start|/stop
+##                          POST /traverse/replays/refresh
 ##                          POST /admin/respawn-shadow-army
 ##   MCP endpoint (MCPort)  POST /mcp
 ##
@@ -18,6 +19,7 @@
 ##   listCharacters()           — roster (SELECT via docker exec)
 ##   traverseStatus()        — Kalimdor Traverse telemetry (DB + live godview)
 ##   startTraversePol()/startTraverseWatch() — detached PoL + live observer
+##   traverseReplays()       — hosted league episodes (version + replay links)
 ##   recentEvents()          — addon Chat.log ring buffer
 ##   reloadAddon()           — SOAP announce <SYS> reload + wait for <SA> loaded
 ##   announceInGame()        — SOAP announce <text>
@@ -26,7 +28,7 @@
 ##   startServer()/stopServer() — queue operator `up`/`down` (async worker)
 ##
 ## Tabs: Army (roster), Murist (human seat), Advisor (events + reload),
-## Traverse (league telemetry + PoL/observer controls), Admin (realm + ops).
+## Traverse (league telemetry + PoL/observer + hosted replays), Admin.
 ## The dashboard stays useful with the realm DOWN: roster/Murist degrade to
 ## offline notes; Admin's Server panel offers Start/Stop. The human only runs
 ## the client and this dashboard.
@@ -85,6 +87,19 @@ const
   TraversePolPidRel* = "local_data/brain-logs/traverse-pol.pid"
   TraverseWatchLogRel* = "local_data/brain-logs/traverse-watch.log"
   TraverseWatchPidRel* = "local_data/brain-logs/traverse-watch.pid"
+  ## Hosted league episodes cache (ctf-bots runs/field pattern).
+  TraverseEpisodesHistoryRel* = "local_data/traverse/episodes_history.json"
+  TraverseFieldPullLogRel* = "local_data/brain-logs/traverse-field-pull.log"
+  TraverseFieldPullPidRel* = "local_data/brain-logs/traverse-field-pull.pid"
+  TraverseVersionsMdRel* = "docs/traverse/versions.md"
+  ## Softmax league / division for Kalimdor Traverse (docs/traverse_wow.md).
+  TraverseLeagueId* = "league_0f38d762-930a-41d3-9979-1858dd52c1ae"
+  TraverseDivisionId* = "div_b50e0091-514d-4406-837a-420ef9c372ca"
+  ## Policy names we own on the traverse ladder (version labels ibis:vN).
+  TraverseOurPolicyNames* = ["ibis"]
+  ObservatoryV2Base* = "https://softmax.com/observatory/v2"
+  ## Replays panel poll (file-backed; slower than live telemetry).
+  TraverseReplaysPollSeconds* = 15
   ## Observer needs a live army_host session (PoL exits after 50 yd).
   ## Long run: full episode wall clock, no pol-min-yards early exit.
   TraverseWatchAgentMaxSeconds* = TraverseEpisodeLimitSeconds
@@ -288,6 +303,33 @@ type
     watchRunning*: bool
     watchPid*: int
     watchLog*: string
+    lastDetail*: string
+    lastOk*: bool
+
+  TraverseReplayRow* = object
+    ## One hosted traverse episode for the dashboard replays table.
+    id*: string
+    episodeId*: string
+    status*: string
+    versionLabel*: string ## e.g. ibis:v2
+    version*: int
+    policyName*: string
+    policyVersionId*: string
+    score*: float
+    hasScore*: bool
+    whenText*: string
+    replayUrl*: string
+    liveUrl*: string
+    observatoryUrl*: string
+    versionNote*: string ## human note from docs/traverse/versions.md
+
+  TraverseReplaysStatus* = object
+    ## File-backed hosted episode list (pulled via tools/pull_traverse_field.sh).
+    available*: bool
+    path*: string
+    note*: string
+    rows*: seq[TraverseReplayRow]
+    pullRunning*: bool
     lastDetail*: string
     lastOk*: bool
 
@@ -1974,6 +2016,18 @@ proc traverseWatchLogPath*(): string =
 proc traverseWatchPidPath*(): string =
   armyRoot() / TraverseWatchPidRel
 
+proc traverseEpisodesHistoryPath*(): string =
+  armyRoot() / TraverseEpisodesHistoryRel
+
+proc traverseFieldPullLogPath*(): string =
+  armyRoot() / TraverseFieldPullLogRel
+
+proc traverseFieldPullPidPath*(): string =
+  armyRoot() / TraverseFieldPullPidRel
+
+proc traverseVersionsMdPath*(): string =
+  armyRoot() / TraverseVersionsMdRel
+
 proc readPidFile*(path: string): int =
   ## Best-effort PID from a file; 0 when missing/invalid.
   try:
@@ -2189,6 +2243,248 @@ proc stopTraverseWatch*(): TraverseOpsStatus =
   result = traverseOpsStatus()
   result.lastOk = true
   result.lastDetail = if bits.len > 0: bits.join("; ") else: "nothing to stop"
+
+# ---------------------------------------------------------------------------
+# Hosted traverse replays (ctf-bots field history pattern)
+# ---------------------------------------------------------------------------
+
+proc isTraverseOurPolicy*(name: string): bool =
+  ## True when the policy name is one we ship (ibis today).
+  let n = name.strip().toLowerAscii()
+  for owned in TraverseOurPolicyNames:
+    if n == owned:
+      return true
+  result = false
+
+proc parseTraverseVersionNotes*(text: string): seq[(string, string)] =
+  ## Parse docs/traverse/versions.md bullets into (ibis:vN, note) pairs.
+  result = @[]
+  for line in text.splitLines():
+    var t = line.strip()
+    if t.len == 0 or t.startsWith("#"):
+      continue
+    if t.startsWith("-"):
+      t = t[1..^1].strip()
+    if t.len == 0:
+      continue
+    if t.toLowerAscii().startsWith("ibis:v"):
+      let sp = t.find(' ')
+      if sp > 0:
+        result.add((t[0..<sp], t[sp + 1..^1].strip()))
+      continue
+    if t.len >= 2 and t[0] == 'v' and t[1].isDigit:
+      var i = 1
+      while i < t.len and t[i].isDigit:
+        inc i
+      let num = t[1..<i]
+      var note = t[i..^1].strip()
+      if note.startsWith(":") or note.startsWith("—") or note.startsWith("-"):
+        note = note[1..^1].strip()
+      if note.toLowerAscii().startsWith("was "):
+        note = note[4..^1].strip()
+      result.add(("ibis:v" & num, note))
+
+proc lookupTraverseVersionNote*(
+    notes: seq[(string, string)]; label: string): string =
+  ## Note for one version label (exact match).
+  for (k, v) in notes:
+    if k == label:
+      return v
+  result = ""
+
+proc loadTraverseVersionNotes*(): seq[(string, string)] =
+  ## Load version notes from docs/traverse/versions.md when present.
+  result = @[]
+  let path = traverseVersionsMdPath()
+  try:
+    if fileExists(path):
+      result = parseTraverseVersionNotes(readFile(path))
+  except CatchableError:
+    result = @[]
+
+proc formatTraverseWhen*(iso: string): string =
+  ## Compact UTC stamp for table cells (YYYY-MM-DD HH:MM).
+  if iso.len < 16:
+    return iso
+  result = iso[0..9] & " " & iso[11..15]
+
+proc episodeObservatoryUrl*(id: string): string =
+  ## Softmax Observatory episode-request (or episode) detail URL.
+  if id.len == 0:
+    return ""
+  let detail =
+    if id.startsWith("ereq_"):
+      "episode-request:" & id
+    else:
+      "episode:" & id
+  result = ObservatoryV2Base & "?tab=episodes&detail=" & detail
+
+proc parseTraverseReplayRow*(
+    node: JsonNode; notes: seq[(string, string)] = @[]): Option[TraverseReplayRow] =
+  ## Map one Softmax episode-request JSON object to a table row.
+  if node.isNil or node.kind != JObject:
+    return none(TraverseReplayRow)
+  var row: TraverseReplayRow
+  row.id = node{"id"}.getStr("")
+  if row.id.len == 0:
+    row.id = node{"episode_id"}.getStr("")
+  row.episodeId = node{"episode_id"}.getStr("")
+  row.status = node{"status"}.getStr("").toLowerAscii()
+  row.replayUrl = node{"replay_url"}.getStr("")
+  row.liveUrl = node{"live_url"}.getStr("")
+  let whenRaw =
+    node{"completed_at"}.getStr("")
+  let whenFallback =
+    if whenRaw.len > 0: whenRaw
+    else:
+      let r = node{"running_at"}.getStr("")
+      if r.len > 0: r else: node{"created_at"}.getStr("")
+  row.whenText = formatTraverseWhen(whenFallback)
+  var our: JsonNode = nil
+  let participants = node{"participants"}
+  if not participants.isNil and participants.kind == JArray:
+    for p in participants:
+      if p.kind != JObject:
+        continue
+      if p{"is_filler"}.getBool(false):
+        continue
+      let pname = p{"policy_name"}.getStr("")
+      if isTraverseOurPolicy(pname):
+        our = p
+        break
+    if our.isNil:
+      for p in participants:
+        if p.kind != JObject:
+          continue
+        if p{"is_filler"}.getBool(false):
+          continue
+        our = p
+        break
+  if not our.isNil:
+    row.policyName = our{"policy_name"}.getStr("")
+    row.version = our{"version"}.getInt(0)
+    row.policyVersionId = our{"policy_version_id"}.getStr("")
+    row.versionLabel = our{"label"}.getStr("")
+    if row.versionLabel.len == 0 and row.policyName.len > 0:
+      row.versionLabel = &"{row.policyName}:v{row.version}"
+  if row.versionLabel.len == 0:
+    row.versionLabel = "—"
+  row.versionNote = lookupTraverseVersionNote(notes, row.versionLabel)
+  let scores = node{"scores"}
+  if not scores.isNil and scores.kind == JArray:
+    for s in scores:
+      if s.kind != JObject:
+        continue
+      let pvid = s{"policy_version_id"}.getStr("")
+      if row.policyVersionId.len > 0 and pvid.len > 0 and pvid != row.policyVersionId:
+        continue
+      if s.hasKey("score") and s["score"].kind in {JFloat, JInt}:
+        row.score = s["score"].getFloat()
+        row.hasScore = true
+        break
+  if not row.hasScore:
+    let ps = node{"participant_scores"}
+    if not ps.isNil and ps.kind == JArray and ps.len > 0:
+      let s0 = ps[0]
+      if s0.kind == JObject and s0.hasKey("score") and
+          s0["score"].kind in {JFloat, JInt}:
+        row.score = s0["score"].getFloat()
+        row.hasScore = true
+  row.observatoryUrl = episodeObservatoryUrl(row.id)
+  if row.id.len == 0 and row.versionLabel == "—":
+    return none(TraverseReplayRow)
+  result = some(row)
+
+proc parseTraverseEpisodesJson*(
+    text: string; notes: seq[(string, string)] = @[]): seq[TraverseReplayRow] =
+  ## Parse a JSON array of episode requests into table rows (newest first).
+  result = @[]
+  let node = parseJson(text)
+  if node.kind != JArray:
+    return
+  for item in node:
+    let rowOpt = parseTraverseReplayRow(item, notes)
+    if rowOpt.isSome:
+      result.add(rowOpt.get)
+  result.sort(proc(a, b: TraverseReplayRow): int =
+    cmp(b.whenText, a.whenText))
+
+proc isTraverseFieldPullProcess*(pid: int): bool =
+  ## True when pid is tools/pull_traverse_field.sh or its make target.
+  if not pidAlive(pid):
+    return false
+  let cmd = pidCmdline(pid)
+  result =
+    ("pull_traverse_field" in cmd) or
+    ("make" in cmd and "traverse-field" in cmd)
+
+proc traverseFieldPullRunning*(): bool =
+  ## Detached field-pull process still alive.
+  let pid = readPidFile(traverseFieldPullPidPath())
+  if pid > 0 and isTraverseFieldPullProcess(pid):
+    return true
+  result = false
+
+proc traverseReplays*(): TraverseReplaysStatus =
+  ## Load durable hosted episodes for the Traverse replays table.
+  result = TraverseReplaysStatus(
+    path: TraverseEpisodesHistoryRel,
+    pullRunning: traverseFieldPullRunning()
+  )
+  let path = traverseEpisodesHistoryPath()
+  if not fileExists(path):
+    result.available = false
+    result.note =
+      "No hosted episodes yet — click Refresh (or run make traverse-field)."
+    return
+  try:
+    let notes = loadTraverseVersionNotes()
+    result.rows = parseTraverseEpisodesJson(readFile(path), notes)
+    result.available = result.rows.len > 0
+    if result.rows.len == 0:
+      result.note = "episodes_history.json is empty"
+    else:
+      result.note = &"{result.rows.len} episodes"
+      result.lastOk = true
+  except CatchableError as e:
+    result.available = false
+    result.note = &"failed to read episodes: {e.msg}"
+    result.lastOk = false
+    result.lastDetail = e.msg
+
+proc startTraverseFieldPull*(): TraverseReplaysStatus =
+  ## Detached `make traverse-field` to refresh hosted episode cache.
+  result = traverseReplays()
+  if result.pullRunning:
+    result.lastOk = true
+    result.lastDetail = "pull already running"
+    result.pullRunning = true
+    return
+  let root = armyRoot()
+  if not fileExists(root / "Makefile"):
+    result.lastOk = false
+    result.lastDetail = &"Makefile missing in {root}"
+    return
+  let logPath = traverseFieldPullLogPath()
+  let pidPath = traverseFieldPullPidPath()
+  createDir(parentDir(logPath))
+  try:
+    writeFile(logPath, "")
+  except CatchableError:
+    discard
+  let cmd =
+    &"cd {quoteShell(root)} && " &
+    &"( setsid nohup make traverse-field >> {quoteShell(logPath)} 2>&1 < /dev/null & " &
+    &"echo $! > {quoteShell(pidPath)} )"
+  let r = runShell(&"bash -lc {quoteShell(cmd)}")
+  if not r.ok:
+    result.lastOk = false
+    result.lastDetail = r.detail
+    return
+  result = traverseReplays()
+  result.lastOk = true
+  result.lastDetail = "field pull started"
+  result.pullRunning = true
 
 proc latestGodviewHasCharacter*(
     capturesDir, character: string; maxAgeSec: float): bool =
@@ -3804,10 +4100,123 @@ proc renderTraverseOpsPanel*(ops: TraverseOpsStatus): string =
       {watchBtn}
     </div>
 {lastLine}"""
-proc renderTraversePage*(st: TraverseStatus; ops: TraverseOpsStatus): string =
-  ## Traverse tab: league telemetry + PoL / observer controls.
+
+proc formatTraverseScoreCell*(row: TraverseReplayRow): string =
+  ## Score column: northing yards when present.
+  if not row.hasScore:
+    return "—"
+  result = formatTraverseYards(row.score)
+
+proc renderTraverseReplayLinks*(row: TraverseReplayRow): string =
+  ## Replay / live / Observatory links (ctf-bots matchLinksHtml pattern).
+  var bits: seq[string] = @[]
+  if row.liveUrl.len > 0:
+    bits.add(&"""<a href="{escapeHtml(row.liveUrl)}" target="_blank" rel="noopener">Live</a>""")
+  if row.replayUrl.len > 0:
+    bits.add(&"""<a href="{escapeHtml(row.replayUrl)}" target="_blank" rel="noopener">Replay</a>""")
+  if row.observatoryUrl.len > 0:
+    bits.add(&"""<a href="{escapeHtml(row.observatoryUrl)}" target="_blank" rel="noopener">Obs</a>""")
+  if bits.len == 0:
+    return """<span class="meta">—</span>"""
+  result = bits.join(" · ")
+
+proc renderTraverseReplayRows*(rows: seq[TraverseReplayRow]): string =
+  ## Table body for hosted traverse episodes.
+  if rows.len == 0:
+    return """<tr><td colspan="6" class="empty">No episodes yet.</td></tr>"""
+  result = ""
+  for row in rows:
+    let statusBadge =
+      case row.status
+      of "completed", "complete", "succeeded":
+        """<span class="badge ok">done</span>"""
+      of "running", "dispatched", "in_progress":
+        """<span class="badge accent">live</span>"""
+      of "failed", "error":
+        """<span class="badge bad">fail</span>"""
+      else:
+        &"""<span class="badge">{escapeHtml(row.status)}</span>"""
+    result.add(&"""
+      <tr>
+        <td><code>{escapeHtml(row.versionLabel)}</code></td>
+        <td>{escapeHtml(formatTraverseScoreCell(row))}</td>
+        <td>{statusBadge}</td>
+        <td class="meta" style="white-space:nowrap">{escapeHtml(row.whenText)}</td>
+        <td>{renderTraverseReplayLinks(row)}</td>
+        <td class="meta" style="font-size:0.75rem">{escapeHtml(row.id)}</td>
+      </tr>""")
+
+proc renderTraverseVersionLegend*(rows: seq[TraverseReplayRow]): string =
+  ## One-line legend: which policy version label means what.
+  var seen: seq[string] = @[]
+  var bits: seq[string] = @[]
+  for row in rows:
+    if row.versionLabel in seen:
+      continue
+    seen.add(row.versionLabel)
+    if row.versionNote.len > 0:
+      bits.add(&"""<code>{escapeHtml(row.versionLabel)}</code> — {escapeHtml(row.versionNote)}""")
+    else:
+      bits.add(&"""<code>{escapeHtml(row.versionLabel)}</code>""")
+  if bits.len == 0:
+    return ""
+  result = &"""
+    <div class="meta" style="margin-bottom:0.5rem">{bits.join(" · ")}</div>"""
+
+proc renderTraverseReplaysPanel*(st: TraverseReplaysStatus): string =
+  ## Hosted league episodes: version + score + replay links.
+  let pullPill =
+    if st.pullRunning:
+      """<span class="pill"><span class="dot on"></span> refreshing</span>"""
+    else:
+      """<span class="pill"><span class="dot off"></span> cache</span>"""
+  let summary =
+    if st.note.len > 0: escapeHtml(st.note) else: "—"
+  var lastLine = ""
+  if st.lastDetail.len > 0:
+    let cls = if st.lastOk: "admin-ok" else: "admin-err"
+    let mark = if st.lastOk: "ok" else: "FAIL"
+    lastLine = &"""
+      <div class="server-last {cls}" title="{escapeHtml(st.lastDetail)}">
+        last: {mark} — {escapeHtml(st.lastDetail)}
+      </div>"""
+  let legend = renderTraverseVersionLegend(st.rows)
+  let rowsHtml = renderTraverseReplayRows(st.rows)
+  result = &"""
+    <div class="panel-actions" style="margin-bottom:0.75rem;flex-wrap:wrap;gap:0.5rem">
+      {pullPill}
+      <span class="meta">{summary}</span>
+      <button class="btn primary"
+              hx-post="/traverse/replays/refresh"
+              hx-target="#traverse-replays"
+              hx-swap="innerHTML">Refresh</button>
+    </div>
+{lastLine}
+{legend}
+    <div class="table-scroll">
+      <table>
+        <thead>
+          <tr>
+            <th>Version</th>
+            <th>Score</th>
+            <th>Status</th>
+            <th>When</th>
+            <th>Links</th>
+            <th>Episode</th>
+          </tr>
+        </thead>
+        <tbody>
+{rowsHtml}
+        </tbody>
+      </table>
+    </div>"""
+proc renderTraversePage*(
+    st: TraverseStatus; ops: TraverseOpsStatus; replays: TraverseReplaysStatus
+): string =
+  ## Traverse tab: league telemetry + PoL / observer + hosted replays.
   let statusBody = renderTraverseStatus(st)
   let opsBody = renderTraverseOpsPanel(ops)
+  let replaysBody = renderTraverseReplaysPanel(replays)
   let body = &"""
     <section class="panel">
       <div class="panel-head">
@@ -3837,6 +4246,21 @@ proc renderTraversePage*(st: TraverseStatus; ops: TraverseOpsStatus): string =
            hx-trigger="every {PollSeconds}s"
            hx-swap="innerHTML settle:0s swap:0s">
 {statusBody}
+      </div>
+    </section>
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Hosted replays</h2>
+        <div class="panel-actions">
+          <span class="badge accent">league</span>
+        </div>
+      </div>
+      <div class="panel-body"
+           id="traverse-replays"
+           hx-get="/traverse/replays"
+           hx-trigger="every {TraverseReplaysPollSeconds}s"
+           hx-swap="innerHTML settle:0s swap:0s">
+{replaysBody}
       </div>
     </section>"""
   result = renderDashboard("Traverse", "traverse", body)
@@ -4052,14 +4476,16 @@ proc muristEventsHandler(request: Request) {.gcsafe.} =
       &"""<tr><td colspan="4" class="empty">error: {escapeHtml(e.msg)}</td></tr>""")
 
 proc traversePageHandler(request: Request) {.gcsafe.} =
-  ## GET /traverse — Traverse tab (telemetry + PoL / observer controls).
+  ## GET /traverse — Traverse tab (telemetry + PoL / observer + replays).
   try:
     var st: TraverseStatus
     var ops: TraverseOpsStatus
+    var replays: TraverseReplaysStatus
     {.gcsafe.}:
       st = traverseStatus()
       ops = traverseOpsStatus()
-    request.respond(200, htmlHeaders(), renderTraversePage(st, ops))
+      replays = traverseReplays()
+    request.respond(200, htmlHeaders(), renderTraversePage(st, ops, replays))
   except Exception as e:
     # Never surface a hard failure for a missing scenario — soft empty page.
     try:
@@ -4069,7 +4495,10 @@ proc traversePageHandler(request: Request) {.gcsafe.} =
       )
       let ops = TraverseOpsStatus(
         polLog: TraversePolLogRel, watchLog: TraverseWatchLogRel)
-      request.respond(200, htmlHeaders(), renderTraversePage(soft, ops))
+      var replays: TraverseReplaysStatus
+      {.gcsafe.}:
+        replays = traverseReplays()
+      request.respond(200, htmlHeaders(), renderTraversePage(soft, ops, replays))
     except Exception:
       request.respond(500, htmlHeaders(),
         &"<!DOCTYPE html><html><body><h1>Traverse error</h1><pre>{escapeHtml(e.msg)}</pre></body></html>")
@@ -4139,6 +4568,28 @@ proc traverseWatchStopHandler(request: Request) {.gcsafe.} =
   except Exception as e:
     request.respond(500, htmlHeaders(),
       &"""<span class="admin-err">stop observer failed: {escapeHtml(e.msg)}</span>""")
+
+proc traverseReplaysHandler(request: Request) {.gcsafe.} =
+  ## GET /traverse/replays — htmx fragment for hosted episode table.
+  try:
+    var st: TraverseReplaysStatus
+    {.gcsafe.}:
+      st = traverseReplays()
+    request.respond(200, htmlHeaders(), renderTraverseReplaysPanel(st))
+  except Exception as e:
+    request.respond(500, htmlHeaders(),
+      &"""<p class="empty">replays error: {escapeHtml(e.msg)}</p>""")
+
+proc traverseReplaysRefreshHandler(request: Request) {.gcsafe.} =
+  ## POST /traverse/replays/refresh — pull hosted episodes into local cache.
+  try:
+    var st: TraverseReplaysStatus
+    {.gcsafe.}:
+      st = startTraverseFieldPull()
+    request.respond(200, htmlHeaders(), renderTraverseReplaysPanel(st))
+  except Exception as e:
+    request.respond(500, htmlHeaders(),
+      &"""<p class="empty">refresh failed: {escapeHtml(e.msg)}</p>""")
 
 proc rosterPartialHandler(request: Request) {.gcsafe.} =
   ## GET /roster — htmx fragment (table rows only). Foundation seats hidden.
@@ -4690,10 +5141,12 @@ proc main() =
   router.get("/traverse", traversePageHandler)
   router.get("/traverse/status", traverseStatusHandler)
   router.get("/traverse/ops", traverseOpsHandler)
+  router.get("/traverse/replays", traverseReplaysHandler)
   router.post("/traverse/pol/start", traversePolStartHandler)
   router.post("/traverse/pol/stop", traversePolStopHandler)
   router.post("/traverse/watch/start", traverseWatchStartHandler)
   router.post("/traverse/watch/stop", traverseWatchStopHandler)
+  router.post("/traverse/replays/refresh", traverseReplaysRefreshHandler)
   router.get("/admin", adminPageHandler)
   router.get("/roster", rosterPartialHandler)
   router.get("/events", eventsPartialHandler)

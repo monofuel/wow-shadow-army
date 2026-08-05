@@ -284,10 +284,140 @@ suite "traverse ops panel":
     let st = TraverseStatus(containerFound: false)
     let ops = TraverseOpsStatus(
       polLog: TraversePolLogRel, watchLog: TraverseWatchLogRel)
-    let page = renderTraversePage(st, ops)
+    let replays = TraverseReplaysStatus(note: "no data")
+    let page = renderTraversePage(st, ops, replays)
     check "Controls" in page
     check "id=\"traverse-ops\"" in page
     check "hx-get=\"/traverse/ops\"" in page
+    check "Hosted replays" in page
+    check "id=\"traverse-replays\"" in page
+    check "hx-get=\"/traverse/replays\"" in page
+
+suite "traverse hosted replays":
+  const sampleEpisodes = """
+[
+  {
+    "id": "ereq_dde219b5-33b7-4364-a073-4356e2288a35",
+    "episode_id": "52b9a6cc-c319-41ff-b3af-c94396daea38",
+    "status": "completed",
+    "replay_url": "https://softmax-public.s3.amazonaws.com/replays/f2c52d1d-5f11-433d-953a-693950f68c2b.replay",
+    "live_url": null,
+    "scores": [
+      {"policy_version_id": "76a72f80-bb4f-4fcb-aad6-95fb1f8fa4b8", "score": 1996.05}
+    ],
+    "participants": [
+      {
+        "position": 0,
+        "policy_version_id": "76a72f80-bb4f-4fcb-aad6-95fb1f8fa4b8",
+        "policy_name": "ibis",
+        "version": 2,
+        "is_filler": false,
+        "label": "ibis:v2"
+      }
+    ],
+    "created_at": "2026-08-05T17:34:21.261552Z",
+    "completed_at": "2026-08-05T18:23:01.394277Z",
+    "running_at": "2026-08-05T17:37:13.114494Z"
+  },
+  {
+    "id": "ereq_be25298c-1651-46a4-a002-111c127fa708",
+    "status": "running",
+    "replay_url": null,
+    "live_url": "https://example.test/live",
+    "scores": [],
+    "participants": [
+      {
+        "policy_version_id": "76a72f80-bb4f-4fcb-aad6-95fb1f8fa4b8",
+        "policy_name": "ibis",
+        "version": 2,
+        "is_filler": false,
+        "label": "ibis:v2"
+      }
+    ],
+    "created_at": "2026-08-05T18:23:41.526204Z",
+    "running_at": "2026-08-05T18:23:53.125886Z"
+  },
+  {
+    "id": "ereq_0e650027-caed-4044-be1e-bdeab8ddb1f0",
+    "status": "completed",
+    "replay_url": "https://softmax-public.s3.amazonaws.com/replays/v1.replay",
+    "scores": [
+      {"policy_version_id": "ccbfd6ab-9d7e-48d5-aff1-25a7c000c1d4", "score": 2278.73}
+    ],
+    "participants": [
+      {
+        "policy_version_id": "ccbfd6ab-9d7e-48d5-aff1-25a7c000c1d4",
+        "policy_name": "ibis",
+        "version": 1,
+        "is_filler": false,
+        "label": "ibis:v1"
+      }
+    ],
+    "completed_at": "2026-08-05T04:08:50.424344Z"
+  }
+]
+"""
+
+  test "version notes parse bullets":
+    let notes = parseTraverseVersionNotes("""
+# versions
+- v1 stock RealPlayerBot (retired)
+- v2 army_host + Lua PoL smoke
+""")
+    check notes.len == 2
+    check lookupTraverseVersionNote(notes, "ibis:v1").contains("RealPlayerBot")
+    check lookupTraverseVersionNote(notes, "ibis:v2").contains("army_host")
+    check lookupTraverseVersionNote(notes, "ibis:v9") == ""
+
+  test "parse episodes into version + score + links":
+    let notes = parseTraverseVersionNotes("- v1 RealPlayerBot\n- v2 Lua PoL\n")
+    let rows = parseTraverseEpisodesJson(sampleEpisodes, notes)
+    check rows.len == 3
+    var foundV1 = false
+    var foundV2Done = false
+    var foundLive = false
+    for r in rows:
+      if r.versionLabel == "ibis:v1":
+        foundV1 = true
+        check r.hasScore
+        check abs(r.score - 2278.73) < 0.01
+        check r.replayUrl.len > 0
+        check "Replay" in renderTraverseReplayLinks(r)
+        check r.versionNote.contains("RealPlayerBot")
+      if r.versionLabel == "ibis:v2" and r.status == "completed":
+        foundV2Done = true
+        check abs(r.score - 1996.05) < 0.01
+        check "ereq_" in r.observatoryUrl
+        check "observatory" in r.observatoryUrl
+      if r.status == "running":
+        foundLive = true
+        check not r.hasScore
+        check "Live" in renderTraverseReplayLinks(r)
+    check foundV1 and foundV2Done and foundLive
+
+  test "render panel has version column and refresh":
+    let notes = parseTraverseVersionNotes("- v2 Lua PoL smoke\n")
+    let rows = parseTraverseEpisodesJson(sampleEpisodes, notes)
+    let st = TraverseReplaysStatus(
+      available: true,
+      note: "3 episodes",
+      rows: rows,
+      lastOk: true
+    )
+    let html = renderTraverseReplaysPanel(st)
+    check "ibis:v2" in html
+    check "ibis:v1" in html
+    check "Replay" in html
+    check "Obs" in html
+    check "/traverse/replays/refresh" in html
+    check "Version" in html
+    check "1996.1" in html or "1996.0" in html
+    check "Lua PoL" in html
+    check html.count("Lua PoL") == 1
+  test "our policy name filter":
+    check isTraverseOurPolicy("ibis")
+    check isTraverseOurPolicy("Ibis")
+    check not isTraverseOurPolicy("osprey")
 
 suite "traverse docker port parse":
   test "parse published host port line":

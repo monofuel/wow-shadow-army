@@ -46,7 +46,7 @@ COMPOSE_FILE := infra/compose.vmangos.yml
 ACCOUNT_USER := monofuel
 ACCOUNT_PASS := password
 
-.PHONY: test test-lua test-nim system pin-check start-server stop-server server-logging logs account soap-account play play-classic play-classic-netlog play-xr traverse traverse-pol traverse-desert escort escort-army grind quest-data warlock-account warlock-bot botwarrior-bot tusk-account tusk-bot beru-account beru-bot party-army navmesh-helper navmesh-status
+.PHONY: test test-lua test-nim system pin-check start-server stop-server server-logging logs account soap-account play play-classic play-classic-netlog play-xr traverse traverse-pol traverse-desert traverse-field escort escort-army grind quest-data warlock-account warlock-bot botwarrior-bot tusk-account tusk-bot beru-account beru-bot party-army navmesh-helper navmesh-status
 
 # Unit tier: Lua tools + Nim host/system tests only (v2 DoD: no Python required
 # for bot correctness). If nim is missing, test-nim-soft skips rather than
@@ -645,6 +645,11 @@ play:
 			--owner=$(PLAY_OWNER) \
 			--username=$(ACCOUNT_USER) \
 			--password=$(ACCOUNT_PASS) $(EXTRA)'
+
+# Pull hosted Traverse league episodes into local_data/traverse/ for the System
+# dashboard Hosted replays table (version + score + replay/obs links).
+traverse-field:
+	@tools/pull_traverse_field.sh
 
 # Lua traverse proof-of-life (docs/traverse-2026-08-04.md): short local smoke.
 # Starts upstream local --league=traverse backend, attaches army_host
