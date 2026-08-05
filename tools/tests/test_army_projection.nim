@@ -58,12 +58,43 @@ block:
   check(guids.len == 0, "no guids when no units")
   check(proj["self_unit"]["x"].getFloat == 1.0, "self x")
   check(proj["self_unit"]["class_id"].getInt == 1, "class_id")
+  check(proj["self_unit"]["shapeshift_form_id"].getInt == 0, "form id default 0")
   check(proj["combat"]["health_pct"].getFloat == 80.0, "health_pct 80")
   check(proj["spells"]["mana"].getInt == 50, "mana pool 0")
   check(proj["spells"]["mana_pct"].getFloat == 50.0, "mana_pct")
   check(proj["death"]["corpse"].kind == JNull, "corpse null when unknown")
   check(proj["leader_unit"].kind == JNull, "leader null when not in group")
   check(proj["party"]["invite_pending"].getBool == false, "invite false")
+
+# --- shapeshift form fields surface on self_unit (Travel Form = 3 / 783) ---
+block:
+  let frame = %*{
+    "name": "Northbound",
+    "class_id": 11,
+    "level": 60,
+    "health_known": true,
+    "health": 100,
+    "max_health": 100,
+    "powers": [0],
+    "max_powers": [0],
+    "location": {"map_id": 1, "x": -9187.0, "y": -2530.25, "z": 14.09},
+    "shapeshift_form_id": 3,
+    "shapeshift_form_spell_id": 783,
+    "units": [],
+    "known_spells": [783],
+    "cooldown_spell_ids": [],
+    "is_dead": false,
+    "is_ghost": false,
+    "can_reclaim_corpse": false,
+    "corpse_known": false,
+    "party": {
+      "in_group": false, "invite_pending": false, "invite_from": "",
+      "leader_name": "", "members": []
+    }
+  }
+  let (proj, _) = projectV2(frame)
+  check(proj["self_unit"]["shapeshift_form_id"].getInt == 3, "travel form id")
+  check(proj["self_unit"]["shapeshift_form_spell_id"].getInt == 783, "travel form spell")
 
 # --- corpse_known false maps to absent (null), not zero coords ---
 block:

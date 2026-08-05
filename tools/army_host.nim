@@ -262,7 +262,9 @@ proc projectV2*(frame: JsonNode; preferLeaderName = ""):
     "z": jnum(jget(loc, "z")),
     "map_id": jnum(jget(loc, "map_id")),
     "class_id": jint(jget(obs, "class_id")),
-    "level": jint(jget(obs, "level"))
+    "level": jint(jget(obs, "level")),
+    "shapeshift_form_id": jint(jget(obs, "shapeshift_form_id")),
+    "shapeshift_form_spell_id": jint(jget(obs, "shapeshift_form_spell_id"))
   }
 
   var hpPct = 100.0
