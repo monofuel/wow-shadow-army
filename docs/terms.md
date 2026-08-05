@@ -21,8 +21,7 @@ doc.
   in client files are an expected cost of that and we resolve them — they are
   not a reason to stop syncing. Remotes: `origin` = our Gitea, `upstream` =
   GitHub (push disabled), `local-upstream` = the local upstream checkout
-  (push disabled). Our work branches: `shadow-army-fixes`,
-  `lua-external-policy`, etc. See `docs/coworld-fork.md`.
+  (push disabled). See `docs/coworld-fork.md`.
 - **xr** — `../coworld-vanilla-wow-xr`, a third checkout used for `-d:xr`
   client-build testing. Carries its own provisioned player client.
 - **mirror** — our Gitea copy of upstream (`10.11.4.11:222/Monolab/

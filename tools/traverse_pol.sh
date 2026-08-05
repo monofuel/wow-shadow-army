@@ -89,7 +89,10 @@ cleanup_all() {
     (cd "$UPSTREAM" && uv run python -m player.launch.native_support cleanup --league=traverse) || true
   fi
 }
+# EXIT covers normal army_host finish; TERM/INT so Stop also tears down the unit.
 trap cleanup_all EXIT
+trap 'exit 143' TERM
+trap 'exit 130' INT
 
 echo "[traverse-pol] preparing local --league=traverse backend…"
 cd "$UPSTREAM"

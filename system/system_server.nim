@@ -2238,9 +2238,25 @@ proc killPidTree*(pid: int): bool =
     &"kill -KILL -{pid} 2>/dev/null || kill -KILL {pid} 2>/dev/null || true")
   result = true
 
-proc stopTraversePol*(): TraverseOpsStatus =
+proc cleanupTraverseBackend*(): bool =
+  ## Tear down local --league=traverse unit (*-traverse-coworld-game-1 + lease).
+  ## Used when a run finishes or the operator hits Stop — not on Start restart
+  ## (prepare reuses a healthy unit and full teardown made Start feel broken).
+  let upstream = upstreamDir()
+  if not dirExists(upstream):
+    return false
+  let inner =
+    &"cd {quoteShell(upstream)} && " &
+    "uv run python -m player.launch.native_support cleanup --league=traverse"
+  let r = runShell(
+    &"bash -lc {quoteShell(inner)} >/dev/null 2>&1 || true")
+  result = r.ok
+
+proc stopTraversePol*(cleanupBackend = false): TraverseOpsStatus =
   ## Kill every local traverse-bot process (launcher, prepare, env-host, army_host).
   ## Fast: one TERM sweep, short wait, one KILL sweep — no per-pid sleeps.
+  ## cleanupBackend=true (dashboard Stop) also drops the traverse container;
+  ## leave false for Start's force-restart so prepare can reuse a live unit.
   var bits: seq[string] = @[]
   var targets: seq[int] = @[]
   let pid = readPidFile(traversePolPidPath())
@@ -2274,9 +2290,11 @@ proc stopTraversePol*(): TraverseOpsStatus =
       if pidAlive(p):
         discard killPidTree(p)
     bits.add("kill " & targets.join(","))
-  # Do NOT docker-stop the traverse game container here: prepare reuses a
-  # healthy unit, and tearing it down on every Start is what made the button
-  # feel broken/slow after a prior manual run.
+  if cleanupBackend:
+    if cleanupTraverseBackend():
+      bits.add("cleanup traverse backend")
+    else:
+      bits.add("cleanup traverse backend (attempted)")
   clearPidFile(traversePolPidPath())
   result = traverseOpsStatus()
   result.lastOk = true
@@ -2658,11 +2676,9 @@ proc startTraverseAgentSession*(
   result = traverseOpsStatus()
   result.lastOk = r.ok
   if r.ok:
-    if result.polRunning:
-      result.lastDetail = &"{detailPrefix} (log {TraversePolLogRel})"
-    else:
-      result.lastDetail =
-        &"{detailPrefix} — launched (log {TraversePolLogRel}; status may lag 1s)"
+    result.lastDetail =
+      if result.polRunning: detailPrefix
+      else: detailPrefix & " (starting…)"
   else:
     result.lastDetail = r.detail
 
@@ -4164,25 +4180,23 @@ proc renderTraverseOpsPanel*(ops: TraverseOpsStatus): string =
               hx-swap="innerHTML">Start local traverse</button>"""
   var lastLine = ""
   if ops.lastDetail.len > 0:
+    # Short status only — never dump policy/army_host log spam on the panel.
     let cls = if ops.lastOk: "admin-ok" else: "admin-err"
     let mark = if ops.lastOk: "ok" else: "FAIL"
+    let detail = ops.lastDetail
+    let short =
+      if detail.len > 80: detail[0 .. 79] & "…"
+      else: detail
     lastLine = &"""
-      <div class="server-last {cls}" title="{escapeHtml(ops.lastDetail)}">
-        last: {mark} — {escapeHtml(ops.lastDetail)}
+      <div class="server-last {cls}" title="{escapeHtml(detail)}">
+        last: {mark} — {escapeHtml(short)}
       </div>"""
-  let logTail = logFileTail(armyRoot() / ops.polLog, 4)
-  var logBlock = ""
-  if logTail.len > 0:
-    logBlock = &"""
-      <div class="meta" style="margin-top:0.5rem;font-size:0.75rem;max-height:4.5rem;overflow:auto"
-           title="{escapeHtml(ops.polLog)}">{escapeHtml(logTail)}</div>"""
   result = &"""
     <div class="panel-actions" style="margin-bottom:0.75rem;flex-wrap:wrap;gap:0.5rem">
       {polPill}
       {polBtn}
     </div>
-{lastLine}
-{logBlock}"""
+{lastLine}"""
 
 proc formatTraverseScoreCell*(row: TraverseReplayRow): string =
   ## Score column: northing yards when present.
@@ -4599,11 +4613,11 @@ proc traversePolStartHandler(request: Request) {.gcsafe.} =
       &"""<span class="admin-err">start local traverse failed: {escapeHtml(e.msg)}</span>""")
 
 proc traversePolStopHandler(request: Request) {.gcsafe.} =
-  ## POST /traverse/pol/stop — kill local traverse bot process tree.
+  ## POST /traverse/pol/stop — kill bot tree and tear down traverse container.
   try:
     var ops: TraverseOpsStatus
     {.gcsafe.}:
-      ops = stopTraversePol()
+      ops = stopTraversePol(cleanupBackend = true)
     request.respond(200, htmlHeaders(), renderTraverseOpsPanel(ops))
   except Exception as e:
     request.respond(500, htmlHeaders(),

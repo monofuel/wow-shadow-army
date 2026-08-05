@@ -1,0 +1,283 @@
+# World map browser + waypoint tool — plan
+
+Status: **plan only** (no implementation yet). Goal: a Nim-headed map
+visualization tool in this repo that approximates a coworker tool —
+hierarchical vanilla world-map art with zoom levels, full (non-fog-of-war)
+zone detail on continents, and click-to-draw waypoints.
+
+Terms: `docs/terms.md`. Client imports come from **the fork**
+(`../coworld-vanilla-wow-fork`, on `main`) — this tool builds on client
+work. Read-only stock upstream is `../coworld-vanilla-wow`.
+
+## Checklist
+
+Track progress here. Use `nix develop` (or `nix develop --command …`) for
+every compile/run step.
+
+### Preconditions
+
+- [x] Plan written (`docs/map-plan.md`)
+- [x] `nim.cfg` path to `../coworld-vanilla-wow-fork`
+- [x] Fork and stock upstream checkouts on `main` (no `shadow-army-fixes`)
+- [ ] Confirm world-map assets resolve (browser-assets and/or
+      `VANILLA_WOW_CLIENT_DATA_DIR` / classic data)
+- [ ] `nix develop` shell works on this machine (`nim --version`)
+
+### Phase 0 — spike (first real `src/` tree)
+
+- [ ] Create `src/` and `src/tools/`
+- [ ] Scaffold `src/tools/map_browser.nim` (+ optional `src/map_browser/`)
+- [ ] Import something small from the fork under `nix develop`
+- [ ] Open a window and draw the **world** mosaic (World 1–12 tiles)
+- [ ] Exit: compiles and shows art
+
+### Phase 1 — surfaces
+
+- [ ] World → continent drill (click / ProcessMapClick path)
+- [ ] Continent → zone drill
+- [ ] Zoom-out back to continent / world
+- [ ] Exit: discrete drill works end-to-end
+
+### Phase 2 — full overlays (no fog)
+
+- [ ] List all continent overlays without explored-bit gating
+- [ ] Draw overlays on the continent surface
+- [ ] Exit: continent looks fully painted, not fog-of-war
+
+### Phase 3 — waypoints
+
+- [ ] Click → world coords (`worldMapSurfaceLocation`)
+- [ ] Draw points / polyline (`projectWorldMapPoint`)
+- [ ] Select / delete waypoint
+- [ ] Exit: placement feels correct on a known zone (e.g. Durotar)
+
+### Phase 4 — I/O
+
+- [ ] JSON schema for a route (`map_id`, `x`, `y`, optional `z`)
+- [ ] Save / load file (CLI path or `local_data/waypoints/`)
+- [ ] Round-trip test (no network, no sleeps)
+- [ ] Exit: reload restores the same route
+
+### Phase 5 — polish (optional)
+
+- [ ] Zone / area hover labels
+- [ ] Pan within surface
+- [ ] Continuous zoom / LOD only if discrete drill is not enough
+- [ ] Makefile target: `make map-browser` → `nix develop --command nim r …`
+
+### Hard rules (do not skip)
+
+- [ ] No Python for this tool
+- [ ] No GM/SOAP tele for map preview
+- [ ] Do not commit into stock `../coworld-vanilla-wow`
+- [ ] Client fixes only on the fork if needed; monofuel decides upstream reports
+- [ ] Do not write engineering notes into `kb/`
+- [ ] `make test` stays green when code lands
+
+## Repo layout note — first real Nim tools under `src/`
+
+Today this repo’s Nim surface is mostly ops/host code under `tools/`
+(`army_host.nim`, System, fair-play audit). The map browser is the first
+**product Nim tool** meant to live under a proper source tree:
+
+```text
+src/                        # CREATE — does not exist yet
+  tools/
+    map_browser.nim         # entrypoint (name TBD)
+  map_browser/              # library modules for the tool
+    assets.nim
+    surface.nim
+    projection.nim
+    waypoints.nim
+    draw.nim
+```
+
+- Create `src/` when implementation starts; do not invent a second layout.
+- Prefer `src/tools/<name>.nim` for new headed/CLI tools of this kind.
+- Leave existing `tools/` host/ops scripts where they are unless we later
+  decide to migrate them (out of scope for this plan).
+- Wire `nim.cfg` / Makefile only as needed so `nim r src/tools/…` works
+  from repo root.
+
+## Build environment — always `nix develop`
+
+Hermetic shell is the flake at repo root (`flake.nix`). It supplies `nim`,
+`pkg-config`, OpenSSL/X11/GL runtime libs (windy/silky-class stack), and the
+usual ops packages.
+
+**All compile and run of this tool go through the flake shell.** Do not
+hand-roll host OpenSSL/lib paths.
+
+```sh
+# interactive
+nix develop
+
+# one-shot (agents / Makefile)
+nix develop --command nim check src/tools/map_browser.nim
+nix develop --command nim r src/tools/map_browser.nim
+```
+
+Pattern already used elsewhere: `nix develop --command …` so agents and
+systemd do not invent library paths (see flake description and
+`docs/play-classic.md`). Future Makefile target should wrap the same way,
+e.g. `make map-browser` → `nix develop --command nim r src/tools/map_browser.nim`.
+
+## Product goal
+
+Offline/headed **map browser + waypoint authoring**:
+
+1. Fully zoomed out → full vanilla **world** map art.
+2. Zoom / drill in → **continent** map with **all zone overlays fully
+   visible** (not fog-of-war / exploration-gated).
+3. Zoom / drill farther → **zone** map surface.
+4. Click to place / edit / delete waypoints; save and load a simple JSON
+   route file.
+
+Not bot policy, not the advisor, not a dashboard tutorial, not live GM
+teleport.
+
+## Upstream already has the map stack
+
+Do **not** reimplement WorldMapFrame parity from scratch. The nim client
+already models stock 1.12 behavior. Primary sources under
+`../coworld-vanilla-wow`:
+
+| Concern | Module(s) |
+|---|---|
+| Surfaces, overlays, projection | `environment/client/world_maps.nim` |
+| DBC geometry, explored bits, click | `environment/client/world_catalogs/world_map.nim` |
+| Draw path, overlays, frame layout | `environment/client/ui/world_map_frame.nim` |
+| 12-tile BLP mosaic → 1002×668 | `environment/client/ui/wow_atlas_assets.nim` (`composeWorldMapSurface`) |
+| Asset roots / env | `environment/client/localpaths.nim` (`VANILLA_WOW_CLIENT_DATA_DIR`, …) |
+| Selection API | `client_state/world.nim` (`setWorldMapZoom*`, `processWorldMapClick`, world level) |
+
+### Zoom levels ↔ stock WorldMapFrame
+
+| UX level | Stock surface | Art path pattern |
+|---|---|---|
+| Fully out | world level (`SetMapZoom(0)`) | `Interface\WorldMap\World\World{1..12}.blp` |
+| Mid | continent (`Azeroth` / `Kalimdor`) | `Interface\WorldMap\<Continent>\…` + `WorldMapOverlay` tiles |
+| Far | zone (`Durotar`, …) | `Interface\WorldMap\<Zone>\<Zone>{1..12}.blp` |
+
+Detail size is stock **1002×668** (`WorldMapDetailWidth` /
+`WorldMapDetailHeight`). Assets on high-steel already appear under
+upstream’s browser extract, e.g.:
+
+`../coworld-vanilla-wow/local_data/player/browser-assets/delta/interface/worldmap/`
+
+…and/or via client `Data/*.MPQ` when `VANILLA_WOW_CLIENT_DATA_DIR` points at
+classic data (`wow-classic-data` / Coworld-WoW-Classic).
+
+### Fog of war vs “fully visible”
+
+Continent detail fills in through `WorldMapOverlay.dbc` rows, gated by
+`PLAYER_EXPLORED_ZONES` bits (`worldMapOverlaysFor*`). For this tool we
+want **every overlay for the surface**, not exploration-gated art.
+
+Implementation: tool-local list/filter that skips explored checks (or
+all-bits-set mask). Do **not** change stock client explored behavior
+upstream; this is authoring-tool policy only.
+
+### World ↔ map math (waypoint clicks)
+
+- Place: UV on surface → world via `worldMapSurfaceLocation`.
+- Draw: world → UV via `projectWorldMapPoint` / player-map position helpers.
+- Drill: `processMapClick` / `setWorldMapZoom` / `setWorldMapToWorldLevel`.
+
+Waypoint schema (draft): `{ map_id, x, y, z? }` points in a named route
+file. Persist under something gitignored like `local_data/waypoints/` (or
+an explicit CLI path). **Not** `kb/` until a planner exists to read bot
+memory.
+
+## What not to build on
+
+| Surface | Why not |
+|---|---|
+| `viewers/map_viewer` / `runMapViewer` | 3D terrain viewer, wrong product |
+| `world_editor` creature waypoints | Patrol / live GM edit path |
+| Dashboard map widgets | Wrong surface; dashboard is buttons/metrics |
+| GM/SOAP tele for “preview” | Forbidden unless monofuel explicitly orders tele |
+
+## Architecture (proposed)
+
+Thin tool that **imports** client map/catalog/UI helpers from the fork;
+does not vendor client source and does not embed a full play session.
+
+```text
+src/tools/map_browser.nim
+  → src/map_browser/*
+  → import fork modules (path via nim.cfg → ../coworld-vanilla-wow-fork)
+  → silky (or existing client window stack) for the GUI
+```
+
+**Import reality:** the coworld client is a monorepo of modules, not a tidy
+`import wow` package. Expect a phase-0 spike to prove which path set
+compiles from this repo under `nix develop`. Prefer the smallest import
+set (catalog + texture compose + projection); fall back to more of the
+WorldMapFrame draw path only if mosaic loading is painful.
+
+**Coupling isolation:** one config module for asset env vars and fork root —
+not scattered string paths.
+
+**Checkout:** import from `../coworld-vanilla-wow-fork` on `main`. Stock
+`../coworld-vanilla-wow` stays read-only. Do not commit into either from
+this tool’s workflow except deliberate fork client work monofuel owns.
+
+### Suggested modules
+
+| Module | Role |
+|---|---|
+| `assets.nim` | Resolve data roots; load/composemaps via client helpers |
+| `surface.nim` | World / continent / zone selection; full overlay list |
+| `projection.nim` | Thin wrappers over world ↔ UV |
+| `waypoints.nim` | Edit model + JSON load/save |
+| `draw.nim` | Blit surface, overlays, waypoint UI |
+
+## Phased delivery
+
+| Phase | Outcome | Exit check |
+|---|---|---|
+| **0. Spike** | Create `src/`; open a window; draw **world** mosaic from a known asset root under `nix develop` | Compiles and shows art |
+| **1. Surfaces** | World → continent → zone drill; zoom-out back up | Click drill works |
+| **2. Full overlays** | Continent fully painted (no fog) | Overlays match full zone fill |
+| **3. Waypoints** | Click place, select, delete, polyline | UV↔world feels right |
+| **4. I/O** | JSON save/load; stable schema | Round-trip file |
+| **5. Polish** | Labels, hover names, pan; optional continuous zoom/LOD | Nice-to-have only |
+
+Default zoom model for MVP: **stock discrete drill** (cheap, matches
+client). Continuous scroll + LOD crossfade is phase 5 if discrete feels
+wrong for authoring.
+
+## Tests and Makefile (when coding starts)
+
+- Unit: projection math + waypoint JSON only — no network, no sleeps
+  (repo testing doctrine).
+- `make test` stays green; add a focused target if needed for map modules.
+- Document one Makefile entry for the tool that always uses
+  `nix develop --command …`.
+
+## Hard rules (carry from AGENTS.md)
+
+- No Python for this tool.
+- Upstream read-only; client fixes go on the fork only if we discover a
+  real client bug (document + monofuel decides).
+- No tele / GM position writes for map preview.
+- Agents own ops commands; human surface remains play clients.
+- Docs for engineers stay in `docs/`; do not refill `kb/` with this plan.
+
+## Open decisions (record when chosen)
+
+1. **Zoom model for v1:** discrete drill (default) vs continuous LOD.
+2. **Waypoint consumers:** human-only authoring vs later feed into Lua /
+   army host (affects schema stability).
+3. **Import depth:** thin catalog+textures vs hitch WorldMapFrame draw
+   more heavily (phase 0 decides).
+
+## Related docs
+
+- `docs/terms.md` — vocabulary
+- `docs/interfaces.md` — boundaries (nim client vs vanilla client)
+- `docs/nim-client.md` — how we compose against the pinned client
+- `docs/navmesh.md` — separate; navmesh is not the painted WorldMap
+- Upstream: `environment/client/world_maps.nim`, `ui/world_map_frame.nim`
+  (read-only checkout)

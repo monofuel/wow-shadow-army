@@ -3,7 +3,8 @@
 # Env (optional): TRAVERSE_POL_* overrides (see tools/traverse_pol.sh).
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-export TRAVERSE_POL_CLEANUP="${TRAVERSE_POL_CLEANUP:-0}"
+# Tear down *-traverse-coworld-game-1 when army_host exits (checkpoint/timeout/error).
+export TRAVERSE_POL_CLEANUP="${TRAVERSE_POL_CLEANUP:-1}"
 export TRAVERSE_POL_MIN_YARDS="${TRAVERSE_POL_MIN_YARDS:-0}"
 export TRAVERSE_POL_MAX_SECONDS="${TRAVERSE_POL_MAX_SECONDS:-1200}"
 export TRAVERSE_POL_GOAL_RADIUS="${TRAVERSE_POL_GOAL_RADIUS:-50}"

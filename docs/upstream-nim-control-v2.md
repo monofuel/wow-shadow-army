@@ -32,13 +32,6 @@ Docs (`docs/bot-environment-contract.md`):
 | Headless seats + autonomous upstream planner | May still run for stock bots |
 | Fork `bakPromoteParty` execute path | Still present on `party-invite-observation`; no external mask to expose it |
 
-## Carried fork after rebase
-
-- `main` = stock `ec5bd2f9d` (Gitea pushed)
-- `shadow-army-fixes`: faction-standing cowpatch + dual parse (rebased)
-- `party-invite-observation`: social-party + promote execute (rebased);
-  **quest/death external mask hunks dropped** (no target API on v2)
-
 ## Do not
 
 - Rebuild/restart all seats onto v2 and expect escort Lua to work without a
