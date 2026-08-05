@@ -1984,6 +1984,15 @@ proc pidAlive*(pid: int): bool =
     return false
   result = dirExists("/proc/" & $pid)
 
+proc pidCmdline*(pid: int): string =
+  ## /proc/<pid>/cmdline with NULs as spaces (empty if unreadable).
+  if pid <= 0:
+    return ""
+  try:
+    result = readFile("/proc/" & $pid & "/cmdline").replace('\0', ' ').strip()
+  except CatchableError:
+    result = ""
+
 proc clearPidFile(path: string) =
   try:
     if fileExists(path):
@@ -1991,17 +2000,49 @@ proc clearPidFile(path: string) =
   except CatchableError:
     discard
 
-proc pgrepPatternRunning*(pattern: string): bool =
-  ## True when `pgrep -f pattern` finds at least one process.
+proc isTraversePolProcess*(pid: int): bool =
+  ## True when pid is our PoL launcher or army_host traverse mode.
+  let cmd = pidCmdline(pid)
+  if cmd.len == 0:
+    return false
+  result =
+    ("traverse_pol.sh" in cmd) or
+    ("make" in cmd and "traverse-pol" in cmd) or
+    ("army_host" in cmd and "mode=traverse" in cmd)
+
+proc isTraverseWatchProcess*(pid: int): bool =
+  ## True when pid is the watch launcher tree (uv/python or its nix-shell wrapper).
+  let cmd = pidCmdline(pid)
+  if cmd.len == 0:
+    return false
+  # Require watch_bots.py in the argv so agent shells that only mention the
+  # string in a long pipeline are less likely to match.
+  if "watch_bots.py" notin cmd:
+    return false
+  result =
+    ("uv" in cmd) or ("python" in cmd) or ("nix-shell" in cmd) or
+    ("nix" in cmd and "shell" in cmd)
+
+proc findProcessByMarker*(marker: string): int =
+  ## Scan /proc for a cmdline containing marker; return first pid or 0.
   try:
-    let process = startProcess(
-      "pgrep", args = ["-f", pattern], options = {poUsePath, poStdErrToStdOut})
-    discard process.outputStream.readAll()
-    let code = process.waitForExit()
-    process.close()
-    result = code == 0
+    for kind, path in walkDir("/proc", relative = false):
+      if kind != pcDir:
+        continue
+      let base = path.extractFilename
+      var pid = 0
+      try:
+        pid = parseInt(base)
+      except CatchableError:
+        continue
+      if pid <= 1:
+        continue
+      let cmd = pidCmdline(pid)
+      if marker in cmd:
+        return pid
   except CatchableError:
-    result = false
+    discard
+  result = 0
 
 proc traverseOpsStatus*(): TraverseOpsStatus =
   ## Whether PoL / observer detaches are live (pid files + process probe).
@@ -2010,27 +2051,123 @@ proc traverseOpsStatus*(): TraverseOpsStatus =
     watchLog: TraverseWatchLogRel
   )
   let polPid = readPidFile(traversePolPidPath())
-  if pidAlive(polPid) or pgrepPatternRunning("tools/traverse_pol.sh") or
-      pgrepPatternRunning("army_host --mode=traverse"):
+  if isTraversePolProcess(polPid):
     result.polRunning = true
-    result.polPid = if pidAlive(polPid): polPid else: 0
+    result.polPid = polPid
   else:
-    if polPid > 0:
+    let found = findProcessByMarker("army_host --mode=traverse")
+    if found > 0:
+      result.polRunning = true
+      result.polPid = found
+    elif polPid > 0:
       clearPidFile(traversePolPidPath())
   let watchPid = readPidFile(traverseWatchPidPath())
-  if pidAlive(watchPid) or pgrepPatternRunning("observe/watch_bots"):
+  if isTraverseWatchProcess(watchPid):
     result.watchRunning = true
-    result.watchPid = if pidAlive(watchPid): watchPid else: 0
+    result.watchPid = watchPid
   else:
-    if watchPid > 0:
+    let found = findProcessByMarker("watch_bots.py")
+    if found > 0:
+      result.watchRunning = true
+      result.watchPid = found
+    elif watchPid > 0:
       clearPidFile(traverseWatchPidPath())
 
+proc dockerPublishedHostPort*(container, containerPort: string): int =
+  ## Parse `docker port <container> <port>/tcp` → host port (0 on failure).
+  if container.len == 0 or containerPort.len == 0:
+    return 0
+  try:
+    let process = startProcess(
+      "docker",
+      args = ["port", container, containerPort & "/tcp"],
+      options = {poUsePath, poStdErrToStdOut})
+    let output = process.outputStream.readAll().strip()
+    let code = process.waitForExit()
+    process.close()
+    if code != 0 or output.len == 0:
+      return 0
+    let line = output.splitLines()[0].strip()
+    let colon = line.rfind(':')
+    if colon < 0 or colon + 1 >= line.len:
+      return 0
+    result = parseInt(line[colon + 1 .. ^1])
+  except CatchableError:
+    result = 0
+
+proc logFileTail*(path: string; maxLines = 8): string =
+  ## Last N lines of a log file (empty if missing).
+  try:
+    if not fileExists(path):
+      return ""
+    let lines = readFile(path).strip().splitLines()
+    let n = min(maxLines, lines.len)
+    if n <= 0:
+      return ""
+    result = lines[lines.len - n .. ^1].join(" | ")
+  except CatchableError:
+    result = ""
+
+proc nixDevelopCmd*(root, inner: string): string =
+  ## Run `inner` inside this repo's flake (`nix develop --command …`).
+  ## Prefer this over nix-shell -p hand-rolls.
+  &"cd {quoteShell(root)} && nix develop --command bash -lc {quoteShell(inner)}"
+
+proc stopTraversePol*(): TraverseOpsStatus =
+  ## TERM the PoL launcher / army_host mode=traverse processes.
+  var bits: seq[string] = @[]
+  let pid = readPidFile(traversePolPidPath())
+  if pid > 0 and pidAlive(pid):
+    discard runShell(&"kill {pid} 2>/dev/null || true")
+    bits.add(&"kill pid {pid}")
+  for kind, path in walkDir("/proc", relative = false):
+    if kind != pcDir:
+      continue
+    var p = 0
+    try:
+      p = parseInt(path.extractFilename)
+    except CatchableError:
+      continue
+    if isTraversePolProcess(p):
+      discard runShell(&"kill {p} 2>/dev/null || true")
+      bits.add(&"kill {p}")
+  clearPidFile(traversePolPidPath())
+  result = traverseOpsStatus()
+  result.lastOk = true
+  result.lastDetail = if bits.len > 0: bits.join("; ") else: "nothing to stop"
+
+proc stopTraverseWatch*(): TraverseOpsStatus =
+  ## TERM the watch_bots observer process tree (and leftover live-pov/viewer).
+  var bits: seq[string] = @[]
+  let pid = readPidFile(traverseWatchPidPath())
+  if pid > 0 and pidAlive(pid):
+    discard runShell(&"kill -TERM -{pid} 2>/dev/null || kill {pid} 2>/dev/null || true")
+    bits.add(&"kill pid {pid}")
+  for kind, path in walkDir("/proc", relative = false):
+    if kind != pcDir:
+      continue
+    var p = 0
+    try:
+      p = parseInt(path.extractFilename)
+    except CatchableError:
+      continue
+    let cmd = pidCmdline(p)
+    if isTraverseWatchProcess(p) or
+        ("live-pov" in cmd and "watch-bots" in cmd) or
+        ("global-viewer" in cmd and "live-pov=" in cmd):
+      discard runShell(&"kill {p} 2>/dev/null || true")
+      bits.add(&"kill {p}")
+  clearPidFile(traverseWatchPidPath())
+  result = traverseOpsStatus()
+  result.lastOk = true
+  result.lastDetail = if bits.len > 0: bits.join("; ") else: "nothing to stop"
+
 proc startTraversePol*(): TraverseOpsStatus =
-  ## Detached `make traverse-pol` (CLEANUP=0 so the scenario stays for watch).
+  ## Detached `make traverse-pol` under `nix develop` (CLEANUP=0 for watch).
   result = traverseOpsStatus()
   if result.polRunning:
     result.lastOk = true
-    result.lastDetail = "proof of life already running"
+    result.lastDetail = "already running"
     return
   let root = armyRoot()
   if not fileExists(root / "Makefile"):
@@ -2040,81 +2177,100 @@ proc startTraversePol*(): TraverseOpsStatus =
   let logPath = traversePolLogPath()
   let pidPath = traversePolPidPath()
   createDir(parentDir(logPath))
+  let inner =
+    &"export TRAVERSE_POL_CLEANUP=0 TRAVERSE_POL_LOG={quoteShell(logPath)}; " &
+    &"exec make -C {quoteShell(root)} traverse-pol"
   let cmd =
-    &"mkdir -p '{parentDir(logPath)}' && (" &
-    &"setsid nohup env TRAVERSE_POL_CLEANUP=0 " &
-    &"TRAVERSE_POL_LOG='{logPath}' " &
-    &"make -C '{root}' traverse-pol >> '{logPath}' 2>&1 < /dev/null & " &
-    &"echo $! > '{pidPath}' )"
+    &"mkdir -p {quoteShell(parentDir(logPath))} && (" &
+    &"setsid nohup bash -lc {quoteShell(nixDevelopCmd(root, inner))} " &
+    &">> {quoteShell(logPath)} 2>&1 < /dev/null & " &
+    &"echo $! > {quoteShell(pidPath)} )"
   let r = runShell(cmd)
   result = traverseOpsStatus()
   result.lastOk = r.ok
   result.lastDetail =
-    if r.ok: &"started make traverse-pol (log: {TraversePolLogRel}; CLEANUP=0)"
+    if r.ok: &"started (log {TraversePolLogRel})"
     else: r.detail
 
-proc stopTraversePol*(): TraverseOpsStatus =
-  ## TERM the PoL launcher / army_host mode=traverse processes.
-  let pid = readPidFile(traversePolPidPath())
-  var bits: seq[string] = @[]
-  if pid > 0 and pidAlive(pid):
-    discard runShell(&"kill {pid} 2>/dev/null || true")
-    bits.add(&"kill pid {pid}")
-  discard runShell(
-    "pkill -f 'tools/traverse_pol.sh' 2>/dev/null || true; " &
-    "pkill -f 'army_host --mode=traverse' 2>/dev/null || true")
-  bits.add("pkill traverse_pol/army_host")
-  clearPidFile(traversePolPidPath())
-  result = traverseOpsStatus()
-  result.lastOk = true
-  result.lastDetail = bits.join("; ")
-
 proc startTraverseWatch*(): TraverseOpsStatus =
-  ## Detached upstream `observe/watch_bots.nim --watch Northbound` (native viewer).
+  ## Detached watch_bots live POV under `nix develop` (openssl/nginx/uv in flake).
   result = traverseOpsStatus()
   if result.watchRunning:
     result.lastOk = true
-    result.lastDetail = "observer already running"
+    result.lastDetail = "already running"
     return
+  let root = armyRoot()
   let upstream = upstreamDir()
-  let watchNim = upstream / "observe" / "watch_bots.nim"
-  if not fileExists(watchNim):
+  let watchPy = upstream / "observe" / "watch_bots.py"
+  if not fileExists(watchPy):
     result.lastOk = false
-    result.lastDetail = &"watch_bots.nim missing under {upstream}"
+    result.lastDetail = &"watch_bots.py missing under {upstream}"
     return
+  let container = resolveTraverseContainer()
+  if container.len == 0:
+    result.lastOk = false
+    result.lastDetail = "no traverse container"
+    return
+  let captures = resolveTraverseCapturesDir(container)
+  if captures.len == 0 or not dirExists(captures):
+    result.lastOk = false
+    result.lastDetail = "no traverse captures"
+    return
+  let realmPort = dockerPublishedHostPort(container, "3724")
+  let worldPort = dockerPublishedHostPort(container, "8085")
+  if realmPort <= 0 or worldPort <= 0:
+    result.lastOk = false
+    result.lastDetail = "realm/world ports unmapped"
+    return
+  discard stopTraverseWatch()
   let logPath = traverseWatchLogPath()
   let pidPath = traverseWatchPidPath()
   createDir(parentDir(logPath))
+  try:
+    writeFile(logPath, "")
+  except CatchableError:
+    discard
   let display = getEnv("DISPLAY", ":0")
+  # Inside flake shell: uv + openssl + nginx. Workdir = upstream for watch_bots.
+  let watchInner =
+    &"export DISPLAY={quoteShell(display)}; " &
+    &"export VMANGOS_CAPTURES_DIR={quoteShell(captures)}; " &
+    &"cd {quoteShell(upstream)}; " &
+    &"exec uv run python observe/watch_bots.py " &
+    &"--watch {TraverseCharacterName} " &
+    &"--no-bring-up --no-provision " &
+    &"--realm-host 127.0.0.1 --realm-port {realmPort} --world-port {worldPort}"
   let cmd =
-    &"mkdir -p '{parentDir(logPath)}' && (" &
-    &"cd '{upstream}' && " &
-    &"setsid nohup env DISPLAY='{display}' " &
-    &"nim r --hints:off observe/watch_bots.nim -- " &
-    &"--watch {TraverseCharacterName} >> '{logPath}' 2>&1 < /dev/null & " &
-    &"echo $! > '{pidPath}' )"
+    &"mkdir -p {quoteShell(parentDir(logPath))} && (" &
+    &"setsid nohup bash -lc {quoteShell(nixDevelopCmd(root, watchInner))} " &
+    &">> {quoteShell(logPath)} 2>&1 < /dev/null & " &
+    &"echo $! > {quoteShell(pidPath)} )"
   let r = runShell(cmd)
+  sleep(5000)
   result = traverseOpsStatus()
-  result.lastOk = r.ok
+  if not r.ok:
+    result.lastOk = false
+    result.lastDetail = r.detail
+    return
+  let pid = readPidFile(pidPath)
+  let pyPid = findProcessByMarker("watch_bots.py")
+  if pidAlive(pid) or pyPid > 0:
+    let tail = logFileTail(logPath, 12)
+    if pyPid == 0 and "error:" in tail.toLowerAscii:
+      result.watchRunning = false
+      result.lastOk = false
+      result.lastDetail = tail
+      return
+    result.watchRunning = true
+    result.watchPid = if pyPid > 0: pyPid elif pidAlive(pid): pid else: 0
+    result.lastOk = true
+    result.lastDetail = &"started (log {TraverseWatchLogRel})"
+    return
+  let tail = logFileTail(logPath, 10)
+  result.lastOk = false
   result.lastDetail =
-    if r.ok:
-      &"started watch_bots --watch {TraverseCharacterName} " &
-      &"(log: {TraverseWatchLogRel}; DISPLAY={display})"
-    else: r.detail
-
-proc stopTraverseWatch*(): TraverseOpsStatus =
-  ## TERM the watch_bots observer process.
-  let pid = readPidFile(traverseWatchPidPath())
-  var bits: seq[string] = @[]
-  if pid > 0 and pidAlive(pid):
-    discard runShell(&"kill {pid} 2>/dev/null || true")
-    bits.add(&"kill pid {pid}")
-  discard runShell("pkill -f 'observe/watch_bots' 2>/dev/null || true")
-  bits.add("pkill watch_bots")
-  clearPidFile(traverseWatchPidPath())
-  result = traverseOpsStatus()
-  result.lastOk = true
-  result.lastDetail = bits.join("; ")
+    if tail.len > 0: tail
+    else: "exited early"
 
 # ---------------------------------------------------------------------------
 # SOAP GM command client (inbound: System → addon via announce)
@@ -3450,15 +3606,7 @@ proc renderTraverseOpsPanel*(ops: TraverseOpsStatus): string =
       {polBtn}
       {watchBtn}
     </div>
-    <p class="meta" style="margin:0 0 0.5rem 0">
-      PoL runs <code>make traverse-pol</code> (Lua <code>--mode=traverse</code>, short smoke, not 45m).
-      Observer is upstream <code>watch_bots --watch {TraverseCharacterName}</code> (live POV; does not take the policy seat).
-      Start PoL first, then observer while the fixture is up. Logs:
-      <code>{escapeHtml(ops.polLog)}</code> ·
-      <code>{escapeHtml(ops.watchLog)}</code>
-    </p>
 {lastLine}"""
-
 proc renderTraversePage*(st: TraverseStatus; ops: TraverseOpsStatus): string =
   ## Traverse tab: league telemetry + PoL / observer controls.
   let statusBody = renderTraverseStatus(st)

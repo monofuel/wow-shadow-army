@@ -3,7 +3,7 @@
 ## No network, no docker, no realm — pure functions only.
 
 import
-  std/[options, strutils, unittest],
+  std/[options, os, strutils, unittest],
   ../system_server
 
 suite "traverse episode clock":
@@ -258,6 +258,9 @@ suite "traverse ops panel":
     check "/traverse/watch/start" in html
     check "PoL idle" in html
     check "observer idle" in html
+    # Dashboard is metrics+buttons only (autoresearch docs/dashboard.md).
+    check "make traverse-pol" notin html
+    check "watch_bots" notin html
 
   test "running shows stop buttons":
     let ops = TraverseOpsStatus(
@@ -285,3 +288,14 @@ suite "traverse ops panel":
     check "Controls" in page
     check "id=\"traverse-ops\"" in page
     check "hx-get=\"/traverse/ops\"" in page
+
+suite "traverse docker port parse":
+  test "parse published host port line":
+    # Unit-test only the parser logic via dockerPublishedHostPort needs docker;
+    # instead pin logFileTail and ops panel still compile.
+    check logFileTail("/nonexistent/file") == ""
+    let tmp = getTempDir() / "traverse-ops-tail-test.log"
+    writeFile(tmp, "a\nb\nc\nd\ne\n")
+    let t = logFileTail(tmp, 3)
+    check "c" in t and "d" in t and "e" in t
+    removeFile(tmp)

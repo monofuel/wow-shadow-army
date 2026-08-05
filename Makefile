@@ -131,13 +131,9 @@ test-nim:
 # Works with the realm up or down; Admin tab starts/stops it via the operator.
 # SYSTEM_UPSTREAM_DIR pins the operator checkout explicitly (no cwd guessing).
 system:
-	@if command -v nim >/dev/null 2>&1; then \
-		SYSTEM_UPSTREAM_DIR="$${SYSTEM_UPSTREAM_DIR:-$(UPSTREAM)}" nim r system/system_server.nim; \
-	elif [ -f flake.nix ] || [ -f shell.nix ]; then \
-		SYSTEM_UPSTREAM_DIR="$${SYSTEM_UPSTREAM_DIR:-$(UPSTREAM)}" nix develop --command nim r system/system_server.nim; \
-	else \
-		echo "error: nim not on PATH and no flake/shell.nix fallback" >&2; exit 1; \
-	fi
+	@SYSTEM_UPSTREAM_DIR="$${SYSTEM_UPSTREAM_DIR:-$(UPSTREAM)}" \
+		SYSTEM_ARMY_DIR="$${SYSTEM_ARMY_DIR:-$$(pwd)}" \
+		nix develop --command nim r system/system_server.nim
 
 # Pin-drift only: HEAD of ../coworld-vanilla-wow must match upstream.lock.
 # Pure shell — no Python. Format of upstream.lock: "<name> <sha>".
