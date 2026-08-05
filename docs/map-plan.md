@@ -1,9 +1,9 @@
 # World map browser + waypoint tool — plan
 
-Status: **plan only** (no implementation yet). Goal: a Nim-headed map
-visualization tool in this repo that approximates a coworker tool —
-hierarchical vanilla world-map art with zoom levels, full (non-fog-of-war)
-zone detail on continents, and click-to-draw waypoints.
+Status: **phase 0 done** (world mosaic loads and displays). Goal: a
+Nim-headed map visualization tool in this repo that approximates a coworker
+tool — hierarchical vanilla world-map art with zoom levels, full
+(non-fog-of-war) zone detail on continents, and click-to-draw waypoints.
 
 Terms: `docs/terms.md`. Client imports come from **the fork**
 (`../coworld-vanilla-wow-fork`, on `main`) — this tool builds on client
@@ -19,17 +19,18 @@ every compile/run step.
 - [x] Plan written (`docs/map-plan.md`)
 - [x] `nim.cfg` path to `../coworld-vanilla-wow-fork`
 - [x] Fork and stock upstream checkouts on `main` (no `shadow-army-fixes`)
-- [ ] Confirm world-map assets resolve (browser-assets and/or
-      `VANILLA_WOW_CLIENT_DATA_DIR` / classic data)
-- [ ] `nix develop` shell works on this machine (`nim --version`)
+- [x] Confirm world-map assets resolve (prepared BLPs under
+      `coworld-vanilla-wow/player/assets/interface/worldmap/world`; override
+      via `MAP_BROWSER_WORLD_MAP_DIR`)
+- [x] `nix develop` shell works on this machine (`nim --version`)
 
 ### Phase 0 — spike (first real `src/` tree)
 
-- [ ] Create `src/` and `src/tools/`
-- [ ] Scaffold `src/tools/map_browser.nim` (+ optional `src/map_browser/`)
-- [ ] Import something small from the fork under `nix develop`
-- [ ] Open a window and draw the **world** mosaic (World 1–12 tiles)
-- [ ] Exit: compiles and shows art
+- [x] Create `src/` and `src/tools/`
+- [x] Scaffold `src/tools/map_browser.nim` + `src/map_browser/assets.nim`
+- [x] Import from the fork under `nix develop` (`environment/client/localpaths`)
+- [x] Open a window and draw the **world** mosaic (World 1–12 tiles)
+- [x] Exit: compiles and shows art (`make map-browser` / `make map-browser-once`)
 
 ### Phase 1 — surfaces
 
@@ -81,23 +82,22 @@ Today this repo’s Nim surface is mostly ops/host code under `tools/`
 **product Nim tool** meant to live under a proper source tree:
 
 ```text
-src/                        # CREATE — does not exist yet
+src/                        # exists — first product Nim tools live here
   tools/
-    map_browser.nim         # entrypoint (name TBD)
+    map_browser.nim         # entrypoint (phase 0+)
   map_browser/              # library modules for the tool
-    assets.nim
-    surface.nim
-    projection.nim
-    waypoints.nim
-    draw.nim
+    assets.nim              # phase 0: tile resolve + World mosaic compose
+    surface.nim             # later
+    projection.nim          # later
+    waypoints.nim           # later
+    draw.nim                # later
 ```
 
-- Create `src/` when implementation starts; do not invent a second layout.
 - Prefer `src/tools/<name>.nim` for new headed/CLI tools of this kind.
 - Leave existing `tools/` host/ops scripts where they are unless we later
   decide to migrate them (out of scope for this plan).
-- Wire `nim.cfg` / Makefile only as needed so `nim r src/tools/…` works
-  from repo root.
+- `nim.cfg` has `--path:"src"`; Makefile: `make map-browser` and
+  `make map-browser-once` (both via `nix develop`).
 
 ## Build environment — always `nix develop`
 

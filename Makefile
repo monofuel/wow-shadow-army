@@ -46,7 +46,7 @@ COMPOSE_FILE := infra/compose.vmangos.yml
 ACCOUNT_USER := monofuel
 ACCOUNT_PASS := password
 
-.PHONY: test test-lua test-nim system pin-check start-server stop-server server-logging logs account soap-account play play-classic play-classic-netlog play-xr traverse traverse-pol traverse-desert traverse-field traverse-replay escort escort-army grind quest-data warlock-account warlock-bot botwarrior-bot tusk-account tusk-bot beru-account beru-bot party-army navmesh-helper navmesh-status
+.PHONY: test test-lua test-nim system pin-check start-server stop-server server-logging logs account soap-account play play-classic play-classic-netlog play-xr traverse traverse-pol traverse-desert traverse-field traverse-replay escort escort-army grind quest-data warlock-account warlock-bot botwarrior-bot tusk-account tusk-bot beru-account beru-bot party-army navmesh-helper navmesh-status map-browser map-browser-once
 
 # Unit tier: Lua tools + Nim host/system tests only (v2 DoD: no Python required
 # for bot correctness). If nim is missing, test-nim-soft skips rather than
@@ -59,7 +59,8 @@ test: test-lua test-nim-soft test-smoke
 # no unit suite imports it yet (army_host, msgpack_json).
 NIM_CHECK_FILES = system/system_server.nim tools/army_host.nim \
 	tools/fair_play_audit.nim tools/party_promote.nim tools/msgpack_json.nim \
-	tools/env_transport.nim tools/env_smoke.nim
+	tools/env_transport.nim tools/env_smoke.nim \
+	src/tools/map_browser.nim
 
 .PHONY: test-smoke test-smoke-lua test-smoke-nim test-smoke-nim-soft
 test-smoke: test-smoke-lua test-smoke-nim-soft
@@ -134,6 +135,15 @@ system:
 	@SYSTEM_UPSTREAM_DIR="$${SYSTEM_UPSTREAM_DIR:-$(UPSTREAM)}" \
 		SYSTEM_ARMY_DIR="$${SYSTEM_ARMY_DIR:-$$(pwd)}" \
 		nix develop --command nim r system/system_server.nim
+
+# Map browser (docs/map-plan.md). Headed World map mosaic; phase 0 spike.
+# Assets: prepared BLPs under coworld-vanilla-wow player/assets (or MAP_BROWSER_WORLD_MAP_DIR).
+map-browser:
+	nix develop --command nim r src/tools/map_browser.nim
+
+# Headless smoke: compose mosaic, write PNG, exit (no GUI).
+map-browser-once:
+	MAP_BROWSER_ONCE=1 nix develop --command nim r src/tools/map_browser.nim
 
 # Pin-drift only: HEAD of ../coworld-vanilla-wow must match upstream.lock.
 # Pure shell — no Python. Format of upstream.lock: "<name> <sha>".
