@@ -8,6 +8,11 @@ Management server for the wow-shadow-army: one Nim binary, many interfaces.
 | Murist tab | `GET /murist` | human seat metrics + Murist events |
 | Advisor tab | `GET /advisor` | addon event tail + reload |
 | Admin tab | `GET /admin` | realm Start/Stop + ops buttons |
+| Traverse tab | `GET /traverse` | Kalimdor telemetry + PoL / observer controls |
+| Start traverse PoL | `POST /traverse/pol/start` | detached `make traverse-pol` |
+| Stop traverse PoL | `POST /traverse/pol/stop` | kill PoL processes |
+| Start traverse observer | `POST /traverse/watch/start` | detached `watch_bots --watch Northbound` |
+| Stop traverse observer | `POST /traverse/watch/stop` | kill watch_bots |
 | Roster partial | `GET /roster` | htmx fragment (roster table rows) |
 | Events partial | `GET /events` | htmx fragment (addon event rows) |
 | Server partial | `GET /server` | htmx fragment (realm status + Start/Stop buttons) |

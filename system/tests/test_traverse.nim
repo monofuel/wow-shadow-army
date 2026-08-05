@@ -242,3 +242,46 @@ suite "traverse godview live pos":
     check "northing yards" in html
     check sc.northingYards > 1.0
     check formatTraverseYards(sc.northingYards) in html
+
+suite "traverse ops panel":
+  test "idle shows start buttons":
+    let ops = TraverseOpsStatus(
+      polRunning: false,
+      watchRunning: false,
+      polLog: TraversePolLogRel,
+      watchLog: TraverseWatchLogRel
+    )
+    let html = renderTraverseOpsPanel(ops)
+    check "Start proof of life" in html
+    check "Start observer" in html
+    check "/traverse/pol/start" in html
+    check "/traverse/watch/start" in html
+    check "PoL idle" in html
+    check "observer idle" in html
+
+  test "running shows stop buttons":
+    let ops = TraverseOpsStatus(
+      polRunning: true,
+      watchRunning: true,
+      polLog: TraversePolLogRel,
+      watchLog: TraverseWatchLogRel,
+      lastOk: true,
+      lastDetail: "started make traverse-pol"
+    )
+    let html = renderTraverseOpsPanel(ops)
+    check "Stop proof of life" in html
+    check "Stop observer" in html
+    check "/traverse/pol/stop" in html
+    check "/traverse/watch/stop" in html
+    check "PoL running" in html
+    check "observer running" in html
+    check "started make traverse-pol" in html
+
+  test "page includes controls section":
+    let st = TraverseStatus(containerFound: false)
+    let ops = TraverseOpsStatus(
+      polLog: TraversePolLogRel, watchLog: TraverseWatchLogRel)
+    let page = renderTraversePage(st, ops)
+    check "Controls" in page
+    check "id=\"traverse-ops\"" in page
+    check "hx-get=\"/traverse/ops\"" in page

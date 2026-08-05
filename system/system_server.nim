@@ -5,8 +5,11 @@
 ##                          GET /traverse  GET /admin
 ##                          GET /roster  GET /murist/status  GET /murist/quests
 ##                          GET /murist/events  GET /traverse/status
+##                          GET /traverse/ops
 ##                          GET /events  GET /server
 ##                          POST /reload  POST /server/start  POST /server/stop
+##                          POST /traverse/pol/start|/stop
+##                          POST /traverse/watch/start|/stop
 ##                          POST /admin/respawn-shadow-army
 ##   MCP endpoint (MCPort)  POST /mcp
 ##
@@ -14,6 +17,7 @@
 ## proc; the htmx handlers render it and the MCP tools serialize it.
 ##   listCharacters()           — roster (SELECT via docker exec)
 ##   traverseStatus()        — Kalimdor Traverse telemetry (DB + live godview)
+##   startTraversePol()/startTraverseWatch() — detached PoL + live observer
 ##   recentEvents()          — addon Chat.log ring buffer
 ##   reloadAddon()           — SOAP announce <SYS> reload + wait for <SA> loaded
 ##   announceInGame()        — SOAP announce <text>
@@ -22,10 +26,10 @@
 ##   startServer()/stopServer() — queue operator `up`/`down` (async worker)
 ##
 ## Tabs: Army (roster), Murist (human seat), Advisor (events + reload),
-## Traverse (league telemetry), Admin (realm + ops). The dashboard stays
-## useful with the realm DOWN: roster/Murist degrade to offline notes;
-## Admin's Server panel offers Start/Stop. The human only runs the client
-## and this dashboard.
+## Traverse (league telemetry + PoL/observer controls), Admin (realm + ops).
+## The dashboard stays useful with the realm DOWN: roster/Murist degrade to
+## offline notes; Admin's Server panel offers Start/Stop. The human only runs
+## the client and this dashboard.
 ##
 ## Admin interfaces (same procs): HTTP /admin, MCP tools, and human-seat addon
 ## chat (`<SA> admin <action>` from Murist → Chat.log tailer).
@@ -76,6 +80,11 @@ const
   TraverseContainerSuffix* = "-traverse-coworld-game-1"
   ## Host path under ~/.coworld for league runtime captures (godview JSONL).
   TraverseCapturesRel* = ".coworld/player/launcher_units/runtime"
+  ## Detached traverse ops (dashboard Start PoL / observer).
+  TraversePolLogRel* = "local_data/brain-logs/traverse-pol.log"
+  TraversePolPidRel* = "local_data/brain-logs/traverse-pol.pid"
+  TraverseWatchLogRel* = "local_data/brain-logs/traverse-watch.log"
+  TraverseWatchPidRel* = "local_data/brain-logs/traverse-watch.pid"
   ## Tail window when reading the latest godview shard (live pos, not full history).
   GodviewTailBytes* = 256 * 1024
   ## VMaNGOS CHARACTER_FLAG_GHOST — set while spirit-running / unreleased corpse.
@@ -263,6 +272,17 @@ type
     ## True when pos/score used godview capture (not just characters DB).
     livePos*: bool
     clock*: TraverseClock
+
+  TraverseOpsStatus* = object
+    ## Detached PoL / observer controls on the Traverse tab.
+    polRunning*: bool
+    polPid*: int
+    polLog*: string
+    watchRunning*: bool
+    watchPid*: int
+    watchLog*: string
+    lastDetail*: string
+    lastOk*: bool
 
   TraverseLivePos* = object
     ## One godview snapshot of the fixture character (in-world, not DB save).
@@ -1932,6 +1952,171 @@ proc stopBotSeat*(name: string): JsonNode =
               "detail": &"sent TERM to ctrl :{port} holder"}
 
 # ---------------------------------------------------------------------------
+# Traverse detached ops: Lua proof-of-life + local watch_bots observer
+# ---------------------------------------------------------------------------
+
+proc traversePolLogPath*(): string =
+  armyRoot() / TraversePolLogRel
+
+proc traversePolPidPath*(): string =
+  armyRoot() / TraversePolPidRel
+
+proc traverseWatchLogPath*(): string =
+  armyRoot() / TraverseWatchLogRel
+
+proc traverseWatchPidPath*(): string =
+  armyRoot() / TraverseWatchPidRel
+
+proc readPidFile*(path: string): int =
+  ## Best-effort PID from a file; 0 when missing/invalid.
+  try:
+    if not fileExists(path):
+      return 0
+    result = parseInt(readFile(path).strip().splitLines()[0])
+    if result <= 0:
+      result = 0
+  except CatchableError:
+    result = 0
+
+proc pidAlive*(pid: int): bool =
+  ## True when /proc/<pid> exists (Linux).
+  if pid <= 0:
+    return false
+  result = dirExists("/proc/" & $pid)
+
+proc clearPidFile(path: string) =
+  try:
+    if fileExists(path):
+      removeFile(path)
+  except CatchableError:
+    discard
+
+proc pgrepPatternRunning*(pattern: string): bool =
+  ## True when `pgrep -f pattern` finds at least one process.
+  try:
+    let process = startProcess(
+      "pgrep", args = ["-f", pattern], options = {poUsePath, poStdErrToStdOut})
+    discard process.outputStream.readAll()
+    let code = process.waitForExit()
+    process.close()
+    result = code == 0
+  except CatchableError:
+    result = false
+
+proc traverseOpsStatus*(): TraverseOpsStatus =
+  ## Whether PoL / observer detaches are live (pid files + process probe).
+  result = TraverseOpsStatus(
+    polLog: TraversePolLogRel,
+    watchLog: TraverseWatchLogRel
+  )
+  let polPid = readPidFile(traversePolPidPath())
+  if pidAlive(polPid) or pgrepPatternRunning("tools/traverse_pol.sh") or
+      pgrepPatternRunning("army_host --mode=traverse"):
+    result.polRunning = true
+    result.polPid = if pidAlive(polPid): polPid else: 0
+  else:
+    if polPid > 0:
+      clearPidFile(traversePolPidPath())
+  let watchPid = readPidFile(traverseWatchPidPath())
+  if pidAlive(watchPid) or pgrepPatternRunning("observe/watch_bots"):
+    result.watchRunning = true
+    result.watchPid = if pidAlive(watchPid): watchPid else: 0
+  else:
+    if watchPid > 0:
+      clearPidFile(traverseWatchPidPath())
+
+proc startTraversePol*(): TraverseOpsStatus =
+  ## Detached `make traverse-pol` (CLEANUP=0 so the scenario stays for watch).
+  result = traverseOpsStatus()
+  if result.polRunning:
+    result.lastOk = true
+    result.lastDetail = "proof of life already running"
+    return
+  let root = armyRoot()
+  if not fileExists(root / "Makefile"):
+    result.lastOk = false
+    result.lastDetail = &"Makefile missing in {root}"
+    return
+  let logPath = traversePolLogPath()
+  let pidPath = traversePolPidPath()
+  createDir(parentDir(logPath))
+  let cmd =
+    &"mkdir -p '{parentDir(logPath)}' && (" &
+    &"setsid nohup env TRAVERSE_POL_CLEANUP=0 " &
+    &"TRAVERSE_POL_LOG='{logPath}' " &
+    &"make -C '{root}' traverse-pol >> '{logPath}' 2>&1 < /dev/null & " &
+    &"echo $! > '{pidPath}' )"
+  let r = runShell(cmd)
+  result = traverseOpsStatus()
+  result.lastOk = r.ok
+  result.lastDetail =
+    if r.ok: &"started make traverse-pol (log: {TraversePolLogRel}; CLEANUP=0)"
+    else: r.detail
+
+proc stopTraversePol*(): TraverseOpsStatus =
+  ## TERM the PoL launcher / army_host mode=traverse processes.
+  let pid = readPidFile(traversePolPidPath())
+  var bits: seq[string] = @[]
+  if pid > 0 and pidAlive(pid):
+    discard runShell(&"kill {pid} 2>/dev/null || true")
+    bits.add(&"kill pid {pid}")
+  discard runShell(
+    "pkill -f 'tools/traverse_pol.sh' 2>/dev/null || true; " &
+    "pkill -f 'army_host --mode=traverse' 2>/dev/null || true")
+  bits.add("pkill traverse_pol/army_host")
+  clearPidFile(traversePolPidPath())
+  result = traverseOpsStatus()
+  result.lastOk = true
+  result.lastDetail = bits.join("; ")
+
+proc startTraverseWatch*(): TraverseOpsStatus =
+  ## Detached upstream `observe/watch_bots.nim --watch Northbound` (native viewer).
+  result = traverseOpsStatus()
+  if result.watchRunning:
+    result.lastOk = true
+    result.lastDetail = "observer already running"
+    return
+  let upstream = upstreamDir()
+  let watchNim = upstream / "observe" / "watch_bots.nim"
+  if not fileExists(watchNim):
+    result.lastOk = false
+    result.lastDetail = &"watch_bots.nim missing under {upstream}"
+    return
+  let logPath = traverseWatchLogPath()
+  let pidPath = traverseWatchPidPath()
+  createDir(parentDir(logPath))
+  let display = getEnv("DISPLAY", ":0")
+  let cmd =
+    &"mkdir -p '{parentDir(logPath)}' && (" &
+    &"cd '{upstream}' && " &
+    &"setsid nohup env DISPLAY='{display}' " &
+    &"nim r --hints:off observe/watch_bots.nim -- " &
+    &"--watch {TraverseCharacterName} >> '{logPath}' 2>&1 < /dev/null & " &
+    &"echo $! > '{pidPath}' )"
+  let r = runShell(cmd)
+  result = traverseOpsStatus()
+  result.lastOk = r.ok
+  result.lastDetail =
+    if r.ok:
+      &"started watch_bots --watch {TraverseCharacterName} " &
+      &"(log: {TraverseWatchLogRel}; DISPLAY={display})"
+    else: r.detail
+
+proc stopTraverseWatch*(): TraverseOpsStatus =
+  ## TERM the watch_bots observer process.
+  let pid = readPidFile(traverseWatchPidPath())
+  var bits: seq[string] = @[]
+  if pid > 0 and pidAlive(pid):
+    discard runShell(&"kill {pid} 2>/dev/null || true")
+    bits.add(&"kill pid {pid}")
+  discard runShell("pkill -f 'observe/watch_bots' 2>/dev/null || true")
+  bits.add("pkill watch_bots")
+  clearPidFile(traverseWatchPidPath())
+  result = traverseOpsStatus()
+  result.lastOk = true
+  result.lastDetail = bits.join("; ")
+
+# ---------------------------------------------------------------------------
 # SOAP GM command client (inbound: System → addon via announce)
 # ---------------------------------------------------------------------------
 
@@ -3212,10 +3397,88 @@ proc renderTraverseStatus*(st: TraverseStatus): string =
       </div>
     </div>"""
 
-proc renderTraversePage*(st: TraverseStatus): string =
-  ## Traverse tab: league telemetry only (no viewport, no launch controls).
+proc renderTraverseOpsPanel*(ops: TraverseOpsStatus): string =
+  ## Controls for detached Lua PoL + local watch_bots observer.
+  let polPill =
+    if ops.polRunning:
+      """<span class="pill"><span class="dot on"></span> PoL running</span>"""
+    else:
+      """<span class="pill"><span class="dot off"></span> PoL idle</span>"""
+  let watchPill =
+    if ops.watchRunning:
+      """<span class="pill"><span class="dot on"></span> observer running</span>"""
+    else:
+      """<span class="pill"><span class="dot off"></span> observer idle</span>"""
+  let polBtn =
+    if ops.polRunning:
+      """
+      <button class="btn danger"
+              hx-post="/traverse/pol/stop"
+              hx-target="#traverse-ops"
+              hx-swap="innerHTML">Stop proof of life</button>"""
+    else:
+      """
+      <button class="btn primary"
+              hx-post="/traverse/pol/start"
+              hx-target="#traverse-ops"
+              hx-swap="innerHTML">Start proof of life</button>"""
+  let watchBtn =
+    if ops.watchRunning:
+      """
+      <button class="btn danger"
+              hx-post="/traverse/watch/stop"
+              hx-target="#traverse-ops"
+              hx-swap="innerHTML">Stop observer</button>"""
+    else:
+      """
+      <button class="btn primary"
+              hx-post="/traverse/watch/start"
+              hx-target="#traverse-ops"
+              hx-swap="innerHTML">Start observer</button>"""
+  var lastLine = ""
+  if ops.lastDetail.len > 0:
+    let cls = if ops.lastOk: "admin-ok" else: "admin-err"
+    let mark = if ops.lastOk: "ok" else: "FAIL"
+    lastLine = &"""
+      <div class="server-last {cls}" title="{escapeHtml(ops.lastDetail)}">
+        last: {mark} — {escapeHtml(ops.lastDetail)}
+      </div>"""
+  result = &"""
+    <div class="panel-actions" style="margin-bottom:0.75rem;flex-wrap:wrap;gap:0.5rem">
+      {polPill}
+      {watchPill}
+      {polBtn}
+      {watchBtn}
+    </div>
+    <p class="meta" style="margin:0 0 0.5rem 0">
+      PoL runs <code>make traverse-pol</code> (Lua <code>--mode=traverse</code>, short smoke, not 45m).
+      Observer is upstream <code>watch_bots --watch {TraverseCharacterName}</code> (live POV; does not take the policy seat).
+      Start PoL first, then observer while the fixture is up. Logs:
+      <code>{escapeHtml(ops.polLog)}</code> ·
+      <code>{escapeHtml(ops.watchLog)}</code>
+    </p>
+{lastLine}"""
+
+proc renderTraversePage*(st: TraverseStatus; ops: TraverseOpsStatus): string =
+  ## Traverse tab: league telemetry + PoL / observer controls.
   let statusBody = renderTraverseStatus(st)
+  let opsBody = renderTraverseOpsPanel(ops)
   let body = &"""
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Controls</h2>
+        <div class="panel-actions">
+          <span class="badge accent">ops</span>
+        </div>
+      </div>
+      <div class="panel-body"
+           id="traverse-ops"
+           hx-get="/traverse/ops"
+           hx-trigger="every {PollSeconds}s"
+           hx-swap="innerHTML settle:0s swap:0s">
+{opsBody}
+      </div>
+    </section>
     <section class="panel">
       <div class="panel-head">
         <h2>Kalimdor Traverse</h2>
@@ -3444,12 +3707,14 @@ proc muristEventsHandler(request: Request) {.gcsafe.} =
       &"""<tr><td colspan="4" class="empty">error: {escapeHtml(e.msg)}</td></tr>""")
 
 proc traversePageHandler(request: Request) {.gcsafe.} =
-  ## GET /traverse — Traverse tab (Kalimdor course telemetry).
+  ## GET /traverse — Traverse tab (telemetry + PoL / observer controls).
   try:
     var st: TraverseStatus
+    var ops: TraverseOpsStatus
     {.gcsafe.}:
       st = traverseStatus()
-    request.respond(200, htmlHeaders(), renderTraversePage(st))
+      ops = traverseOpsStatus()
+    request.respond(200, htmlHeaders(), renderTraversePage(st, ops))
   except Exception as e:
     # Never surface a hard failure for a missing scenario — soft empty page.
     try:
@@ -3457,7 +3722,9 @@ proc traversePageHandler(request: Request) {.gcsafe.} =
         containerFound: false,
         score: scoreTraverse(false, 0, 0, false, 0.0)
       )
-      request.respond(200, htmlHeaders(), renderTraversePage(soft))
+      let ops = TraverseOpsStatus(
+        polLog: TraversePolLogRel, watchLog: TraverseWatchLogRel)
+      request.respond(200, htmlHeaders(), renderTraversePage(soft, ops))
     except Exception:
       request.respond(500, htmlHeaders(),
         &"<!DOCTYPE html><html><body><h1>Traverse error</h1><pre>{escapeHtml(e.msg)}</pre></body></html>")
@@ -3472,6 +3739,61 @@ proc traverseStatusHandler(request: Request) {.gcsafe.} =
   except Exception:
     request.respond(200, htmlHeaders(),
       """<p class="empty">Scenario not running — no *-traverse-coworld-game-1 container.</p>""")
+
+proc traverseOpsHandler(request: Request) {.gcsafe.} =
+  ## GET /traverse/ops — htmx fragment for PoL / observer controls.
+  try:
+    var ops: TraverseOpsStatus
+    {.gcsafe.}:
+      ops = traverseOpsStatus()
+    request.respond(200, htmlHeaders(), renderTraverseOpsPanel(ops))
+  except Exception as e:
+    request.respond(500, htmlHeaders(),
+      &"""<span class="admin-err">ops error: {escapeHtml(e.msg)}</span>""")
+
+proc traversePolStartHandler(request: Request) {.gcsafe.} =
+  ## POST /traverse/pol/start — detached make traverse-pol.
+  try:
+    var ops: TraverseOpsStatus
+    {.gcsafe.}:
+      ops = startTraversePol()
+    request.respond(200, htmlHeaders(), renderTraverseOpsPanel(ops))
+  except Exception as e:
+    request.respond(500, htmlHeaders(),
+      &"""<span class="admin-err">start pol failed: {escapeHtml(e.msg)}</span>""")
+
+proc traversePolStopHandler(request: Request) {.gcsafe.} =
+  ## POST /traverse/pol/stop — kill PoL processes.
+  try:
+    var ops: TraverseOpsStatus
+    {.gcsafe.}:
+      ops = stopTraversePol()
+    request.respond(200, htmlHeaders(), renderTraverseOpsPanel(ops))
+  except Exception as e:
+    request.respond(500, htmlHeaders(),
+      &"""<span class="admin-err">stop pol failed: {escapeHtml(e.msg)}</span>""")
+
+proc traverseWatchStartHandler(request: Request) {.gcsafe.} =
+  ## POST /traverse/watch/start — detached watch_bots observer.
+  try:
+    var ops: TraverseOpsStatus
+    {.gcsafe.}:
+      ops = startTraverseWatch()
+    request.respond(200, htmlHeaders(), renderTraverseOpsPanel(ops))
+  except Exception as e:
+    request.respond(500, htmlHeaders(),
+      &"""<span class="admin-err">start observer failed: {escapeHtml(e.msg)}</span>""")
+
+proc traverseWatchStopHandler(request: Request) {.gcsafe.} =
+  ## POST /traverse/watch/stop — kill watch_bots.
+  try:
+    var ops: TraverseOpsStatus
+    {.gcsafe.}:
+      ops = stopTraverseWatch()
+    request.respond(200, htmlHeaders(), renderTraverseOpsPanel(ops))
+  except Exception as e:
+    request.respond(500, htmlHeaders(),
+      &"""<span class="admin-err">stop observer failed: {escapeHtml(e.msg)}</span>""")
 
 proc rosterPartialHandler(request: Request) {.gcsafe.} =
   ## GET /roster — htmx fragment (table rows only). Foundation seats hidden.
@@ -3658,6 +3980,11 @@ proc serverInfoHandler(request: Request) {.gcsafe.} =
         "murist_quests": "/murist/quests",
         "murist_events": "/murist/events",
         "traverse_status": "/traverse/status",
+        "traverse_ops": "/traverse/ops",
+        "traverse_pol_start": "/traverse/pol/start",
+        "traverse_pol_stop": "/traverse/pol/stop",
+        "traverse_watch_start": "/traverse/watch/start",
+        "traverse_watch_stop": "/traverse/watch/stop",
         "events_partial": "/events",
         "server_partial": "/server",
         "server_start": "/server/start",
@@ -4017,6 +4344,11 @@ proc main() =
   router.get("/advisor", advisorPageHandler)
   router.get("/traverse", traversePageHandler)
   router.get("/traverse/status", traverseStatusHandler)
+  router.get("/traverse/ops", traverseOpsHandler)
+  router.post("/traverse/pol/start", traversePolStartHandler)
+  router.post("/traverse/pol/stop", traversePolStopHandler)
+  router.post("/traverse/watch/start", traverseWatchStartHandler)
+  router.post("/traverse/watch/stop", traverseWatchStopHandler)
   router.get("/admin", adminPageHandler)
   router.get("/roster", rosterPartialHandler)
   router.get("/events", eventsPartialHandler)
@@ -4038,6 +4370,7 @@ proc main() =
   echo &"  Murist:      GET  http://127.0.0.1:{HttpPort}/murist"
   echo &"  Advisor:     GET  http://127.0.0.1:{HttpPort}/advisor"
   echo &"  Traverse:    GET  http://127.0.0.1:{HttpPort}/traverse"
+  echo &"  Traverse ops POST /traverse/pol/start|/stop  /traverse/watch/start|/stop"
   echo &"  Admin:       GET  http://127.0.0.1:{HttpPort}/admin"
   echo &"  Events:      GET  http://127.0.0.1:{HttpPort}/events"
   echo &"  Server:      GET  http://127.0.0.1:{HttpPort}/server (POST /server/start /server/stop)"
