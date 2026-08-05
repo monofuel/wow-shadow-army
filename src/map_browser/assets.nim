@@ -1,12 +1,15 @@
-## Resolve stock WorldMap tile roots and compose the 12-tile detail surface.
+## Resolve stock WorldMap tile roots and compose detail surfaces.
 ## Stock layout (upstream `ui/wow_atlas_assets.nim`): 4×3 tiles of 256 → crop
-## to 1002×668.
+## to 1002×668. Zone base BLPs are the fog-of-war “hidden” art; full detail
+## is WorldMapOverlay pieces (Razor Hill, Valley of Trials, …) composited on
+## top — always fully revealed in this tool (no PLAYER_EXPLORED_ZONES gate).
 
 import
   std/[os, strutils],
   pixie,
   wololo/blp,
-  environment/client/localpaths
+  environment/client/localpaths,
+  environment/client/world_catalogs/model
 
 const
   WorldMapDetailWidth* = 1002
@@ -22,6 +25,34 @@ type
     tileDir*: string
     clientDataDir*: string
     sourceLabel*: string
+    overlayCount*: int
+
+proc premultiplyAlpha(image: Image) {.raises: [].} =
+  ## BLP is straight alpha; Pixie NormalBlend wants premultiplied.
+  if image == nil:
+    return
+  for i in 0 ..< image.data.len:
+    var color = image.data[i]
+    if color.a == 255'u8:
+      continue
+    let a = uint32(color.a)
+    color.r = uint8((uint32(color.r) * a + 127'u32) div 255'u32)
+    color.g = uint8((uint32(color.g) * a + 127'u32) div 255'u32)
+    color.b = uint8((uint32(color.b) * a + 127'u32) div 255'u32)
+    image.data[i] = color
+
+proc overlayTileCount(textureSize: int32): int {.raises: [].} =
+  if textureSize <= 0:
+    return 0
+  (textureSize.int + WorldMapTileSize - 1) div WorldMapTileSize
+
+proc overlayTilePixelSize(textureSize: int32; tileIndex, tileCount: int): int
+    {.raises: [].} =
+  if tileIndex < tileCount:
+    WorldMapTileSize
+  else:
+    let remainder = textureSize.int mod WorldMapTileSize
+    if remainder == 0: WorldMapTileSize else: remainder
 
 proc repoRoot*(): string {.raises: [].} =
   ## wow-shadow-army root (this file is src/map_browser/assets.nim).
@@ -107,13 +138,101 @@ proc composeWorldMapSurface*(
     )
   result = mosaic.subImage(0, 0, WorldMapDetailWidth, WorldMapDetailHeight)
 
-proc loadSurfaceMosaic*(fileName: string): tuple[image: Image, roots: AssetRoots]
+proc overlayBlpPath(tileDir, textureName: string; tileIndex: int): string
+    {.raises: [].} =
+  var base = textureName.strip()
+  if base.toLowerAscii().endsWith(".blp"):
+    base = base[0 ..< base.len - 4]
+  let lower = base.toLowerAscii()
+  let a = tileDir / (lower & $tileIndex & ".blp")
+  if fileExists(a):
+    return a
+  tileDir / (base & $tileIndex & ".blp")
+
+proc composeWorldMapOverlay*(
+  tileDir: string;
+  overlay: WorldMapOverlayInfo
+): Image {.raises: [IOError, PixieError, BlpError].} =
+  ## Numbered overlay tiles at 256px steps (stock FrameXML / composeWorldMapOverlay).
+  let
+    columns = overlay.textureWidth.overlayTileCount()
+    rows = overlay.textureHeight.overlayTileCount()
+  if columns <= 0 or rows <= 0:
+    raise newException(IOError, "empty world-map overlay dimensions")
+  result = newImage(overlay.textureWidth.int, overlay.textureHeight.int)
+  for row in 0 ..< rows:
+    let tileHeight = overlayTilePixelSize(overlay.textureHeight, row + 1, rows)
+    for column in 0 ..< columns:
+      let
+        tileWidth = overlayTilePixelSize(
+          overlay.textureWidth, column + 1, columns)
+        tileIndex = row * columns + column + 1
+        path = overlayBlpPath(tileDir, overlay.textureName, tileIndex)
+      if not fileExists(path):
+        raise newException(IOError, "missing overlay tile: " & path)
+      let tile = readBlpTexture(path).image
+      if tile == nil:
+        raise newException(IOError, "failed to decode overlay BLP: " & path)
+      let clipped = tile.subImage(
+        0, 0,
+        min(tileWidth, tile.width),
+        min(tileHeight, tile.height)
+      )
+      result.draw(
+        clipped,
+        translate(vec2(
+          float32(column * WorldMapTileSize),
+          float32(row * WorldMapTileSize)
+        )),
+        OverwriteBlend
+      )
+  result.premultiplyAlpha()
+
+proc allOverlaysForArea*(
+  overlays: openArray[WorldMapOverlayInfo];
+  areaMapId: uint32
+): seq[WorldMapOverlayInfo] {.raises: [].} =
+  ## Every WorldMapOverlay row for a surface — no explored-bit filter.
+  if areaMapId == 0'u32:
+    return
+  for overlay in overlays:
+    if overlay.mapAreaId == areaMapId:
+      result.add overlay
+
+proc compositeRevealedSurface*(
+  base: Image;
+  tileDir: string;
+  overlays: openArray[WorldMapOverlayInfo]
+): tuple[image: Image, applied: int]
     {.raises: [IOError, PixieError, BlpError].} =
-  ## Load any WorldMap surface token (World, Kalimdor, Durotar, …).
+  ## Base fog art + all overlay pieces (fully explored).
+  result.image = base
+  for overlay in overlays:
+    if overlay.textureWidth <= 0 or overlay.textureHeight <= 0:
+      continue
+    try:
+      let piece = composeWorldMapOverlay(tileDir, overlay)
+      result.image.draw(
+        piece,
+        translate(vec2(float32(overlay.offsetX), float32(overlay.offsetY))),
+        NormalBlend
+      )
+      inc result.applied
+    except CatchableError as err:
+      # Missing optional overlay tiles should not blank the whole map.
+      echo "map_browser: overlay skip ", overlay.textureName, ": ", err.msg
+
+proc loadSurfaceMosaic*(
+  fileName: string;
+  areaMapId: uint32 = 0'u32;
+  overlays: openArray[WorldMapOverlayInfo] = []
+): tuple[image: Image, roots: AssetRoots]
+    {.raises: [IOError, PixieError, BlpError].} =
+  ## Load World / continent / zone surface; zone maps get full overlay reveal.
   let token =
     if fileName.len > 0: fileName
     else: WorldMapSurfaceFile
-  let roots = resolveWorldMapTileDir(token)
+  var roots = resolveWorldMapTileDir(token)
   if roots.tileDir.len == 0:
     raise newException(
       IOError,
@@ -121,7 +240,13 @@ proc loadSurfaceMosaic*(fileName: string): tuple[image: Image, roots: AssetRoots
         "or ensure coworld-vanilla-wow player/assets interface/worldmap/" &
         token.toLowerAscii() & " exists. defaultClientDataDir=" & roots.clientDataDir
     )
-  (composeWorldMapSurface(roots.tileDir, token), roots)
+  var image = composeWorldMapSurface(roots.tileDir, token)
+  let applicable = overlays.allOverlaysForArea(areaMapId)
+  if applicable.len > 0:
+    let composed = compositeRevealedSurface(image, roots.tileDir, applicable)
+    image = composed.image
+    roots.overlayCount = composed.applied
+  (image, roots)
 
 proc loadWorldMosaic*(): tuple[image: Image, roots: AssetRoots]
     {.raises: [IOError, PixieError, BlpError].} =

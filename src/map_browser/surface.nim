@@ -19,6 +19,7 @@ type
     worldLevel*: bool
     surface*: WorldMapSurface ## meaningful when not world level
     fileName*: string         ## BLP folder token: World / Kalimdor / Durotar
+    areaMapId*: uint32        ## WorldMapArea id for overlay lookup (0 = none)
     label*: string
     status*: string
 
@@ -60,6 +61,7 @@ proc worldSurfaceState*(): SurfaceState {.raises: [].} =
     level: MapLevelWorld,
     worldLevel: true,
     fileName: WorldMapSurfaceFile,
+    areaMapId: 0'u32,
     label: "World",
     status: "click a continent · Esc/right-click zoom out"
   )
@@ -80,6 +82,7 @@ proc applyContinent*(
     fileName:
       if surface.fileName.len > 0: surface.fileName
       else: $uint32(mapId),
+    areaMapId: surface.area.areaMapId,
     label: surface.label,
     status: "click a zone · Esc/right-click zoom out"
   )
@@ -105,8 +108,9 @@ proc applyZone*(
     worldLevel: false,
     surface: surface,
     fileName: fileName,
+    areaMapId: surface.area.areaMapId,
     label: surface.label,
-    status: "zone view · Esc/right-click zoom out"
+    status: "zone view (fully revealed) · Esc/right-click zoom out"
   )
 
 proc drillIn*(
@@ -162,20 +166,52 @@ proc zoomOut*(
     else:
       result = worldSurfaceState()
 
+proc hoverAt*(
+  catalog: WorldCatalog;
+  state: SurfaceState;
+  uv: Vec2
+): WorldMapAreaHover {.raises: [].} =
+  ## Stock UpdateMapHighlight for the current surface (geometry + label).
+  if state.worldLevel or state.level == MapLevelWorld:
+    catalog.updateMapHighlight(uv, worldLevel = true)
+  elif state.surface.found:
+    catalog.updateMapHighlight(
+      uv,
+      surface = state.surface,
+      mapId = state.surface.mapId
+    )
+  else:
+    WorldMapAreaHover()
+
 proc hoverLabel*(
   catalog: WorldCatalog;
   state: SurfaceState;
   uv: Vec2
 ): string {.raises: [].} =
-  let hover =
-    if state.worldLevel or state.level == MapLevelWorld:
-      catalog.updateMapHighlight(uv, worldLevel = true)
-    elif state.surface.found:
-      catalog.updateMapHighlight(
-        uv,
-        surface = state.surface,
-        mapId = state.surface.mapId
-      )
-    else:
-      WorldMapAreaHover()
+  let hover = catalog.hoverAt(state, uv)
   if hover.found: hover.label else: ""
+
+proc continentLabel*(catalog: WorldCatalog; mapId: MapId): string
+    {.raises: [].} =
+  let surface = catalog.worldMapSurfaceFor(mapId, 0'u32)
+  if surface.found and surface.label.len > 0:
+    surface.label
+  else:
+    "Map " & $uint32(mapId)
+
+proc breadcrumb*(catalog: WorldCatalog; state: SurfaceState): string
+    {.raises: [].} =
+  ## e.g. "World  ›  Kalimdor  ›  Thousand Needles"
+  const Sep = "  ›  "
+  case state.level
+  of MapLevelWorld:
+    "World"
+  of MapLevelContinent:
+    "World" & Sep & state.label
+  of MapLevelZone:
+    let cont =
+      if state.surface.found:
+        catalog.continentLabel(state.surface.mapId)
+      else:
+        "?"
+    "World" & Sep & cont & Sep & state.label

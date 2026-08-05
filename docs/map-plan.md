@@ -1,7 +1,7 @@
 # World map browser + waypoint tool — plan
 
-Status: **phase 0 done** (world mosaic loads and displays). Goal: a
-Nim-headed map visualization tool in this repo that approximates a coworker
+Status: **phase 1 done** (World → continent → zone drill + zoom out). Goal:
+a Nim-headed map visualization tool in this repo that approximates a coworker
 tool — hierarchical vanilla world-map art with zoom levels, full
 (non-fog-of-war) zone detail on continents, and click-to-draw waypoints.
 
@@ -34,16 +34,22 @@ every compile/run step.
 
 ### Phase 1 — surfaces
 
-- [ ] World → continent drill (click / ProcessMapClick path)
-- [ ] Continent → zone drill
-- [ ] Zoom-out back to continent / world
-- [ ] Exit: discrete drill works end-to-end
+- [x] World → continent drill (click / ProcessMapClick path)
+- [x] Continent → zone drill (ZMP masks + WorldMapArea surfaces)
+- [x] Zoom-out back to continent / world (Esc / right-click / Backspace)
+- [x] Exit: discrete drill works end-to-end (`make map-browser-once` samples)
 
 ### Phase 2 — full overlays (no fog)
 
-- [ ] List all continent overlays without explored-bit gating
-- [ ] Draw overlays on the continent surface
-- [ ] Exit: continent looks fully painted, not fog-of-war
+- [x] Zone surfaces: base fog art + **all** WorldMapOverlay pieces (no
+      explored-bit gate). Zone base BLPs alone are the “hidden” maps.
+- [x] Continent surfaces: 1.12 DBC has **0** overlays on Kalimdor/Azeroth
+      rows (areaMapId 13/14) — continent detail is zone overlays, not
+      continent-level. Base continent mosaic is what stock shows unexplored.
+- [ ] Optional: paint zone overlays onto the continent view by projecting
+      each zone’s revealed art into continent UVs (not stock, authoring only)
+- [x] Exit for zone drill: zone map shows full labels/terrain (Teldrassil/
+      Durotar verified with overlayCount=11)
 
 ### Phase 3 — waypoints
 
@@ -86,8 +92,8 @@ src/                        # exists — first product Nim tools live here
   tools/
     map_browser.nim         # entrypoint (phase 0+)
   map_browser/              # library modules for the tool
-    assets.nim              # phase 0: tile resolve + World mosaic compose
-    surface.nim             # later
+    assets.nim              # tile resolve + mosaic compose
+    surface.nim             # phase 1: World/continent/zone selection
     projection.nim          # later
     waypoints.nim           # later
     draw.nim                # later

@@ -12,14 +12,19 @@
 ##   VANILLA_WOW_EXTRACTED_DATA_DIR=…/vmangos-5875-data
 
 import
-  std/[os, strutils, tables],
+  std/[os, osproc, strutils, tables],
   chroma, pixie, silky, vmath,
   environment/client/world_catalogs,
+  environment/client/world_catalogs/model,
   map_browser/[assets, surface]
 
 const
   WindowTitle = "map browser"
   AtlasSize = 8192
+  HoverOutline = rgbx(220, 200, 140, 180)
+  HeaderBg = rgbx(24, 28, 36, 240)
+  HeaderText = rgbx(230, 220, 190, 255)
+  HeaderMuted = rgbx(160, 150, 130, 255)
 
 type
   Browser = object
@@ -49,26 +54,88 @@ proc drawPackedImage(sk: Silky; name: string; pos, size: Vec2) =
     rgbx(255, 255, 255, 255)
   )
 
+proc drawBorder(sk: Silky; pos, size: Vec2; thickness: float32; color: ColorRGBX) =
+  if size.x <= 0 or size.y <= 0:
+    return
+  let t = max(1.0'f32, thickness)
+  sk.drawRect(pos, vec2(size.x, t), color)
+  sk.drawRect(pos + vec2(0, size.y - t), vec2(size.x, t), color)
+  sk.drawRect(pos, vec2(t, size.y), color)
+  sk.drawRect(pos + vec2(size.x - t, 0), vec2(t, size.y), color)
+
+proc uvToScreen(
+  mapPos, mapSize, uvPos, uvSize: Vec2
+): tuple[pos, size: Vec2] {.raises: [].} =
+  (
+    pos: mapPos + vec2(uvPos.x * mapSize.x, uvPos.y * mapSize.y),
+    size: vec2(uvSize.x * mapSize.x, uvSize.y * mapSize.y)
+  )
+
+proc drawHoverHint(
+  sk: Silky;
+  mapPos, mapSize: Vec2;
+  hover: WorldMapAreaHover
+) =
+  ## Thin outline only over stock highlight UV (no fill).
+  if not hover.found:
+    return
+  if hover.highlightUvSize.x > 0.0'f32 and hover.highlightUvSize.y > 0.0'f32:
+    let r = uvToScreen(
+      mapPos, mapSize, hover.highlightUvPos, hover.highlightUvSize)
+    if r.size.x >= 4.0'f32 and r.size.y >= 4.0'f32:
+      sk.drawBorder(r.pos, r.size, 1.5'f32, HoverOutline)
+
+proc resolveUiFont(): string {.raises: [].} =
+  ## Prefer fontconfig match, then common paths / silky example.
+  try:
+    let (output, code) = execCmdEx("fc-match -f '%{file}' 'DejaVu Sans'")
+    if code == 0:
+      let path = output.strip()
+      if path.len > 0 and fileExists(path):
+        return path
+  except CatchableError:
+    discard
+  const candidates = [
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/TTF/DejaVuSans.ttf"
+  ]
+  for path in candidates:
+    if fileExists(path):
+      return path
+  let silkyExample =
+    getHomeDir() / ".nimby" / "pkgs" / "silky" / "examples" / "basicwindow" /
+      "data" / "IBMPlexSans-Regular.ttf"
+  if fileExists(silkyExample):
+    return silkyExample
+  ""
+
 proc atlasKey(fileName: string): string =
   "map:" & fileName.toLowerAscii()
 
-proc ensurePacked(b: var Browser; fileName: string) =
-  let key = fileName.atlasKey
+proc ensurePacked(b: var Browser; state: SurfaceState) =
+  ## Pack fully-revealed surface (base + all WorldMapOverlay pieces).
+  let key = state.fileName.atlasKey
   if b.packed.getOrDefault(key):
     return
-  let loaded = loadSurfaceMosaic(fileName)
+  let loaded = loadSurfaceMosaic(
+    state.fileName,
+    state.areaMapId,
+    b.catalog.worldMapOverlays
+  )
   if not b.sk.builder.addImage(key, loaded.image):
-    raise newException(IOError, "atlas full packing " & fileName)
+    raise newException(IOError, "atlas full packing " & state.fileName)
   b.sk.image = b.sk.builder.atlasImage
   b.sk.atlas = b.sk.builder.atlas
   b.sk.uploadAtlas()
   b.packed[key] = true
-  echo "map_browser: packed ", fileName, " from ", loaded.roots.sourceLabel
+  echo "map_browser: packed ", state.fileName,
+    " overlays=", loaded.roots.overlayCount,
+    " from ", loaded.roots.sourceLabel
 
 proc setSurface(b: var Browser; next: SurfaceState) =
   b.state = next
   try:
-    b.ensurePacked(next.fileName)
+    b.ensurePacked(next)
     b.statusLine = next.label & "  ·  " & next.status
   except CatchableError as err:
     b.statusLine = "failed to load " & next.fileName & ": " & err.msg
@@ -86,6 +153,35 @@ proc screenToUv(b: Browser; mouse: Vec2): tuple[ok: bool, uv: Vec2] =
   result.uv = vec2(
     clamp((mouse.x - layout.pos.x) / layout.size.x, 0.0'f32, 1.0'f32),
     clamp((mouse.y - layout.pos.y) / layout.size.y, 0.0'f32, 1.0'f32)
+  )
+
+proc drawHeader(
+  sk: Silky;
+  pad: float32;
+  crumbs, hoverName: string
+) =
+  let
+    barW = sk.size.x - pad * 2
+    barH = 26.0'f32
+  sk.drawRect(vec2(pad, pad), vec2(barW, barH), HeaderBg)
+  let crumbLine =
+    if hoverName.len > 0:
+      crumbs & "   ·   " & hoverName
+    else:
+      crumbs
+  discard sk.drawText(
+    sk.textStyle,
+    crumbLine,
+    vec2(pad + 8, pad + 5),
+    HeaderText
+  )
+  let hint = "click drill  ·  Esc / right-click zoom out"
+  let hintSize = sk.getTextSize(sk.textStyle, hint)
+  discard sk.drawText(
+    sk.textStyle,
+    hint,
+    vec2(pad + barW - hintSize.x - 8, pad + 5),
+    HeaderMuted
   )
 
 proc main() =
@@ -107,12 +203,11 @@ proc main() =
     createDir(outPath.parentDir())
     loaded.image.writeFile(outPath)
     echo "map_browser: wrote ", outPath, " (", state.fileName, ")"
-    # Smoke the catalog drill without a window.
     let cont = catalog.drillIn(state, vec2(0.25, 0.5))
     echo "map_browser: sample world→continent level=", cont.level,
       " file=", cont.fileName, " label=", cont.label
+    echo "map_browser: breadcrumb=", catalog.breadcrumb(cont)
     if cont.level == MapLevelContinent:
-      var zoneHits = 0
       var sampleZone = cont
       for yi in 0 .. 4:
         for xi in 0 .. 7:
@@ -122,32 +217,37 @@ proc main() =
           )
           let z = catalog.drillIn(cont, uv)
           if z.level == MapLevelZone:
-            inc zoneHits
-            if sampleZone.level != MapLevelZone:
-              sampleZone = z
-      echo "map_browser: sample zone hits on ", cont.fileName, "=", zoneHits
+            sampleZone = z
+            break
+        if sampleZone.level == MapLevelZone:
+          break
       if sampleZone.level == MapLevelZone:
-        echo "map_browser: sample zone file=", sampleZone.fileName,
-          " label=", sampleZone.label
-        let back = catalog.zoomOut(sampleZone)
-        echo "map_browser: zoomOut zone→", back.level, " ", back.fileName
-        let world = catalog.zoomOut(back)
-        echo "map_browser: zoomOut continent→", world.level, " ", world.fileName
+        echo "map_browser: breadcrumb=", catalog.breadcrumb(sampleZone)
+        let hover = catalog.hoverAt(cont, vec2(0.5, 0.5))
+        echo "map_browser: sample hover found=", hover.found,
+          " label=", hover.label,
+          " rect=", hover.highlightUvPos, " ", hover.highlightUvSize
     return
+
+  let fontPath = resolveUiFont()
+  if fontPath.len == 0:
+    echo "map_browser: warning: no UI font found; breadcrumbs may not render"
 
   let window = newWindow(WindowTitle, ivec2(1100, 780), vsync = true)
   makeContextCurrent(window)
   loadExtensions()
 
   let builder = newAtlasBuilder(AtlasSize, 4)
+  if fontPath.len > 0:
+    builder.addFont(fontPath, "Default", 16.0)
   let sk = newSilky(window, builder.atlasImage, builder.atlas)
   sk.builder = builder
+  sk.textStyle = "Default"
 
   var b = Browser(catalog: catalog, sk: sk, packed: initTable[string, bool]())
   b.setSurface(state)
 
   window.onFrame = proc() =
-    # Zoom out
     if window.buttonPressed[KeyEscape] or window.buttonPressed[MouseRight] or
         window.buttonPressed[KeyBackspace]:
       b.setSurface(b.catalog.zoomOut(b.state))
@@ -157,7 +257,7 @@ proc main() =
 
     let
       pad = 12.0'f32
-      header = 28.0'f32
+      header = 32.0'f32
       content = vec2(float32(WorldMapDetailWidth), float32(WorldMapDetailHeight))
       viewport = sk.size - vec2(pad * 2, pad * 2 + header)
       layout = fitRect(content, viewport)
@@ -170,24 +270,30 @@ proc main() =
     if b.packed.getOrDefault(key):
       sk.drawPackedImage(key, b.mapLayout.pos, b.mapLayout.size)
 
-    # Hover label + status
     let mouse = window.mousePos.vec2 / sk.uiScale
     let hit = b.screenToUv(mouse)
-    var hover = ""
+    var hover = WorldMapAreaHover()
     if hit.ok:
-      hover = b.catalog.hoverLabel(b.state, hit.uv)
+      hover = b.catalog.hoverAt(b.state, hit.uv)
+      # Only show clickable hint when drill can go deeper.
+      if b.state.level != MapLevelZone:
+        sk.drawHoverHint(b.mapLayout.pos, b.mapLayout.size, hover)
 
-    # Left click drill-in
     if window.buttonPressed[MouseLeft] and hit.ok:
       b.setSurface(b.catalog.drillIn(b.state, hit.uv))
 
-    # Simple text via drawRect bars (no font packed) — title in window chrome.
-    window.title = WindowTitle & " — " & b.state.label
-    if hover.len > 0:
-      window.title = WindowTitle & " — " & b.state.label & " / " & hover
+    let crumbs = b.catalog.breadcrumb(b.state)
+    let hoverName =
+      if hover.found and hover.label.len > 0 and
+          b.state.level != MapLevelZone:
+        hover.label
+      else:
+        ""
+    sk.drawHeader(pad, crumbs, hoverName)
 
-    # Status strip
-    sk.drawRect(vec2(pad, pad), vec2(sk.size.x - pad * 2, 22), rgbx(24, 28, 36, 230))
+    window.title = WindowTitle & " — " & crumbs
+    if hoverName.len > 0:
+      window.title = window.title & " / " & hoverName
 
     sk.endUi()
     window.swapBuffers()
