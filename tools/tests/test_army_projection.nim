@@ -228,6 +228,22 @@ block:
   check(b.isSome and b.get["target_z_known"].getBool == true,
     "absent destination_z_unknown → target_z_known true")
 
+  let pointMove = %*{
+    "kind": "move",
+    "map_id": 1,
+    "x": -9100.0,
+    "y": -2530.0,
+    "z": 14.0,
+    "intent": "travel",
+    "reason": "north_hop"
+  }
+  let c = mapIntentV2(pointMove, guids)
+  check(c.isSome, "bare move maps")
+  check(c.get["kind"].getStr == "move", "bare kind move")
+  check(c.get["destination"]["map_id"].getInt == 1, "bare map_id")
+  check(c.get["destination"]["x"].getFloat == -9100.0, "bare x")
+  check(c.get["intent"].getStr == "travel", "bare intent travel")
+
   let env = parseJson(actionSubmissionPayload(a.get, 42, 2))
   check(env["protocol"].getStr == "vanilla_wow.environment.v1", "protocol")
   check(env["type"].getStr == "action_submission", "type action_submission")

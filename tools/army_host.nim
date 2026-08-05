@@ -6,8 +6,11 @@
 ## shape) → lua/tools/<tool>.decide → mapIntentV2 → action_submission.
 ##
 ##   nim r tools/army_host.nim --slot:2 --leader:Murist --character:Igris
+##   nim r tools/army_host.nim --mode:traverse --ws --slot:0 --token:…
 ##
 ## Cadence defaults from hello.action_deadline_seconds; `--cadence` overrides.
+## `--mode=<name>` loads lua/entry/<name>.lua; `--tool=<name>` loads a tool.
+## Mode wins when both are set.
 
 import
   std/[
@@ -34,7 +37,8 @@ const
 type
   HostConfig = object
     slot: int
-    tool: string
+    tool: string            ## lua/tools/<tool> when mode is empty
+    mode: string            ## lua/entry/<mode> when set (wins over tool)
     leader: string
     party: seq[string]
     cadence: float          ## 0 = use hello.action_deadline_seconds
@@ -52,6 +56,8 @@ type
     gameUrl: string
     token: string
     assetSlot: int          ## slot used in assets/navmesh URLs, NOT the attach slot
+    polMinYards: float      ## >0: exit 0 after path yards reach this (PoL)
+    polRequireMove: bool    ## require at least one accepted move action
 
 # ---------- JSON helpers ----------
 
@@ -471,6 +477,13 @@ proc mapIntentV2*(intent: JsonNode; guids: seq[string]): Option[JsonNode] =
   case kind
   of "hold", "":
     none(JsonNode)
+  of "move", "move_to":
+    ## Destination point move (traverse / shared move_to tool).
+    if jget(intent, "x") == nil or jget(intent, "y") == nil:
+      none(JsonNode)
+    else:
+      let arr = jnum(jget(intent, "arrival_radius"), 4.0)
+      some(destMove(if arr > 0: arr else: 4.0))
   of "move_to_unit":
     if jget(intent, "x") != nil and jget(intent, "y") != nil:
       some(destMove(4.0))
@@ -567,16 +580,31 @@ proc actionIsPending(frame: JsonNode): bool =
 proc actionIsRejected(frame: JsonNode): bool =
   actionStateStatus(frame) == "rejected"
 
-proc runDecide(tool: string; proj: JsonNode): JsonNode =
-  ## Run lua/tools/<tool>.decide(proj) in a subprocess; return intent JSON.
+proc runDecide(cfg: HostConfig; proj: JsonNode): JsonNode =
+  ## Run entry or tool decide(proj) in a lua5.3 subprocess; return intent JSON.
   let repo = getCurrentDir()
-  let script = """
-package.path = [[$1/lua/?.lua;$1/lua/tools/?.lua;;]]
-local registry = require("registry")
-require("$2")
-local tool = registry.get("$2")
-local frame = $3
-local intent = tool.decide(frame, {})
+  let useMode = cfg.mode.len > 0
+  let name = if useMode: cfg.mode else: cfg.tool
+  let packagePath =
+    if useMode:
+      repo & "/lua/?.lua;" & repo & "/lua/entry/?.lua;" & repo &
+        "/lua/tools/?.lua;;"
+    else:
+      repo & "/lua/?.lua;" & repo & "/lua/tools/?.lua;;"
+  let loadBody =
+    if useMode:
+      "local entry = require(\"" & name & "\")\n" &
+      "local intent = entry.decide(frame, {})\n"
+    else:
+      "local registry = require(\"registry\")\n" &
+      "require(\"" & name & "\")\n" &
+      "local tool = registry.get(\"" & name & "\")\n" &
+      "local intent = tool.decide(frame, {})\n"
+  let script = (
+    "package.path = [[" & packagePath & "]]\n" &
+    "local frame = " & toLua(proj) & "\n" &
+    loadBody &
+    """
 local function enc(v)
   local t = type(v)
   if v == nil then return "null"
@@ -604,7 +632,8 @@ local function enc(v)
   else return "null" end
 end
 print(enc(intent))
-""" % [repo, tool, toLua(proj)]
+"""
+  )
   let tmp = getTempDir() / ("army_decide_" & $getCurrentProcessId() & ".lua")
   writeFile(tmp, script)
   var bin = findExe("lua5.3")
@@ -631,6 +660,7 @@ proc parseConfig(): HostConfig =
   result = HostConfig(
     slot: 2,
     tool: "escort_leader",
+    mode: "",
     leader: "Murist",
     party: @["Murist", "Shadowfel", "Igris", "Tusk", "Beru"],
     cadence: 0.0,
@@ -647,7 +677,9 @@ proc parseConfig(): HostConfig =
     character: "",
     gameUrl: DefaultGameUrl,
     token: DefaultToken,
-    assetSlot: DefaultAssetSlot
+    assetSlot: DefaultAssetSlot,
+    polMinYards: 0.0,
+    polRequireMove: false
   )
   for kind, key, val in getopt():
     case kind
@@ -655,6 +687,7 @@ proc parseConfig(): HostConfig =
       case key
       of "slot": result.slot = parseInt(val)
       of "tool": result.tool = val
+      of "mode": result.mode = val
       of "leader": result.leader = val
       of "party": result.party = val.split(',')
       of "cadence":
@@ -675,6 +708,8 @@ proc parseConfig(): HostConfig =
       of "game-url": result.gameUrl = val
       of "token", "t": result.token = val
       of "asset-slot": result.assetSlot = parseInt(val)
+      of "pol-min-yards": result.polMinYards = parseFloat(val)
+      of "pol-require-move": result.polRequireMove = true
       # Dead goal-era flags: accepted and ignored so old Makefiles still parse.
       of "goal-id", "leader-slot", "external": discard
       else: discard
@@ -725,13 +760,21 @@ proc say(msg: string) =
 
 proc main() =
   var cfg = parseConfig()
-  let mode = if cfg.direct: "direct" else: "ws"
-  echo &"[army_host] env policy slot={cfg.slot} tool={cfg.tool} " &
-    &"leader={cfg.leader} mode={mode} character={cfg.character}"
+  let transport = if cfg.direct: "direct" else: "ws"
+  let policyLabel =
+    if cfg.mode.len > 0: "mode=" & cfg.mode
+    else: "tool=" & cfg.tool
+  echo &"[army_host] env policy slot={cfg.slot} {policyLabel} " &
+    &"leader={cfg.leader} transport={transport} character={cfg.character}"
   if cfg.auditPath.len > 0:
     echo &"[army_host] fair-play audit → {cfg.auditPath}"
+  if cfg.polMinYards > 0:
+    echo &"[army_host] pol-min-yards={cfg.polMinYards}"
 
-  var audit = AuditState(path: cfg.auditPath, slot: cfg.slot, tool: cfg.tool)
+  let auditTool =
+    if cfg.mode.len > 0: "mode:" & cfg.mode
+    else: cfg.tool
+  var audit = AuditState(path: cfg.auditPath, slot: cfg.slot, tool: auditTool)
   var client: EnvClient
   try:
     client = connectHost(cfg)
@@ -788,10 +831,21 @@ proc main() =
   var lastHeartbeatAt = 0.0
   var lastIntent = ""
   const HeartbeatSec = 15.0
+  var pathYards = 0.0
+  var haveLastPos = false
+  var lastX = 0.0
+  var lastY = 0.0
+  var acceptedMoves = 0
+  var polPassed = false
+  var lastSubmittedWasMove = false
+  var pendingSince = 0.0
+  const PendingStallSec = 30.0
 
   while true:
     if cfg.maxSeconds > 0 and epochTime() - t0 > cfg.maxSeconds:
-      echo "[army_host] max-seconds"
+      echo "[army_host] max-seconds path_yards=",
+        pathYards.formatFloat(ffDecimal, 1),
+        " accepted_moves=", acceptedMoves
       break
     inc i
     try:
@@ -810,26 +864,67 @@ proc main() =
         let frameId = jint(jget(node, "frame_id"))
         let name = jstr(jget(node, "name"))
         let loc = jget(node, "location")
+        let px = jnum(jget(loc, "x"))
+        let py = jnum(jget(loc, "y"))
+        let pz = jnum(jget(loc, "z"))
+        let mapId = jint(jget(loc, "map_id"))
+        if loc != nil and jget(loc, "x") != nil:
+          if haveLastPos:
+            let dx = px - lastX
+            let dy = py - lastY
+            let step = sqrt(dx * dx + dy * dy)
+            # Accept larger steps (teleport rare); reject only zero/noise.
+            if step > 0.05 and step < 500.0:
+              pathYards += step
+          lastX = px
+          lastY = py
+          haveLastPos = true
 
         # ActionState settlement tracking.
         let st = actionStateStatus(node)
+        if cfg.polMinYards > 0 and i <= 25:
+          let detail = jstr(jget(node, "action_state", "detail"))
+          let aid = jstr(jget(node, "action_state", "action_id"))
+          echo "[army_host] diag #", i, " frame=", frameId,
+            " astate=", st,
+            " detail=", detail,
+            " action_id=", aid,
+            " map=", mapId,
+            " pos=(", px.formatFloat(ffDecimal, 2), ",",
+            py.formatFloat(ffDecimal, 2), ",",
+            pz.formatFloat(ffDecimal, 2), ")",
+            " path_yd=", pathYards.formatFloat(ffDecimal, 1)
         if pendingAction:
           case st
           of "pending":
-            discard  # still waiting
+            if pendingSince > 0 and epochTime() - pendingSince > PendingStallSec:
+              echo "[army_host] pending stall >", PendingStallSec,
+                "s — clear local pending to resubmit"
+              pendingAction = false
+              lastSubmittedFrameId = -1
+              lastSubmittedWasMove = false
+              pendingSince = 0.0
           of "rejected":
             # Recompute from this frame — do not resend the old body.
             pendingAction = false
             lastSubmittedFrameId = -1
+            lastSubmittedWasMove = false
+            pendingSince = 0.0
             if not cfg.quiet:
               say &"[army_host] action rejected frame={frameId} " &
                 jstr(jget(node, "action_state", "detail"))
           of "succeeded", "failed", "timed_out", "cancelled", "":
+            if st == "succeeded" and lastSubmittedWasMove:
+              inc acceptedMoves
             pendingAction = false
             lastSubmittedFrameId = -1
+            lastSubmittedWasMove = false
+            pendingSince = 0.0
           else:
             pendingAction = false
             lastSubmittedFrameId = -1
+            lastSubmittedWasMove = false
+            pendingSince = 0.0
 
         if swingingAtOwnPet(node):
           echo "[army_host] warn aa-on-own-pet name=", name, " frame=", frameId
@@ -837,7 +932,7 @@ proc main() =
         let (proj, guids) = projectV2(node, cfg.leader)
         var intentDesc = "hold"
         try:
-          let intent = runDecide(cfg.tool, proj)
+          let intent = runDecide(cfg, proj)
           if not cfg.quiet:
             say "[policy] intent " & $intent
           intentDesc = jstr(jget(intent, "kind"), "hold") & ":" &
@@ -849,7 +944,9 @@ proc main() =
             let payload = actionSubmissionPayload(action.get, frameId, helloSlot)
             client.sendActionSubmission(reqId, payload)
             pendingAction = true
+            pendingSince = epochTime()
             lastSubmittedFrameId = frameId
+            lastSubmittedWasMove = jstr(jget(action.get, "kind")) == "move"
             recordSelect(
               audit, name, jstr(jget(action.get, "kind")), intent, true
             )
@@ -857,6 +954,15 @@ proc main() =
             say &"[army_host] skip submit (pending) frame={frameId}"
         except CatchableError as e:
           echo "[army_host] decide FAIL: ", e.msg
+
+        if cfg.polMinYards > 0 and pathYards >= cfg.polMinYards:
+          let moveOk = (not cfg.polRequireMove) or acceptedMoves > 0
+          if moveOk:
+            echo "[army_host] pol PASS path_yards=",
+              pathYards.formatFloat(ffDecimal, 1),
+              " accepted_moves=", acceptedMoves
+            polPassed = true
+            break
 
         if intentDesc != lastIntent or
             epochTime() - lastHeartbeatAt >= HeartbeatSec:
@@ -866,9 +972,12 @@ proc main() =
             " intent=", intentDesc,
             " frame=", frameId,
             " pending=", pendingAction,
+            " astate=", st,
+            " path_yd=", pathYards.formatFloat(ffDecimal, 1),
+            " moves=", acceptedMoves,
             " pos=(",
-            jnum(jget(loc, "x")).formatFloat(ffDecimal, 0), ",",
-            jnum(jget(loc, "y")).formatFloat(ffDecimal, 0), ")",
+            px.formatFloat(ffDecimal, 0), ",",
+            py.formatFloat(ffDecimal, 0), ")",
             " hp=", jnum(jget(proj, "combat", "health_pct")).formatFloat(
               ffDecimal, 0)
 
@@ -889,7 +998,10 @@ proc main() =
       echo closeMessage(e.closeCode, e.closeReason)
       if e.closeCode == 0:
         echo "[army_host] loop error: ", e.msg
-      # Soft reconnect for operator-run sessions only (not during tests).
+      # PoL runs must not soft-reconnect into a stale pending session.
+      if cfg.polMinYards > 0:
+        break
+      # Soft reconnect for operator-run sessions only.
       try: client.close()
       except CatchableError: discard
       sleep(1000)
@@ -903,6 +1015,7 @@ proc main() =
           echo &"[army_host] reconnected session_id={sessionId} " &
             &"detached_steps={detachedSteps}"
           pendingAction = false
+          pendingSince = 0.0
         else:
           echo "[army_host] reconnect: unexpected frame ", hello.kind
           break
@@ -916,6 +1029,15 @@ proc main() =
     # agent frames arrive pushed. Keep it small when deadline-driven.
     if loopCadence > 0 and loopCadence < 60:
       sleep(int(min(loopCadence, 0.25) * 1000))
+
+  if cfg.polMinYards > 0:
+    if polPassed:
+      quit 0
+    echo "[army_host] pol FAIL path_yards=",
+      pathYards.formatFloat(ffDecimal, 1),
+      " accepted_moves=", acceptedMoves,
+      " need>=", cfg.polMinYards.formatFloat(ffDecimal, 1)
+    quit 1
 
 when isMainModule:
   main()

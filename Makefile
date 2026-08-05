@@ -46,7 +46,7 @@ COMPOSE_FILE := infra/compose.vmangos.yml
 ACCOUNT_USER := monofuel
 ACCOUNT_PASS := password
 
-.PHONY: test test-lua test-nim system pin-check start-server stop-server server-logging logs account soap-account play play-classic play-classic-netlog play-xr traverse escort escort-army grind quest-data warlock-account warlock-bot botwarrior-bot tusk-account tusk-bot beru-account beru-bot party-army navmesh-helper navmesh-status
+.PHONY: test test-lua test-nim system pin-check start-server stop-server server-logging logs account soap-account play play-classic play-classic-netlog play-xr traverse traverse-pol escort escort-army grind quest-data warlock-account warlock-bot botwarrior-bot tusk-account tusk-bot beru-account beru-bot party-army navmesh-helper navmesh-status
 
 # Unit tier: Lua tools + Nim host/system tests only (v2 DoD: no Python required
 # for bot correctness). If nim is missing, test-nim-soft skips rather than
@@ -68,7 +68,7 @@ test-smoke: test-smoke-lua test-smoke-nim-soft
 # but 5.3 luac still catches syntax errors; the addon itself is never run by
 # lua/tests, so this is its only automated gate).
 test-smoke-lua:
-	@rc=0; for f in addons/*/*.lua lua/*.lua lua/tools/*.lua; do \
+	@rc=0; for f in addons/*/*.lua lua/*.lua lua/tools/*.lua lua/entry/*.lua; do \
 		[ -f "$$f" ] || continue; \
 		$(RUN_LUAC) -p "$$f" || { echo "PARSE FAIL: $$f"; rc=1; }; \
 	done; \
@@ -100,7 +100,7 @@ test-nim-soft:
 
 test-lua:
 	@rc=0; for t in lua/tests/test_*.lua; do \
-		echo "== $$t"; LUA_PATH="lua/?.lua;lua/tools/?.lua;;" $(RUN_LUA) $$t || rc=1; \
+		echo "== $$t"; LUA_PATH="lua/?.lua;lua/entry/?.lua;lua/tools/?.lua;;" $(RUN_LUA) $$t || rc=1; \
 	done; exit $$rc
 
 # Optional Nim unit tier (enum maps / pure parsers). Not part of `make test`
@@ -649,6 +649,13 @@ play:
 			--owner=$(PLAY_OWNER) \
 			--username=$(ACCOUNT_USER) \
 			--password=$(ACCOUNT_PASS) $(EXTRA)'
+
+# Lua traverse proof-of-life (docs/traverse-2026-08-04.md): short local smoke.
+# Starts upstream local --league=traverse backend, attaches army_host
+# --mode=traverse over WS /env, passes on >=50 path yards within ~3 minutes.
+# Not stock RPB --proof-of-life (that only drives RealPlayerBot).
+traverse-pol:
+	@tools/traverse_pol.sh
 
 # Launch the traverse-wow league scenario for HUMAN play (docs/traverse_wow.md).
 # Unlike `play`, this does NOT use our local realm: --league=traverse makes the

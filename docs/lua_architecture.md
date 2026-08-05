@@ -94,9 +94,14 @@ Host selection:
 
 | Context | Mode selection |
 |---|---|
-| Local Shadow Army | `army_host --mode=<name>`; default `shadow_army` |
+| Local Shadow Army | `army_host --tool=<name>` (legacy) or `--mode=shadow_army` when that entry exists |
+| Local traverse PoL | `army_host --mode=traverse` (see `make traverse-pol`) |
 | League player image | Env or image CMD maps to one entry (one image, five modes preferred) |
 | Tests | Unit-test tools; entry tests assert thin goal→intent paths |
+
+`army_host --mode=<name>` loads `lua/entry/<name>.lua` and calls `entry.decide`.
+`--tool=<name>` loads a registered tool under `lua/tools/`. Mode wins when both
+are set. Destination moves use Lua intent `kind = "move"` (also `move_to`).
 
 ## Mode goals
 
