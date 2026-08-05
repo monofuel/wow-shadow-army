@@ -1,6 +1,6 @@
 ## Resolve stock WorldMap tile roots and compose the 12-tile detail surface.
 ## Stock layout (upstream `ui/wow_atlas_assets.nim`): 4×3 tiles of 256 → crop
-## to 1002×668. Phase 0 only needs the world mosaic ("World").
+## to 1002×668.
 
 import
   std/[os, strutils],
@@ -36,8 +36,12 @@ proc worldMapTileDirCandidates*(fileName = WorldMapSurfaceFile): seq[string]
   let lower = fileName.toLowerAscii()
   let classicClient = getEnv("VANILLA_WOW_CLIENT_DATA_DIR").strip()
   let override = getEnv("MAP_BROWSER_WORLD_MAP_DIR").strip()
+  # MAP_BROWSER_WORLD_MAP_DIR may point at a single surface folder or the
+  # worldmap parent that contains World/, Kalimdor/, Durotar/, …
   if override.len > 0:
     result.add override
+    result.add override / fileName
+    result.add override / lower
   for coworld in [
     siblingCoworld("coworld-vanilla-wow-fork"),
     siblingCoworld("coworld-vanilla-wow")
@@ -49,7 +53,6 @@ proc worldMapTileDirCandidates*(fileName = WorldMapSurfaceFile): seq[string]
     let data = classicClient
     result.add data / "Interface" / "WorldMap" / fileName
     result.add data / "interface" / "worldmap" / lower
-  # local_classic thin instance (symlinked MPQ + optional extracts)
   result.add repoRoot() / "local_classic" / "client" / "Data" / "Interface" /
     "WorldMap" / fileName
 
@@ -104,14 +107,45 @@ proc composeWorldMapSurface*(
     )
   result = mosaic.subImage(0, 0, WorldMapDetailWidth, WorldMapDetailHeight)
 
-proc loadWorldMosaic*(): tuple[image: Image, roots: AssetRoots]
+proc loadSurfaceMosaic*(fileName: string): tuple[image: Image, roots: AssetRoots]
     {.raises: [IOError, PixieError, BlpError].} =
-  let roots = resolveWorldMapTileDir(WorldMapSurfaceFile)
+  ## Load any WorldMap surface token (World, Kalimdor, Durotar, …).
+  let token =
+    if fileName.len > 0: fileName
+    else: WorldMapSurfaceFile
+  let roots = resolveWorldMapTileDir(token)
   if roots.tileDir.len == 0:
     raise newException(
       IOError,
-      "World map tiles not found. Set MAP_BROWSER_WORLD_MAP_DIR or ensure " &
-        "coworld-vanilla-wow player/assets interface/worldmap/world exists. " &
-        "defaultClientDataDir=" & roots.clientDataDir
+      "World map tiles not found for '" & token & "'. Set MAP_BROWSER_WORLD_MAP_DIR " &
+        "or ensure coworld-vanilla-wow player/assets interface/worldmap/" &
+        token.toLowerAscii() & " exists. defaultClientDataDir=" & roots.clientDataDir
     )
-  (composeWorldMapSurface(roots.tileDir, WorldMapSurfaceFile), roots)
+  (composeWorldMapSurface(roots.tileDir, token), roots)
+
+proc loadWorldMosaic*(): tuple[image: Image, roots: AssetRoots]
+    {.raises: [IOError, PixieError, BlpError].} =
+  loadSurfaceMosaic(WorldMapSurfaceFile)
+
+proc zmpPathCandidates*(): seq[string] {.raises: [].} =
+  ## Folders that may contain azeroth.zmp / kalimdor.zmp (zone ownership grids).
+  let override = getEnv("MAP_BROWSER_ZMP_DIR").strip()
+  if override.len > 0:
+    result.add override
+  for coworld in [
+    siblingCoworld("coworld-vanilla-wow-fork"),
+    siblingCoworld("coworld-vanilla-wow")
+  ]:
+    result.add coworld / "player" / "assets" / "client_assets" / "interface" /
+      "worldmap"
+    result.add coworld / "local_data" / "player" / "browser-assets" / "delta" /
+      "client_assets" / "interface" / "worldmap"
+
+proc findZmpFile*(logicalPath: string): string {.raises: [].} =
+  ## Resolve Interface\\WorldMap\\Kalimdor.zmp → on-disk path, or "".
+  let base = logicalPath.replace("\\", "/").split('/')[^1].toLowerAscii()
+  for dir in zmpPathCandidates():
+    let path = dir / base
+    if fileExists(path):
+      return path
+  ""

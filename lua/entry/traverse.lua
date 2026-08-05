@@ -1,7 +1,6 @@
 -- traverse mode: maximize Kalimdor northing under fair play.
--- V1 desert segment: Travel Form, then move toward Gadgetzan-area checkpoint.
+-- V4: Travel Form to desert water entry; Aquatic Form while swimming.
 -- Single checkpoint only — not a continent waypoint list.
--- No authored multi-zone route.
 
 local move_to = require("move_to")
 
@@ -10,14 +9,17 @@ local M = {
   goal = "Maximize Kalimdor northing under fair play.",
 }
 
--- Classic 1.12 Travel Form (spell id 783, shapeshift form id 3).
+-- Classic 1.12 Travel Form (spell 783, shapeshift form id 3).
 local TRAVEL_FORM_SPELL = 783
 local TRAVEL_FORM_ID = 3
+-- Classic 1.12 Aquatic Form (spell 1066, shapeshift form id 4 / FORM_AQUA).
+local AQUATIC_FORM_SPELL = 1066
+local AQUATIC_FORM_ID = 4
 
--- Monofuel personal run: north end of starting desert (near Gadgetzan).
-local CHECKPOINT_X = -6960.4
-local CHECKPOINT_Y = -3714.4
-local CHECKPOINT_Z = 38.9
+-- North end of Tanaris desert in water (docs/traverse/traverse-2026-08-05.md).
+local CHECKPOINT_X = -6784.5
+local CHECKPOINT_Y = -4833.9
+local CHECKPOINT_Z = 0.7
 local ARRIVAL_RADIUS = 50.0
 
 -- Segment hops along the goal vector (navmesh handles mild obstacles).
@@ -47,12 +49,54 @@ local function knows_spell(frame, spellId)
   return false
 end
 
+local function is_swimming(frame)
+  local me = frame and frame.self_unit
+  if me and me.is_swimming == true then return true end
+  return false
+end
+
 local function in_travel_form(frame)
   local me = frame and frame.self_unit
   if not me then return false end
   if me.shapeshift_form_id == TRAVEL_FORM_ID then return true end
   if me.shapeshift_form_spell_id == TRAVEL_FORM_SPELL then return true end
   return false
+end
+
+local function in_aquatic_form(frame)
+  local me = frame and frame.self_unit
+  if not me then return false end
+  if me.shapeshift_form_id == AQUATIC_FORM_ID then return true end
+  if me.shapeshift_form_spell_id == AQUATIC_FORM_SPELL then return true end
+  return false
+end
+
+--- Cast Travel Form if needed; nil when already travel-shaped.
+local function ensure_travel_form(frame)
+  if in_travel_form(frame) then return nil end
+  local known = frame.spells and frame.spells.known
+  if known == nil or knows_spell(frame, TRAVEL_FORM_SPELL) then
+    return {
+      kind = "cast_spell",
+      spell = TRAVEL_FORM_SPELL,
+      reason = "travel_form",
+    }
+  end
+  return { kind = "hold", reason = "travel_form_unknown" }
+end
+
+--- Cast Aquatic Form if needed; nil when already aquatic.
+local function ensure_aquatic_form(frame)
+  if in_aquatic_form(frame) then return nil end
+  local known = frame.spells and frame.spells.known
+  if known == nil or knows_spell(frame, AQUATIC_FORM_SPELL) then
+    return {
+      kind = "cast_spell",
+      spell = AQUATIC_FORM_SPELL,
+      reason = "aquatic_form",
+    }
+  end
+  return { kind = "hold", reason = "aquatic_form_unknown" }
 end
 
 local function planar_dist(x0, y0, x1, y1)
@@ -87,32 +131,30 @@ function M.decide(frame, args)
   local arrival = args.arrival_radius or ARRIVAL_RADIUS
   local hop = args.hop_yards or HOP_YARDS
 
-  -- V1: always travel-shaped before any hop; re-cast if dropped.
-  if not in_travel_form(frame) then
-    local known = frame.spells and frame.spells.known
-    if known == nil or knows_spell(frame, TRAVEL_FORM_SPELL) then
-      return {
-        kind = "cast_spell",
-        spell = TRAVEL_FORM_SPELL,
-        reason = "travel_form",
-      }
-    end
-    return { kind = "hold", reason = "travel_form_unknown" }
+  -- Water: Aquatic Form always (breath). Land: Travel Form.
+  local swimming = is_swimming(frame)
+  if swimming then
+    local formAct = ensure_aquatic_form(frame)
+    if formAct then return formAct end
+  else
+    local formAct = ensure_travel_form(frame)
+    if formAct then return formAct end
   end
 
   local dist = planar_dist(me.x, me.y, goal_x, goal_y)
   if dist <= arrival then
-    return { kind = "hold", reason = "desert_checkpoint" }
+    return { kind = "hold", reason = "water_entry" }
   end
 
   local nx, ny = hop_toward(me.x, me.y, goal_x, goal_y, hop)
+  local reason = swimming and "swim_toward" or "water_entry"
   return move_to.decide(frame, {
     map_id = me.map_id or 1,
     x = nx,
     y = ny,
     z = goal_z,
     intent = "travel",
-    reason = "desert_checkpoint",
+    reason = reason,
     destination_z_unknown = true,
     arrival_radius = math.min(arrival, 8.0),
   })

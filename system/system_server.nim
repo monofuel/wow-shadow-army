@@ -2687,8 +2687,9 @@ proc startTraversePol*(): TraverseOpsStatus =
   ## Stops at the Gadgetzan-area checkpoint (~50 yd), not a 50-yard PoL smoke.
   const
     # Keep in sync with lua/entry/traverse.lua CHECKPOINT_* and traverse_pol.sh.
-    DesertGoalX = -6960.4
-    DesertGoalY = -3714.4
+    # V4 leg 1: north-desert water entry (docs/traverse/traverse-2026-08-05.md).
+    DesertGoalX = -6784.5
+    DesertGoalY = -4833.9
     DesertGoalRadius = 50.0
     DesertMaxSeconds = 1200
   startTraverseAgentSession(

@@ -136,14 +136,17 @@ system:
 		SYSTEM_ARMY_DIR="$${SYSTEM_ARMY_DIR:-$$(pwd)}" \
 		nix develop --command nim r system/system_server.nim
 
-# Map browser (docs/map-plan.md). Headed World map mosaic; phase 0 spike.
+# Map browser (docs/map-plan.md). World → continent → zone drill (phase 1).
 # Assets: prepared BLPs under coworld-vanilla-wow player/assets (or MAP_BROWSER_WORLD_MAP_DIR).
+# DBC/ZMP: VANILLA_WOW_EXTRACTED_DATA_DIR + player/assets client_assets worldmap *.zmp.
 map-browser:
-	nix develop --command nim r src/tools/map_browser.nim
+	VANILLA_WOW_EXTRACTED_DATA_DIR="$(VANILLA_WOW_EXTRACTED_DATA_DIR)" \
+		nix develop --command nim r src/tools/map_browser.nim
 
-# Headless smoke: compose mosaic, write PNG, exit (no GUI).
+# Headless smoke: compose World PNG + sample catalog drill (no GUI).
 map-browser-once:
-	MAP_BROWSER_ONCE=1 nix develop --command nim r src/tools/map_browser.nim
+	VANILLA_WOW_EXTRACTED_DATA_DIR="$(VANILLA_WOW_EXTRACTED_DATA_DIR)" \
+		MAP_BROWSER_ONCE=1 nix develop --command nim r src/tools/map_browser.nim
 
 # Pin-drift only: HEAD of ../coworld-vanilla-wow must match upstream.lock.
 # Pure shell — no Python. Format of upstream.lock: "<name> <sha>".

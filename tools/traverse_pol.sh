@@ -21,8 +21,8 @@ LOG="${TRAVERSE_POL_LOG:-$ROOT/local_data/brain-logs/traverse-pol.log}"
 ENV_LOG="${TRAVERSE_POL_ENV_LOG:-$ROOT/local_data/env-host-traverse.log}"
 ENV_PIDFILE="${TRAVERSE_POL_ENV_PID:-$ROOT/local_data/env-host-traverse.pid}"
 # Desert checkpoint (planar). When radius>0, army_host exits 0 at goal (not 45m).
-GOAL_X="${TRAVERSE_POL_GOAL_X:--6960.4}"
-GOAL_Y="${TRAVERSE_POL_GOAL_Y:--3714.4}"
+GOAL_X="${TRAVERSE_POL_GOAL_X:--6784.5}"
+GOAL_Y="${TRAVERSE_POL_GOAL_Y:--4833.9}"
 GOAL_RADIUS="${TRAVERSE_POL_GOAL_RADIUS:-0}"
 if awk "BEGIN{exit !($GOAL_RADIUS > 0)}"; then
   # Checkpoint MVP: default 15m fail budget; path-yards bar off unless set.

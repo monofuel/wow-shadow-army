@@ -270,7 +270,8 @@ proc projectV2*(frame: JsonNode; preferLeaderName = ""):
     "class_id": jint(jget(obs, "class_id")),
     "level": jint(jget(obs, "level")),
     "shapeshift_form_id": jint(jget(obs, "shapeshift_form_id")),
-    "shapeshift_form_spell_id": jint(jget(obs, "shapeshift_form_spell_id"))
+    "shapeshift_form_spell_id": jint(jget(obs, "shapeshift_form_spell_id")),
+    "is_swimming": jbool(jget(obs, "is_swimming"))
   }
 
   var hpPct = 100.0
