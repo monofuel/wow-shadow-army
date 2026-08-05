@@ -252,12 +252,13 @@ suite "traverse ops panel":
       watchLog: TraverseWatchLogRel
     )
     let html = renderTraverseOpsPanel(ops)
-    check "Start proof of life" in html
-    check "Start observer" in html
+    check "Start local traverse" in html
     check "/traverse/pol/start" in html
-    check "/traverse/watch/start" in html
-    check "PoL idle" in html
-    check "observer idle" in html
+    check "local bot idle" in html
+    check "proof of life" notin html.toLowerAscii
+    check "Start observer" notin html
+    check "/traverse/watch/start" notin html
+    check "observer" notin html
     # Dashboard is metrics+buttons only (autoresearch docs/dashboard.md).
     check "make traverse-pol" notin html
     check "watch_bots" notin html
@@ -269,16 +270,21 @@ suite "traverse ops panel":
       polLog: TraversePolLogRel,
       watchLog: TraverseWatchLogRel,
       lastOk: true,
-      lastDetail: "started make traverse-pol"
+      lastDetail: "local traverse started"
     )
     let html = renderTraverseOpsPanel(ops)
-    check "Stop proof of life" in html
-    check "Stop observer" in html
+    check "Stop local traverse" in html
     check "/traverse/pol/stop" in html
-    check "/traverse/watch/stop" in html
-    check "PoL running" in html
-    check "observer running" in html
-    check "started make traverse-pol" in html
+    check "local bot running" in html
+    check "Stop observer" notin html
+    check "/traverse/watch/stop" notin html
+    check "observer" notin html
+    check "local traverse started" in html
+
+  test "isTraversePolProcess matches prepare leftovers":
+    # Pure string contract for the marker set (no live /proc).
+    check "native_support" in "uv run python -m player.launch.native_support prepare --league=traverse"
+    check isTraversePolProcess(0) == false
 
   test "page includes controls section":
     let st = TraverseStatus(containerFound: false)
@@ -300,6 +306,9 @@ suite "traverse hosted replays":
     "id": "ereq_dde219b5-33b7-4364-a073-4356e2288a35",
     "episode_id": "52b9a6cc-c319-41ff-b3af-c94396daea38",
     "status": "completed",
+    "coworld_id": "cow_3eca82b6-2ad7-476b-88af-832d1faa666d",
+    "coworld_name": "traverse-wow",
+    "coworld_version": "0.1.160",
     "replay_url": "https://softmax-public.s3.amazonaws.com/replays/f2c52d1d-5f11-433d-953a-693950f68c2b.replay",
     "live_url": null,
     "scores": [
@@ -339,7 +348,11 @@ suite "traverse hosted replays":
   },
   {
     "id": "ereq_0e650027-caed-4044-be1e-bdeab8ddb1f0",
+    "episode_id": "020bca5f-1b8c-4248-b97a-a3f2e623eeeb",
     "status": "completed",
+    "coworld_id": "cow_ac19464b-66da-4c94-a8d2-3580e567f0a2",
+    "coworld_name": "traverse-wow",
+    "coworld_version": "0.1.160",
     "replay_url": "https://softmax-public.s3.amazonaws.com/replays/v1.replay",
     "scores": [
       {"policy_version_id": "ccbfd6ab-9d7e-48d5-aff1-25a7c000c1d4", "score": 2278.73}
@@ -358,20 +371,25 @@ suite "traverse hosted replays":
 ]
 """
 
-  test "version notes parse bullets":
-    let notes = parseTraverseVersionNotes("""
-# versions
-- v1 stock RealPlayerBot (retired)
-- v2 army_host + Lua PoL smoke
-""")
-    check notes.len == 2
-    check lookupTraverseVersionNote(notes, "ibis:v1").contains("RealPlayerBot")
-    check lookupTraverseVersionNote(notes, "ibis:v2").contains("army_host")
-    check lookupTraverseVersionNote(notes, "ibis:v9") == ""
+  test "observatory replay viewer URL shape":
+    let url = episodeObservatoryReplayUrl(
+      "cow_3eca82b6-2ad7-476b-88af-832d1faa666d",
+      "https://softmax-public.s3.amazonaws.com/replays/f2c52d1d-5f11-433d-953a-693950f68c2b.replay",
+      "traverse-wow",
+      "0.1.160",
+      "52b9a6cc-c319-41ff-b3af-c94396daea38"
+    )
+    check url.startsWith(
+      "https://softmax.com/observatory/coworld-replays/cow_3eca82b6-2ad7-476b-88af-832d1faa666d?")
+    check "replay_uri=" in url
+    check "softmax-public.s3.amazonaws.com" in url
+    check "game=traverse-wow" in url
+    check "game_version=0.1.160" in url
+    check "episode_id=52b9a6cc-c319-41ff-b3af-c94396daea38" in url
+    check episodeObservatoryReplayUrl("", "https://x.replay", "g", "1", "e") == ""
 
   test "parse episodes into version + score + links":
-    let notes = parseTraverseVersionNotes("- v1 RealPlayerBot\n- v2 Lua PoL\n")
-    let rows = parseTraverseEpisodesJson(sampleEpisodes, notes)
+    let rows = parseTraverseEpisodesJson(sampleEpisodes)
     check rows.len == 3
     var foundV1 = false
     var foundV2Done = false
@@ -382,22 +400,28 @@ suite "traverse hosted replays":
         check r.hasScore
         check abs(r.score - 2278.73) < 0.01
         check r.replayUrl.len > 0
-        check "Replay" in renderTraverseReplayLinks(r)
-        check r.versionNote.contains("RealPlayerBot")
+        let links = renderTraverseReplayLinks(r)
+        check "Replay" notin links
+        check "Obs" in links
+        check "coworld-replays/" in r.observatoryUrl
+        check "replay_uri=" in r.observatoryUrl
       if r.versionLabel == "ibis:v2" and r.status == "completed":
         foundV2Done = true
         check abs(r.score - 1996.05) < 0.01
-        check "ereq_" in r.observatoryUrl
-        check "observatory" in r.observatoryUrl
+        check "coworld-replays/cow_3eca82b6" in r.observatoryUrl
+        check "episode_id=52b9a6cc" in r.observatoryUrl
+        check "s3.amazonaws.com" in r.observatoryUrl
       if r.status == "running":
         foundLive = true
         check not r.hasScore
         check "Live" in renderTraverseReplayLinks(r)
+        check "Replay" notin renderTraverseReplayLinks(r)
+        # No replay yet → fall back to episode-request detail.
+        check "episode-request:" in r.observatoryUrl
     check foundV1 and foundV2Done and foundLive
 
   test "render panel has version column and refresh":
-    let notes = parseTraverseVersionNotes("- v2 Lua PoL smoke\n")
-    let rows = parseTraverseEpisodesJson(sampleEpisodes, notes)
+    let rows = parseTraverseEpisodesJson(sampleEpisodes)
     let st = TraverseReplaysStatus(
       available: true,
       note: "3 episodes",
@@ -407,13 +431,14 @@ suite "traverse hosted replays":
     let html = renderTraverseReplaysPanel(st)
     check "ibis:v2" in html
     check "ibis:v1" in html
-    check "Replay" in html
+    check "Replay" notin html
     check "Obs" in html
+    check "coworld-replays/" in html
     check "/traverse/replays/refresh" in html
     check "Version" in html
     check "1996.1" in html or "1996.0" in html
-    check "Lua PoL" in html
-    check html.count("Lua PoL") == 1
+    check "proof-of-life" notin html
+    check "RealPlayerBot" notin html
   test "our policy name filter":
     check isTraverseOurPolicy("ibis")
     check isTraverseOurPolicy("Ibis")

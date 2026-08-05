@@ -14,8 +14,8 @@ check(type(entry.decide) == "function", "decide")
 
 local start_x = -9187.0
 local start_y = -2530.25
-local goal_x = -7033.0
-local goal_y = -3681.1
+local goal_x = -6960.4
+local goal_y = -3714.4
 
 -- No form → cast Travel Form (783) before moving.
 local r = entry.decide({
@@ -50,7 +50,7 @@ check(r.intent == "travel", "travel intent")
 -- Closer to goal in x only would still need y; full near goal → hold.
 r = entry.decide({
   self_unit = {
-    x = goal_x + 10, y = goal_y + 10, z = 17.2, map_id = 1,
+    x = goal_x + 10, y = goal_y + 10, z = 38.9, map_id = 1,
     shapeshift_form_id = 3,
   },
   death = {},

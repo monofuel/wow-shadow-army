@@ -15,9 +15,9 @@ local TRAVEL_FORM_SPELL = 783
 local TRAVEL_FORM_ID = 3
 
 -- Monofuel personal run: north end of starting desert (near Gadgetzan).
-local CHECKPOINT_X = -7033.0
-local CHECKPOINT_Y = -3681.1
-local CHECKPOINT_Z = 17.2
+local CHECKPOINT_X = -6960.4
+local CHECKPOINT_Y = -3714.4
+local CHECKPOINT_Z = 38.9
 local ARRIVAL_RADIUS = 50.0
 
 -- Segment hops along the goal vector (navmesh handles mild obstacles).

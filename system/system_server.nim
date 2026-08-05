@@ -39,7 +39,7 @@
 import
   std/[
     algorithm, base64, httpclient, json, locks, net, options, os, osproc,
-    streams, strformat, strutils, times
+    streams, strformat, strutils, times, uri
   ],
   mummy, mummy/routers,
   webby/httpheaders as mummyheaders,
@@ -69,7 +69,7 @@ const
   DbName = "characters"
   ## Default compose container name for coworld-game. Override with SYSTEM_MYSQL_CONTAINER.
   DefaultGameContainer = "coworld-vmangos-coworld-game-1"
-  ## Kalimdor Traverse fixture character (docs/traverse_wow.md).
+  ## Kalimdor Traverse fixture character (docs/traverse/traverse_wow.md).
   TraverseCharacterName* = "Northbound"
   ## Course anchors from upstream game/scoring.py (X is north/south).
   TraverseStartWorldX* = -9187.0
@@ -91,13 +91,14 @@ const
   TraverseEpisodesHistoryRel* = "local_data/traverse/episodes_history.json"
   TraverseFieldPullLogRel* = "local_data/brain-logs/traverse-field-pull.log"
   TraverseFieldPullPidRel* = "local_data/brain-logs/traverse-field-pull.pid"
-  TraverseVersionsMdRel* = "docs/traverse/versions.md"
-  ## Softmax league / division for Kalimdor Traverse (docs/traverse_wow.md).
+  ## Softmax league / division for Kalimdor Traverse (docs/traverse/traverse_wow.md).
   TraverseLeagueId* = "league_0f38d762-930a-41d3-9979-1858dd52c1ae"
   TraverseDivisionId* = "div_b50e0091-514d-4406-837a-420ef9c372ca"
   ## Policy names we own on the traverse ladder (version labels ibis:vN).
   TraverseOurPolicyNames* = ["ibis"]
   ObservatoryV2Base* = "https://softmax.com/observatory/v2"
+  ## In-browser coworld replay viewer (not raw S3 .replay).
+  ObservatoryCoworldReplaysBase* = "https://softmax.com/observatory/coworld-replays"
   ## Replays panel poll (file-backed; slower than live telemetry).
   TraverseReplaysPollSeconds* = 15
   ## Observer needs a live army_host session (PoL exits after 50 yd).
@@ -321,7 +322,6 @@ type
     replayUrl*: string
     liveUrl*: string
     observatoryUrl*: string
-    versionNote*: string ## human note from docs/traverse/versions.md
 
   TraverseReplaysStatus* = object
     ## File-backed hosted episode list (pulled via tools/pull_traverse_field.sh).
@@ -1955,6 +1955,35 @@ proc runShell(cmd: string): tuple[ok: bool, detail: string] =
   except CatchableError as e:
     result = (ok: false, detail: e.msg)
 
+proc runShellDetached(cmd: string): tuple[ok: bool, detail: string] =
+  ## Fire-and-forget shell for long-lived children (setsid nohup … &).
+  ## Must NOT use poStdErrToStdOut + readAll — that blocks forever when a
+  ## background job still holds the pipe (see startBotSeat comment).
+  try:
+    let process = startProcess(
+      "sh",
+      args = ["-c", cmd],
+      options = {poUsePath})
+    # Close pipes so a noisy child cannot fill buffers; wait only for the
+    # short-lived launcher shell, not the orphaned setsid session.
+    try:
+      process.inputStream.close()
+    except CatchableError:
+      discard
+    try:
+      process.outputStream.close()
+    except CatchableError:
+      discard
+    try:
+      process.errorStream.close()
+    except CatchableError:
+      discard
+    let exitCode = process.waitForExit()
+    process.close()
+    result = (ok: exitCode == 0, detail: "")
+  except CatchableError as e:
+    result = (ok: false, detail: e.msg)
+
 proc startBotSeat*(name: string): JsonNode =
   ## Launch one bot seat: detached `make <seat>-bot` appending to its
   ## local_data log (the documented nohup pattern). Ready when the seat's
@@ -2025,9 +2054,6 @@ proc traverseFieldPullLogPath*(): string =
 proc traverseFieldPullPidPath*(): string =
   armyRoot() / TraverseFieldPullPidRel
 
-proc traverseVersionsMdPath*(): string =
-  armyRoot() / TraverseVersionsMdRel
-
 proc readPidFile*(path: string): int =
   ## Best-effort PID from a file; 0 when missing/invalid.
   try:
@@ -2062,14 +2088,28 @@ proc clearPidFile(path: string) =
     discard
 
 proc isTraversePolProcess*(pid: int): bool =
-  ## True when pid is our PoL launcher or army_host traverse mode.
+  ## True when pid belongs to a local traverse bot session (launcher or worker).
+  ## Keep markers tight: agent shells that merely *mention* make targets in a
+  ## long `bash -c` script must not match (that blocked Start as "running").
   let cmd = pidCmdline(pid)
   if cmd.len == 0:
     return false
-  result =
-    ("traverse_pol.sh" in cmd) or
-    ("make" in cmd and "traverse-pol" in cmd) or
-    ("army_host" in cmd and "mode=traverse" in cmd)
+  # Coding-agent / interactive wrappers embed our commands in huge -c scripts.
+  if "snap=$(command cat" in cmd or "builtin eval" in cmd or cmd.len > 400:
+    return false
+  if ("army_host" in cmd) and ("mode=traverse" in cmd or "--mode=traverse" in cmd):
+    return true
+  if "tools/traverse_pol.sh" in cmd or "tools/run_local_traverse.sh" in cmd:
+    return true
+  # `make … traverse-pol` / `make traverse-desert` as the actual process.
+  if (cmd.startsWith("make ") or " make " in cmd) and
+      ("traverse-pol" in cmd or "traverse-desert" in cmd):
+    return true
+  if "native_support" in cmd and "prepare" in cmd and "league=traverse" in cmd:
+    return true
+  if "vanilla-wow-env-host" in cmd and "local_data/bin/vanilla-wow-env-host" in cmd:
+    return true
+  result = false
 
 proc isTraverseWatchProcess*(pid: int): bool =
   ## True when pid is the watch launcher tree or the native viewer it started.
@@ -2182,13 +2222,38 @@ proc nixDevelopCmd*(root, inner: string): string =
   ## Prefer this over nix-shell -p hand-rolls.
   &"cd {quoteShell(root)} && nix develop --command bash -lc {quoteShell(inner)}"
 
+proc termPidTree*(pid: int): bool =
+  ## TERM the process group (setsid leaders) and the pid. True if signal sent.
+  if pid <= 0 or not pidAlive(pid):
+    return false
+  discard runShell(
+    &"kill -TERM -{pid} 2>/dev/null || kill -TERM {pid} 2>/dev/null || true")
+  result = true
+
+proc killPidTree*(pid: int): bool =
+  ## KILL the process group and pid (after a prior TERM). True if signal sent.
+  if pid <= 0 or not pidAlive(pid):
+    return false
+  discard runShell(
+    &"kill -KILL -{pid} 2>/dev/null || kill -KILL {pid} 2>/dev/null || true")
+  result = true
+
 proc stopTraversePol*(): TraverseOpsStatus =
-  ## TERM the PoL launcher / army_host mode=traverse processes.
+  ## Kill every local traverse-bot process (launcher, prepare, env-host, army_host).
+  ## Fast: one TERM sweep, short wait, one KILL sweep — no per-pid sleeps.
   var bits: seq[string] = @[]
+  var targets: seq[int] = @[]
   let pid = readPidFile(traversePolPidPath())
-  if pid > 0 and pidAlive(pid):
-    discard runShell(&"kill {pid} 2>/dev/null || true")
-    bits.add(&"kill pid {pid}")
+  if pid > 0:
+    targets.add(pid)
+  try:
+    let envPidPath = armyRoot() / "local_data" / "env-host-traverse.pid"
+    let envPid = readPidFile(envPidPath)
+    if envPid > 0:
+      targets.add(envPid)
+    clearPidFile(envPidPath)
+  except CatchableError:
+    discard
   for kind, path in walkDir("/proc", relative = false):
     if kind != pcDir:
       continue
@@ -2197,9 +2262,21 @@ proc stopTraversePol*(): TraverseOpsStatus =
       p = parseInt(path.extractFilename)
     except CatchableError:
       continue
-    if isTraversePolProcess(p):
-      discard runShell(&"kill {p} 2>/dev/null || true")
-      bits.add(&"kill {p}")
+    if p <= 1:
+      continue
+    if isTraversePolProcess(p) and p notin targets:
+      targets.add(p)
+  for p in targets:
+    discard termPidTree(p)
+  if targets.len > 0:
+    sleep(100)
+    for p in targets:
+      if pidAlive(p):
+        discard killPidTree(p)
+    bits.add("kill " & targets.join(","))
+  # Do NOT docker-stop the traverse game container here: prepare reuses a
+  # healthy unit, and tearing it down on every Start is what made the button
+  # feel broken/slow after a prior manual run.
   clearPidFile(traversePolPidPath())
   result = traverseOpsStatus()
   result.lastOk = true
@@ -2256,52 +2333,6 @@ proc isTraverseOurPolicy*(name: string): bool =
       return true
   result = false
 
-proc parseTraverseVersionNotes*(text: string): seq[(string, string)] =
-  ## Parse docs/traverse/versions.md bullets into (ibis:vN, note) pairs.
-  result = @[]
-  for line in text.splitLines():
-    var t = line.strip()
-    if t.len == 0 or t.startsWith("#"):
-      continue
-    if t.startsWith("-"):
-      t = t[1..^1].strip()
-    if t.len == 0:
-      continue
-    if t.toLowerAscii().startsWith("ibis:v"):
-      let sp = t.find(' ')
-      if sp > 0:
-        result.add((t[0..<sp], t[sp + 1..^1].strip()))
-      continue
-    if t.len >= 2 and t[0] == 'v' and t[1].isDigit:
-      var i = 1
-      while i < t.len and t[i].isDigit:
-        inc i
-      let num = t[1..<i]
-      var note = t[i..^1].strip()
-      if note.startsWith(":") or note.startsWith("—") or note.startsWith("-"):
-        note = note[1..^1].strip()
-      if note.toLowerAscii().startsWith("was "):
-        note = note[4..^1].strip()
-      result.add(("ibis:v" & num, note))
-
-proc lookupTraverseVersionNote*(
-    notes: seq[(string, string)]; label: string): string =
-  ## Note for one version label (exact match).
-  for (k, v) in notes:
-    if k == label:
-      return v
-  result = ""
-
-proc loadTraverseVersionNotes*(): seq[(string, string)] =
-  ## Load version notes from docs/traverse/versions.md when present.
-  result = @[]
-  let path = traverseVersionsMdPath()
-  try:
-    if fileExists(path):
-      result = parseTraverseVersionNotes(readFile(path))
-  except CatchableError:
-    result = @[]
-
 proc formatTraverseWhen*(iso: string): string =
   ## Compact UTC stamp for table cells (YYYY-MM-DD HH:MM).
   if iso.len < 16:
@@ -2319,8 +2350,22 @@ proc episodeObservatoryUrl*(id: string): string =
       "episode:" & id
   result = ObservatoryV2Base & "?tab=episodes&detail=" & detail
 
-proc parseTraverseReplayRow*(
-    node: JsonNode; notes: seq[(string, string)] = @[]): Option[TraverseReplayRow] =
+proc episodeObservatoryReplayUrl*(
+    coworldId, replayUrl, game, gameVersion, episodeId: string
+): string =
+  ## Observatory in-browser coworld replay viewer for a hosted .replay URI.
+  if coworldId.len == 0 or replayUrl.len == 0:
+    return ""
+  var q = "replay_uri=" & encodeUrl(replayUrl)
+  if game.len > 0:
+    q.add("&game=" & encodeUrl(game))
+  if gameVersion.len > 0:
+    q.add("&game_version=" & encodeUrl(gameVersion))
+  if episodeId.len > 0:
+    q.add("&episode_id=" & encodeUrl(episodeId))
+  result = ObservatoryCoworldReplaysBase & "/" & coworldId & "?" & q
+
+proc parseTraverseReplayRow*(node: JsonNode): Option[TraverseReplayRow] =
   ## Map one Softmax episode-request JSON object to a table row.
   if node.isNil or node.kind != JObject:
     return none(TraverseReplayRow)
@@ -2332,6 +2377,9 @@ proc parseTraverseReplayRow*(
   row.status = node{"status"}.getStr("").toLowerAscii()
   row.replayUrl = node{"replay_url"}.getStr("")
   row.liveUrl = node{"live_url"}.getStr("")
+  let coworldId = node{"coworld_id"}.getStr("")
+  let game = node{"coworld_name"}.getStr("")
+  let gameVersion = node{"coworld_version"}.getStr("")
   let whenRaw =
     node{"completed_at"}.getStr("")
   let whenFallback =
@@ -2369,7 +2417,6 @@ proc parseTraverseReplayRow*(
       row.versionLabel = &"{row.policyName}:v{row.version}"
   if row.versionLabel.len == 0:
     row.versionLabel = "—"
-  row.versionNote = lookupTraverseVersionNote(notes, row.versionLabel)
   let scores = node{"scores"}
   if not scores.isNil and scores.kind == JArray:
     for s in scores:
@@ -2390,20 +2437,24 @@ proc parseTraverseReplayRow*(
           s0["score"].kind in {JFloat, JInt}:
         row.score = s0["score"].getFloat()
         row.hasScore = true
-  row.observatoryUrl = episodeObservatoryUrl(row.id)
+  let replayViewer = episodeObservatoryReplayUrl(
+    coworldId, row.replayUrl, game, gameVersion, row.episodeId)
+  if replayViewer.len > 0:
+    row.observatoryUrl = replayViewer
+  else:
+    row.observatoryUrl = episodeObservatoryUrl(row.id)
   if row.id.len == 0 and row.versionLabel == "—":
     return none(TraverseReplayRow)
   result = some(row)
 
-proc parseTraverseEpisodesJson*(
-    text: string; notes: seq[(string, string)] = @[]): seq[TraverseReplayRow] =
+proc parseTraverseEpisodesJson*(text: string): seq[TraverseReplayRow] =
   ## Parse a JSON array of episode requests into table rows (newest first).
   result = @[]
   let node = parseJson(text)
   if node.kind != JArray:
     return
   for item in node:
-    let rowOpt = parseTraverseReplayRow(item, notes)
+    let rowOpt = parseTraverseReplayRow(item)
     if rowOpt.isSome:
       result.add(rowOpt.get)
   result.sort(proc(a, b: TraverseReplayRow): int =
@@ -2438,8 +2489,7 @@ proc traverseReplays*(): TraverseReplaysStatus =
       "No hosted episodes yet — click Refresh (or run make traverse-field)."
     return
   try:
-    let notes = loadTraverseVersionNotes()
-    result.rows = parseTraverseEpisodesJson(readFile(path), notes)
+    result.rows = parseTraverseEpisodesJson(readFile(path))
     result.available = result.rows.len > 0
     if result.rows.len == 0:
       result.note = "episodes_history.json is empty"
@@ -2541,15 +2591,33 @@ proc latestGodviewHasCharacter*(
   result = false
 
 proc startTraverseAgentSession*(
-    minYards: float; maxSeconds: int; detailPrefix: string
+    minYards: float;
+    maxSeconds: int;
+    detailPrefix: string;
+    goalRadius = 0.0;
+    goalX = 0.0;
+    goalY = 0.0;
+    forceRestart = true
 ): TraverseOpsStatus =
-  ## Detached `make traverse-pol` under nix develop. minYards=0 keeps army_host
-  ## alive for maxSeconds (observer needs a live Northbound session).
+  ## Detached local traverse bot (`make traverse-pol` / desert). No nested nix
+  ## develop (The System already runs inside the flake). forceRestart clears
+  ## leftovers from a prior manual or dashboard run so start stays reliable.
+  ##
+  ## Launch uses the same orphaning pattern as startBotSeat: the HTTP worker
+  ## must not hold a pipe open to the child (that blocked the dashboard for
+  ## the whole run).
   result = traverseOpsStatus()
   if result.polRunning:
-    result.lastOk = true
-    result.lastDetail = "already running"
-    return
+    if not forceRestart:
+      result.lastOk = true
+      result.lastDetail = "already running"
+      return
+    discard stopTraversePol()
+    result = traverseOpsStatus()
+    if result.polRunning:
+      # Race / stubborn orphan — KILL and proceed with launch anyway.
+      discard killPidTree(result.polPid)
+      clearPidFile(traversePolPidPath())
   let root = armyRoot()
   if not fileExists(root / "Makefile"):
     result.lastOk = false
@@ -2562,31 +2630,59 @@ proc startTraverseAgentSession*(
     writeFile(logPath, "")
   except CatchableError:
     discard
-  let minYardsStr = minYards.formatFloat(ffDecimal, 1)
-  let inner =
-    &"export TRAVERSE_POL_CLEANUP=0 " &
-    &"TRAVERSE_POL_MIN_YARDS={minYardsStr} " &
-    &"TRAVERSE_POL_MAX_SECONDS={maxSeconds} " &
-    &"TRAVERSE_POL_LOG={quoteShell(logPath)}; " &
-    &"exec make -C {quoteShell(root)} traverse-pol"
+  let launcher = root / "tools" / "run_local_traverse.sh"
+  if not fileExists(launcher):
+    result.lastOk = false
+    result.lastDetail = &"missing {launcher}"
+    return
+  # Defaults live in run_local_traverse.sh (desert checkpoint). Optional overrides
+  # via env for special sessions (observer long-run, short PoL, etc.).
+  var envAssign: seq[string] = @[]
+  envAssign.add(&"TRAVERSE_POL_LOG={quoteShell(logPath)}")
+  envAssign.add(&"TRAVERSE_POL_MIN_YARDS={minYards.formatFloat(ffDecimal, 1)}")
+  envAssign.add(&"TRAVERSE_POL_MAX_SECONDS={maxSeconds}")
+  if goalRadius > 0:
+    envAssign.add(&"TRAVERSE_POL_GOAL_RADIUS={goalRadius.formatFloat(ffDecimal, 1)}")
+    envAssign.add(&"TRAVERSE_POL_GOAL_X={goalX.formatFloat(ffDecimal, 1)}")
+    envAssign.add(&"TRAVERSE_POL_GOAL_Y={goalY.formatFloat(ffDecimal, 1)}")
+  let envPrefix = envAssign.join(" ")
+  # Same orphaning as startBotSeat — HTTP worker must not wait on the child.
   let cmd =
-    &"mkdir -p {quoteShell(parentDir(logPath))} && (" &
-    &"setsid nohup bash -lc {quoteShell(nixDevelopCmd(root, inner))} " &
+    &"mkdir -p {quoteShell(parentDir(logPath))} && " &
+    &"( {envPrefix} setsid nohup {quoteShell(launcher)} " &
     &">> {quoteShell(logPath)} 2>&1 < /dev/null & " &
     &"echo $! > {quoteShell(pidPath)} )"
-  let r = runShell(cmd)
+  let r = runShellDetached(cmd)
+  # Let the setsid child appear in /proc before we sample status.
+  sleep(80)
   result = traverseOpsStatus()
   result.lastOk = r.ok
-  result.lastDetail =
-    if r.ok: &"{detailPrefix} (log {TraversePolLogRel})"
-    else: r.detail
+  if r.ok:
+    if result.polRunning:
+      result.lastDetail = &"{detailPrefix} (log {TraversePolLogRel})"
+    else:
+      result.lastDetail =
+        &"{detailPrefix} — launched (log {TraversePolLogRel}; status may lag 1s)"
+  else:
+    result.lastDetail = r.detail
 
 proc startTraversePol*(): TraverseOpsStatus =
-  ## Detached short PoL: pass at >=50 path yards (CLEANUP=0 so captures stay).
+  ## Detached local desert-checkpoint traverse run (Lua bot + army_host).
+  ## Stops at the Gadgetzan-area checkpoint (~50 yd), not a 50-yard PoL smoke.
+  const
+    # Keep in sync with lua/entry/traverse.lua CHECKPOINT_* and traverse_pol.sh.
+    DesertGoalX = -6960.4
+    DesertGoalY = -3714.4
+    DesertGoalRadius = 50.0
+    DesertMaxSeconds = 1200
   startTraverseAgentSession(
-    minYards = 50.0,
-    maxSeconds = 180,
-    detailPrefix = "started"
+    minYards = 0.0,
+    maxSeconds = DesertMaxSeconds,
+    detailPrefix = "local traverse started",
+    goalRadius = DesertGoalRadius,
+    goalX = DesertGoalX,
+    goalY = DesertGoalY,
+    forceRestart = true
   )
 
 proc ensureTraverseAgentForWatch*(capturesDir: string): TraverseOpsStatus =
@@ -4047,43 +4143,25 @@ proc renderTraverseStatus*(st: TraverseStatus): string =
     </div>"""
 
 proc renderTraverseOpsPanel*(ops: TraverseOpsStatus): string =
-  ## Controls for detached Lua PoL + local watch_bots observer.
+  ## Controls for detached local traverse bot (desert checkpoint run).
   let polPill =
     if ops.polRunning:
-      """<span class="pill"><span class="dot on"></span> PoL running</span>"""
+      """<span class="pill"><span class="dot on"></span> local bot running</span>"""
     else:
-      """<span class="pill"><span class="dot off"></span> PoL idle</span>"""
-  let watchPill =
-    if ops.watchRunning:
-      """<span class="pill"><span class="dot on"></span> observer running</span>"""
-    else:
-      """<span class="pill"><span class="dot off"></span> observer idle</span>"""
+      """<span class="pill"><span class="dot off"></span> local bot idle</span>"""
   let polBtn =
     if ops.polRunning:
       """
       <button class="btn danger"
               hx-post="/traverse/pol/stop"
               hx-target="#traverse-ops"
-              hx-swap="innerHTML">Stop proof of life</button>"""
+              hx-swap="innerHTML">Stop local traverse</button>"""
     else:
       """
       <button class="btn primary"
               hx-post="/traverse/pol/start"
               hx-target="#traverse-ops"
-              hx-swap="innerHTML">Start proof of life</button>"""
-  let watchBtn =
-    if ops.watchRunning:
-      """
-      <button class="btn danger"
-              hx-post="/traverse/watch/stop"
-              hx-target="#traverse-ops"
-              hx-swap="innerHTML">Stop observer</button>"""
-    else:
-      """
-      <button class="btn primary"
-              hx-post="/traverse/watch/start"
-              hx-target="#traverse-ops"
-              hx-swap="innerHTML">Start observer</button>"""
+              hx-swap="innerHTML">Start local traverse</button>"""
   var lastLine = ""
   if ops.lastDetail.len > 0:
     let cls = if ops.lastOk: "admin-ok" else: "admin-err"
@@ -4092,14 +4170,19 @@ proc renderTraverseOpsPanel*(ops: TraverseOpsStatus): string =
       <div class="server-last {cls}" title="{escapeHtml(ops.lastDetail)}">
         last: {mark} — {escapeHtml(ops.lastDetail)}
       </div>"""
+  let logTail = logFileTail(armyRoot() / ops.polLog, 4)
+  var logBlock = ""
+  if logTail.len > 0:
+    logBlock = &"""
+      <div class="meta" style="margin-top:0.5rem;font-size:0.75rem;max-height:4.5rem;overflow:auto"
+           title="{escapeHtml(ops.polLog)}">{escapeHtml(logTail)}</div>"""
   result = &"""
     <div class="panel-actions" style="margin-bottom:0.75rem;flex-wrap:wrap;gap:0.5rem">
       {polPill}
-      {watchPill}
       {polBtn}
-      {watchBtn}
     </div>
-{lastLine}"""
+{lastLine}
+{logBlock}"""
 
 proc formatTraverseScoreCell*(row: TraverseReplayRow): string =
   ## Score column: northing yards when present.
@@ -4108,12 +4191,10 @@ proc formatTraverseScoreCell*(row: TraverseReplayRow): string =
   result = formatTraverseYards(row.score)
 
 proc renderTraverseReplayLinks*(row: TraverseReplayRow): string =
-  ## Replay / live / Observatory links (ctf-bots matchLinksHtml pattern).
+  ## Live + Observatory replay viewer (no raw S3 .replay link).
   var bits: seq[string] = @[]
   if row.liveUrl.len > 0:
     bits.add(&"""<a href="{escapeHtml(row.liveUrl)}" target="_blank" rel="noopener">Live</a>""")
-  if row.replayUrl.len > 0:
-    bits.add(&"""<a href="{escapeHtml(row.replayUrl)}" target="_blank" rel="noopener">Replay</a>""")
   if row.observatoryUrl.len > 0:
     bits.add(&"""<a href="{escapeHtml(row.observatoryUrl)}" target="_blank" rel="noopener">Obs</a>""")
   if bits.len == 0:
@@ -4146,23 +4227,6 @@ proc renderTraverseReplayRows*(rows: seq[TraverseReplayRow]): string =
         <td class="meta" style="font-size:0.75rem">{escapeHtml(row.id)}</td>
       </tr>""")
 
-proc renderTraverseVersionLegend*(rows: seq[TraverseReplayRow]): string =
-  ## One-line legend: which policy version label means what.
-  var seen: seq[string] = @[]
-  var bits: seq[string] = @[]
-  for row in rows:
-    if row.versionLabel in seen:
-      continue
-    seen.add(row.versionLabel)
-    if row.versionNote.len > 0:
-      bits.add(&"""<code>{escapeHtml(row.versionLabel)}</code> — {escapeHtml(row.versionNote)}""")
-    else:
-      bits.add(&"""<code>{escapeHtml(row.versionLabel)}</code>""")
-  if bits.len == 0:
-    return ""
-  result = &"""
-    <div class="meta" style="margin-bottom:0.5rem">{bits.join(" · ")}</div>"""
-
 proc renderTraverseReplaysPanel*(st: TraverseReplaysStatus): string =
   ## Hosted league episodes: version + score + replay links.
   let pullPill =
@@ -4180,7 +4244,6 @@ proc renderTraverseReplaysPanel*(st: TraverseReplaysStatus): string =
       <div class="server-last {cls}" title="{escapeHtml(st.lastDetail)}">
         last: {mark} — {escapeHtml(st.lastDetail)}
       </div>"""
-  let legend = renderTraverseVersionLegend(st.rows)
   let rowsHtml = renderTraverseReplayRows(st.rows)
   result = &"""
     <div class="panel-actions" style="margin-bottom:0.75rem;flex-wrap:wrap;gap:0.5rem">
@@ -4192,7 +4255,6 @@ proc renderTraverseReplaysPanel*(st: TraverseReplaysStatus): string =
               hx-swap="innerHTML">Refresh</button>
     </div>
 {lastLine}
-{legend}
     <div class="table-scroll">
       <table>
         <thead>
@@ -4526,7 +4588,7 @@ proc traverseOpsHandler(request: Request) {.gcsafe.} =
       &"""<span class="admin-err">ops error: {escapeHtml(e.msg)}</span>""")
 
 proc traversePolStartHandler(request: Request) {.gcsafe.} =
-  ## POST /traverse/pol/start — detached make traverse-pol.
+  ## POST /traverse/pol/start — detached local desert-checkpoint traverse run.
   try:
     var ops: TraverseOpsStatus
     {.gcsafe.}:
@@ -4534,10 +4596,10 @@ proc traversePolStartHandler(request: Request) {.gcsafe.} =
     request.respond(200, htmlHeaders(), renderTraverseOpsPanel(ops))
   except Exception as e:
     request.respond(500, htmlHeaders(),
-      &"""<span class="admin-err">start pol failed: {escapeHtml(e.msg)}</span>""")
+      &"""<span class="admin-err">start local traverse failed: {escapeHtml(e.msg)}</span>""")
 
 proc traversePolStopHandler(request: Request) {.gcsafe.} =
-  ## POST /traverse/pol/stop — kill PoL processes.
+  ## POST /traverse/pol/stop — kill local traverse bot process tree.
   try:
     var ops: TraverseOpsStatus
     {.gcsafe.}:
@@ -4545,7 +4607,7 @@ proc traversePolStopHandler(request: Request) {.gcsafe.} =
     request.respond(200, htmlHeaders(), renderTraverseOpsPanel(ops))
   except Exception as e:
     request.respond(500, htmlHeaders(),
-      &"""<span class="admin-err">stop pol failed: {escapeHtml(e.msg)}</span>""")
+      &"""<span class="admin-err">stop local traverse failed: {escapeHtml(e.msg)}</span>""")
 
 proc traverseWatchStartHandler(request: Request) {.gcsafe.} =
   ## POST /traverse/watch/start — detached watch_bots observer.

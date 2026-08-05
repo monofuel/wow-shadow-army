@@ -19,6 +19,8 @@ govern how we work in the sibling wow repos too:
 - `../wow-classic-data` — canonical game data store (one copy; everything
   else symlinks to it).
 
+- please follow the general rules of `../autoresearch` when relevant
+
 ## Mission
 
 Build the solo-leveling bot army per `coworld-playbook/games/solo-leveling.md`:
@@ -34,6 +36,8 @@ upstream controller already owns.
 Only **`lua/`** exists today. `kb/` is a reserved empty folder and the LLM
 planner is unbuilt — see "Docs vs knowledgebase" below before writing a
 markdown file anywhere.
+
+Our tools need to be fast and robust. we only have a week for each coworld competition and can't waste time on buggy or slow tools.
 
 ## Hard rules
 
@@ -125,6 +129,11 @@ markdown file anywhere.
 - If something needs a human decision (force-push, report upstream bug,
   irreversible data loss, tournament-risking cheat), **state the decision
   and options** — do not dump a command list for the operator to type.
+
+## Dashboard rules
+
+- a dashboard is for buttons, metrics, and dashboard like stuff
+- a dashboard is NOT documentation, a tutorial, or a conversation. DO NOT include instructions, comments, implementation details, or explanations on a dashboard unless directly requested. 
 
 ## The System service (dashboard) — restart after changes
 

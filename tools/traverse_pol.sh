@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Local Lua traverse proof-of-life (docs/traverse-2026-08-04.md).
+# Local Lua traverse proof-of-life (docs/traverse/traverse-2026-08-04.md).
 #
 # Stock RPB --proof-of-life is not this path (ClientView only). We:
 #   1) prepare upstream local --league=traverse backend
@@ -21,8 +21,8 @@ LOG="${TRAVERSE_POL_LOG:-$ROOT/local_data/brain-logs/traverse-pol.log}"
 ENV_LOG="${TRAVERSE_POL_ENV_LOG:-$ROOT/local_data/env-host-traverse.log}"
 ENV_PIDFILE="${TRAVERSE_POL_ENV_PID:-$ROOT/local_data/env-host-traverse.pid}"
 # Desert checkpoint (planar). When radius>0, army_host exits 0 at goal (not 45m).
-GOAL_X="${TRAVERSE_POL_GOAL_X:--7033.0}"
-GOAL_Y="${TRAVERSE_POL_GOAL_Y:--3681.1}"
+GOAL_X="${TRAVERSE_POL_GOAL_X:--6960.4}"
+GOAL_Y="${TRAVERSE_POL_GOAL_Y:--3714.4}"
 GOAL_RADIUS="${TRAVERSE_POL_GOAL_RADIUS:-0}"
 if awk "BEGIN{exit !($GOAL_RADIUS > 0)}"; then
   # Checkpoint MVP: default 15m fail budget; path-yards bar off unless set.
@@ -44,10 +44,28 @@ fi
 mkdir -p "$(dirname "$RESULT")" "$(dirname "$LOG")" "$ROOT/local_data/bin"
 cd "$ROOT"
 
-echo "[traverse-pol] building army_host…"
-nim c --hints:off -o:tools/army_host tools/army_host.nim
+# Fast path: only rebuild when sources are newer than the binary.
+need_army=0
+if [[ ! -x tools/army_host ]]; then
+  need_army=1
+else
+  for src in tools/army_host.nim tools/env_transport.nim tools/msgpack_json.nim \
+             tools/fair_play_audit.nim; do
+    if [[ -f "$src" && "$src" -nt tools/army_host ]]; then
+      need_army=1
+      break
+    fi
+  done
+fi
+if [[ "$need_army" == "1" ]]; then
+  echo "[traverse-pol] building army_host…"
+  nim c --hints:off -o:tools/army_host tools/army_host.nim
+else
+  echo "[traverse-pol] army_host up to date — skip rebuild"
+fi
 
 echo "[traverse-pol] ensuring env host binary…"
+# env_host.sh build is idempotent / cached when possible.
 tools/env_host.sh build
 BIN="$ROOT/local_data/bin/vanilla-wow-env-host"
 LIBS="$(cat "$ROOT/local_data/env-host-libs.path")"

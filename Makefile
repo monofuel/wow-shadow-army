@@ -46,7 +46,7 @@ COMPOSE_FILE := infra/compose.vmangos.yml
 ACCOUNT_USER := monofuel
 ACCOUNT_PASS := password
 
-.PHONY: test test-lua test-nim system pin-check start-server stop-server server-logging logs account soap-account play play-classic play-classic-netlog play-xr traverse traverse-pol traverse-desert traverse-field escort escort-army grind quest-data warlock-account warlock-bot botwarrior-bot tusk-account tusk-bot beru-account beru-bot party-army navmesh-helper navmesh-status
+.PHONY: test test-lua test-nim system pin-check start-server stop-server server-logging logs account soap-account play play-classic play-classic-netlog play-xr traverse traverse-pol traverse-desert traverse-field traverse-replay escort escort-army grind quest-data warlock-account warlock-bot botwarrior-bot tusk-account tusk-bot beru-account beru-bot party-army navmesh-helper navmesh-status
 
 # Unit tier: Lua tools + Nim host/system tests only (v2 DoD: no Python required
 # for bot correctness). If nim is missing, test-nim-soft skips rather than
@@ -651,7 +651,13 @@ play:
 traverse-field:
 	@tools/pull_traverse_field.sh
 
-# Lua traverse proof-of-life (docs/traverse-2026-08-04.md): short local smoke.
+# Open the latest local traverse league replay (headed native viewer).
+# Finds newest ~/.coworld/.../leagues/traverse/run/replay.json.z
+# Override: TRAVERSE_REPLAY=/path TRAVERSE_REPLAY_WATCH=Northbound
+traverse-replay:
+	@tools/traverse_replay.sh
+
+# Lua traverse proof-of-life (docs/traverse/traverse-2026-08-04.md): short local smoke.
 # Starts upstream local --league=traverse backend, attaches army_host
 # --mode=traverse over WS /env, passes on >=50 path yards within ~3 minutes.
 # Not stock RPB --proof-of-life (that only drives RealPlayerBot).
@@ -664,7 +670,7 @@ traverse-desert:
 	@TRAVERSE_POL_GOAL_RADIUS=50 TRAVERSE_POL_LOG=local_data/brain-logs/traverse-desert.log \
 		tools/traverse_pol.sh
 
-# Launch the traverse-wow league scenario for HUMAN play (docs/traverse_wow.md).
+# Launch the traverse-wow league scenario for HUMAN play (docs/traverse/traverse_wow.md).
 # Unlike `play`, this does NOT use our local realm: --league=traverse makes the
 # launcher provision upstream's own Docker scenario with the level-60 Tanaris
 # fixture, so no --realm-host/--world-port. --bot is rejected with
