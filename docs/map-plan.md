@@ -1,8 +1,8 @@
 # World map browser + waypoint tool — plan
 
-Status: **phase 3d zone view in** — World → continent → zone 2D → bird's-eye
-3D terrain (`map_browser_3d` / fork `runMapViewer`). Goal: hierarchical
-vanilla world-map art, full zone reveal, 3D bird's-eye, then waypoints.
+Status: **single-window map browser** — 2D WorldMap drill + zone 3D via
+fork `runMapViewer` terrain (same window, no child process). Map-tool mode:
+fog off, doodads/WMOs off, whole-zone bird's-eye. Not a second game client.
 
 Terms: `docs/terms.md`. Client imports come from **the fork**
 (`../coworld-vanilla-wow-fork`, on `main`) — this tool builds on client
@@ -50,14 +50,14 @@ every compile/run step.
 - [x] Exit for zone drill: zone map shows full labels/terrain (Teldrassil/
       Durotar verified with overlayCount=11)
 
-### Phase 3 — 3D bird's-eye zone view
+### Phase 3 — full-region 3D (reuse client terrain, one window)
 
-- [x] Zone drill from continent opens 3D terrain over zone bounds
-- [x] Overhead scaled from WorldMapArea span (bird's-eye)
-- [x] Free camera: WASD / mouse / scroll (stock map viewer)
-- [x] Esc/Q closes 3D and returns to 2D; Enter/Space/3 re-opens from zone 2D
-- [x] Entry: `src/tools/map_browser_3d.nim` + `src/map_browser/view3d.nim`
-- [ ] Optional: in-process 3D (no child process) for smoother window flow
+- [x] **One window**: `map_browser` is a `runMapViewer` shell (like world_editor)
+- [x] World/continent = painted 2D overlay; zone = client **ADT terrain** bird's-eye
+- [x] No child process / second window
+- [x] Map-tool presentation: fog forced far, doodads/WMOs off, wide stream window
+- [x] Esc backs out; `M` on zone toggles painted overlay
+- [ ] Optional: orthographic camera for huge zones
 
 ### Phase 4 — waypoints
 

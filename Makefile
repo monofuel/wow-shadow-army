@@ -46,7 +46,7 @@ COMPOSE_FILE := infra/compose.vmangos.yml
 ACCOUNT_USER := monofuel
 ACCOUNT_PASS := password
 
-.PHONY: test test-lua test-nim system pin-check start-server stop-server server-logging logs account soap-account play play-classic play-classic-netlog play-xr traverse traverse-pol traverse-desert traverse-field traverse-replay traverse-pack-replay army-debug-status army-debug-reload army-debug-hold army-debug-resume escort escort-army grind quest-data warlock-account warlock-bot botwarrior-bot tusk-account tusk-bot beru-account beru-bot party-army navmesh-helper navmesh-status map-browser map-browser-once map-browser-3d
+.PHONY: test test-lua test-nim system pin-check start-server stop-server server-logging logs account soap-account play play-classic play-classic-netlog play-xr traverse traverse-pol traverse-desert traverse-field traverse-replay traverse-pack-replay traverse-headed army-debug-status army-debug-reload army-debug-hold army-debug-resume escort escort-army grind quest-data warlock-account warlock-bot botwarrior-bot tusk-account tusk-bot beru-account beru-bot party-army navmesh-helper navmesh-status map-browser map-browser-once map-browser-3d
 
 # Unit tier: Lua tools + Nim host/system tests only (v2 DoD: no Python required
 # for bot correctness). If nim is missing, test-nim-soft skips rather than
@@ -60,7 +60,7 @@ test: test-lua test-nim-soft test-smoke
 NIM_CHECK_FILES = system/system_server.nim tools/army_host.nim tools/army_debug.nim \
 	tools/fair_play_audit.nim tools/party_promote.nim tools/msgpack_json.nim \
 	tools/env_transport.nim tools/env_smoke.nim \
-	src/tools/map_browser.nim src/tools/map_browser_3d.nim
+	src/tools/map_browser.nim
 
 .PHONY: test-smoke test-smoke-lua test-smoke-nim test-smoke-nim-soft
 test-smoke: test-smoke-lua test-smoke-nim-soft
@@ -136,37 +136,21 @@ system:
 		SYSTEM_ARMY_DIR="$${SYSTEM_ARMY_DIR:-$$(pwd)}" \
 		nix develop --command nim r system/system_server.nim
 
-# Classic client Data for 3D ADT extract / MPQ (override if needed).
+# Map browser (docs/map-plan.md). Single window: 2D drill + client terrain 3D.
+# Zone view reuses fork runMapViewer terrain (fog off, no doodads).
 CLASSIC_CLIENT := $(abspath ../wow-classic-data/Coworld-WoW-Classic/client)
 ifeq ($(wildcard $(CLASSIC_CLIENT)/Data),)
   CLASSIC_CLIENT := $(abspath ../coworld-vanilla-wow/local_data/coworld-bundle/Coworld-WoW-Classic/client)
 endif
-ifeq ($(wildcard $(CLASSIC_CLIENT)/Data),)
-  CLASSIC_CLIENT := $(abspath local_classic/client)
-endif
-
-# Map browser (docs/map-plan.md). World → continent → zone 2D → bird's-eye 3D.
-# Assets: prepared BLPs under coworld-vanilla-wow player/assets (or MAP_BROWSER_WORLD_MAP_DIR).
-# DBC/ZMP: VANILLA_WOW_EXTRACTED_DATA_DIR + player/assets client_assets worldmap *.zmp.
-# 3D: fork player/tmp/client_assets must see prepared ADTs (auto-symlinked to
-# upstream's tmp/client_assets → coworld-local-data player-cache).
 map-browser:
 	VANILLA_WOW_EXTRACTED_DATA_DIR="$(VANILLA_WOW_EXTRACTED_DATA_DIR)" \
 	VANILLA_WOW_CLIENT_DATA_DIR="$${VANILLA_WOW_CLIENT_DATA_DIR:-$(CLASSIC_CLIENT)}" \
 		nix develop --command nim r src/tools/map_browser.nim
 
-# Headless smoke: compose World PNG + sample catalog drill (no GUI/3D).
 map-browser-once:
 	VANILLA_WOW_EXTRACTED_DATA_DIR="$(VANILLA_WOW_EXTRACTED_DATA_DIR)" \
-		MAP_BROWSER_ONCE=1 MAP_BROWSER_NO_3D=1 \
+		MAP_BROWSER_ONCE=1 \
 		nix develop --command nim r src/tools/map_browser.nim
-
-# Direct 3D bird's-eye (args after --): --map:1 --x:… --y:… --z:… --overhead:… --label:…
-map-browser-3d:
-	VANILLA_WOW_EXTRACTED_DATA_DIR="$(VANILLA_WOW_EXTRACTED_DATA_DIR)" \
-	VANILLA_WOW_CLIENT_DATA_DIR="$${VANILLA_WOW_CLIENT_DATA_DIR:-$(CLASSIC_CLIENT)}" \
-		nix develop --command nim r src/tools/map_browser_3d.nim -- \
-		--map:1 --x:-2372 --y:-1940 --z:96 --overhead:1400 --label:Barrens
 
 # Pin-drift only: HEAD of ../coworld-vanilla-wow must match upstream.lock.
 # Pure shell — no Python. Format of upstream.lock: "<name> <sha>".
@@ -706,6 +690,13 @@ traverse-replay:
 # Pack latest traverse godview/worldwire → run/replay.json.z (also auto on pol EXIT).
 traverse-pack-replay:
 	@tools/pack_traverse_replay.sh
+
+# Headed Nim client on Traverse (Softmax one-command: window + RealPlayerBot).
+# Same as upstream: launch_nim_player --league=traverse --presentation=headed
+# --controller=embedded --bot=real-playerbot. Not the live-POV spectator.
+# Our Lua army_host path is external /env (headless); this is Softmax's headed bot.
+traverse-headed:
+	@tools/traverse_headed.sh
 
 # Lua traverse proof-of-life (docs/traverse/traverse-2026-08-04.md): short local smoke.
 # Starts upstream local --league=traverse backend, attaches army_host

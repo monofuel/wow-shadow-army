@@ -49,3 +49,17 @@ make army-debug-status   # lua.gen bumped
 ```
 
 Hold during multi-file edits: `make army-debug-hold` … edit … `make army-debug-resume`.
+
+## Headed Nim client (Softmax path)
+
+```bash
+make traverse-headed
+```
+
+One Softmax command: headed Nim client + **RealPlayerBot** on `--league=traverse`
+(same as their participate guide). Window = the bot process.
+
+Our **Lua / army_host** pilot is Softmax’s **external `/env`** lane (headless
+reference/env host). Softmax does not put that lane in `player.nim` headed mode.
+`make traverse-pol` + dashboard status is how we run *our* bot; headed Softmax
+RPB is how their stack is meant to be watched in a window.

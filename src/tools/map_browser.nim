@@ -1,92 +1,82 @@
-## Map browser: World → continent → zone (2D) → bird's-eye 3D terrain.
+## Single-window map browser: 2D WorldMap drill + full-region 3D terrain.
 ##
-##   nix develop --command nim r src/tools/map_browser.nim
+## One process, one window (`runMapViewer` shell — same pattern as world_editor).
+## Zone view reuses **client ADT terrain** with map-tool presentation (no fog
+## wall, no doodads/WMOs). World/continent levels are painted 2D overlays.
+##
 ##   make map-browser
 ##
-## Zone drill opens a 3D bird's-eye view (map_browser_3d). Esc/Q closes 3D
-## and returns here. Enter/Space on a zone 2D map re-opens 3D.
+## Controls
+##   Left-click   drill World → continent → zone (3D terrain)
+##   Esc / RMB    zoom out (zone 3D → continent 2D → world 2D)
+##   Zone 3D:     WASD / mouse / scroll (stock free camera)
+##   M            (on zone) toggle painted map overlay on top of 3D
 ##
-## Optional:
-##   MAP_BROWSER_WORLD_MAP_DIR=/path/to/worldmap_or_surface
-##   MAP_BROWSER_ZMP_DIR=/path/to/zmp_folder
-##   MAP_BROWSER_ONCE=1          # compose current surface PNG and exit
-##   MAP_BROWSER_OUT=local_data/map_browser_world.png
-##   MAP_BROWSER_NO_3D=1         # skip auto 3D on zone drill
-##   VANILLA_WOW_EXTRACTED_DATA_DIR=…/vmangos-5875-data
+## Env: VANILLA_WOW_EXTRACTED_DATA_DIR, VANILLA_WOW_CLIENT_DATA_DIR,
+##      MAP_BROWSER_ONCE=1 (headless smoke, no window)
 
 import
-  std/[os, osproc, strutils, tables],
-  chroma, pixie, silky, vmath,
+  std/[math, os, strutils, tables],
+  chroma, pixie, silky, vmath, windy,
+  environment/client/renderer/runtime,
+  environment/client/renderer/world_streaming,
+  environment/client/renderer/cameras,
   environment/client/world_catalogs,
   environment/client/world_catalogs/model,
-  map_browser/[assets, surface, view3d]
+  map_browser/[assets, surface, terrain3d, view3d]
+
+from environment/client/renderer/environments import
+  fogDistanceOverride, fogStartOverride, fogEndOverride, renderFarclip
 
 const
-  WindowTitle = "map browser"
-  AtlasSize = 8192
+  AppTitle = "map browser"
   HoverOutline = rgbx(220, 200, 140, 180)
-  HeaderBg = rgbx(24, 28, 36, 240)
+  HeaderBg = rgbx(24, 28, 36, 230)
   HeaderText = rgbx(230, 220, 190, 255)
   HeaderMuted = rgbx(160, 150, 130, 255)
+  MapDim = rgbx(0, 0, 0, 40)
 
 type
   Browser = object
     catalog: WorldCatalog
     state: SurfaceState
-    sk: Silky
+    ## True when the main view is zone 3D terrain (not covered by 2D art).
+    terrainMode: bool
+    ## Optional painted zone map drawn over 3D when true.
+    showPaintedOverlay: bool
     packed: Table[string, bool]
     mapLayout: tuple[pos, size: Vec2]
-    statusLine: string
+    ready: bool
 
-proc auto3dEnabled(): bool =
-  getEnv("MAP_BROWSER_NO_3D").strip() notin ["1", "true", "yes"]
+var browser: Browser
 
-proc launchZone3d*(focus: BirdseyeFocus) =
-  ## Blocks in a child map_browser_3d process (fork runMapViewer).
-  discard ensureForkPlayerAssets()
-  # Child inherits env; fill dead defaults so MPQ/extract paths resolve.
-  if getEnv("VANILLA_WOW_CLIENT_DATA_DIR").strip().len == 0:
-    let client = resolveClientDataDir()
-    if client.len > 0:
-      putEnv("VANILLA_WOW_CLIENT_DATA_DIR", client)
-  if getEnv("VANILLA_WOW_EXTRACTED_DATA_DIR").strip().len == 0:
-    let extracted =
-      siblingCoworld("coworld-vanilla-wow") / "local_data" / "vmangos-5875-data"
-    if dirExists(extracted):
-      putEnv("VANILLA_WOW_EXTRACTED_DATA_DIR", extracted)
-  let
-    root = repoRoot()
-    tool = root / "src" / "tools" / "map_browser_3d.nim"
-  var args = @[
-    "develop", "--command", "nim", "r", "--hints:off", tool, "--"
-  ]
-  args.add focus.birdseyeCliArgs()
-  echo "map_browser: 3D bird's-eye ", focus.label,
-    " map=", focus.mapId,
-    " @(", focus.x, ", ", focus.y, ", ", focus.z, ")",
-    " overhead=", focus.overhead
-  echo "map_browser: CLIENT_DATA=", getEnv("VANILLA_WOW_CLIENT_DATA_DIR")
-  echo "map_browser: EXTRACTED=", getEnv("VANILLA_WOW_EXTRACTED_DATA_DIR")
-  let p = startProcess(
-    command = "nix",
-    args = args,
-    workingDir = root,
-    options = {poParentStreams, poUsePath}
-  )
-  let code = p.waitForExit()
-  if code != 0:
-    echo "map_browser: 3D viewer exited with code ", code
-  p.close()
+proc atlasKey(fileName: string): string =
+  "mb:" & fileName.toLowerAscii()
 
-proc openZone3d(b: var Browser; state: SurfaceState) =
-  if state.level != MapLevelZone or not state.surface.found:
+proc applyMapExplorerPresentation() =
+  ## Terrain yes; full-client clutter no. Re-applied each frame in terrain mode.
+  showVisual = false
+  showNav = false
+  showCollision = false
+  chunkWindowSize = MaxChunkWindowSize
+  moveSpeed = 260.0'f32
+  fogDistanceOverride = true
+  fogStartOverride = 7000.0'f32
+  fogEndOverride = 9800.0'f32
+  renderFarclip = 12000.0'f32
+
+proc ensurePacked(fileName: string; areaMapId: uint32) =
+  let key = fileName.atlasKey
+  if browser.packed.getOrDefault(key):
     return
-  let focus = state.birdseyeFocus()
-  if focus.overhead < 1.0'f32:
-    echo "map_browser: no 3D focus for ", state.label
+  if sk == nil:
     return
-  b.statusLine = "3D: " & focus.label & "  ·  Esc/Q returns"
-  launchZone3d(focus)
+  let loaded = loadSurfaceMosaic(
+    fileName, areaMapId, browser.catalog.worldMapOverlays)
+  sk.addAtlasImage(key, loaded.image)
+  browser.packed[key] = true
+  echo "map_browser: packed ", fileName,
+    " overlays=", loaded.roots.overlayCount
 
 proc fitRect(content, viewport: Vec2): tuple[pos, size: Vec2] =
   if content.x <= 0 or content.y <= 0 or viewport.x <= 0 or viewport.y <= 0:
@@ -95,107 +85,26 @@ proc fitRect(content, viewport: Vec2): tuple[pos, size: Vec2] =
   let size = content * scale
   ((viewport - size) * 0.5'f32, size)
 
-proc drawPackedImage(sk: Silky; name: string; pos, size: Vec2) =
+proc drawPacked(name: string; pos, size: Vec2) =
   var entry: Entry
   if not sk.getAtlasEntry(name, entry):
     return
   sk.drawQuad(
-    pos,
-    size,
+    pos, size,
     vec2(entry.x.float32, entry.y.float32),
     vec2(entry.width.float32, entry.height.float32),
     rgbx(255, 255, 255, 255)
   )
 
-proc drawBorder(sk: Silky; pos, size: Vec2; thickness: float32; color: ColorRGBX) =
-  if size.x <= 0 or size.y <= 0:
-    return
+proc drawBorder(pos, size: Vec2; thickness: float32; color: ColorRGBX) =
   let t = max(1.0'f32, thickness)
   sk.drawRect(pos, vec2(size.x, t), color)
   sk.drawRect(pos + vec2(0, size.y - t), vec2(size.x, t), color)
   sk.drawRect(pos, vec2(t, size.y), color)
   sk.drawRect(pos + vec2(size.x - t, 0), vec2(t, size.y), color)
 
-proc uvToScreen(
-  mapPos, mapSize, uvPos, uvSize: Vec2
-): tuple[pos, size: Vec2] {.raises: [].} =
-  (
-    pos: mapPos + vec2(uvPos.x * mapSize.x, uvPos.y * mapSize.y),
-    size: vec2(uvSize.x * mapSize.x, uvSize.y * mapSize.y)
-  )
-
-proc drawHoverHint(
-  sk: Silky;
-  mapPos, mapSize: Vec2;
-  hover: WorldMapAreaHover
-) =
-  ## Thin outline only over stock highlight UV (no fill).
-  if not hover.found:
-    return
-  if hover.highlightUvSize.x > 0.0'f32 and hover.highlightUvSize.y > 0.0'f32:
-    let r = uvToScreen(
-      mapPos, mapSize, hover.highlightUvPos, hover.highlightUvSize)
-    if r.size.x >= 4.0'f32 and r.size.y >= 4.0'f32:
-      sk.drawBorder(r.pos, r.size, 1.5'f32, HoverOutline)
-
-proc resolveUiFont(): string {.raises: [].} =
-  ## Prefer fontconfig match, then common paths / silky example.
-  try:
-    let (output, code) = execCmdEx("fc-match -f '%{file}' 'DejaVu Sans'")
-    if code == 0:
-      let path = output.strip()
-      if path.len > 0 and fileExists(path):
-        return path
-  except CatchableError:
-    discard
-  const candidates = [
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-    "/usr/share/fonts/TTF/DejaVuSans.ttf"
-  ]
-  for path in candidates:
-    if fileExists(path):
-      return path
-  let silkyExample =
-    getHomeDir() / ".nimby" / "pkgs" / "silky" / "examples" / "basicwindow" /
-      "data" / "IBMPlexSans-Regular.ttf"
-  if fileExists(silkyExample):
-    return silkyExample
-  ""
-
-proc atlasKey(fileName: string): string =
-  "map:" & fileName.toLowerAscii()
-
-proc ensurePacked(b: var Browser; state: SurfaceState) =
-  ## Pack fully-revealed surface (base + all WorldMapOverlay pieces).
-  let key = state.fileName.atlasKey
-  if b.packed.getOrDefault(key):
-    return
-  let loaded = loadSurfaceMosaic(
-    state.fileName,
-    state.areaMapId,
-    b.catalog.worldMapOverlays
-  )
-  if not b.sk.builder.addImage(key, loaded.image):
-    raise newException(IOError, "atlas full packing " & state.fileName)
-  b.sk.image = b.sk.builder.atlasImage
-  b.sk.atlas = b.sk.builder.atlas
-  b.sk.uploadAtlas()
-  b.packed[key] = true
-  echo "map_browser: packed ", state.fileName,
-    " overlays=", loaded.roots.overlayCount,
-    " from ", loaded.roots.sourceLabel
-
-proc setSurface(b: var Browser; next: SurfaceState) =
-  b.state = next
-  try:
-    b.ensurePacked(next)
-    b.statusLine = next.label & "  ·  " & next.status
-  except CatchableError as err:
-    b.statusLine = "failed to load " & next.fileName & ": " & err.msg
-    echo "map_browser: ", b.statusLine
-
-proc screenToUv(b: Browser; mouse: Vec2): tuple[ok: bool, uv: Vec2] =
-  let layout = b.mapLayout
+proc screenToUv(mouse: Vec2): tuple[ok: bool, uv: Vec2] =
+  let layout = browser.mapLayout
   if layout.size.x <= 0 or layout.size.y <= 0:
     return
   if mouse.x < layout.pos.x or mouse.y < layout.pos.y or
@@ -208,167 +117,215 @@ proc screenToUv(b: Browser; mouse: Vec2): tuple[ok: bool, uv: Vec2] =
     clamp((mouse.y - layout.pos.y) / layout.size.y, 0.0'f32, 1.0'f32)
   )
 
-proc drawHeader(
-  sk: Silky;
-  pad: float32;
-  crumbs, hoverName: string
-) =
+proc focusZoneTerrain(state: SurfaceState) =
+  ## Point stock terrain camera at the whole zone AABB.
+  if not state.surface.found:
+    return
+  let b = state.zoneWorldBounds()
   let
-    barW = sk.size.x - pad * 2
-    barH = 26.0'f32
-  sk.drawRect(vec2(pad, pad), vec2(barW, barH), HeaderBg)
-  let crumbLine =
-    if hoverName.len > 0:
-      crumbs & "   ·   " & hoverName
-    else:
-      crumbs
-  discard sk.drawText(
-    sk.textStyle,
-    crumbLine,
-    vec2(pad + 8, pad + 5),
-    HeaderText
+    cx = (b.minX + b.maxX) * 0.5'f32
+    cy = (b.minY + b.maxY) * 0.5'f32
+    span = max(b.maxX - b.minX, b.maxY - b.minY)
+    overhead = clamp(span * 0.55'f32, 400.0'f32, 2800.0'f32)
+  applyMapExplorerPresentation()
+  focusWorldPosition(
+    b.mapId, cx, cy, 80.0'f32,
+    overhead = overhead,
+    loadTiles = true
   )
-  let hint = "click drill  ·  zone→3D  ·  Esc zoom out"
-  let hintSize = sk.getTextSize(sk.textStyle, hint)
+  browser.terrainMode = true
+  browser.showPaintedOverlay = false
+  echo "map_browser: terrain focus ", b.label,
+    " center=(", cx, ",", cy, ") span=", span, " overhead=", overhead
+
+proc setSurface(next: SurfaceState; enterTerrain = false) =
+  browser.state = next
+  try:
+    ensurePacked(next.fileName, next.areaMapId)
+  except CatchableError as err:
+    echo "map_browser: pack failed ", next.fileName, ": ", err.msg
+  if enterTerrain and next.level == MapLevelZone:
+    focusZoneTerrain(next)
+  else:
+    browser.terrainMode = false
+    browser.showPaintedOverlay = false
+
+proc drawHeader(crumbs, extra: string) =
+  let
+    pad = 10.0'f32
+    barW = sk.size.x - pad * 2
+    barH = 28.0'f32
+  sk.drawRect(vec2(pad, pad), vec2(barW, barH), HeaderBg)
+  let line =
+    if extra.len > 0: crumbs & "   ·   " & extra
+    else: crumbs
+  discard sk.drawText(sk.textStyle, line, vec2(pad + 8, pad + 6), HeaderText)
+  let hint =
+    if browser.terrainMode:
+      "WASD/mouse 3D  ·  M painted  ·  Esc out"
+    else:
+      "click drill  ·  Esc out"
+  let hs = sk.getTextSize(sk.textStyle, hint)
   discard sk.drawText(
-    sk.textStyle,
-    hint,
-    vec2(pad + barW - hintSize.x - 8, pad + 5),
+    sk.textStyle, hint,
+    vec2(pad + barW - hs.x - 8, pad + 6),
     HeaderMuted
   )
-
-proc main() =
-  var catalog = loadMapCatalog()
-  echo "map_browser: dbc=", extractedDbcDir()
-  echo "map_browser: worldMapAreas=", catalog.worldMapAreas.len
-  echo "map_browser: zoneMasks=", catalog.worldMapZoneMasks.len
-
-  var state = worldSurfaceState()
-
-  let once = getEnv("MAP_BROWSER_ONCE").strip() in ["1", "true", "yes"]
-  let outPath = block:
-    let o = getEnv("MAP_BROWSER_OUT").strip()
-    if o.len > 0: o
-    else: repoRoot() / "local_data" / "map_browser_world.png"
-
-  if once:
-    let loaded = loadSurfaceMosaic(state.fileName)
-    createDir(outPath.parentDir())
-    loaded.image.writeFile(outPath)
-    echo "map_browser: wrote ", outPath, " (", state.fileName, ")"
-    let cont = catalog.drillIn(state, vec2(0.25, 0.5))
-    echo "map_browser: sample world→continent level=", cont.level,
-      " file=", cont.fileName, " label=", cont.label
-    echo "map_browser: breadcrumb=", catalog.breadcrumb(cont)
-    if cont.level == MapLevelContinent:
-      var sampleZone = cont
-      for yi in 0 .. 4:
-        for xi in 0 .. 7:
-          let uv = vec2(
-            (xi.float32 + 0.5'f32) / 8.0'f32,
-            (yi.float32 + 0.5'f32) / 5.0'f32
-          )
-          let z = catalog.drillIn(cont, uv)
-          if z.level == MapLevelZone:
-            sampleZone = z
-            break
-        if sampleZone.level == MapLevelZone:
-          break
-      if sampleZone.level == MapLevelZone:
-        echo "map_browser: breadcrumb=", catalog.breadcrumb(sampleZone)
-        let hover = catalog.hoverAt(cont, vec2(0.5, 0.5))
-        echo "map_browser: sample hover found=", hover.found,
-          " label=", hover.label,
-          " rect=", hover.highlightUvPos, " ", hover.highlightUvSize
-        let focus = sampleZone.birdseyeFocus()
-        echo "map_browser: 3D focus map=", focus.mapId,
-          " pos=(", focus.x, ", ", focus.y, ", ", focus.z, ")",
-          " overhead=", focus.overhead, " label=", focus.label
-    return
-
-  let fontPath = resolveUiFont()
-  if fontPath.len == 0:
-    echo "map_browser: warning: no UI font found; breadcrumbs may not render"
-
-  let window = newWindow(WindowTitle, ivec2(1100, 780), vsync = true)
-  makeContextCurrent(window)
-  loadExtensions()
-
-  let builder = newAtlasBuilder(AtlasSize, 4)
-  if fontPath.len > 0:
-    builder.addFont(fontPath, "Default", 16.0)
-  let sk = newSilky(window, builder.atlasImage, builder.atlas)
-  sk.builder = builder
-  sk.textStyle = "Default"
-
-  var b = Browser(catalog: catalog, sk: sk, packed: initTable[string, bool]())
-  b.setSurface(state)
-
-  window.onFrame = proc() =
-    if window.buttonPressed[KeyEscape] or window.buttonPressed[MouseRight] or
-        window.buttonPressed[KeyBackspace]:
-      b.setSurface(b.catalog.zoomOut(b.state))
-
-    # Re-enter bird's-eye 3D while already on a zone 2D map.
-    if b.state.level == MapLevelZone and
-        (window.buttonPressed[KeyEnter] or window.buttonPressed[KeySpace] or
-          window.buttonPressed[Key3]):
-      b.openZone3d(b.state)
-
-    sk.beginUi(window, window.size)
-    sk.clearScreen(rgbx(12, 14, 20, 255))
-
-    let
-      pad = 12.0'f32
-      header = 32.0'f32
-      content = vec2(float32(WorldMapDetailWidth), float32(WorldMapDetailHeight))
-      viewport = sk.size - vec2(pad * 2, pad * 2 + header)
-      layout = fitRect(content, viewport)
-    b.mapLayout = (
-      pos: layout.pos + vec2(pad, pad + header),
-      size: layout.size
+  # Surface load errors (why grey happened before)
+  if loadError.len > 0:
+    let err = "terrain: " & loadError
+    discard sk.drawText(
+      sk.textStyle, err,
+      vec2(pad + 8, pad + barH + 4),
+      rgbx(255, 120, 100, 255)
     )
 
-    let key = b.state.fileName.atlasKey
-    if b.packed.getOrDefault(key):
-      sk.drawPackedImage(key, b.mapLayout.pos, b.mapLayout.size)
+proc drawMapBrowserUi() =
+  if sk == nil or window == nil:
+    return
 
-    let mouse = window.mousePos.vec2 / sk.uiScale
-    let hit = b.screenToUv(mouse)
-    var hover = WorldMapAreaHover()
-    if hit.ok:
-      hover = b.catalog.hoverAt(b.state, hit.uv)
-      # Only show clickable hint when drill can go deeper.
-      if b.state.level != MapLevelZone:
-        sk.drawHoverHint(b.mapLayout.pos, b.mapLayout.size, hover)
+  if not browser.ready:
+    browser.ready = true
+    try:
+      ensurePacked(browser.state.fileName, browser.state.areaMapId)
+    except CatchableError as err:
+      echo "map_browser: initial pack: ", err.msg
 
-    if window.buttonPressed[MouseLeft] and hit.ok:
-      let next = b.catalog.drillIn(b.state, hit.uv)
-      b.setSurface(next)
-      if next.level == MapLevelZone and auto3dEnabled():
-        # Pack 2D first so returning from 3D shows the zone art immediately.
-        b.openZone3d(next)
+  if browser.terrainMode:
+    applyMapExplorerPresentation()
 
-    let crumbs = b.catalog.breadcrumb(b.state)
-    let hoverName =
-      if hover.found and hover.label.len > 0 and
-          b.state.level != MapLevelZone:
-        hover.label
-      elif b.state.level == MapLevelZone:
-        "Enter/Space/3 · bird's-eye 3D"
-      else:
-        ""
-    sk.drawHeader(pad, crumbs, hoverName)
+  # Esc / RMB zoom out
+  if window.buttonPressed[KeyEscape] or window.buttonPressed[MouseRight] or
+      window.buttonPressed[KeyBackspace]:
+    if browser.terrainMode and browser.showPaintedOverlay:
+      browser.showPaintedOverlay = false
+    elif browser.terrainMode:
+      browser.terrainMode = false
+      setSurface(browser.catalog.zoomOut(browser.state))
+    else:
+      setSurface(browser.catalog.zoomOut(browser.state))
 
-    window.title = WindowTitle & " — " & crumbs
-    if hoverName.len > 0 and b.state.level != MapLevelZone:
-      window.title = window.title & " / " & hoverName
+  if browser.terrainMode and window.buttonPressed[KeyM]:
+    browser.showPaintedOverlay = not browser.showPaintedOverlay
 
-    sk.endUi()
-    window.swapBuffers()
+  let
+    pad = 10.0'f32
+    header = 36.0'f32
+    content = vec2(float32(WorldMapDetailWidth), float32(WorldMapDetailHeight))
+    viewport = sk.size - vec2(pad * 2, pad * 2 + header)
+    layout = fitRect(content, viewport)
+  browser.mapLayout = (
+    pos: layout.pos + vec2(pad, pad + header),
+    size: layout.size
+  )
 
-  while not window.closeRequested:
-    pollEvents()
+  let mouse = window.mousePos.vec2 / max(sk.uiScale, 0.01'f32)
+  let crumbs = browser.catalog.breadcrumb(browser.state)
+  var extra = ""
+
+  # --- 2D painted layers: fullscreen when not terrain, or optional overlay ---
+  let show2d =
+    not browser.terrainMode or browser.showPaintedOverlay
+  if show2d:
+    # Dim 3D behind optional overlay
+    if browser.terrainMode and browser.showPaintedOverlay:
+      sk.drawRect(vec2(0, 0), sk.size, MapDim)
+    let key = browser.state.fileName.atlasKey
+    try:
+      ensurePacked(browser.state.fileName, browser.state.areaMapId)
+    except CatchableError:
+      discard
+    if browser.packed.getOrDefault(key):
+      drawPacked(key, browser.mapLayout.pos, browser.mapLayout.size)
+
+    if not browser.terrainMode:
+      let hit = screenToUv(mouse)
+      if hit.ok:
+        let hover = browser.catalog.hoverAt(browser.state, hit.uv)
+        if hover.found and hover.highlightUvSize.x > 0:
+          let
+            hp = browser.mapLayout.pos + vec2(
+              hover.highlightUvPos.x * browser.mapLayout.size.x,
+              hover.highlightUvPos.y * browser.mapLayout.size.y)
+            hs = vec2(
+              hover.highlightUvSize.x * browser.mapLayout.size.x,
+              hover.highlightUvSize.y * browser.mapLayout.size.y)
+          drawBorder(hp, hs, 1.5'f32, HoverOutline)
+          extra = hover.label
+        if window.buttonPressed[MouseLeft]:
+          let next = browser.catalog.drillIn(browser.state, hit.uv)
+          setSurface(next, enterTerrain = next.level == MapLevelZone)
+  else:
+    extra = "3D terrain  ·  full zone"
+
+  drawHeader(crumbs, extra)
+  window.title = AppTitle & " — " & crumbs
+
+proc runHeadlessSmoke() =
+  let catalog = loadMapCatalog()
+  echo "map_browser: dbc=", extractedDbcDir()
+  echo "map_browser: areas=", catalog.worldMapAreas.len
+  let loaded = loadSurfaceMosaic("World")
+  let outPath = repoRoot() / "local_data" / "map_browser_world.png"
+  createDir(outPath.parentDir())
+  loaded.image.writeFile(outPath)
+  echo "map_browser: wrote ", outPath
+  let cont = catalog.drillIn(worldSurfaceState(), vec2(0.25, 0.5))
+  echo "map_browser: sample continent ", cont.fileName
+  if cont.level == MapLevelContinent:
+    for yi in 0 .. 6:
+      for xi in 0 .. 10:
+        let uv = vec2((xi.float32 + 0.5) / 11.0, (yi.float32 + 0.5) / 7.0)
+        let z = catalog.drillIn(cont, uv)
+        if z.level == MapLevelZone:
+          let b = z.zoneWorldBounds()
+          echo "map_browser: sample zone ", b.label,
+            " span=", max(b.maxX - b.minX, b.maxY - b.minY)
+          return
+
+proc main() =
+  if getEnv("MAP_BROWSER_ONCE").strip() in ["1", "true", "yes"]:
+    runHeadlessSmoke()
+    return
+
+  if getEnv("VANILLA_WOW_CLIENT_DATA_DIR").strip().len == 0:
+    let client = resolveClientDataDir()
+    if client.len > 0:
+      putEnv("VANILLA_WOW_CLIENT_DATA_DIR", client)
+      echo "map_browser: CLIENT_DATA=", client
+  if getEnv("VANILLA_WOW_EXTRACTED_DATA_DIR").strip().len == 0:
+    let extracted =
+      siblingCoworld("coworld-vanilla-wow") / "local_data" / "vmangos-5875-data"
+    if dirExists(extracted):
+      putEnv("VANILLA_WOW_EXTRACTED_DATA_DIR", extracted)
+
+  if not ensureForkPlayerAssets():
+    echo "map_browser: WARNING prepared assets incomplete — 3D may stay grey"
+
+  browser = Browser(
+    catalog: loadMapCatalog(),
+    state: worldSurfaceState(),
+    packed: initTable[string, bool]()
+  )
+  echo "map_browser: catalog areas=", browser.catalog.worldMapAreas.len,
+    " masks=", browser.catalog.worldMapZoneMasks.len
+
+  # Seed terrain stream somewhere on Kalimdor so setup is happy; 2D covers it
+  # until the user drills into a zone.
+  applyMapExplorerPresentation()
+  setInitialWorldFocus(
+    1'u32, -600.0'f32, -4200.0'f32, 50.0'f32,
+    overhead = 800.0'f32
+  )
+
+  # Free camera only useful in zone terrain mode; still allow look around.
+  runMapViewer(
+    title = AppTitle,
+    topUi = drawMapBrowserUi,
+    showMapPanel = false,
+    enableCameraInput = true,
+    loadInitialMapTiles = true
+  )
 
 when isMainModule:
   main()
