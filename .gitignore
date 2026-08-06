@@ -21,3 +21,8 @@ tools/player_bin
 # Accidental local clones — army_host uses tools/msgpack_json.nim (stdlib only),
 # not a vendored msgpack4nim tree.
 tools/vendor/
+
+# ClientView traverse bridge binaries
+tools/traverse_lua_bridge
+tools/tests/test_traverse_cv
+tools/tests/debug_decide

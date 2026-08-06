@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+# Kalimdor Traverse via ClientView Lua pilot (not /env, not stock RPB decide).
+#
+#   tools/traverse_cv.sh headed|headless
+#   make traverse          → headless (xvfb-run via launch_nim_player)
+#   make traverse-headed   → headed window
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+MODE="${1:-headless}"
+UPSTREAM="${UPSTREAM:-$ROOT/../coworld-vanilla-wow}"
+FORK="${TRAVERSE_FORK:-$ROOT/../coworld-vanilla-wow-fork}"
+PLAYER_SRC="${TRAVERSE_PLAYER_SRC:-}"
+if [[ -z "$PLAYER_SRC" ]]; then
+  for cand in "$UPSTREAM" "$FORK"; do
+    if [[ -f "$cand/player/runtime/visual_adapter.nim" ]] &&
+       grep -q 'TRAVERSE_LUA_BRIDGE' "$cand/player/runtime/visual_adapter.nim" 2>/dev/null; then
+      PLAYER_SRC="$cand"
+      break
+    fi
+  done
+fi
+if [[ -z "${PLAYER_SRC:-}" || ! -d "$PLAYER_SRC" ]]; then
+  echo "error: no player tree with TRAVERSE_LUA_BRIDGE in visual_adapter.nim" >&2
+  exit 1
+fi
+WOW_ENV="${WOW_ENV:-$ROOT/tools/wow_env.sh}"
+OWNER="${TRAVERSE_OWNER:-${USER:-monofuel}}"
+LOG="${TRAVERSE_CV_LOG:-$ROOT/local_data/brain-logs/traverse-cv-${MODE}.log}"
+BRIDGE="${TRAVERSE_LUA_BRIDGE:-$ROOT/tools/traverse_lua_bridge}"
+MAX_SECONDS="${TRAVERSE_CV_MAX_SECONDS:-1200}"
+
+if [[ ! -f "$WOW_ENV" ]]; then
+  echo "error: missing $WOW_ENV" >&2
+  exit 1
+fi
+
+mkdir -p "$(dirname "$LOG")"
+
+need_bridge=0
+if [[ ! -x "$BRIDGE" ]]; then
+  need_bridge=1
+else
+  for src in \
+    "$ROOT/tools/traverse_lua_bridge.nim" \
+    "$ROOT/src/traverse_cv/project.nim" \
+    "$ROOT/src/traverse_cv/lower.nim" \
+    "$ROOT/src/traverse_cv/decide.nim"
+  do
+    if [[ -f "$src" && "$src" -nt "$BRIDGE" ]]; then
+      need_bridge=1
+      break
+    fi
+  done
+fi
+if [[ "$need_bridge" == "1" ]]; then
+  echo "[traverse-cv] building traverse_lua_bridge…"
+  ( cd "$ROOT" && nim c --hints:off -d:release -o:"$BRIDGE" tools/traverse_lua_bridge.nim )
+fi
+
+case "$MODE" in
+  headed) PRES=headed ;;
+  headless) PRES=headless ;;
+  *)
+    echo "usage: $0 headed|headless" >&2
+    exit 2
+    ;;
+esac
+
+export TRAVERSE_LUA_BRIDGE="$BRIDGE"
+export TRAVERSE_LUA_REPO="$ROOT"
+export DISPLAY="${DISPLAY:-:0}"
+export WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-0}"
+
+echo "[traverse-cv] mode=$MODE presentation=$PRES player_src=$PLAYER_SRC"
+echo "[traverse-cv] bridge=$BRIDGE repo=$ROOT"
+echo "[traverse-cv] ClientView Lua pilot — not /env army_host"
+echo "[traverse-cv] log=$LOG"
+
+cd "$PLAYER_SRC"
+set +u
+# shellcheck source=/dev/null
+. "$WOW_ENV"
+set -u
+
+# Ensure bridge env survives into the player child.
+export TRAVERSE_LUA_BRIDGE TRAVERSE_LUA_REPO
+
+echo "[traverse-cv] launching…" | tee "$LOG"
+set +e
+if command -v timeout >/dev/null 2>&1 && [[ "${TRAVERSE_CV_NO_TIMEOUT:-0}" != "1" ]]; then
+  nix shell nixpkgs#nginx nixpkgs#xvfb-run nixpkgs#xorg.xorgserver --command \
+    timeout --signal=TERM "$MAX_SECONDS" \
+    env TRAVERSE_LUA_BRIDGE="$BRIDGE" TRAVERSE_LUA_REPO="$ROOT" \
+      nim r tools/launch_nim_player.nim -- \
+        --league=traverse \
+        --controller=embedded \
+        --presentation="$PRES" \
+        --bot=real-playerbot \
+        --owner="$OWNER" \
+    >>"$LOG" 2>&1
+  code=$?
+else
+  nix shell nixpkgs#nginx nixpkgs#xvfb-run nixpkgs#xorg.xorgserver --command \
+    env TRAVERSE_LUA_BRIDGE="$BRIDGE" TRAVERSE_LUA_REPO="$ROOT" \
+      nim r tools/launch_nim_player.nim -- \
+        --league=traverse \
+        --controller=embedded \
+        --presentation="$PRES" \
+        --bot=real-playerbot \
+        --owner="$OWNER" \
+    >>"$LOG" 2>&1
+  code=$?
+fi
+set -e
+echo "[traverse-cv] exit=$code (see $LOG)"
+if grep -qE 'traverse-lua|Northbound|TRAVERSE_LUA' "$LOG" 2>/dev/null; then
+  echo "[traverse-cv] bridge/player activity found in log"
+fi
+exit "$code"

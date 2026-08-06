@@ -691,49 +691,25 @@ traverse-replay:
 traverse-pack-replay:
 	@tools/pack_traverse_replay.sh
 
-# Headed Nim client on Traverse (Softmax one-command: window + RealPlayerBot).
-# Same as upstream: launch_nim_player --league=traverse --presentation=headed
-# --controller=embedded --bot=real-playerbot. Not the live-POV spectator.
-# Our Lua army_host path is external /env (headless); this is Softmax's headed bot.
-traverse-headed:
-	@tools/traverse_headed.sh
+# ClientView Lua traverse (docs/traverse/clientview-migration.md).
+# Headless Xvfb player + TRAVERSE_LUA_BRIDGE → lua/entry/traverse.lua.
+# Not /env army_host. Not stock RealPlayerBot decide (bridge replaces it).
+TRAVERSE_OWNER ?= monofuel
+traverse:
+	@tools/traverse_cv.sh headless
 
-# Lua traverse proof-of-life (docs/traverse/traverse-2026-08-04.md): short local smoke.
-# Starts upstream local --league=traverse backend, attaches army_host
-# --mode=traverse over WS /env, passes on >=50 path yards within ~3 minutes.
-# Not stock RPB --proof-of-life (that only drives RealPlayerBot).
+# Headed ClientView Lua traverse (same pilot as `make traverse`).
+traverse-headed:
+	@tools/traverse_cv.sh headed
+
+# Legacy /env PoL (frozen). Prefer `make traverse`.
 traverse-pol:
 	@tools/traverse_pol.sh
 
-# V1 desert checkpoint (~Gadgetzan). Stops as soon as within 50 yd — not 45m.
-# Override: TRAVERSE_POL_GOAL_*, TRAVERSE_POL_MAX_SECONDS, TRAVERSE_POL_CLEANUP=0.
+# Legacy desert /env checkpoint. Prefer `make traverse`.
 traverse-desert:
 	@TRAVERSE_POL_GOAL_RADIUS=50 TRAVERSE_POL_LOG=local_data/brain-logs/traverse-desert.log \
 		tools/traverse_pol.sh
-
-# Launch the traverse-wow league scenario for HUMAN play (docs/traverse/traverse_wow.md).
-# Unlike `play`, this does NOT use our local realm: --league=traverse makes the
-# launcher provision upstream's own Docker scenario with the level-60 Tanaris
-# fixture, so no --realm-host/--world-port. --bot is rejected with
-# --controller=human. First run builds the client and the backend image (slow);
-# the launcher also claims the GUI seat lease under OWNER. Do not run
-# unattended (opens a GUI).
-TRAVERSE_OWNER ?= monofuel
-traverse:
-	@set -e; \
-	if [ ! -d "$(UPSTREAM)" ]; then \
-		echo "error: upstream checkout missing: $(UPSTREAM)" >&2; exit 1; \
-	fi; \
-	if [ ! -f "$(WOW_ENV)" ]; then \
-		echo "error: missing $(WOW_ENV)" >&2; exit 1; \
-	fi; \
-	cd "$(UPSTREAM)"; \
-	nix shell nixpkgs\#nginx --command sh -c \
-		'. "$(WOW_ENV)"; nim r tools/launch_nim_player.nim -- \
-			--league=traverse \
-			--controller=human \
-			--presentation=headed \
-			--owner=$(TRAVERSE_OWNER) $(EXTRA)'
 
 # Launch the GENUINE 1.12.1 client under wine against the local realm
 # (see docs/play-classic.md). First run assembles local_classic/ (Data/
