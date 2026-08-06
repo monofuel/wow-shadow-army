@@ -20,6 +20,7 @@ import
   environment/client/renderer/runtime,
   environment/client/renderer/world_streaming,
   environment/client/renderer/cameras,
+  environment/client/video_options,
   map_browser/[assets, terrain3d, view3d]
 
 # Fog knobs live on environments; import selectively to avoid `window` clash.
@@ -94,13 +95,16 @@ proc applyMapExplorerPresentation*() =
   showVisual = false ## doodads + WMOs off (panel "Show doodads/WMOs")
   showNav = false
   showCollision = false
-  chunkWindowSize = MaxChunkWindowSize ## stream a wide terrain window
-  moveSpeed = 220.0'f32
-  # Distance fog: force far so high bird's-eye isn't solid grey
   fogDistanceOverride = true
-  fogStartOverride = 6000.0'f32
-  fogEndOverride = 9500.0'f32
-  renderFarclip = 10000.0'f32
+  fogStartOverride = 7000.0'f32
+  fogEndOverride = 9800.0'f32
+  renderFarclip = 9000.0'f32
+  var settings = defaultRendererStreamSettings()
+  settings.worldFarclip = 9000.0'f32
+  settings.objectCullDistance = 1.0'f32
+  applyStreamSettings(settings)
+  chunkWindowSize = MaxChunkWindowSize
+  setStreamLoadingScreenActive(true)
 
 proc frameOverhead(spanX, spanY: float32): float32 =
   ## Height so most of the zone fits a bird's-eye perspective.

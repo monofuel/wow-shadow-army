@@ -8,21 +8,23 @@
 ##
 ## Controls
 ##   Left-click   drill World → continent → zone (3D terrain)
-##   Esc / RMB    zoom out (zone 3D → continent 2D → world 2D)
-##   Zone 3D:     WASD / mouse / scroll (stock free camera)
+##   Esc / Backspace / RMB (not look)  zoom out
+##   Zone 3D:     WASD pan map plane  ·  scroll height  ·  RMB look
 ##   M            (on zone) toggle painted map overlay on top of 3D
 ##
 ## Env: VANILLA_WOW_EXTRACTED_DATA_DIR, VANILLA_WOW_CLIENT_DATA_DIR,
 ##      MAP_BROWSER_ONCE=1 (headless smoke, no window)
 
 import
-  std/[math, os, strutils, tables],
+  std/[math, monotimes, os, strutils, tables],
   chroma, pixie, silky, vmath, windy,
   environment/client/renderer/runtime,
   environment/client/renderer/world_streaming,
   environment/client/renderer/cameras,
+  environment/client/video_options,
   environment/client/world_catalogs,
   environment/client/world_catalogs/model,
+  environment/client/wheel_input,
   map_browser/[assets, surface, terrain3d, view3d]
 
 from environment/client/renderer/environments import
@@ -35,6 +37,18 @@ const
   HeaderText = rgbx(230, 220, 190, 255)
   HeaderMuted = rgbx(160, 150, 130, 255)
   MapDim = rgbx(0, 0, 0, 40)
+  ## Stream + draw farclip: stock VideoFarclipMax is only 777 yards and that
+  ## is what drives terrain AOI — raise it so a whole zone can stream.
+  MapExplorerFarclip = 9000.0'f32
+  MapExplorerFogStart = 7000.0'f32
+  MapExplorerFogEnd = 9800.0'f32
+  ## Map-plane pan: yards/sec base + scale with camera height.
+  MapPanBaseSpeed = 1200.0'f32
+  MapPanHeightScale = 1.8'f32
+  MapScrollHeightFactor = 0.14'f32
+  MapMinCameraHeight = 50.0'f32
+  MapMaxCameraHeight = 9000.0'f32
+  MapLookSensitivity = 1.0'f32 / 280.0'f32
 
 type
   Browser = object
@@ -47,6 +61,9 @@ type
     packed: Table[string, bool]
     mapLayout: tuple[pos, size: Vec2]
     ready: bool
+    lastCamNs: int64
+    mouseLookActive: bool
+    lastMousePos: IVec2
 
 var browser: Browser
 
@@ -58,12 +75,88 @@ proc applyMapExplorerPresentation() =
   showVisual = false
   showNav = false
   showCollision = false
-  chunkWindowSize = MaxChunkWindowSize
-  moveSpeed = 260.0'f32
   fogDistanceOverride = true
-  fogStartOverride = 7000.0'f32
-  fogEndOverride = 9800.0'f32
-  renderFarclip = 12000.0'f32
+  fogStartOverride = MapExplorerFogStart
+  fogEndOverride = MapExplorerFogEnd
+  renderFarclip = MapExplorerFarclip
+  ## Stock stream AOI keys off activeStreamSettings.worldFarclip (default 777).
+  var settings = defaultRendererStreamSettings()
+  settings.worldFarclip = MapExplorerFarclip
+  settings.objectCullDistance = 1.0'f32
+  applyStreamSettings(settings)
+  chunkWindowSize = MaxChunkWindowSize
+  ## 50 ms/frame load budget instead of the 3 ms steady-state cap.
+  setStreamLoadingScreenActive(browser.terrainMode)
+
+proc mapPlaneBasis(): tuple[forward, right: Vec3] =
+  ## Horizontal basis from yaw only — bird's-eye free-cam forward is mostly down.
+  let
+    sy = sin(cameraYaw)
+    cy = cos(cameraYaw)
+  (
+    vec3(sy, 0.0'f32, -cy),
+    vec3(cy, 0.0'f32, sy)
+  )
+
+proc updateMapPlaneCamera() =
+  ## WASD pans the map plane; scroll changes height; RMB looks around.
+  if window == nil or not browser.terrainMode:
+    browser.mouseLookActive = false
+    browser.lastCamNs = 0
+    return
+
+  let nowNs = getMonoTime().ticks
+  var dt = 1.0'f32 / 60.0'f32
+  if browser.lastCamNs > 0:
+    dt = float32(float64(nowNs - browser.lastCamNs) / 1e9)
+  browser.lastCamNs = nowNs
+  dt = clamp(dt, 0.001'f32, 0.1'f32)
+
+  let mouseLook = window.clientButtonDown(MouseRight)
+  if mouseLook:
+    if window.clientButtonPressed(MouseRight) or not browser.mouseLookActive:
+      browser.lastMousePos = window.clientMousePos()
+      browser.mouseLookActive = true
+    else:
+      let delta = window.clientMousePos() - browser.lastMousePos
+      browser.lastMousePos = window.clientMousePos()
+      if not delta.isMouseJump():
+        cameraYaw += delta.x.float32 * MapLookSensitivity
+        cameraPitch = clampCameraPitch(
+          cameraPitch - delta.y.float32 * MapLookSensitivity
+        )
+  else:
+    browser.mouseLookActive = false
+
+  var speed = MapPanBaseSpeed + max(cameraPos.y, 0.0'f32) * MapPanHeightScale
+  if window.clientButtonDown(KeyLeftShift):
+    speed *= 3.0'f32
+  if window.clientButtonDown(KeyLeftControl):
+    speed *= 0.25'f32
+  speed *= dt
+
+  let basis = mapPlaneBasis()
+  if window.clientButtonDown(KeyW):
+    cameraPos += basis.forward * speed
+  if window.clientButtonDown(KeyS):
+    cameraPos -= basis.forward * speed
+  if window.clientButtonDown(KeyA):
+    cameraPos -= basis.right * speed
+  if window.clientButtonDown(KeyD):
+    cameraPos += basis.right * speed
+  if window.clientButtonDown(KeyQ) or window.clientButtonDown(KeyX):
+    cameraPos.y = max(MapMinCameraHeight, cameraPos.y - speed)
+  if window.clientButtonDown(KeyE) or window.clientButtonDown(KeySpace):
+    cameraPos.y = min(MapMaxCameraHeight, cameraPos.y + speed)
+
+  let wheel = window.wheelDeltaY()
+  if wheel != 0.0'f32:
+    let factor = pow(1.0'f32 - MapScrollHeightFactor, wheel)
+    cameraPos.y = clamp(
+      cameraPos.y * factor,
+      MapMinCameraHeight,
+      MapMaxCameraHeight
+    )
 
 proc ensurePacked(fileName: string; areaMapId: uint32) =
   let key = fileName.atlasKey
@@ -126,15 +219,19 @@ proc focusZoneTerrain(state: SurfaceState) =
     cx = (b.minX + b.maxX) * 0.5'f32
     cy = (b.minY + b.maxY) * 0.5'f32
     span = max(b.maxX - b.minX, b.maxY - b.minY)
-    overhead = clamp(span * 0.55'f32, 400.0'f32, 2800.0'f32)
+    ## Higher bird's-eye so more of the zone is in frame on enter.
+    overhead = clamp(span * 0.7'f32, 500.0'f32, 3600.0'f32)
+  browser.terrainMode = true
+  browser.showPaintedOverlay = false
+  browser.lastCamNs = 0
   applyMapExplorerPresentation()
   focusWorldPosition(
     b.mapId, cx, cy, 80.0'f32,
     overhead = overhead,
     loadTiles = true
   )
-  browser.terrainMode = true
-  browser.showPaintedOverlay = false
+  ## Steeper look-down for map feel (stock focus uses -1.32 ≈ -75°).
+  cameraPitch = clampCameraPitch(-1.45'f32)
   echo "map_browser: terrain focus ", b.label,
     " center=(", cx, ",", cy, ") span=", span, " overhead=", overhead
 
@@ -162,7 +259,7 @@ proc drawHeader(crumbs, extra: string) =
   discard sk.drawText(sk.textStyle, line, vec2(pad + 8, pad + 6), HeaderText)
   let hint =
     if browser.terrainMode:
-      "WASD/mouse 3D  ·  M painted  ·  Esc out"
+      "WASD pan  ·  scroll height  ·  RMB look  ·  M  ·  Esc"
     else:
       "click drill  ·  Esc out"
   let hs = sk.getTextSize(sk.textStyle, hint)
@@ -193,14 +290,21 @@ proc drawMapBrowserUi() =
 
   if browser.terrainMode:
     applyMapExplorerPresentation()
+    updateMapPlaneCamera()
+  else:
+    setStreamLoadingScreenActive(false)
 
-  # Esc / RMB zoom out
-  if window.buttonPressed[KeyEscape] or window.buttonPressed[MouseRight] or
-      window.buttonPressed[KeyBackspace]:
+  # Esc / Backspace zoom out. RMB is mouse-look in terrain mode.
+  let zoomOut =
+    window.buttonPressed[KeyEscape] or
+    window.buttonPressed[KeyBackspace] or
+    (not browser.terrainMode and window.buttonPressed[MouseRight])
+  if zoomOut:
     if browser.terrainMode and browser.showPaintedOverlay:
       browser.showPaintedOverlay = false
     elif browser.terrainMode:
       browser.terrainMode = false
+      setStreamLoadingScreenActive(false)
       setSurface(browser.catalog.zoomOut(browser.state))
     else:
       setSurface(browser.catalog.zoomOut(browser.state))
@@ -318,12 +422,13 @@ proc main() =
     overhead = 800.0'f32
   )
 
-  # Free camera only useful in zone terrain mode; still allow look around.
+  ## Stock free-cam moves along the look vector (W ≈ zoom at bird's-eye).
+  ## Zone mode uses our map-plane pan instead.
   runMapViewer(
     title = AppTitle,
     topUi = drawMapBrowserUi,
     showMapPanel = false,
-    enableCameraInput = true,
+    enableCameraInput = false,
     loadInitialMapTiles = true
   )
 
