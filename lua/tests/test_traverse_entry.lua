@@ -83,9 +83,10 @@ r = entry.decide({
   death = {}, spells = land_spells, view_id = 10,
 })
 check(r.kind == "navigate", "swim navigate")
-check(r.reason == "swim_merchant", "swim to merchant beat")
 check(r.mode == "liquid_prefer", "liquid mode")
-check(r.x == merch_x and r.y == merch_y, "merchant coords as goal")
+-- Sparse wet legs first; merchant only when nearby (pathfinding-plan).
+check(r.reason:find("swim_", 1, true) == 1, "swim_* wet leg")
+check(r.x > -5500 and r.x <= merch_x + 50, "wet leg north of early coast")
 
 r = entry.decide({
   self_unit = {

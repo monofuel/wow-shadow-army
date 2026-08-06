@@ -8,8 +8,9 @@ traverse writeups here instead of scattering under `docs/`.
 | [petrel-plan.md](petrel-plan.md) | **Plan of record** — legs, fatigue, swim-north, weekend contender thesis |
 | [clientview-migration.md](clientview-migration.md) | ClientView Lua pilot (`make traverse` / `traverse-headed`); water-entry proven |
 | [checkpointing.md](checkpointing.md) | Local wet debug: why config/SQL fail; SOAP tele; Northbound2 free play |
-| [pathing.md](pathing.md) | **Pathing architecture** — sparse major beats + real nav A→B (scales weekly / multi-comp) |
-| [embed-lua-client.md](embed-lua-client.md) | **Plan:** embed Lua in Nim client (strategy) + RPB nav feet; kill bridge hack |
+| [pathing.md](pathing.md) | Layers: sparse beats + nav A→B (fair play, multi-comp) |
+| [pathfinding-plan.md](pathfinding-plan.md) | **Plan of record for feet** — full RPB plan/follow/recover; anti-shortcut phases + source map |
+| [embed-lua-client.md](embed-lua-client.md) | Embed Lua strategy in-process; libpetrel + fork hook |
 | [obstacle-avoidance.md](obstacle-avoidance.md) | Older land polish notes (hut/mountain); superseded for architecture by pathing.md |
 | [traverse-2026-08-05.md](traverse-2026-08-05.md) | Day notes / V4 checklist scratchpad |
 | [traverse_wow.md](traverse_wow.md) | League scouting: rules, scoring, fixture, submission gates (from upstream) |

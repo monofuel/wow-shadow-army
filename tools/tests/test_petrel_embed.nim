@@ -47,9 +47,10 @@ suite "petrel embed":
     let proj = projectClientView(view)
     let intent = globalDecide(proj, repo)
     check intent{"kind"}.getStr == "navigate"
-    check intent{"reason"}.getStr == "swim_merchant"
     check intent{"mode"}.getStr == "liquid_prefer"
-    check intent{"x"}.getFloat > -2000.0  # merchant-ish north
+    # Intermediate wet leg, not single merchant chord (pathfinding-plan).
+    check intent{"reason"}.getStr.startsWith("swim_")
+    check intent{"x"}.getFloat > -5600.0 and intent{"x"}.getFloat < -3000.0
 
   test "wet near merchant → hold merchant_coast":
     var view = parseJson(readFile(fixtures / "swimming.json"))

@@ -213,6 +213,24 @@ if ghost:
     bits.append("ghost")
 if kind or reason:
     bits.append(f"{kind}:{reason}" if kind else reason)
+nav = d.get("nav_progress") or ""
+nerr = d.get("nav_error") or ""
+nsurf = d.get("nav_surface") or ""
+nrec = d.get("nav_recover") or ""
+td = d.get("target_dist")
+st = d.get("stuck_ticks")
+if nav:
+    bits.append(f"nav={nav}")
+if nsurf:
+    bits.append(f"surf={nsurf}")
+if nrec:
+    bits.append(f"rec={nrec}")
+if isinstance(td, (int, float)):
+    bits.append(f"beat={float(td):.0f}yd")
+if isinstance(st, (int, float)) and int(st) > 0:
+    bits.append(f"stuck={int(st)}")
+if nerr:
+    bits.append(f"err={nerr[:48]}")
 if at:
     bits.append("AT_GOAL")
 print(" ".join(bits) if bits else "status empty")

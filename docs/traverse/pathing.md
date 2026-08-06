@@ -3,8 +3,9 @@
 **Status:** design locked for V1+ (not fully implemented)  
 **Audience:** engineers on Petrel / ClientView traverse and any later league that
 reuses the same feet.  
-**Related:** [embed-lua-client.md](embed-lua-client.md) (**integration plan** —
-Lua in-process + Nim nav; not WS/bridge),
+**Related:** [pathfinding-plan.md](pathfinding-plan.md) (**how to implement
+feet properly** — no more half-hooks),
+[embed-lua-client.md](embed-lua-client.md) (Lua in-process host),
 [obstacle-avoidance.md](obstacle-avoidance.md) (older polish notes),
 [petrel-plan.md](petrel-plan.md) (course thesis),
 [clientview-migration.md](clientview-migration.md) (historical pilot stack).
