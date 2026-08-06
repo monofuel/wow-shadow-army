@@ -5,9 +5,10 @@ traverse writeups here instead of scattering under `docs/`.
 
 | Doc | What it is |
 |---|---|
+| [petrel-plan.md](petrel-plan.md) | **Plan of record** — legs, fatigue, swim-north, weekend contender thesis |
 | [clientview-migration.md](clientview-migration.md) | ClientView Lua pilot (`make traverse` / `traverse-headed`); water-entry proven |
-| [obstacle-avoidance.md](obstacle-avoidance.md) | **Next polish:** hut/mountain pathing vs straight-line hop move |
-| [traverse-2026-08-05.md](traverse-2026-08-05.md) | V4 route/product notes (forms, water entry, swim strategy) |
+| [obstacle-avoidance.md](obstacle-avoidance.md) | Optional land polish: hut/mountain pathing |
+| [traverse-2026-08-05.md](traverse-2026-08-05.md) | Day notes / V4 checklist scratchpad |
 | [traverse_wow.md](traverse_wow.md) | League scouting: rules, scoring, fixture, submission gates (from upstream) |
 | [traverse-2026-08-04.md](traverse-2026-08-04.md) | Older V1 plan / status (Lua PoL on `/env` — historical) |
 | [versions.md](versions.md) | `ibis:vN` engineer notes (not on the dashboard) |

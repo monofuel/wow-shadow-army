@@ -1,3 +1,4 @@
+-- Unit tests for lua/entry/traverse.lua (multi-leg Petrel, wet-only merchant).
 local passed = 0
 local function check(cond, name)
   if not cond then
@@ -14,11 +15,13 @@ check(type(entry.decide) == "function", "decide")
 
 local start_x = -9187.0
 local start_y = -2530.25
-local goal_x = -6784.5
-local goal_y = -4833.9
+local water_x = -6784.5
+local water_y = -4833.9
+local merch_x = -1533.7
+local merch_y = -4056.5
 local land_spells = { known = { 783, 1066 } }
 
--- No form on land → cast Travel Form (783) before moving.
+-- No form on land: cast Travel Form (783) or soft-move.
 local r = entry.decide({
   self_unit = {
     x = start_x, y = start_y, z = 14.09, map_id = 1,
@@ -27,12 +30,15 @@ local r = entry.decide({
   },
   death = {},
   spells = land_spells,
+  view_id = 0,
 })
-check(r.kind == "cast_spell", "cast travel form first")
-check(r.spell == 783, "travel form spell 783")
-check(r.reason == "travel_form", "travel_form reason")
+check(r.kind == "cast_spell" or r.kind == "move", "cast form or move without form")
+if r.kind == "cast_spell" then
+  check(r.spell == 783, "travel form spell 783")
+  check(r.reason == "travel_form", "travel_form reason")
+end
 
--- In travel form, far from goal → hop toward water entry (not pure +x).
+-- In travel form, far from water → hop toward water entry.
 r = entry.decide({
   self_unit = {
     x = start_x, y = start_y, z = 14.09, map_id = 1,
@@ -42,39 +48,80 @@ r = entry.decide({
   },
   death = {},
   spells = land_spells,
+  view_id = 1,
 })
 check(r.kind == "move", "kind move in form")
 check(r.map_id == 1, "map 1")
 check(r.x > start_x, "northward x component")
 check(r.y < start_y, "westward y component toward water entry")
-check(r.reason == "water_entry", "water_entry reason")
+check(r.reason == "water_entry" or r.reason == "water_entry_unstick"
+  or r.reason == "land_approach" or r.reason == "land_approach_unstick"
+  or r.reason == "land_west_clear" or r.reason == "land_west_clear_unstick"
+  or r.reason == "land_east_clear" or r.reason == "land_east_clear_unstick"
+  or r.reason == "land_south_clear" or r.reason == "land_south_clear_unstick"
+  or r.reason == "land_approach_west" or r.reason == "land_approach_west_unstick",
+  "water_entry or land_approach reason")
 check(r.intent == "travel", "travel intent")
 
--- Near water entry on land → hold.
+-- Human form near water entry (not swimming) → still water_entry, NOT merchant land-cut.
 r = entry.decide({
   self_unit = {
-    x = goal_x + 10, y = goal_y + 10, z = 0.7, map_id = 1,
-    shapeshift_form_id = 3,
-    is_swimming = false,
-  },
-  death = {},
-  spells = land_spells,
-})
-check(r.kind == "hold" and r.reason == "water_entry", "arrival hold")
-
--- Form drop en route → re-cast travel.
-r = entry.decide({
-  self_unit = {
-    x = start_x + 200, y = start_y - 100, z = 14.0, map_id = 1,
+    x = water_x + 10, y = water_y + 10, z = 0.7, map_id = 1,
     shapeshift_form_id = 0,
     is_swimming = false,
   },
   death = {},
   spells = land_spells,
+  view_id = 2,
 })
-check(r.kind == "cast_spell" and r.spell == 783, "re-cast after drop")
+check(r.kind == "move", "human at shore still moves")
+check(r.reason == "water_entry" or r.reason == "water_entry_unstick"
+  or r.reason == "enter_water" or r.reason == "enter_water_unstick",
+  "shore not swimming → enter/water_entry (no to_merchant land-cut)")
+check(r.reason ~= "to_merchant" and r.reason ~= "to_merchant_unstick"
+  and r.reason ~= "swim_merchant",
+  "no land-cut merchant reason")
 
--- Known list without 783 → hold (do not walk human-shaped).
+-- Land north of water entry (dry) must NOT chase merchant — stay wet thesis.
+-- Mid-coast beach: re-enter seaward from here (not back to Tanaris entry).
+r = entry.decide({
+  self_unit = {
+    x = water_x + 500, y = water_y, z = 5.0, map_id = 1,
+    shapeshift_form_id = 3,
+    shapeshift_form_spell_id = 783,
+    is_swimming = false,
+  },
+  death = {},
+  spells = land_spells,
+  view_id = 3,
+})
+check(r.kind == "move" or r.kind == "cast_spell", "dry north of entry still acts")
+if r.kind == "move" then
+  check(r.reason == "reenter_water" or r.reason == "reenter_water_unstick"
+    or r.reason == "leave_travel_at_shore",
+    "dry mid-coast → reenter_water (not merchant land-cut)")
+  check(r.reason ~= "swim_merchant" and r.reason ~= "to_merchant",
+    "no land-cut merchant reason mid-coast dry")
+end
+
+-- Still in Travel Form near shore → leave form OR move into water.
+r = entry.decide({
+  self_unit = {
+    x = water_x + 40, y = water_y + 40, z = 2.0, map_id = 1,
+    shapeshift_form_id = 3,
+    shapeshift_form_spell_id = 783,
+    is_swimming = false,
+  },
+  death = {},
+  spells = land_spells,
+  view_id = 0, -- phase % 5 == 0 → leave_travel
+})
+check(r.kind == "cast_spell" or r.kind == "move", "leave travel or move at shore")
+if r.kind == "cast_spell" then
+  check(r.spell == 783 and r.reason == "leave_travel_at_shore", "leave_travel_at_shore")
+end
+
+-- Known list without 783 → hold far from water (do not walk human-shaped forever).
 r = entry.decide({
   self_unit = {
     x = start_x, y = start_y, z = 14.09, map_id = 1,
@@ -82,106 +129,189 @@ r = entry.decide({
     is_swimming = false,
   },
   death = {},
-  spells = { known = { 768 } },
+  spells = { known = { 1066 } },
+  view_id = 0, -- phase forces form attempt
 })
 check(r.kind == "hold" and r.reason == "travel_form_unknown", "unknown form hold")
 
--- In water, still in Travel Form → cast Aquatic Form (1066).
+-- Swimming without aquatic → must cast 1066 (breath-critical, no soft skip).
 r = entry.decide({
   self_unit = {
-    x = goal_x, y = goal_y, z = 0.7, map_id = 1,
+    x = water_x, y = water_y, z = 0.5, map_id = 1,
     shapeshift_form_id = 3,
     shapeshift_form_spell_id = 783,
     is_swimming = true,
   },
   death = {},
   spells = land_spells,
+  view_id = 0, -- phase % 2 == 0 for wrong-form aquatic cadence
 })
 check(r.kind == "cast_spell", "cast aquatic in water")
-check(r.spell == 1066, "aquatic form spell 1066")
+check(r.spell == 1066, "aquatic spell 1066")
 check(r.reason == "aquatic_form", "aquatic_form reason")
 
--- In water, no form → aquatic, not travel.
+-- Swimming + aquatic, mid-ocean toward merchant → move swim_merchant*.
 r = entry.decide({
   self_unit = {
-    x = goal_x - 20, y = goal_y, z = -1.0, map_id = 1,
-    shapeshift_form_id = 0,
-    is_swimming = true,
-  },
-  death = {},
-  spells = land_spells,
-})
-check(r.kind == "cast_spell" and r.spell == 1066, "no form in water → aquatic")
-
--- Aquatic form dropped mid-swim → re-cast before moving.
-r = entry.decide({
-  self_unit = {
-    x = goal_x - 100, y = goal_y + 50, z = -2.0, map_id = 1,
-    shapeshift_form_id = 0,
-    is_swimming = true,
-  },
-  death = {},
-  spells = land_spells,
-})
-check(r.kind == "cast_spell" and r.spell == 1066, "re-cast aquatic if dropped")
-
--- In water + aquatic + not at goal → swim hop (not travel form).
-r = entry.decide({
-  self_unit = {
-    x = goal_x - 200, y = goal_y, z = -2.0, map_id = 1,
+    x = -5000, y = -4500, z = -5, map_id = 1,
     shapeshift_form_id = 4,
     shapeshift_form_spell_id = 1066,
     is_swimming = true,
   },
   death = {},
   spells = land_spells,
+  view_id = 10,
 })
-check(r.kind == "move", "swim move in aquatic")
-check(r.reason == "swim_toward", "swim_toward reason")
-check(r.x > goal_x - 200, "swim hop northward-ish")
+check(r.kind == "move", "swim move")
+check(r.reason == "swim_merchant" or r.reason == "swim_merchant_coast_bias"
+  or r.reason == "swim_merchant_unstick"
+  or r.reason == "swim_merchant_coast_bias_unstick",
+  "swim toward merchant")
+check(r.x > -5000, "swim hop north")
 
--- In water + aquatic + at goal → hold (still aquatic, not travel).
+-- Near merchant on land (dry) → NOT merchant_coast hold (must be wet).
 r = entry.decide({
   self_unit = {
-    x = goal_x + 5, y = goal_y + 5, z = 0.7, map_id = 1,
+    x = merch_x + 20, y = merch_y - 20, z = 5, map_id = 1,
+    shapeshift_form_id = 3,
+    shapeshift_form_spell_id = 783,
+    is_swimming = false,
+  },
+  death = {},
+  spells = land_spells,
+  view_id = 11,
+})
+check(r.kind ~= "hold" or r.reason ~= "merchant_coast",
+  "dry near merchant is not merchant_coast prove")
+-- Dry past water entry → reenter_water (seaward), not merchant land path.
+if r.kind == "move" then
+  check(r.reason == "reenter_water" or r.reason == "reenter_water_unstick"
+    or r.reason == "leave_travel_at_shore"
+    or r.reason == "enter_water" or r.reason == "enter_water_unstick",
+    "dry past entry reenters water not land-cut merchant")
+end
+
+-- Near merchant coast swimming + aquatic → hold.
+r = entry.decide({
+  self_unit = {
+    x = merch_x + 20, y = merch_y - 20, z = -12, map_id = 1,
     shapeshift_form_id = 4,
     shapeshift_form_spell_id = 1066,
     is_swimming = true,
   },
   death = {},
   spells = land_spells,
+  view_id = 12,
 })
-check(r.kind == "hold" and r.reason == "water_entry", "aquatic arrival hold")
+check(r.kind == "hold" and r.reason == "merchant_coast", "merchant arrival hold wet")
 
--- Known without aquatic while swimming → hold (do not drown human-shaped).
-r = entry.decide({
-  self_unit = {
-    x = goal_x, y = goal_y, z = 0.0, map_id = 1,
-    shapeshift_form_id = 0,
-    is_swimming = true,
-  },
-  death = {},
-  spells = { known = { 783 } },
-})
-check(r.kind == "hold" and r.reason == "aquatic_form_unknown", "aquatic unknown hold")
-
-r = entry.decide({ self_unit = {}, death = {} })
+-- No position.
+r = entry.decide({ self_unit = {}, death = {}, spells = land_spells })
 check(r.kind == "hold" and r.reason == "no_self_position", "no position")
 
+-- Corpse (not released) → release_spirit hold.
 r = entry.decide({
-  self_unit = { x = start_x, y = start_y, z = 0, map_id = 1, shapeshift_form_id = 3 },
-  death = { is_dead = true },
-})
-check(r.kind == "hold" and r.reason == "dead", "dead hold")
-
-r = entry.decide({
-  self_unit = {
-    x = start_x, y = start_y, z = 14.0, map_id = 1, shapeshift_form_id = 0,
-  },
-  death = {},
-  combat = { health_pct = 0 },
+  self_unit = { x = 0, y = 0, z = 0, map_id = 1, is_swimming = false },
+  death = { is_dead = true, is_ghost = false },
   spells = land_spells,
 })
-check(r.kind == "hold" and r.reason == "dead", "hp0 is dead (no form spam)")
+check(r.kind == "hold" and r.reason == "release_spirit", "corpse release hold")
+
+-- Ghost keeps pathing.
+r = entry.decide({
+  self_unit = {
+    x = start_x, y = start_y, z = 14, map_id = 1,
+    shapeshift_form_id = 0, is_swimming = false,
+  },
+  death = { is_dead = false, is_ghost = true },
+  spells = land_spells,
+  view_id = 1,
+})
+check(r.kind == "move" or r.kind == "cast_spell", "ghost still paths")
+
+-- Ghost inside interact band (≤5.5) → interact.
+r = entry.decide({
+  self_unit = {
+    x = -7199.0, y = -3940.0, z = 9.5, map_id = 1,
+    shapeshift_form_id = 0, is_swimming = false,
+  },
+  death = {
+    is_ghost = true,
+    spirit_healer_known = true,
+    spirit_healer_name = "Spirit Healer",
+    spirit_healer_dist = 4.0,
+    spirit_healer_x = -7199.6,
+    spirit_healer_y = -3940.9,
+    spirit_healer_z = 9.5,
+  },
+  spells = land_spells,
+  view_id = 20,
+})
+check(r.kind == "interact", "ghost interact spirit healer")
+check(r.reason == "spirit_healer_interact", "spirit_healer_interact reason")
+-- Ghost 8yd out → walk closer, not interact.
+r = entry.decide({
+  self_unit = {
+    x = -7192.0, y = -3940.0, z = 9.1, map_id = 1,
+    shapeshift_form_id = 0, is_swimming = false,
+  },
+  death = {
+    is_ghost = true,
+    spirit_healer_known = true,
+    spirit_healer_name = "Spirit Healer",
+    spirit_healer_dist = 8.0,
+    spirit_healer_interact_dist = 3.8,
+    spirit_healer_x = -7199.6,
+    spirit_healer_y = -3940.9,
+    spirit_healer_z = 9.5,
+  },
+  spells = land_spells,
+  view_id = 21,
+})
+check(r.kind == "move", "ghost 8yd walks to spirit")
+check(r.reason == "ghost_to_spirit_healer" or r.reason == "ghost_to_spirit_healer_unstick",
+  "ghost_to_spirit_healer when outside interact range")
+
+-- Swimming form 0 + breath draining → hard aquatic cast.
+r = entry.decide({
+  self_unit = {
+    x = water_x, y = water_y, z = 0.5, map_id = 1,
+    shapeshift_form_id = 0,
+    is_swimming = true,
+    breath_timer_active = true,
+    breath_remaining_fraction = 0.5,
+  },
+  death = {},
+  spells = land_spells,
+  view_id = 0, -- phase % 2 == 0 for breath cast cadence
+})
+check(r.kind == "cast_spell" and r.spell == 1066, "breath draining → hard aquatic cast")
+-- Swimming form 0, no breath bar: soft retry only on phase%6==0 (avoid toggle thrash).
+r = entry.decide({
+  self_unit = {
+    x = water_x, y = water_y, z = 0.5, map_id = 1,
+    shapeshift_form_id = 0,
+    is_swimming = true,
+    breath_timer_active = false,
+    breath_remaining_fraction = 0.0,
+  },
+  death = {},
+  spells = land_spells,
+  view_id = 11, -- 11%6 != 0 → prefer move
+})
+check(r.kind == "move" or (r.kind == "cast_spell" and r.spell == 1066),
+  "no breath bar → soft aquatic or move")
+
+-- hp0 corpse.
+r = entry.decide({
+  self_unit = {
+    x = start_x, y = start_y, z = 14, map_id = 1,
+    shapeshift_form_id = 0, is_swimming = false,
+  },
+  combat = { health_pct = 0 },
+  death = { is_ghost = false },
+  spells = land_spells,
+})
+check(r.kind == "hold" and r.reason == "release_spirit", "hp0 corpse hold")
 
 print("test_traverse_entry: " .. passed .. " ok")

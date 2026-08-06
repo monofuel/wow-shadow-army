@@ -69,6 +69,9 @@ esac
 
 export TRAVERSE_LUA_BRIDGE="$BRIDGE"
 export TRAVERSE_LUA_REPO="$ROOT"
+# Prefer pinned ~/.nimby/pkgs over Softmax sibling deps when those are off-pin
+# (sibling windy often breaks launch_nim_player pin check).
+export NIMBY_PKGS_DIR="${NIMBY_PKGS_DIR:-$HOME/.nimby/pkgs}"
 export DISPLAY="${DISPLAY:-:0}"
 export WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-0}"
 
@@ -83,8 +86,11 @@ set +u
 . "$WOW_ENV"
 set -u
 
-# Ensure bridge env survives into the player child.
-export TRAVERSE_LUA_BRIDGE TRAVERSE_LUA_REPO
+# Ensure bridge + pin env survive into the player child (and bridge grandchildren).
+export TRAVERSE_LUA_BRIDGE TRAVERSE_LUA_REPO NIMBY_PKGS_DIR
+export TRAVERSE_GOAL_X="${TRAVERSE_GOAL_X:--1533.7}"
+export TRAVERSE_GOAL_Y="${TRAVERSE_GOAL_Y:--4056.5}"
+export TRAVERSE_GOAL_RADIUS="${TRAVERSE_GOAL_RADIUS:-100}"
 
 echo "[traverse-cv] launching…" | tee "$LOG"
 set +e
@@ -92,6 +98,9 @@ if command -v timeout >/dev/null 2>&1 && [[ "${TRAVERSE_CV_NO_TIMEOUT:-0}" != "1
   nix shell nixpkgs#nginx nixpkgs#xvfb-run nixpkgs#xorg.xorgserver --command \
     timeout --signal=TERM "$MAX_SECONDS" \
     env TRAVERSE_LUA_BRIDGE="$BRIDGE" TRAVERSE_LUA_REPO="$ROOT" \
+      NIMBY_PKGS_DIR="$NIMBY_PKGS_DIR" \
+      TRAVERSE_GOAL_X="$TRAVERSE_GOAL_X" TRAVERSE_GOAL_Y="$TRAVERSE_GOAL_Y" \
+      TRAVERSE_GOAL_RADIUS="$TRAVERSE_GOAL_RADIUS" \
       nim r tools/launch_nim_player.nim -- \
         --league=traverse \
         --controller=embedded \
@@ -103,6 +112,9 @@ if command -v timeout >/dev/null 2>&1 && [[ "${TRAVERSE_CV_NO_TIMEOUT:-0}" != "1
 else
   nix shell nixpkgs#nginx nixpkgs#xvfb-run nixpkgs#xorg.xorgserver --command \
     env TRAVERSE_LUA_BRIDGE="$BRIDGE" TRAVERSE_LUA_REPO="$ROOT" \
+      NIMBY_PKGS_DIR="$NIMBY_PKGS_DIR" \
+      TRAVERSE_GOAL_X="$TRAVERSE_GOAL_X" TRAVERSE_GOAL_Y="$TRAVERSE_GOAL_Y" \
+      TRAVERSE_GOAL_RADIUS="$TRAVERSE_GOAL_RADIUS" \
       nim r tools/launch_nim_player.nim -- \
         --league=traverse \
         --controller=embedded \

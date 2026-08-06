@@ -90,25 +90,32 @@ proc main() =
     stderr.writeLine $intent
   let batch = lowerIntent(view, intent, cfg.sequence)
   let outBody = $batch
-  # Status file for launch scripts / live PoL (planar water-entry goal).
+  # Status for long-run watching (merchant coast is the leg-2 prove target).
   try:
     let me = jget(proj, "self_unit")
-    let gx = parseFloat(getEnv("TRAVERSE_GOAL_X", "-6784.5"))
-    let gy = parseFloat(getEnv("TRAVERSE_GOAL_Y", "-4833.9"))
-    let gr = parseFloat(getEnv("TRAVERSE_GOAL_RADIUS", "50"))
+    # Primary prove goal: merchant coast (override with TRAVERSE_GOAL_*).
+    let gx = parseFloat(getEnv("TRAVERSE_GOAL_X", "-1533.7"))
+    let gy = parseFloat(getEnv("TRAVERSE_GOAL_Y", "-4056.5"))
+    let gr = parseFloat(getEnv("TRAVERSE_GOAL_RADIUS", "100"))
+    let wx = parseFloat(getEnv("TRAVERSE_WATER_X", "-6784.5"))
+    let wy = parseFloat(getEnv("TRAVERSE_WATER_Y", "-4833.9"))
     let px = jnum(jget(me, "x"))
     let py = jnum(jget(me, "y"))
-    let dx = px - gx
-    let dy = py - gy
-    let dist = sqrt(dx * dx + dy * dy)
+    let dist = sqrt((px - gx) * (px - gx) + (py - gy) * (py - gy))
+    let waterDist = sqrt((px - wx) * (px - wx) + (py - wy) * (py - wy))
     let statusDir = cfg.repo / "local_data"
     createDir(statusDir)
     writeFile(
       statusDir / "traverse-cv-status.json",
       $(%*{
-        "x": px, "y": py, "goal_x": gx, "goal_y": gy,
+        "x": px, "y": py, "z": jnum(jget(me, "z")),
+        "goal_x": gx, "goal_y": gy,
         "dist": dist, "radius": gr,
+        "water_dist": waterDist,
         "at_goal": dist <= gr,
+        "swimming": jbool(jget(me, "is_swimming")),
+        "form_spell": jint(jget(me, "shapeshift_form_spell_id")),
+        "ghost": jbool(jget(jget(proj, "death"), "is_ghost")),
         "intent": intent,
         "sequence": cfg.sequence,
         "view_id": jint(jget(view, "view_id"))
