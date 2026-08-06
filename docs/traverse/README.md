@@ -7,6 +7,7 @@ traverse writeups here instead of scattering under `docs/`.
 |---|---|
 | [petrel-plan.md](petrel-plan.md) | **Plan of record** — legs, fatigue, swim-north, weekend contender thesis |
 | [clientview-migration.md](clientview-migration.md) | ClientView Lua pilot (`make traverse` / `traverse-headed`); water-entry proven |
+| [checkpointing.md](checkpointing.md) | Local wet debug: why config/SQL fail; SOAP tele; Northbound2 free play |
 | [obstacle-avoidance.md](obstacle-avoidance.md) | Optional land polish: hut/mountain pathing |
 | [traverse-2026-08-05.md](traverse-2026-08-05.md) | Day notes / V4 checklist scratchpad |
 | [traverse_wow.md](traverse_wow.md) | League scouting: rules, scoring, fixture, submission gates (from upstream) |

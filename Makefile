@@ -46,14 +46,20 @@ COMPOSE_FILE := infra/compose.vmangos.yml
 ACCOUNT_USER := monofuel
 ACCOUNT_PASS := password
 
-.PHONY: test test-lua test-nim system pin-check start-server stop-server server-logging logs account soap-account play play-classic play-classic-netlog play-xr traverse traverse-pol traverse-desert traverse-field traverse-replay traverse-pack-replay traverse-headed army-debug-status army-debug-reload army-debug-hold army-debug-resume escort escort-army grind quest-data warlock-account warlock-bot botwarrior-bot tusk-account tusk-bot beru-account beru-bot party-army navmesh-helper navmesh-status map-browser map-browser-once map-browser-3d
+.PHONY: test test-lua test-nim system pin-check start-server stop-server server-logging logs account soap-account play play-classic play-classic-netlog play-xr traverse traverse-pol traverse-desert traverse-field traverse-replay traverse-pack-replay traverse-headed traverse-checkpoints army-debug-status army-debug-reload army-debug-hold army-debug-resume escort escort-army grind quest-data warlock-account warlock-bot botwarrior-bot tusk-account tusk-bot beru-account beru-bot party-army navmesh-helper navmesh-status map-browser map-browser-once map-browser-3d
 
 # Unit tier: Lua tools + Nim host/system tests only (v2 DoD: no Python required
 # for bot correctness). If nim is missing, test-nim-soft skips rather than
 # failing bare CI hosts. Smoke tier parse/compile-checks code no unit test
 # executes (addon Lua, army_host) — doctrine: a cheap compile-check is a
 # legitimate leg for a binary with no unit tests yet.
-test: test-lua test-nim-soft test-smoke
+test: test-lua test-nim-soft test-smoke test-traverse-soap test-traverse-checkpoint
+
+.PHONY: test-traverse-soap test-traverse-checkpoint
+test-traverse-soap:
+	@python3 tools/tests/test_traverse_soap.py
+test-traverse-checkpoint:
+	@python3 tools/tests/test_traverse_checkpoint.py
 
 # Every Nim entrypoint/module must at least compile (`nim check`), even where
 # no unit suite imports it yet (army_host, msgpack_json).
@@ -694,13 +700,20 @@ traverse-pack-replay:
 # ClientView Lua traverse (docs/traverse/clientview-migration.md).
 # Headless Xvfb player + TRAVERSE_LUA_BRIDGE → lua/entry/traverse.lua.
 # Not /env army_host. Not stock RealPlayerBot decide (bridge replaces it).
+# Optional local debug: CHECKPOINT=water_entry → SOAP tele after in-world
+# (docs/traverse/checkpointing.md). Omit CHECKPOINT for stock Tanaris spawn.
 TRAVERSE_OWNER ?= monofuel
+CHECKPOINT ?=
 traverse:
-	@tools/traverse_cv.sh headless
+	@TRAVERSE_CHECKPOINT="$(CHECKPOINT)" tools/traverse_cv.sh headless
 
 # Headed ClientView Lua traverse (same pilot as `make traverse`).
 traverse-headed:
-	@tools/traverse_cv.sh headed
+	@TRAVERSE_CHECKPOINT="$(CHECKPOINT)" tools/traverse_cv.sh headed
+
+# List SOAP tele checkpoints (does not launch).
+traverse-checkpoints:
+	@python3 tools/traverse_checkpoint.py list
 
 # Legacy /env PoL (frozen). Prefer `make traverse`.
 traverse-pol:
