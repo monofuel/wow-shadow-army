@@ -13,22 +13,23 @@ UPSTREAM="${UPSTREAM:-$ROOT/../coworld-vanilla-wow}"
 FORK="${TRAVERSE_FORK:-$ROOT/../coworld-vanilla-wow-fork}"
 PLAYER_SRC="${TRAVERSE_PLAYER_SRC:-}"
 if [[ -z "$PLAYER_SRC" ]]; then
-  for cand in "$UPSTREAM" "$FORK"; do
+  for cand in "$FORK" "$UPSTREAM"; do
     if [[ -f "$cand/player/runtime/visual_adapter.nim" ]] &&
-       grep -q 'TRAVERSE_LUA_BRIDGE' "$cand/player/runtime/visual_adapter.nim" 2>/dev/null; then
+       grep -qE 'petrelEnabled|libpetrel|TRAVERSE_LUA_REPO' \
+         "$cand/player/runtime/visual_adapter.nim" 2>/dev/null; then
       PLAYER_SRC="$cand"
       break
     fi
   done
 fi
 if [[ -z "${PLAYER_SRC:-}" || ! -d "$PLAYER_SRC" ]]; then
-  echo "error: no player tree with TRAVERSE_LUA_BRIDGE in visual_adapter.nim" >&2
+  echo "error: no player tree with Petrel/libpetrel hook in visual_adapter.nim" >&2
   exit 1
 fi
 WOW_ENV="${WOW_ENV:-$ROOT/tools/wow_env.sh}"
 OWNER="${TRAVERSE_OWNER:-${USER:-monofuel}}"
 LOG="${TRAVERSE_CV_LOG:-$ROOT/local_data/brain-logs/traverse-cv-${MODE}.log}"
-BRIDGE="${TRAVERSE_LUA_BRIDGE:-$ROOT/tools/traverse_lua_bridge}"
+PETREL_LIB="${PETREL_LIB:-$ROOT/tools/libpetrel.so}"
 MAX_SECONDS="${TRAVERSE_CV_MAX_SECONDS:-1200}"
 
 if [[ ! -f "$WOW_ENV" ]]; then
@@ -38,25 +39,27 @@ fi
 
 mkdir -p "$(dirname "$LOG")"
 
-need_bridge=0
-if [[ ! -x "$BRIDGE" ]]; then
-  need_bridge=1
+need_petrel=0
+if [[ ! -f "$PETREL_LIB" ]]; then
+  need_petrel=1
 else
   for src in \
-    "$ROOT/tools/traverse_lua_bridge.nim" \
+    "$ROOT/src/petrel/c_api.nim" \
+    "$ROOT/src/petrel/embed.nim" \
+    "$ROOT/src/petrel/lua53.nim" \
     "$ROOT/src/traverse_cv/project.nim" \
-    "$ROOT/src/traverse_cv/lower.nim" \
-    "$ROOT/src/traverse_cv/decide.nim"
+    "$ROOT/src/traverse_cv/decide.nim" \
+    "$ROOT/lua/entry/traverse.lua"
   do
-    if [[ -f "$src" && "$src" -nt "$BRIDGE" ]]; then
-      need_bridge=1
+    if [[ -f "$src" && "$src" -nt "$PETREL_LIB" ]]; then
+      need_petrel=1
       break
     fi
   done
 fi
-if [[ "$need_bridge" == "1" ]]; then
-  echo "[traverse-cv] building traverse_lua_bridge…"
-  ( cd "$ROOT" && nim c --hints:off -d:release -o:"$BRIDGE" tools/traverse_lua_bridge.nim )
+if [[ "$need_petrel" == "1" ]]; then
+  echo "[traverse-cv] building libpetrel.so (in-process Lua)…"
+  "$ROOT/tools/build_libpetrel.sh" "$PETREL_LIB"
 fi
 
 case "$MODE" in
@@ -69,8 +72,10 @@ case "$MODE" in
     ;;
 esac
 
-export TRAVERSE_LUA_BRIDGE="$BRIDGE"
 export TRAVERSE_LUA_REPO="$ROOT"
+export PETREL_LIB
+# Unset legacy bridge so we never exec a per-tick binary.
+unset TRAVERSE_LUA_BRIDGE || true
 # Prefer pinned ~/.nimby/pkgs over Softmax sibling deps when those are off-pin
 # (sibling windy often breaks launch_nim_player pin check).
 export NIMBY_PKGS_DIR="${NIMBY_PKGS_DIR:-$HOME/.nimby/pkgs}"
@@ -93,18 +98,28 @@ fi
 # Local-debug CHECKPOINT: post-login SOAP tele (not fixture start — prepare stomps that).
 CHECKPOINT_NAME="${TRAVERSE_CHECKPOINT:-${CHECKPOINT:-}}"
 CHECKPOINT_PID=""
-cleanup_checkpoint_watch() {
+PROGRESS_PID=""
+STATUS_JSON="${TRAVERSE_CV_STATUS:-$ROOT/local_data/traverse-cv-status.json}"
+PROGRESS_INTERVAL="${TRAVERSE_PROGRESS_INTERVAL:-5}"
+cleanup_bg() {
   if [[ -n "${CHECKPOINT_PID:-}" ]] && kill -0 "$CHECKPOINT_PID" 2>/dev/null; then
     kill "$CHECKPOINT_PID" 2>/dev/null || true
     wait "$CHECKPOINT_PID" 2>/dev/null || true
   fi
+  CHECKPOINT_PID=""
+  if [[ -n "${PROGRESS_PID:-}" ]] && kill -0 "$PROGRESS_PID" 2>/dev/null; then
+    kill "$PROGRESS_PID" 2>/dev/null || true
+    wait "$PROGRESS_PID" 2>/dev/null || true
+  fi
+  PROGRESS_PID=""
 }
-trap cleanup_checkpoint_watch EXIT
+trap cleanup_bg EXIT
 
 echo "[traverse-cv] mode=$MODE presentation=$PRES player_src=$PLAYER_SRC"
-echo "[traverse-cv] bridge=$BRIDGE repo=$ROOT"
-echo "[traverse-cv] ClientView Lua pilot — not /env army_host"
+echo "[traverse-cv] petrel_lib=$PETREL_LIB repo=$ROOT"
+echo "[traverse-cv] in-process Lua + RPB nav — not /env, not per-tick exec"
 echo "[traverse-cv] log=$LOG"
+echo "[traverse-cv] progress every ${PROGRESS_INTERVAL}s → console + log (status=$STATUS_JSON)"
 if [[ -n "$CHECKPOINT_NAME" ]]; then
   echo "[traverse-cv] CHECKPOINT=$CHECKPOINT_NAME (SOAP tele after in-world)"
 fi
@@ -115,11 +130,15 @@ set +u
 . "$WOW_ENV"
 set -u
 
-# Ensure bridge + pin env survive into the player child (and bridge grandchildren).
-export TRAVERSE_LUA_BRIDGE TRAVERSE_LUA_REPO NIMBY_PKGS_DIR
+# Ensure petrel + pin env survive into the player child.
+export TRAVERSE_LUA_REPO PETREL_LIB NIMBY_PKGS_DIR
 export TRAVERSE_GOAL_X="${TRAVERSE_GOAL_X:--1533.7}"
 export TRAVERSE_GOAL_Y="${TRAVERSE_GOAL_Y:--4056.5}"
 export TRAVERSE_GOAL_RADIUS="${TRAVERSE_GOAL_RADIUS:-100}"
+export TRAVERSE_START_X="${TRAVERSE_START_X:--9187.0}"
+export TRAVERSE_SCORE_CAP_X="${TRAVERSE_SCORE_CAP_X:-6687.333052}"
+# Prefer fork player (has petrel hook). Force TRAVERSE_PLAYER if needed.
+export TRAVERSE_PLAYER_SRC="${TRAVERSE_PLAYER_SRC:-$PLAYER_SRC}"
 
 : >"$LOG"
 echo "[traverse-cv] launching…" | tee -a "$LOG"
@@ -138,14 +157,85 @@ if [[ -n "$CHECKPOINT_NAME" && -f "$ROOT/tools/traverse_checkpoint.py" ]]; then
   echo "[traverse-cv] checkpoint watcher pid=$CHECKPOINT_PID" | tee -a "$LOG"
 fi
 
+# Periodic position + northing score while the player is running (player stdout
+# is redirected to the log only; this watcher speaks to the console).
+if [[ "${TRAVERSE_PROGRESS:-1}" != "0" ]]; then
+  (
+    export PYTHONUNBUFFERED=1
+    # shellcheck disable=SC2030
+    status="$STATUS_JSON"
+    interval="$PROGRESS_INTERVAL"
+    log="$LOG"
+    start_t=$SECONDS
+    while true; do
+      sleep "$interval"
+      if [[ ! -f "$status" ]]; then
+        echo "[traverse-cv] t=$((SECONDS - start_t))s waiting for status…" | tee -a "$log"
+        continue
+      fi
+      line="$(
+        python3 - "$status" <<'PY' 2>/dev/null || true
+import json, sys
+path = sys.argv[1]
+try:
+    d = json.load(open(path))
+except Exception:
+    sys.exit(0)
+x = d.get("x"); y = d.get("y"); z = d.get("z")
+score = d.get("score")
+if score is None and isinstance(x, (int, float)):
+    start = float(d.get("start_x", -9187.0))
+    cap = float(d.get("score_cap_x", 6687.333052))
+    score = max(0.0, min(float(x), cap) - start)
+dist = d.get("dist")
+swim = d.get("swimming")
+form = d.get("form_spell")
+ghost = d.get("ghost")
+reason = d.get("intent_reason") or ""
+kind = d.get("intent_kind") or ""
+if not reason and isinstance(d.get("intent"), dict):
+    reason = d["intent"].get("reason") or ""
+    kind = d["intent"].get("kind") or kind
+at = d.get("at_goal")
+bits = []
+if isinstance(x, (int, float)) and isinstance(y, (int, float)):
+    zz = f",{float(z):.1f}" if isinstance(z, (int, float)) else ""
+    bits.append(f"pos=({float(x):.1f},{float(y):.1f}{zz})")
+if isinstance(score, (int, float)):
+    bits.append(f"score={float(score):.0f}yd")
+if isinstance(dist, (int, float)):
+    bits.append(f"merch={float(dist):.0f}yd")
+if swim is not None:
+    bits.append("swim" if swim else "land")
+if form is not None:
+    bits.append(f"form={form}")
+if ghost:
+    bits.append("ghost")
+if kind or reason:
+    bits.append(f"{kind}:{reason}" if kind else reason)
+if at:
+    bits.append("AT_GOAL")
+print(" ".join(bits) if bits else "status empty")
+PY
+      )"
+      if [[ -n "$line" ]]; then
+        echo "[traverse-cv] t=$((SECONDS - start_t))s $line" | tee -a "$log"
+      fi
+    done
+  ) &
+  PROGRESS_PID=$!
+  echo "[traverse-cv] progress watcher pid=$PROGRESS_PID (every ${PROGRESS_INTERVAL}s)" | tee -a "$LOG"
+fi
+
 set +e
 if command -v timeout >/dev/null 2>&1 && [[ "${TRAVERSE_CV_NO_TIMEOUT:-0}" != "1" ]]; then
   nix shell nixpkgs#nginx nixpkgs#xvfb-run nixpkgs#xorg.xorgserver --command \
     timeout --signal=TERM "$MAX_SECONDS" \
-    env TRAVERSE_LUA_BRIDGE="$BRIDGE" TRAVERSE_LUA_REPO="$ROOT" \
+    env TRAVERSE_LUA_REPO="$ROOT" PETREL_LIB="$PETREL_LIB" \
       NIMBY_PKGS_DIR="$NIMBY_PKGS_DIR" \
       TRAVERSE_GOAL_X="$TRAVERSE_GOAL_X" TRAVERSE_GOAL_Y="$TRAVERSE_GOAL_Y" \
       TRAVERSE_GOAL_RADIUS="$TRAVERSE_GOAL_RADIUS" \
+      TRAVERSE_START_X="$TRAVERSE_START_X" TRAVERSE_SCORE_CAP_X="$TRAVERSE_SCORE_CAP_X" \
       VMANGOS_MANGOSD_CONFIG_OVERRIDES="${VMANGOS_MANGOSD_CONFIG_OVERRIDES:-}" \
       nim r tools/launch_nim_player.nim -- \
         --league=traverse \
@@ -157,10 +247,11 @@ if command -v timeout >/dev/null 2>&1 && [[ "${TRAVERSE_CV_NO_TIMEOUT:-0}" != "1
   code=$?
 else
   nix shell nixpkgs#nginx nixpkgs#xvfb-run nixpkgs#xorg.xorgserver --command \
-    env TRAVERSE_LUA_BRIDGE="$BRIDGE" TRAVERSE_LUA_REPO="$ROOT" \
+    env TRAVERSE_LUA_REPO="$ROOT" PETREL_LIB="$PETREL_LIB" \
       NIMBY_PKGS_DIR="$NIMBY_PKGS_DIR" \
       TRAVERSE_GOAL_X="$TRAVERSE_GOAL_X" TRAVERSE_GOAL_Y="$TRAVERSE_GOAL_Y" \
       TRAVERSE_GOAL_RADIUS="$TRAVERSE_GOAL_RADIUS" \
+      TRAVERSE_START_X="$TRAVERSE_START_X" TRAVERSE_SCORE_CAP_X="$TRAVERSE_SCORE_CAP_X" \
       VMANGOS_MANGOSD_CONFIG_OVERRIDES="${VMANGOS_MANGOSD_CONFIG_OVERRIDES:-}" \
       nim r tools/launch_nim_player.nim -- \
         --league=traverse \
@@ -177,9 +268,22 @@ if [[ -n "${CHECKPOINT_PID:-}" ]]; then
   wait "$CHECKPOINT_PID" 2>/dev/null || true
   CHECKPOINT_PID=""
 fi
-cleanup_checkpoint_watch
+cleanup_bg
 trap - EXIT
 echo "[traverse-cv] exit=$code (see $LOG)"
+if [[ -f "$STATUS_JSON" ]]; then
+  python3 - "$STATUS_JSON" <<'PY' 2>/dev/null || true
+import json, sys
+d = json.load(open(sys.argv[1]))
+x, y, z = d.get("x"), d.get("y"), d.get("z")
+score = d.get("score")
+dist = d.get("dist")
+print(
+    f"[traverse-cv] final pos=({x},{y},{z}) score={score} merch_dist={dist}"
+    f" at_goal={d.get('at_goal')} reason={d.get('intent_reason') or ''}"
+)
+PY
+fi
 if grep -qE 'traverse-lua|Northbound|TRAVERSE_LUA' "$LOG" 2>/dev/null; then
   echo "[traverse-cv] bridge/player activity found in log"
 fi

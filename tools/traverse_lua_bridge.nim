@@ -99,23 +99,40 @@ proc main() =
     let gr = parseFloat(getEnv("TRAVERSE_GOAL_RADIUS", "100"))
     let wx = parseFloat(getEnv("TRAVERSE_WATER_X", "-6784.5"))
     let wy = parseFloat(getEnv("TRAVERSE_WATER_Y", "-4833.9"))
+    # League northing: max(0, min(x, cap) - start). Same formula as official scoring.
+    let startX = parseFloat(getEnv("TRAVERSE_START_X", "-9187.0"))
+    let scoreCapX = parseFloat(getEnv("TRAVERSE_SCORE_CAP_X", "6687.333052"))
     let px = jnum(jget(me, "x"))
     let py = jnum(jget(me, "y"))
+    let pz = jnum(jget(me, "z"))
     let dist = sqrt((px - gx) * (px - gx) + (py - gy) * (py - gy))
     let waterDist = sqrt((px - wx) * (px - wx) + (py - wy) * (py - wy))
+    let northing = max(0.0, min(px, scoreCapX) - startX)
+    let reason =
+      if intent.isNil: ""
+      else: jstr(jget(intent, "reason"))
+    let kind =
+      if intent.isNil: ""
+      else: jstr(jget(intent, "kind"))
     let statusDir = cfg.repo / "local_data"
     createDir(statusDir)
     writeFile(
       statusDir / "traverse-cv-status.json",
       $(%*{
-        "x": px, "y": py, "z": jnum(jget(me, "z")),
+        "x": px, "y": py, "z": pz,
         "goal_x": gx, "goal_y": gy,
         "dist": dist, "radius": gr,
         "water_dist": waterDist,
         "at_goal": dist <= gr,
+        "score": northing,
+        "score_metric": "kalimdor_northing_yards",
+        "start_x": startX,
+        "score_cap_x": scoreCapX,
         "swimming": jbool(jget(me, "is_swimming")),
         "form_spell": jint(jget(me, "shapeshift_form_spell_id")),
         "ghost": jbool(jget(jget(proj, "death"), "is_ghost")),
+        "intent_kind": kind,
+        "intent_reason": reason,
         "intent": intent,
         "sequence": cfg.sequence,
         "view_id": jint(jget(view, "view_id"))

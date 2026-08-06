@@ -7,7 +7,11 @@ const
   ClientProtocol* = "vanilla_wow.client.v2"
   TravelFormSpell* = 783
   AquaticFormSpell* = 1066
-  TurnThreshold* = 0.35   ## radians before we turn instead of only pressing W
+  # Face-then-go only. Wide hysteresis so A/D never chatters at the aim edge.
+  # NEVER pulse left/right, alternate A/D by phase, or hold W while spinning —
+  # that thrash causes horrible motion sickness and helps nothing in open water.
+  TurnStart* = 0.40
+  TurnDone* = 0.12
   ArriveHoldYards* = 0.0  ## lowerer does not hold; Lua already holds at checkpoint
 
 proc eventKey(kind, key: string): JsonNode =
@@ -344,7 +348,7 @@ proc normalizeAngle(a: float): float =
   while result > PI: result -= 2 * PI
 
 proc moveEvents(view: JsonNode; intent: JsonNode): JsonNode =
-  ## Face toward (x,y) and hold MOVEFORWARD. Uses stock W/A/D fallbacks.
+  ## Face toward (x,y), then hold MOVEFORWARD. Face-then-go only — never thrash.
   result = newJArray()
   # Close chat only when there is text to discard. Ghost GY stuck forever with
   # chat_input_visible=true + empty text; Escape/Enter never cleared the flag.
@@ -376,17 +380,6 @@ proc moveEvents(view: JsonNode; intent: JsonNode): JsonNode =
     dx = tx - px
     dy = ty - py
     dist = sqrt(dx * dx + dy * dy)
-  if dist < 1.0:
-    # Release movement keys near hop target; Lua will issue next hop.
-    setKeyDesired(view, result, movementKey(view, "MOVEFORWARD", "KeyW"), false)
-    setKeyDesired(view, result, movementKey(view, "TURNLEFT", "KeyA"), false)
-    setKeyDesired(view, result, movementKey(view, "TURNRIGHT", "KeyD"), false)
-    return result
-
-  # WoW: orientation 0 faces +X (north); increasing orientation turns left (CCW)
-  # toward +Y. desired = atan2(dy, dx) matches that convention.
-  let desired = arctan2(dy, dx)
-  let delta = normalizeAngle(desired - o)
 
   let keyW = movementKey(view, "MOVEFORWARD", "KeyW")
   let keyA = movementKey(view, "TURNLEFT", "KeyA")
@@ -395,52 +388,55 @@ proc moveEvents(view: JsonNode; intent: JsonNode): JsonNode =
   let keyE = movementKey(view, "STRAFERIGHT", "KeyE")
   let keyS = movementKey(view, "MOVEBACKWARD", "KeyS")
 
-  # Always clear strafe/back first — unstick used to leave sticky KeyQ (live:
-  # held Q+W forever, empty batches, orbiting water_entry).
+  # ALWAYS clear thrash keys. Jump surfaces + cancels Aquatic. Q/E/S + L/R
+  # pulse dances cause motion sickness. There is zero reason for any of that.
   setKeyDesired(view, result, keyQ, false)
   setKeyDesired(view, result, keyE, false)
   setKeyDesired(view, result, keyS, false)
 
-  if delta > TurnThreshold:
-    setKeyDesired(view, result, keyA, true)
-    setKeyDesired(view, result, keyD, false)
-    setKeyDesired(view, result, keyW, abs(delta) < 1.2)
-  elif delta < -TurnThreshold:
-    setKeyDesired(view, result, keyD, true)
-    setKeyDesired(view, result, keyA, false)
-    setKeyDesired(view, result, keyW, abs(delta) < 1.2)
-  else:
+  if dist < 1.0:
+    # Release movement keys near hop target; Lua will issue next hop.
+    setKeyDesired(view, result, keyW, false)
     setKeyDesired(view, result, keyA, false)
     setKeyDesired(view, result, keyD, false)
-    setKeyDesired(view, result, keyW, true)
+    return result
 
-  # Land-only stick: jump/strafe when frozen. Never jump while swimming —
-  # Space surfaces the character, cancels Aquatic, and dumps you on the beach
-  # (live: hop out of water every few ticks, human form thrash).
-  let moving = jbool(jget(player, "moving"))
-  let swimming = jbool(jget(player, "swimming"))
-  let phase = jint(jget(view, "view_id")) div 6
-  if swimming:
-    discard
-  elif dist > 5.0 and not moving:
-    let jumpKey = movementKey(view, "JUMP", "Space")
-    appendKeyPress(result, jumpKey)
-    case phase mod 3
-    of 0:
-      setKeyDesired(view, result, keyQ, true)
-      setKeyDesired(view, result, keyA, true)
-      setKeyDesired(view, result, keyD, false)
-      setKeyDesired(view, result, keyW, true)
-    of 1:
-      setKeyDesired(view, result, keyE, true)
-      setKeyDesired(view, result, keyD, true)
-      setKeyDesired(view, result, keyA, false)
-      setKeyDesired(view, result, keyW, true)
-    else:
-      setKeyDesired(view, result, keyW, false)
-      setKeyDesired(view, result, keyS, true)
-      setKeyDesired(view, result, keyA, phase mod 2 == 0)
-      setKeyDesired(view, result, keyD, phase mod 2 != 0)
+  # WoW: orientation 0 faces +X (north); increasing orientation turns left (CCW)
+  # toward +Y. desired = atan2(dy, dx) matches that convention.
+  let desired = arctan2(dy, dx)
+  let delta = normalizeAngle(desired - o)
+
+  # MOTION SICKNESS BAN — left/right thrash is FORBIDDEN forever:
+  #   - no timed "unstick" that flips A/D by phase / side
+  #   - no alternating turn keys frame-to-frame at a single threshold
+  #   - no W held while yanking A/D (curves + wobble = vomit)
+  #   - no jump / strafe / reverse "stuck" dances
+  # Control law: pick ONE turn direction with hysteresis, hold it until aimed,
+  # then pure W. Face, then go. Open water needs nothing else.
+  let wasLeft = keyHeld(view, keyA)
+  let wasRight = keyHeld(view, keyD)
+  var turnLeft = false
+  var turnRight = false
+  if wasLeft and not wasRight:
+    if delta > TurnDone:
+      turnLeft = true
+    elif delta < -TurnStart:
+      turnRight = true
+  elif wasRight and not wasLeft:
+    if delta < -TurnDone:
+      turnRight = true
+    elif delta > TurnStart:
+      turnLeft = true
+  else:
+    if delta > TurnStart:
+      turnLeft = true
+    elif delta < -TurnStart:
+      turnRight = true
+
+  setKeyDesired(view, result, keyA, turnLeft)
+  setKeyDesired(view, result, keyD, turnRight)
+  # W only when straight. Never W+A or W+D thrash-curves.
+  setKeyDesired(view, result, keyW, not turnLeft and not turnRight)
 
 proc releaseMoveEvents(view: JsonNode): JsonNode =
   result = newJArray()

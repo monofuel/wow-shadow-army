@@ -80,30 +80,94 @@ suite "lowerIntent":
       check key != "Space" and key != "KeySpace"
       # JUMP binding may still be named Space in fixtures; guard kind+key only.
 
+  test "land stuck never jumps or strafes":
+    # Old unstick: Space + Q/E/S thrash when not moving. Motion-sick and cliffs.
+    var view = parseJson(readFile(fixtures / "tanaris_travel_form.json"))
+    view["view_id"] = %48
+    let player = jget(view, "player")
+    if not player.isNil:
+      player["moving"] = %false
+      player["swimming"] = %false
+    let intent = %*{
+      "kind": "move", "map_id": 1, "x": -7100.0, "y": -4600.0, "z": 5.0,
+      "intent": "travel", "reason": "land_approach"
+    }
+    let batch = lowerIntent(view, intent, 5)
+    let events = jget(batch, "events")
+    for e in events:
+      let key = jstr(jget(e, "key"))
+      check key != "Space" and key != "KeySpace"
+      # May release Q/E/S (key_up) but must never press them down for thrash.
+      if jstr(jget(e, "kind")) == "key_down":
+        check key != "KeyQ" and key != "KeyE" and key != "KeyS"
+
+  test "large heading error turns without W (no W+A curve thrash)":
+    # Goal west while facing north → must turn, must not hold W while turning.
+    var view = parseJson(readFile(fixtures / "tanaris_travel_form.json"))
+    view["held_keys"] = %*[]
+    let intent = %*{
+      "kind": "move", "map_id": 1, "x": -9187.0, "y": -2000.0, "z": 16.0,
+      "intent": "travel", "reason": "water_entry"
+    }
+    let batch = lowerIntent(view, intent, 6)
+    let events = jget(batch, "events")
+    var turnDown = false
+    var wDown = false
+    for e in events:
+      if jstr(jget(e, "kind")) != "key_down": continue
+      let key = jstr(jget(e, "key"))
+      if key == "KeyA" or key == "KeyD": turnDown = true
+      if key == "KeyW": wDown = true
+    check turnDown
+    check wDown == false
+
+  test "hysteresis keeps one turn direction (no A/D chatter)":
+    # Already holding A with small residual left error: keep A, never press D.
+    var view = parseJson(readFile(fixtures / "tanaris_travel_form.json"))
+    view["held_keys"] = %*["KeyA"]
+    # Face slightly left of target north: orientation a bit negative of 0.
+    let player = jget(view, "player")
+    if not player.isNil:
+      let pos = jget(player, "position")
+      if not pos.isNil:
+        pos["orientation"] = %(-0.2)  # need left turn toward 0 for +X goal
+    let intent = %*{
+      "kind": "move", "map_id": 1, "x": -9000.0, "y": -2530.0, "z": 16.0,
+      "intent": "travel", "reason": "water_entry"
+    }
+    let batch = lowerIntent(view, intent, 7)
+    let events = jget(batch, "events")
+    for e in events:
+      if jstr(jget(e, "kind")) == "key_down":
+        check jstr(jget(e, "key")) != "KeyD"
+      if jstr(jget(e, "kind")) == "key_up":
+        # Must not release A while still needing left (delta > TurnDone).
+        check jstr(jget(e, "key")) != "KeyA"
+
 suite "runTraverseDecide":
-  test "land without form → cast travel or move":
+  test "land without form → cast travel or navigate":
     let view = parseJson(readFile(fixtures / "tanaris_land.json"))
     let proj = projectClientView(view)
     let intent = runTraverseDecide(proj, repo)
     let kind = jstr(jget(intent, "kind"))
-    check kind == "cast_spell" or kind == "move"
+    check kind == "cast_spell" or kind == "navigate" or kind == "hold"
     if kind == "cast_spell":
       check jint(jget(intent, "spell")) == 783
 
-  test "travel form → move toward checkpoint":
+  test "travel form → navigate toward beat":
     let view = parseJson(readFile(fixtures / "tanaris_travel_form.json"))
     let proj = projectClientView(view)
     let intent = runTraverseDecide(proj, repo)
-    check jstr(jget(intent, "kind")) == "move"
+    check jstr(jget(intent, "kind")) == "navigate"
     let reason = jstr(jget(intent, "reason"))
-    check reason == "water_entry" or reason == "water_entry_unstick" or
-      reason == "land_approach" or reason == "land_approach_unstick"
+    check reason == "water_entry" or reason == "land_approach" or
+      reason == "enter_water"
 
   test "swimming wrong form → aquatic cast":
-    let view = parseJson(readFile(fixtures / "swimming.json"))
+    var view = parseJson(readFile(fixtures / "swimming.json"))
+    view["view_id"] = %0
     let proj = projectClientView(view)
     let intent = runTraverseDecide(proj, repo)
-    # Travel form while swimming is wrong-form urgent → hard aquatic cast.
     check jstr(jget(intent, "kind")) == "cast_spell"
     check jint(jget(intent, "spell")) == 1066
     check jstr(jget(intent, "reason")) == "aquatic_form"

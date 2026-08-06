@@ -2,6 +2,11 @@
 
 - `make map-browser`
 
+## notes
+
+- do not modify coworld-vanilla-wow (used for server stuff) or coworld-vanilla-wow-fork (used for client stuff)
+- we can import them and use functions but do not modify them, there's no reason to be making upstream changes for our map browser.
+- the map browser is a local tool for us.
 
 ## tasks
 

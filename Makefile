@@ -113,13 +113,21 @@ test-lua:
 # Optional Nim unit tier (enum maps / pure parsers). Not part of `make test`
 # so CI and bare hosts without nim stay green. PATH-nim first, else nix develop
 # if a flake appears later (same pattern as crewrift-prime-bots).
+# Petrel embed tests need Lua 5.3 headers/libs (in-process VM).
+PETREL_LUA_NFLAGS = $$(nix shell nixpkgs\#lua5_3 --command sh -c 'p=$$(dirname $$(dirname $$(which lua))); echo -d:LuaPrefix=$$p --passC:-I$$p/include --passL:-L$$p/lib\ -llua\ -lm\ -ldl')
 test-nim:
 	@if command -v nim >/dev/null 2>&1; then \
 		rc=0; \
+		LUA_NFLAGS="$(PETREL_LUA_NFLAGS)"; \
 		for t in system/tests/test_*.nim tools/tests/test_*.nim; do \
 			[ -f "$$t" ] || continue; \
 			echo "== $$t =="; \
-			nim r --hints:off --warnings:off "$$t" || rc=1; \
+			case "$$t" in \
+				*test_petrel_embed*|*test_traverse_cv*) \
+					nim r --hints:off --warnings:off $$LUA_NFLAGS "$$t" || rc=1 ;; \
+				*) \
+					nim r --hints:off --warnings:off "$$t" || rc=1 ;; \
+			esac; \
 		done; \
 		exit $$rc; \
 	elif [ -f flake.nix ] || [ -f shell.nix ]; then \

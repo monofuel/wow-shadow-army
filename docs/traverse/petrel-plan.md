@@ -15,7 +15,9 @@ file — do not fork a second strategy elsewhere.
 | **This file** | Full plan: thesis, stack, legs, fatigue, success bar, non-goals |
 | [traverse-2026-08-05.md](traverse-2026-08-05.md) | Day checklist / scratchpad (points here) |
 | [clientview-migration.md](clientview-migration.md) | ClientView pilot how/why (done) |
-| [obstacle-avoidance.md](obstacle-avoidance.md) | Optional land polish (not blocking) |
+| [pathing.md](pathing.md) | Pathing architecture: major beats + nav A→B (not micro-waypoints) |
+| [embed-lua-client.md](embed-lua-client.md) | Plan: embed Lua in Nim client + RPB feet (not TRAVERSE_LUA_BRIDGE) |
+| [obstacle-avoidance.md](obstacle-avoidance.md) | Older land polish notes; see pathing.md for architecture of record |
 | [traverse_wow.md](traverse_wow.md) | League rules / scoring / submit gates |
 | [army-debug.md](army-debug.md) | Old `/env` army_host debug port (not CV path) |
 
