@@ -273,11 +273,11 @@ function M.decide(frame, args)
   local merch_dist = planar_dist(me.x, me.y, merch_x, merch_y)
 
   -- Forms: Travel on land far from water; Aquatic while swimming.
-  -- Land→water always drops Travel Form (Classic). Leave Travel only at the
-  -- actual shore or mid-coast beach (human gap), then Aquatic once swimming.
-  -- water_r+400 left Travel thrash on GY ridge ~440yd out (live: freeze at
-  -- leave_travel_at_shore / land_east_clear). Mid-coast dry still must not
-  -- recast Travel (water_dist to Tanaris entry is huge).
+  -- Classic 1.12 auto-cancels Travel Form when you enter water, and Aquatic
+  -- Form when you leave water. No /cancelform, no re-cast to leave form, no
+  -- manual form cancel at the shoreline — walk/swim and let the game drop it.
+  -- Near water / mid-coast dry: do not recast Travel (water_dist to Tanaris
+  -- entry is huge mid-coast and used to thrash travel_form).
   local mid_coast = me.x > (WATER_ENTRY_X + 80.0)
   local near_water = water_dist <= (water_r + 120.0) or mid_coast
   -- Ghosts cannot form; skip form gates and keep pathing.
@@ -311,14 +311,7 @@ function M.decide(frame, args)
         end
       end
     elseif near_water then
-      -- Human gap: leave Travel whenever still on; walk into water.
-      if in_travel_form(frame) and (phase % 3) == 0 then
-        return {
-          kind = "cast_spell",
-          spell = TRAVEL_FORM_SPELL,
-          reason = "leave_travel_at_shore",
-        }
-      end
+      -- Shore / mid-coast beach: keep moving; form change is automatic on water.
     else
       -- Travel far from shore (Tanaris approach only). Soft when form 0 —
       -- hard cast every tick froze live bot when Travel never stuck.

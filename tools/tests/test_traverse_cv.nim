@@ -62,6 +62,24 @@ suite "lowerIntent":
         releasedW = true
     check releasedW
 
+  test "swim move never jumps":
+    # Periodic land jump used Space while swimming → surface + cancel Aquatic.
+    var view = parseJson(readFile(fixtures / "swimming.json"))
+    view["view_id"] = %48  # would have hit phase mod 8 jump cadence
+    let player = jget(view, "player")
+    if not player.isNil:
+      player["moving"] = %false  # land path jumped on not-moving too
+    let intent = %*{
+      "kind": "move", "map_id": 1, "x": -6500.0, "y": -4800.0, "z": -5.0,
+      "intent": "travel", "reason": "swim_merchant"
+    }
+    let batch = lowerIntent(view, intent, 4)
+    let events = jget(batch, "events")
+    for e in events:
+      let key = jstr(jget(e, "key"))
+      check key != "Space" and key != "KeySpace"
+      # JUMP binding may still be named Space in fixtures; guard kind+key only.
+
 suite "runTraverseDecide":
   test "land without form → cast travel or move":
     let view = parseJson(readFile(fixtures / "tanaris_land.json"))

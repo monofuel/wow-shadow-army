@@ -95,16 +95,14 @@ r = entry.decide({
   spells = land_spells,
   view_id = 3,
 })
-check(r.kind == "move" or r.kind == "cast_spell", "dry north of entry still acts")
-if r.kind == "move" then
-  check(r.reason == "reenter_water" or r.reason == "reenter_water_unstick"
-    or r.reason == "leave_travel_at_shore",
-    "dry mid-coast → reenter_water (not merchant land-cut)")
-  check(r.reason ~= "swim_merchant" and r.reason ~= "to_merchant",
-    "no land-cut merchant reason mid-coast dry")
-end
+check(r.kind == "move", "dry north of entry still moves")
+check(r.reason == "reenter_water" or r.reason == "reenter_water_unstick",
+  "dry mid-coast → reenter_water (not merchant land-cut)")
+check(r.reason ~= "swim_merchant" and r.reason ~= "to_merchant",
+  "no land-cut merchant reason mid-coast dry")
 
--- Still in Travel Form near shore → leave form OR move into water.
+-- Still in Travel Form near shore → keep moving into water (game drops Travel).
+-- No leave_travel /cancelform thrash.
 r = entry.decide({
   self_unit = {
     x = water_x + 40, y = water_y + 40, z = 2.0, map_id = 1,
@@ -114,12 +112,11 @@ r = entry.decide({
   },
   death = {},
   spells = land_spells,
-  view_id = 0, -- phase % 5 == 0 → leave_travel
+  view_id = 0,
 })
-check(r.kind == "cast_spell" or r.kind == "move", "leave travel or move at shore")
-if r.kind == "cast_spell" then
-  check(r.spell == 783 and r.reason == "leave_travel_at_shore", "leave_travel_at_shore")
-end
+check(r.kind == "move", "travel at shore moves into water")
+check(r.reason ~= "leave_travel_at_shore", "no leave_travel_at_shore")
+check(r.kind ~= "cast_spell" or (r.spell ~= 783), "no travel toggle at shore")
 
 -- Known list without 783 → hold far from water (do not walk human-shaped forever).
 r = entry.decide({
@@ -186,7 +183,6 @@ check(r.kind ~= "hold" or r.reason ~= "merchant_coast",
 -- Dry past water entry → reenter_water (seaward), not merchant land path.
 if r.kind == "move" then
   check(r.reason == "reenter_water" or r.reason == "reenter_water_unstick"
-    or r.reason == "leave_travel_at_shore"
     or r.reason == "enter_water" or r.reason == "enter_water_unstick",
     "dry past entry reenters water not land-cut merchant")
 end

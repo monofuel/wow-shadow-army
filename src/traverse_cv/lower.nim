@@ -414,14 +414,17 @@ proc moveEvents(view: JsonNode; intent: JsonNode): JsonNode =
     setKeyDesired(view, result, keyD, false)
     setKeyDesired(view, result, keyW, true)
 
-  # Geometry stick: moving=false → jump + strafe. Also periodic jump while
-  # moving — live: KeyW into mesa wall, moving=true, position frozen forever.
+  # Land-only stick: jump/strafe when frozen. Never jump while swimming —
+  # Space surfaces the character, cancels Aquatic, and dumps you on the beach
+  # (live: hop out of water every few ticks, human form thrash).
   let moving = jbool(jget(player, "moving"))
+  let swimming = jbool(jget(player, "swimming"))
   let phase = jint(jget(view, "view_id")) div 6
-  if dist > 5.0 and ((not moving) or (phase mod 8) == 0):
+  if swimming:
+    discard
+  elif dist > 5.0 and not moving:
     let jumpKey = movementKey(view, "JUMP", "Space")
     appendKeyPress(result, jumpKey)
-  if not moving and dist > 5.0:
     case phase mod 3
     of 0:
       setKeyDesired(view, result, keyQ, true)
@@ -486,12 +489,10 @@ proc lowerIntent*(
               break
   of "cast_spell":
     events = releaseMoveEvents(view)
-    let reason = jstr(jget(intent, "reason"))
     let spell = jint(jget(intent, "spell"))
-    # Shore leave: /cancelform is more reliable than toggling Travel again.
-    if reason == "leave_travel_at_shore":
-      discard chatSlashCommand(view, events, "/cancelform")
-    elif spell > 0:
+    # Classic 1.12: Travel Form drops on water entry; Aquatic drops on exit.
+    # Never /cancelform (not a valid slash) and never toggle-cast to leave form.
+    if spell > 0:
       # Guard: never re-issue form cast if already shifted (toggle-off).
       if formIconHint(spell).len == 0 or not playerInForm(view, spell):
         let castEv = castSpellEvents(view, spell)

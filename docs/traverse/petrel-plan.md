@@ -73,7 +73,7 @@ defensive completeness — it is **not** the recovery plan of record.
 | Launch | `make traverse` (headless), `make traverse-headed` |
 | Prove loop | `tools/traverse_cv_pol.sh` watches `local_data/traverse-cv-status.json` |
 | Forms | **Shapeshift bar**, not main action bar 1–12. Travel **783**, Aquatic **1066** |
-| Form gap | **Land → water always drops Travel Form** (Classic). Accept a short human-form gap at the shoreline; do not thrash recasting Travel — walk in, then Aquatic once swimming. |
+| Form gap | **Classic auto-cancels Travel on water entry and Aquatic on exit.** No `/cancelform`, no leave-form cast. Walk in Travel → gap is automatic → Aquatic once swimming. |
 | `/env` | Frozen — no further investment for this challenge |
 
 ### Code map
