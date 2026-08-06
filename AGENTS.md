@@ -130,6 +130,8 @@ Our tools need to be fast and robust. we only have a week for each coworld compe
   irreversible data loss, tournament-risking cheat), **state the decision
   and options** — do not dump a command list for the operator to type.
 
+- DO NOT run gui apps unless specifically directed. this interrupts whatever the human is doing.
+
 ## Dashboard rules
 
 - a dashboard is for buttons, metrics, and dashboard like stuff
