@@ -164,7 +164,7 @@ not to regress the number.
 | **Name** | `best_planar_to_duskwallow_wet` |
 | **Definition** | Minimum planar distance (yards) to goal `(-4627.01, -4869.45)` at any sample where the bot was **swimming** and **Aquatic confirmed**, during a standard wet-lab run |
 | **Direction** | **Lower is better** |
-| **Win** | Number ≤ **100** and run meets §2 success bar (alive hold, no land-cut, durable artifacts) |
+| **Win** | Number ≤ **25** and run meets §2 success bar (alive hold, no land-cut, durable artifacts) |
 
 **Secondary (context only — never sole accept criterion):**
 
@@ -314,7 +314,7 @@ A run **counts** only if **all** of the following hold at stop:
 
 1. Alive (not dead / ghost thrash).  
 2. **Swimming** and **Aquatic Form confirmed**.  
-3. Planar distance to **`(-4627.01, -4869.45)` ≤ 100 yd**.  
+3. Planar distance to **`(-4627.01, -4869.45)` ≤ 25 yd** (beat `radius`; was 100).  
 4. No dry-land shortcut to the score.  
 5. No fatigue exhaustion death.  
 6. Durable artifacts under `local_data/traverse-runs/<id>/` with

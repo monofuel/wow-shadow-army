@@ -96,7 +96,7 @@ proc main() =
     # Primary prove goal: merchant coast (override with TRAVERSE_GOAL_*).
     let gx = parseFloat(getEnv("TRAVERSE_GOAL_X", "-4627.01"))
     let gy = parseFloat(getEnv("TRAVERSE_GOAL_Y", "-4869.45"))
-    let gr = parseFloat(getEnv("TRAVERSE_GOAL_RADIUS", "100"))
+    let gr = parseFloat(getEnv("TRAVERSE_GOAL_RADIUS", "25"))
     let wx = parseFloat(getEnv("TRAVERSE_WATER_X", "-6784.5"))
     let wy = parseFloat(getEnv("TRAVERSE_WATER_Y", "-4833.9"))
     # League northing: max(0, min(x, cap) - start). Same formula as official scoring.
