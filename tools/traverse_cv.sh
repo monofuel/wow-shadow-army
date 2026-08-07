@@ -14,16 +14,20 @@ FORK="${TRAVERSE_FORK:-$ROOT/../coworld-vanilla-wow-fork}"
 PLAYER_SRC="${TRAVERSE_PLAYER_SRC:-}"
 if [[ -z "$PLAYER_SRC" ]]; then
   for cand in "$FORK" "$UPSTREAM"; do
-    if [[ -f "$cand/player/runtime/visual_adapter.nim" ]] &&
-       grep -qE 'petrelEnabled|libpetrel|TRAVERSE_LUA_REPO' \
-         "$cand/player/runtime/visual_adapter.nim" 2>/dev/null; then
+    # Prefer-upstream: petrel_pilot.nim; legacy: visual_adapter.nim Petrel hook.
+    if { [[ -f "$cand/player/runtime/petrel_pilot.nim" ]] &&
+         grep -qE 'petrelEnabled|TRAVERSE_LUA_REPO|libpetrel' \
+           "$cand/player/runtime/petrel_pilot.nim" 2>/dev/null; } ||
+       { [[ -f "$cand/player/runtime/visual_adapter.nim" ]] &&
+         grep -qE 'petrelEnabled|libpetrel|TRAVERSE_LUA_REPO' \
+           "$cand/player/runtime/visual_adapter.nim" 2>/dev/null; }; then
       PLAYER_SRC="$cand"
       break
     fi
   done
 fi
 if [[ -z "${PLAYER_SRC:-}" || ! -d "$PLAYER_SRC" ]]; then
-  echo "error: no player tree with Petrel/libpetrel hook in visual_adapter.nim" >&2
+  echo "error: no player tree with Petrel hook (petrel_pilot.nim or visual_adapter.nim)" >&2
   exit 1
 fi
 WOW_ENV="${WOW_ENV:-$ROOT/tools/wow_env.sh}"
