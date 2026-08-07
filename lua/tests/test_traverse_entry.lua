@@ -47,7 +47,8 @@ r = decide({
   shapeshift_form_id = 4, shapeshift_form_spell_id = 1066,
   is_swimming = true,
 })
-check(r.kind == "navigate" and r.beat_id == "coast_01", "first manual beat")
+-- On cheese ribbon: at first human sample, next unreached wet pearl is cheese_02.
+check(r.kind == "navigate" and r.beat_id == "cheese_02", "first cheese advance")
 check(r.route_reference.cross_track_yards < 150, "reference metric attached")
 
 r = decide({
@@ -55,22 +56,22 @@ r = decide({
   shapeshift_form_id = 4, shapeshift_form_spell_id = 1066,
   is_swimming = true,
 })
-check(r.beat_id == "coast_02", "passed beat never reopens")
+check(r.beat_id == "cheese_05", "passed cheese never reopens early")
 
 r = decide({
   x = -5480, y = -4845, z = -5, map_id = 1,
   shapeshift_form_id = 4, shapeshift_form_spell_id = 1066,
   is_swimming = true,
 })
-check(r.beat_id == "coast_08", "mid-route remains ordered")
+check(r.beat_id == "cheese_25", "mid-route remains ordered cheese")
 
 r = decide({
   x = -5480, y = -4800, z = 1, map_id = 1,
   shapeshift_form_id = 0, is_swimming = false,
   liquid_coverage_known = true, liquid_known = false,
 })
-check(r.reason == "reenter_water" and r.beat_id == "coast_08",
-  "dry recovery rejoins next beat")
+check(r.reason == "reenter_water" and r.beat_id == "cheese_24",
+  "dry recovery rejoins next cheese beat")
 
 r = decide({
   x = -4627, y = -4869, z = -2, map_id = 1,

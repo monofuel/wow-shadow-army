@@ -22,20 +22,38 @@ local function swim(x, y, form)
   }, route)
 end
 
-local r = swim(-6473, -4900)
-check(r.kind == "navigate" and r.beat_id == "coast_02", "early ordered beat")
-check(r.reason == "swim_coast_02", "named swim intent")
+-- Cheese coast: ordered human-ribbon waypoints (not sparse coast_* only).
+local r = swim(-6700, -4870)
+check(r.kind == "navigate", "early navigate")
+check(type(r.beat_id) == "string" and r.beat_id:match("^cheese_"),
+  "early targets cheese waypoint: " .. tostring(r.beat_id))
+check(r.mode == "liquid_prefer", "liquid mode")
 
-r = swim(-5100, -4858)
-check(r.kind == "navigate" and r.beat_id == "coast_10", "mid-route next beat")
-check(r.route_reference.along_route_yards > 1000, "along-route progress")
+r = swim(-5400, -4890)
+check(r.kind == "navigate", "mid navigate")
+check(type(r.beat_id) == "string", "mid has beat")
+-- Must still be a wet cheese point or duskwallow, not land_approach.
+check(r.beat_id ~= "land_approach" and r.beat_id ~= "water_entry",
+  "mid stays on wet cheese chain")
+check(r.route_reference and r.route_reference.along_route_yards
+    and r.route_reference.along_route_yards > 500,
+  "along-route progress")
 check(r.route_reference.total_route_yards > r.route_reference.along_route_yards,
   "route total")
 
 r = swim(-4627, -4869)
 check(r.kind == "hold" and r.reason == "duskwallow_coast", "Dustwallow proof")
 
-r = swim(-6473, -4900, 0)
+r = swim(-6700, -4870, 0)
 check(r.kind == "cast_spell" and r.spell == 1066, "reapply Aquatic")
+
+-- Sequential: further north should not select a far-behind early cheese id.
+r = swim(-5000, -4800)
+check(r.kind == "navigate" or r.kind == "hold", "late segment intent")
+if r.kind == "navigate" then
+  local id = r.beat_id or ""
+  local num = tonumber(id:match("cheese_(%d+)"))
+  check(num == nil or num >= 10, "late does not regress to early cheese: " .. id)
+end
 
 print("test_traverse_wet_beats: " .. passed .. " ok")

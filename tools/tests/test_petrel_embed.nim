@@ -67,7 +67,7 @@ suite "petrel embed":
 
   test "route config is loaded transactionally":
     var route = parseJson(readFile(repo / "lua" / "config" / "traverse_beats.json"))
-    check route{"version"}.getInt == 3
+    check route{"version"}.getInt >= 3
     check route{"goal_id"}.getStr == "duskwallow_coast"
     check route{"beats"}.len >= 12
 

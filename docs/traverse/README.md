@@ -6,6 +6,7 @@ traverse writeups here instead of scattering under `docs/`.
 | Doc | What it is |
 |---|---|
 | [petrel-plan.md](petrel-plan.md) | **Plan of record** — legs, fatigue, swim-north, weekend contender thesis |
+| [duskwallow-plan.md](duskwallow-plan.md) | **Today's isolated swim** — water entry → Dustwallow coast; scoreboard + gates |
 | [clientview-migration.md](clientview-migration.md) | ClientView Lua pilot (`make traverse` / `traverse-headed`); water-entry proven |
 | [checkpointing.md](checkpointing.md) | Local wet debug: why config/SQL fail; SOAP tele; Northbound2 free play |
 | [army-debug.md](army-debug.md) | Embedded Petrel flight recorder, durable runs, anomalies, and admin port |
