@@ -70,3 +70,19 @@ suite "petrel embed":
     check "petrel/embed" in src
     check "execCmdEx" notin src
     check "findLua" notin src
+
+  test "decision trace preserves exact projection and returned intent":
+    let body = readFile(fixtures / "swimming.json")
+    let intent = globalDecideFromViewJson(body, repo)
+    let trace = lastDecisionTrace()
+    check trace{"projection"}{"view_id"}.getInt ==
+      parseJson(body){"view_id"}.getInt
+    check trace{"intent"} == intent
+
+  test "failed transactional reload preserves the live Lua VM":
+    let body = readFile(fixtures / "tanaris_land.json")
+    discard globalDecideFromViewJson(body, repo)
+    let reload = globalReload(repo / "definitely-missing-petrel-root")
+    check not reload.ok
+    let intent = globalDecideFromViewJson(body, repo)
+    check intent{"reason"}.getStr != "embed_boot_failed"

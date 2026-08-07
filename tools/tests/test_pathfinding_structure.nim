@@ -4,13 +4,16 @@ import std/[os, strutils, unittest]
 let repo = getCurrentDir()
 let forkAdapter =
   repo / ".." / "coworld-vanilla-wow-fork" / "player" / "runtime" / "visual_adapter.nim"
+let forkDebug =
+  repo / ".." / "coworld-vanilla-wow-fork" / "player" / "runtime" / "petrel_debug.nim"
 let traverseLua = repo / "lua" / "entry" / "traverse.lua"
 let beatsJson = repo / "lua" / "config" / "traverse_beats.json"
 
 suite "pathfinding structure":
   test "fork pilot recovers instead of freeze-only on unavailable":
     check fileExists(forkAdapter)
-    let src = readFile(forkAdapter)
+    check fileExists(forkDebug)
+    let src = readFile(forkAdapter) & readFile(forkDebug)
     check "advanceRouteTo" in src
     check "recover-step" in src
     check "replan" in src

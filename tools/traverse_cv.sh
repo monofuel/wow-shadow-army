@@ -28,16 +28,24 @@ if [[ -z "${PLAYER_SRC:-}" || ! -d "$PLAYER_SRC" ]]; then
 fi
 WOW_ENV="${WOW_ENV:-$ROOT/tools/wow_env.sh}"
 OWNER="${TRAVERSE_OWNER:-${USER:-monofuel}}"
-LOG="${TRAVERSE_CV_LOG:-$ROOT/local_data/brain-logs/traverse-cv-${MODE}.log}"
 PETREL_LIB="${PETREL_LIB:-$ROOT/tools/libpetrel.so}"
 MAX_SECONDS="${TRAVERSE_CV_MAX_SECONDS:-1200}"
+RUN_ROOT="${PETREL_DEBUG_RUN_ROOT:-$ROOT/local_data/traverse-runs}"
+RUN_ID="${PETREL_DEBUG_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-$$}"
+RUN_DIR="$RUN_ROOT/$RUN_ID"
+LOG="${TRAVERSE_CV_LOG:-$RUN_DIR/player.log}"
+ADMIN_LOG="$RUN_DIR/admin.log"
+ADMIN_PORT="${ARMY_DEBUG_PORT:-7788}"
+ADMIN_TOKEN="${ARMY_DEBUG_TOKEN:-}"
+ADMIN_BIN="${PETREL_DEBUG_ADMIN_BIN:-/tmp/wow-shadow-army-petrel-debug-admin-${UID:-0}}"
 
 if [[ ! -f "$WOW_ENV" ]]; then
   echo "error: missing $WOW_ENV" >&2
   exit 1
 fi
 
-mkdir -p "$(dirname "$LOG")"
+mkdir -p "$RUN_DIR/anomalies" "$RUN_DIR/control/acks" "$(dirname "$LOG")"
+ln -sfn "$RUN_ID" "$RUN_ROOT/latest"
 
 need_petrel=0
 if [[ ! -f "$PETREL_LIB" ]]; then
@@ -99,8 +107,18 @@ fi
 CHECKPOINT_NAME="${TRAVERSE_CHECKPOINT:-${CHECKPOINT:-}}"
 CHECKPOINT_PID=""
 PROGRESS_PID=""
-STATUS_JSON="${TRAVERSE_CV_STATUS:-$ROOT/local_data/traverse-cv-status.json}"
+ADMIN_PID=""
+ADMIN_FINISHED=0
+STATUS_JSON="${TRAVERSE_CV_STATUS:-$RUN_DIR/status.json}"
 PROGRESS_INTERVAL="${TRAVERSE_PROGRESS_INTERVAL:-5}"
+finish_admin() {
+  if [[ "$ADMIN_FINISHED" == "0" && -n "${ADMIN_PID:-}" ]]; then
+    curl -fsS -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
+      "http://127.0.0.1:$ADMIN_PORT/finish?exit_code=${code:-1}" \
+      >/dev/null 2>&1 || true
+    ADMIN_FINISHED=1
+  fi
+}
 cleanup_bg() {
   if [[ -n "${CHECKPOINT_PID:-}" ]] && kill -0 "$CHECKPOINT_PID" 2>/dev/null; then
     kill "$CHECKPOINT_PID" 2>/dev/null || true
@@ -112,6 +130,12 @@ cleanup_bg() {
     wait "$PROGRESS_PID" 2>/dev/null || true
   fi
   PROGRESS_PID=""
+  finish_admin
+  if [[ -n "${ADMIN_PID:-}" ]] && kill -0 "$ADMIN_PID" 2>/dev/null; then
+    kill "$ADMIN_PID" 2>/dev/null || true
+    wait "$ADMIN_PID" 2>/dev/null || true
+  fi
+  ADMIN_PID=""
 }
 trap cleanup_bg EXIT
 
@@ -119,6 +143,7 @@ echo "[traverse-cv] mode=$MODE presentation=$PRES player_src=$PLAYER_SRC"
 echo "[traverse-cv] petrel_lib=$PETREL_LIB repo=$ROOT"
 echo "[traverse-cv] in-process Lua + RPB nav — not /env, not per-tick exec"
 echo "[traverse-cv] log=$LOG"
+echo "[traverse-cv] durable_run=$RUN_DIR"
 echo "[traverse-cv] progress every ${PROGRESS_INTERVAL}s → console + log (status=$STATUS_JSON)"
 if [[ -n "$CHECKPOINT_NAME" ]]; then
   echo "[traverse-cv] CHECKPOINT=$CHECKPOINT_NAME (SOAP tele after in-world)"
@@ -132,6 +157,7 @@ set -u
 
 # Ensure petrel + pin env survive into the player child.
 export TRAVERSE_LUA_REPO PETREL_LIB NIMBY_PKGS_DIR
+export PETREL_DEBUG_RUN_DIR="$RUN_DIR"
 export TRAVERSE_GOAL_X="${TRAVERSE_GOAL_X:--1533.7}"
 export TRAVERSE_GOAL_Y="${TRAVERSE_GOAL_Y:--4056.5}"
 export TRAVERSE_GOAL_RADIUS="${TRAVERSE_GOAL_RADIUS:-100}"
@@ -141,6 +167,52 @@ export TRAVERSE_SCORE_CAP_X="${TRAVERSE_SCORE_CAP_X:-6687.333052}"
 export TRAVERSE_PLAYER_SRC="${TRAVERSE_PLAYER_SRC:-$PLAYER_SRC}"
 
 : >"$LOG"
+: >"$ADMIN_LOG"
+if ! (
+  cd "$ROOT"
+  nim c --hints:off --threads:on \
+    --nimcache:"/tmp/petrel-debug-admin-cache-${UID:-0}" \
+    -o:"$ADMIN_BIN" tools/petrel_debug_admin.nim
+) >>"$ADMIN_LOG" 2>&1; then
+  echo "error: Petrel debug admin did not compile (see $ADMIN_LOG)" >&2
+  exit 1
+fi
+(
+  cd "$ROOT"
+  admin_args=(
+    --run-dir="$RUN_DIR"
+    --repo="$ROOT"
+    --fork="$PLAYER_SRC"
+    --port="$ADMIN_PORT"
+    --presentation="$PRES"
+    --simulation-scale=10
+  )
+  if [[ -n "$ADMIN_TOKEN" ]]; then
+    admin_args+=(--token="$ADMIN_TOKEN")
+  fi
+  if [[ -n "$CHECKPOINT_NAME" ]]; then
+    admin_args+=(--checkpoint="$CHECKPOINT_NAME")
+  fi
+  exec "$ADMIN_BIN" "${admin_args[@]}"
+) >>"$ADMIN_LOG" 2>&1 &
+ADMIN_PID=$!
+for _ in $(seq 1 120); do
+  if curl -fsS -H "Authorization: Bearer $ADMIN_TOKEN" \
+      "http://127.0.0.1:$ADMIN_PORT/healthz" >/dev/null 2>&1; then
+    break
+  fi
+  if ! kill -0 "$ADMIN_PID" 2>/dev/null; then
+    echo "error: Petrel debug admin exited during startup (see $ADMIN_LOG)" >&2
+    exit 1
+  fi
+  sleep 0.25
+done
+if ! curl -fsS -H "Authorization: Bearer $ADMIN_TOKEN" \
+    "http://127.0.0.1:$ADMIN_PORT/healthz" >/dev/null 2>&1; then
+  echo "error: Petrel debug admin did not become healthy (see $ADMIN_LOG)" >&2
+  exit 1
+fi
+echo "[traverse-cv] debug=http://127.0.0.1:$ADMIN_PORT run=$RUN_ID" | tee -a "$LOG"
 echo "[traverse-cv] launching…" | tee -a "$LOG"
 if [[ -n "$CHECKPOINT_NAME" && -f "$ROOT/tools/traverse_checkpoint.py" ]]; then
   # Background: wait for SOAP + fresh in-world status, then tele until near pose.
@@ -251,6 +323,7 @@ if command -v timeout >/dev/null 2>&1 && [[ "${TRAVERSE_CV_NO_TIMEOUT:-0}" != "1
     timeout --signal=TERM "$MAX_SECONDS" \
     env TRAVERSE_LUA_REPO="$ROOT" PETREL_LIB="$PETREL_LIB" \
       NIMBY_PKGS_DIR="$NIMBY_PKGS_DIR" \
+      PETREL_DEBUG_RUN_DIR="$RUN_DIR" \
       TRAVERSE_GOAL_X="$TRAVERSE_GOAL_X" TRAVERSE_GOAL_Y="$TRAVERSE_GOAL_Y" \
       TRAVERSE_GOAL_RADIUS="$TRAVERSE_GOAL_RADIUS" \
       TRAVERSE_START_X="$TRAVERSE_START_X" TRAVERSE_SCORE_CAP_X="$TRAVERSE_SCORE_CAP_X" \
@@ -267,6 +340,7 @@ else
   nix shell nixpkgs#nginx nixpkgs#xvfb-run nixpkgs#xorg.xorgserver --command \
     env TRAVERSE_LUA_REPO="$ROOT" PETREL_LIB="$PETREL_LIB" \
       NIMBY_PKGS_DIR="$NIMBY_PKGS_DIR" \
+      PETREL_DEBUG_RUN_DIR="$RUN_DIR" \
       TRAVERSE_GOAL_X="$TRAVERSE_GOAL_X" TRAVERSE_GOAL_Y="$TRAVERSE_GOAL_Y" \
       TRAVERSE_GOAL_RADIUS="$TRAVERSE_GOAL_RADIUS" \
       TRAVERSE_START_X="$TRAVERSE_START_X" TRAVERSE_SCORE_CAP_X="$TRAVERSE_SCORE_CAP_X" \

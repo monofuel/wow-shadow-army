@@ -20,6 +20,8 @@ when appType == "lib":
   var
     lastResult: string
     lastBatch: string
+    lastTrace: string
+    lastReload: string
     castSeq: int
 
   proc petrel_decide(viewJson: cstring; repoPath: cstring): cstring
@@ -63,3 +65,17 @@ when appType == "lib":
 
   proc petrel_last_error(): cstring {.exportc, dynlib, cdecl.} =
     lastEmbedError().cstring
+
+  proc petrel_last_trace(): cstring {.exportc, dynlib, cdecl.} =
+    ## Exact projected Lua input + returned intent from the last decide call.
+    lastTrace = $lastDecisionTrace()
+    lastTrace.cstring
+
+  proc petrel_reload(repoPath: cstring): cstring {.exportc, dynlib, cdecl.} =
+    ## Transactional reload; a failed replacement leaves the live VM intact.
+    let reloaded = globalReload($repoPath)
+    lastReload = $(%*{
+      "ok": reloaded.ok,
+      "detail": reloaded.detail
+    })
+    lastReload.cstring

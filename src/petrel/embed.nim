@@ -16,6 +16,8 @@ var
   gEmbed: PetrelEmbed
   gLock: Lock
   gLockInited: bool
+  gLastProjection: JsonNode
+  gLastIntent: JsonNode
 
 proc initLockOnce() =
   if not gLockInited:
@@ -201,7 +203,33 @@ proc globalDecideFromViewJson*(viewBody: string; repoRoot: string): JsonNode =
   ## ClientView JSON → project → strategy intent (in-process).
   let view = parseJson(viewBody)
   let proj = projectClientView(view)
-  globalDecide(proj, repoRoot)
+  initLockOnce()
+  withLock gLock:
+    result = gEmbed.decide(proj, repoRoot)
+    gLastProjection = proj
+    gLastIntent = result
+
+proc globalReload*(repoRoot: string): tuple[ok: bool, detail: string] =
+  ## Transactional hot reload: keep the active VM if the replacement fails.
+  initLockOnce()
+  withLock gLock:
+    var candidate: PetrelEmbed
+    if not candidate.openEmbed(repoRoot):
+      return (false, candidate.lastError)
+    gEmbed.closeEmbed()
+    gEmbed = candidate
+    gLastProjection = nil
+    gLastIntent = nil
+    result = (true, "reloaded")
+
+proc lastDecisionTrace*(): JsonNode =
+  initLockOnce()
+  withLock gLock:
+    result = %*{
+      "projection":
+        (if gLastProjection.isNil: newJObject() else: gLastProjection),
+      "intent": (if gLastIntent.isNil: newJObject() else: gLastIntent)
+    }
 
 proc lastEmbedError*(): string =
   initLockOnce()

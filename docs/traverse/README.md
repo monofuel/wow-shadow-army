@@ -8,6 +8,7 @@ traverse writeups here instead of scattering under `docs/`.
 | [petrel-plan.md](petrel-plan.md) | **Plan of record** — legs, fatigue, swim-north, weekend contender thesis |
 | [clientview-migration.md](clientview-migration.md) | ClientView Lua pilot (`make traverse` / `traverse-headed`); water-entry proven |
 | [checkpointing.md](checkpointing.md) | Local wet debug: why config/SQL fail; SOAP tele; Northbound2 free play |
+| [army-debug.md](army-debug.md) | Embedded Petrel flight recorder, durable runs, anomalies, and admin port |
 | [pathing.md](pathing.md) | Layers: sparse beats + nav A→B (fair play, multi-comp) |
 | [pathfinding-plan.md](pathfinding-plan.md) | **Plan of record for feet** — full RPB plan/follow/recover; anti-shortcut phases + source map |
 | [embed-lua-client.md](embed-lua-client.md) | Embed Lua strategy in-process; libpetrel + fork hook |

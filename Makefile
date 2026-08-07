@@ -64,6 +64,7 @@ test-traverse-checkpoint:
 # Every Nim entrypoint/module must at least compile (`nim check`), even where
 # no unit suite imports it yet (army_host, msgpack_json).
 NIM_CHECK_FILES = system/system_server.nim tools/army_host.nim tools/army_debug.nim \
+	tools/petrel_debug_admin.nim \
 	tools/fair_play_audit.nim tools/party_promote.nim tools/msgpack_json.nim \
 	tools/env_transport.nim tools/env_smoke.nim \
 	src/tools/map_browser.nim
@@ -114,7 +115,7 @@ test-lua:
 # so CI and bare hosts without nim stay green. PATH-nim first, else nix develop
 # if a flake appears later (same pattern as crewrift-prime-bots).
 # Petrel embed tests need Lua 5.3 headers/libs (in-process VM).
-PETREL_LUA_NFLAGS = $$(nix shell nixpkgs\#lua5_3 --command sh -c 'p=$$(dirname $$(dirname $$(which lua))); echo -d:LuaPrefix=$$p --passC:-I$$p/include --passL:-L$$p/lib\ -llua\ -lm\ -ldl')
+PETREL_LUA_NFLAGS = $$(nix shell nixpkgs\#lua5_3 --command sh -c 'p=$$(dirname $$(dirname $$(which lua))); echo -d:LuaPrefix=$$p --passC:-I$$p/include --passL:-L$$p/lib --passL:-llua --passL:-lm --passL:-ldl')
 test-nim:
 	@if command -v nim >/dev/null 2>&1; then \
 		rc=0; \

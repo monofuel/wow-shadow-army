@@ -1,65 +1,65 @@
-# Army host debug admin (HTTP + WebSocket)
+# Embedded Petrel debug admin
 
-Local live-debug surface for long traverse runs (`docs/traverse/traverse-2026-08-05.md` side quest).
+Local, read-only-first diagnostics for ClientView traverse runs. `make traverse`
+and `make traverse-headed` start it automatically on `127.0.0.1:7788`.
+The port is local only and is not part of a hosted policy image.
 
-## Enable
+## Durable runs
 
-| | |
-|---|---|
-| Flag | `--debug-port:7788` |
-| Env | `ARMY_DEBUG_PORT=7788` (local traverse defaults this on) |
-| Token | optional `ARMY_DEBUG_TOKEN` / `--debug-token` (Bearer or `?token=`) |
-| Bind | **127.0.0.1 only** |
+Every launch creates `local_data/traverse-runs/<UTC timestamp>-<pid>/` and
+updates `local_data/traverse-runs/latest`. Runs are retained until deliberately
+removed; the launcher does not prune them.
 
-Hosted Softmax policy images should leave the port **off** (`ARMY_DEBUG_PORT=0` / omit flag).
+Each run contains:
 
-## Lua reload — honest semantics
+- `manifest.json`: revisions, dirty state, upstream pin, input hashes, mode,
+  checkpoint label, and simulation scale
+- `player.log`, `admin.log`, `status.json`
+- `timeline.jsonl`: ClientView observation → exact Lua projection and intent →
+  upstream navigation/lowering stages → final input batch and receipt → observed
+  movement execution
+- `transitions.jsonl`: water, form, intent, route, and branch changes, timestamped
+  in both simulation and wall time
+- `control/`: admin requests and client acknowledgements
+- `anomalies/<id>/`: anomaly metadata, the triggering ClientView, a 60-second
+  simulation-time pre-window, a 5-second post-window, and `frame.png` when capture
+  succeeds
+- `run-summary.json`: exit code, final status, and anomaly count
 
-`army_host` already runs **one fresh `lua5.3` process per decide frame** (`runDecide`). Editing `lua/**` on disk is live on the **next frame** without any admin call.
+Breath and fatigue are represented as `active`, `remaining_fraction`, and
+`source`. An absent timer is explicitly recorded as assumed full, not observed.
+Water and form fields carry their corresponding `*_known` evidence.
 
-`POST /lua/reload` / WS `lua.reload` still matter as:
+## Automatic anomaly capture
 
-- validate entry with a dry-run `require`
-- bump `lua_gen` so agents can prove a handshake
-- surface parse errors without waiting for a live decide FAIL
+The client detects jumping while wet, Aquatic Form loss while wet, repeated form
+casts, rapid alternating turns without a heading change, movement input without
+position progress, sustained unavailable navigation, and an authoritative dry
+observation during a liquid leg. Severe anomalies capture through five more
+simulation seconds and then stop the player, preserving the failing state.
 
 ## HTTP
 
-| Method | Path |
-|---|---|
-| `GET` | `/healthz` |
-| `GET` | `/status` |
-| `GET` | `/log?n=50&src=policy` |
-| `POST` | `/hold` / `/resume` |
-| `POST` | `/lua/reload` |
-| `POST` | `/dump` |
+An optional `ARMY_DEBUG_TOKEN` is accepted as a Bearer token. Historical reads
+take `run_id`; timeline reads also accept `limit` and `sim_seconds`.
 
-## WebSocket `ws://127.0.0.1:7788/ws`
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/healthz`, `/status`, `/runs` | service and run state |
+| `GET` | `/timeline`, `/transitions` | causal records |
+| `GET` | `/anomalies`, `/anomalies/latest` | captured failures; latest includes its JSON bundle |
+| `GET` | `/anomaly?anomaly_id=…`, `/frame?anomaly_id=…` | full JSON bundle/rendered frame |
+| `GET` | `/command?id=…` | command acknowledgement |
+| `POST` | `/hold`, `/resume` | stop/resume Petrel decisions safely |
+| `POST` | `/dump`, `/stop` | manual capture, or capture then stop |
+| `POST` | `/lua/reload` | transactional embedded-Lua reload |
 
-Client ops: `auth`, `subscribe`/`unsubscribe` (`status`|`log`), `status`, `hold`, `resume`, `lua.reload`, `ping`.
+`/ws` streams `status` and `anomaly` topics after an `auth` message when a token
+is configured. Reload builds a replacement Lua VM first; a parse or boot failure
+leaves the active VM untouched and is reported by `/command`.
 
-## Agent loop
+## Investigation contract
 
-```bash
-# while local traverse is running
-make army-debug-status
-# edit lua/entry/traverse.lua
-make army-debug-reload
-make army-debug-status   # lua.gen bumped
-```
-
-Hold during multi-file edits: `make army-debug-hold` … edit … `make army-debug-resume`.
-
-## Headed Nim client (Softmax path)
-
-```bash
-make traverse-headed
-```
-
-One Softmax command: headed Nim client + **RealPlayerBot** on `--league=traverse`
-(same as their participate guide). Window = the bot process.
-
-Our **Lua / army_host** pilot is Softmax’s **external `/env`** lane (headless
-reference/env host). Softmax does not put that lane in `player.nim` headed mode.
-`make traverse-pol` + dashboard status is how we run *our* bot; headed Softmax
-RPB is how their stack is meant to be watched in a window.
+Before changing behavior, inspect the causal trace, cite the observations that
+support the hypothesis, list facts that remain unknown, and identify the layer
+that emitted the bad input. Do not add recovery behavior for an assumed obstacle.
