@@ -44,3 +44,15 @@ Flow: ClientView → `petrel_decide` → intent → RPB `advanceRouteTo` / cast 
   present under the old merge-base; realign is for **later** nav + contract drift.
 - Gitea `origin/main` was polluted with Petrel history; realign restores pure
   mirror via `upstream-mirror` and/or force-with-lease of `main` (operator OK).
+
+
+## Port status (2026-08-07)
+
+| Item | State |
+|---|---|
+| `upstream-mirror` / pure base | Done — Gitea `origin/upstream-mirror` |
+| `monofuel/petrel` | **Petrel re-hosted** on Observation→Action via `player/runtime/petrel_pilot.nim` |
+| Working play branch | Use **`monofuel/petrel`** for prefer-upstream Petrel; `embedded-lua-client` is rollback |
+| Gitea `main` rewrite | Still needs monofuel OK for force-with-lease |
+| Land beads | Removed from shadow-army strategy |
+| Flight recorder / liquid_corridor | Not yet ported (optional); cheese + RPB liquid first |
