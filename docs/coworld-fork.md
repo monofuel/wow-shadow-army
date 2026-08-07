@@ -25,8 +25,8 @@ Never push to GitHub from this worktree. All writes go to Gitea via `origin`.
 | Branch | Meaning |
 |---|---|
 | `upstream-mirror` | Exact `upstream/main` tip (pure Metta). **Use this as the integration base.** |
-| `monofuel/petrel` | Started at pure `upstream/main` for rebased Petrel (WIP — not a full Petrel port yet). |
-| `embedded-lua-client` | **Current working Petrel** on old merge-base (`petrel-pre-realign-20260807` tag). Wet cheese still runs here. |
+| `monofuel/petrel` | **Prefer-upstream Petrel** — pure Metta tip + `petrel_pilot.nim` (Observation→Action). **Use this.** |
+| `embedded-lua-client` | Legacy Petrel on old ClientView path (`petrel-pre-realign-20260807` tag). Rollback only. |
 | `main` (Gitea) | Dirty until rewritten; do not treat as pure upstream until fixed. |
 
 Prefer **upstream** on every shared RPB/nav/player conflict. Do not forever-vendor
