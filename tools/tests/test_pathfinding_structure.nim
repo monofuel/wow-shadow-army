@@ -39,20 +39,19 @@ suite "pathfinding structure":
     # steering treats unknown swim depth as a request to jump to the surface.
     check "pilot.policy.navigation.targetZKnown = true" in src
     # Proximity to a surface is not proof that liquid movement owns the body.
-    check "(swimNow or view.player.liquidSubmerged)" in src
+    check "swimNow or view.player.liquidSubmerged" in src
     check "pilot.petrelLiquidUnknownSince = 0" in src
     check "liquid" in src
 
-  test "wet strategy has intermediate wet beats not merchant-only":
+  test "wet strategy uses the scoped manual route":
     let lua = readFile(traverseLua)
-    check "next_wet_beat" in lua or "wet_leg" in lua
-    check "swim_merchant" in lua  # final only
+    check "next_wet_beat" in lua
+    check "route_reference" in lua
     let beats = readFile(beatsJson)
-    check "wet_leg_a" in beats
-    check "wet_leg_b" in beats
-    check "merchant" in beats
-    # More than one wet target besides merchant.
-    check beats.count("liquid_prefer") >= 3
+    check "coast_01" in beats
+    check "coast_11" in beats
+    check "duskwallow_coast" in beats
+    check beats.count("liquid_prefer") >= 12
 
   test "no L/R thrash unstick in strategy":
     let lua = readFile(traverseLua)

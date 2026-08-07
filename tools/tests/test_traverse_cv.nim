@@ -81,7 +81,7 @@ suite "lowerIntent":
       player["moving"] = %false  # land path jumped on not-moving too
     let intent = %*{
       "kind": "move", "map_id": 1, "x": -6500.0, "y": -4800.0, "z": -5.0,
-      "intent": "travel", "reason": "swim_merchant"
+      "intent": "travel", "reason": "swim_duskwallow"
     }
     let batch = lowerIntent(view, intent, 4)
     let events = jget(batch, "events")

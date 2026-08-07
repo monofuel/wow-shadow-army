@@ -9,6 +9,7 @@ type
   PetrelEmbed* = object
     L: PState
     repo: string
+    routeArgs: JsonNode
     ready: bool
     lastError: string
 
@@ -131,10 +132,47 @@ proc closeEmbed*(e: var PetrelEmbed) =
     e.L.close()
     e.L = nil
   e.ready = false
+  e.routeArgs = nil
+
+proc loadRouteArgs(repoRoot: string): tuple[ok: bool, args: JsonNode, error: string] =
+  let path = repoRoot / "lua" / "config" / "traverse_beats.json"
+  try:
+    if not fileExists(path):
+      return (false, nil, "route config missing: " & path)
+    let config = parseJson(readFile(path))
+    if config.kind != JObject or config{"version"}.getInt(0) < 3:
+      return (false, nil, "route config version must be >= 3")
+    let beats = config{"beats"}
+    if beats.kind != JArray or beats.len < 3:
+      return (false, nil, "route config needs land, water, and wet beats")
+    let goalId = config{"goal_id"}.getStr("")
+    if goalId.len == 0:
+      return (false, nil, "route config goal_id missing")
+    var foundGoal = false
+    for beat in beats:
+      if beat.kind != JObject or beat{"id"}.getStr("").len == 0 or
+          not beat.hasKey("x") or not beat.hasKey("y"):
+        return (false, nil, "route config contains an invalid beat")
+      if beat{"id"}.getStr == goalId:
+        foundGoal = true
+    if not foundGoal:
+      return (false, nil, "route config goal_id has no matching beat")
+    result = (true, %*{
+      "map_id": config{"map_id"}.getInt(1),
+      "goal_id": goalId,
+      "beats": beats
+    }, "")
+  except CatchableError as error:
+    result = (false, nil, "route config: " & error.msg)
 
 proc openEmbed*(e: var PetrelEmbed; repoRoot: string): bool =
   e.closeEmbed()
   e.repo = repoRoot
+  let route = loadRouteArgs(repoRoot)
+  if not route.ok:
+    e.lastError = route.error
+    return false
+  e.routeArgs = route.args
   e.L = newstate()
   if e.L.isNil:
     e.lastError = "luaL_newstate failed"
@@ -178,7 +216,7 @@ proc decide*(e: var PetrelEmbed; proj: JsonNode; repoRoot: string): JsonNode =
     e.lastError = "decide missing"
     return %*{"kind": "hold", "reason": "embed_no_decide"}
   L.pushJson(proj)
-  L.createtable(0, 0)
+  L.pushJson(e.routeArgs)
   let st = L.pcall(2, 1, 0)
   if st != OK:
     let err = if L.tostring(-1).isNil: $st else: $L.tostring(-1)

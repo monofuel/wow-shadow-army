@@ -6,7 +6,7 @@
 --   cast_spell { spell, reason }
 --   hold { reason }
 --
--- Never: hop polylines, L/R thrash, one straight swim to merchant.
+-- Never: hop polylines, L/R thrash, one straight swim across the ocean.
 
 local M = {
   name = "traverse",
@@ -17,45 +17,6 @@ local TRAVEL_FORM_SPELL = 783
 local TRAVEL_FORM_ID = 3
 local AQUATIC_FORM_SPELL = 1066
 local AQUATIC_FORM_ID = 4
-
--- Defaults match lua/config/traverse_beats.json (sparse; wet legs stay seaward).
-local DEFAULT_BEATS = {
-  {
-    id = "land_approach",
-    x = -7100.0, y = -4600.0, z = 10.0,
-    radius = 80.0, mode = "land", require_wet = false,
-  },
-  {
-    id = "water_entry",
-    x = -6784.5, y = -4920.0, z = 0.7,
-    radius = 50.0, mode = "land", require_wet = false,
-  },
-  {
-    id = "wet_leg_a",
-    x = -6200.0, y = -4920.0, z = -8.0,
-    radius = 60.0, mode = "liquid_prefer", require_wet = true,
-  },
-  {
-    id = "wet_leg_b",
-    x = -5000.0, y = -4800.0, z = -10.0,
-    radius = 70.0, mode = "liquid_prefer", require_wet = true,
-  },
-  {
-    id = "wet_leg_c",
-    x = -3800.0, y = -4500.0, z = -12.0,
-    radius = 80.0, mode = "liquid_prefer", require_wet = true,
-  },
-  {
-    id = "wet_leg_d",
-    x = -2600.0, y = -4200.0, z = -12.0,
-    radius = 80.0, mode = "liquid_prefer", require_wet = true,
-  },
-  {
-    id = "merchant",
-    x = -1533.7, y = -4056.5, z = -12.3,
-    radius = 100.0, mode = "liquid_prefer", require_wet = true,
-  },
-}
 
 local function is_corpse(frame)
   local d = frame and frame.death
@@ -124,8 +85,8 @@ local function planar_dist(x0, y0, x1, y1)
   return math.sqrt(dx * dx + dy * dy)
 end
 
-local function navigate_to(beat, reason, map_id)
-  return {
+local function navigate_to(beat, reason, map_id, reference)
+  local intent = {
     kind = "navigate",
     map_id = map_id or 1,
     x = beat.x,
@@ -136,13 +97,15 @@ local function navigate_to(beat, reason, map_id)
     reason = reason or beat.id or "navigate",
     beat_id = beat.id,
   }
+  if reference then intent.route_reference = reference end
+  return intent
 end
 
 local function load_beats(args)
   if args and type(args.beats) == "table" and #args.beats > 0 then
     return args.beats
   end
-  return DEFAULT_BEATS
+  return nil
 end
 
 local function beat_by_id(beats, id)
@@ -176,6 +139,54 @@ local function next_wet_beat(beats, me_x, me_y)
   return wet[#wet]
 end
 
+local function route_reference(beats, me_x, me_y)
+  local wet = {}
+  for _, b in ipairs(beats) do
+    if b.require_wet or b.mode == "liquid_prefer" then
+      wet[#wet + 1] = b
+    end
+  end
+  if #wet == 0 then return nil end
+  if #wet == 1 then
+    return {
+      segment_index = 1,
+      cross_track_yards = planar_dist(me_x, me_y, wet[1].x, wet[1].y),
+      along_route_yards = 0.0,
+      total_route_yards = 0.0,
+    }
+  end
+
+  local best_dist2, best_along, best_segment = nil, 0.0, 1
+  local cumulative, total = 0.0, 0.0
+  for i = 1, #wet - 1 do
+    local a, b = wet[i], wet[i + 1]
+    local dx, dy = b.x - a.x, b.y - a.y
+    local len2 = dx * dx + dy * dy
+    local len = math.sqrt(len2)
+    local t = 0.0
+    if len2 > 0 then
+      t = ((me_x - a.x) * dx + (me_y - a.y) * dy) / len2
+      if t < 0 then t = 0 elseif t > 1 then t = 1 end
+    end
+    local qx, qy = a.x + t * dx, a.y + t * dy
+    local ex, ey = me_x - qx, me_y - qy
+    local dist2 = ex * ex + ey * ey
+    if best_dist2 == nil or dist2 < best_dist2 then
+      best_dist2 = dist2
+      best_along = cumulative + t * len
+      best_segment = i
+    end
+    cumulative = cumulative + len
+  end
+  total = cumulative
+  return {
+    segment_index = best_segment,
+    cross_track_yards = math.sqrt(best_dist2 or 0.0),
+    along_route_yards = best_along,
+    total_route_yards = total,
+  }
+end
+
 function M.decide(frame, args)
   args = args or {}
   local me = frame and frame.self_unit
@@ -195,15 +206,20 @@ function M.decide(frame, args)
   end
 
   local beats = load_beats(args)
+  if not beats then
+    return { kind = "hold", reason = "route_config_missing" }
+  end
   local land = beat_by_id(beats, "land_approach") or beats[1]
   local water = beat_by_id(beats, "water_entry") or beats[2] or land
-  local merch = beat_by_id(beats, "merchant") or beats[#beats]
+  local goal_id = args.goal_id or "duskwallow_coast"
+  local goal = beat_by_id(beats, goal_id) or beats[#beats]
   local map_id = me.map_id or 1
   local swimming = is_swimming(frame)
   local wading = is_wading(frame)
-  local merch_dist = planar_dist(me.x, me.y, merch.x, merch.y)
+  local goal_dist = planar_dist(me.x, me.y, goal.x, goal.y)
   local water_dist = planar_dist(me.x, me.y, water.x, water.y)
   local land_dist = planar_dist(me.x, me.y, land.x, land.y)
+  local reference = route_reference(beats, me.x, me.y)
 
   local phase = 0
   if type(frame.view_id) == "number" then
@@ -247,41 +263,47 @@ function M.decide(frame, args)
     end
   end
 
-  if swimming and merch_dist <= (merch.radius or 100.0) then
-    return { kind = "hold", reason = "merchant_coast" }
+  if swimming and goal_dist <= (goal.radius or 100.0) then
+    return {
+      kind = "hold",
+      reason = goal_id,
+      beat_id = goal.id,
+      route_reference = reference,
+    }
   end
 
-  -- Wet: next sparse open-water beat only (never single chord to merchant).
+  -- Wet: next manual-route beat only (never one ocean chord).
   if swimming then
     local wet = next_wet_beat(beats, me.x, me.y)
     if wet then
-      return navigate_to(wet, "swim_" .. (wet.id or "leg"), map_id)
+      return navigate_to(
+        wet, "swim_" .. (wet.id or "leg"), map_id, reference)
     end
-    return navigate_to(merch, "swim_merchant", map_id)
+    return navigate_to(goal, "swim_" .. goal_id, map_id, reference)
   end
 
 
   if wading then
-    local wet = beat_by_id(beats, "wet_leg_a") or next_wet_beat(beats, me.x, me.y)
+    local wet = next_wet_beat(beats, me.x, me.y)
     if wet then
-      return navigate_to(wet, "enter_water", map_id)
+      return navigate_to(wet, "enter_water", map_id, reference)
     end
   end
 
   if mid_coast then
-    -- Dry past entry: reenter via first wet leg (open water), not merchant.
-    local wet = beat_by_id(beats, "wet_leg_a") or next_wet_beat(beats, me.x, me.y)
+    -- Dry past entry: rejoin the next manual-route beat, never the first beat.
+    local wet = next_wet_beat(beats, me.x, me.y)
     if wet then
-      return navigate_to(wet, "reenter_water", map_id)
+      return navigate_to(wet, "reenter_water", map_id, reference)
     end
     return navigate_to(water, "reenter_water", map_id)
   end
 
   if water_dist <= ((water.radius or 50) + 25.0) then
     -- Into first wet open-water beat so we leave the beach.
-    local wet = beat_by_id(beats, "wet_leg_a")
+    local wet = next_wet_beat(beats, me.x, me.y)
     if wet then
-      return navigate_to(wet, "enter_water", map_id)
+      return navigate_to(wet, "enter_water", map_id, reference)
     end
     local into = {
       id = "enter_water",

@@ -38,7 +38,7 @@ suite "petrel embed":
     check intent{"kind"}.getStr == "cast_spell"
     check intent{"spell"}.getInt == 1066
 
-  test "swimming aquatic mid-ocean → navigate merchant":
+  test "swimming aquatic mid-ocean → navigate manual coast route":
     var view = parseJson(readFile(fixtures / "swimming.json"))
     view["player"]["shapeshift_form_id"] = %4
     view["player"]["shapeshift_form_spell_id"] = %1066
@@ -48,21 +48,28 @@ suite "petrel embed":
     let intent = globalDecide(proj, repo)
     check intent{"kind"}.getStr == "navigate"
     check intent{"mode"}.getStr == "liquid_prefer"
-    # Intermediate wet leg, not single merchant chord (pathfinding-plan).
+    # Intermediate manual beat, not one chord across the ocean.
     check intent{"reason"}.getStr.startsWith("swim_")
-    check intent{"x"}.getFloat > -5600.0 and intent{"x"}.getFloat < -3000.0
+    check intent{"x"}.getFloat > -5100.0 and intent{"x"}.getFloat < -4500.0
+    check intent{"route_reference"}{"total_route_yards"}.getFloat > 1500.0
 
-  test "wet near merchant → hold merchant_coast":
+  test "wet near Dustwallow → hold scoped endpoint":
     var view = parseJson(readFile(fixtures / "swimming.json"))
     view["player"]["shapeshift_form_id"] = %4
     view["player"]["shapeshift_form_spell_id"] = %1066
-    view["player"]["position"]["x"] = %(-1533.7 + 20.0)
-    view["player"]["position"]["y"] = %(-4056.5 - 20.0)
+    view["player"]["position"]["x"] = %(-4627.01 + 20.0)
+    view["player"]["position"]["y"] = %(-4869.45 - 20.0)
     view["player"]["swimming"] = %true
     let proj = projectClientView(view)
     let intent = globalDecide(proj, repo)
     check intent{"kind"}.getStr == "hold"
-    check intent{"reason"}.getStr == "merchant_coast"
+    check intent{"reason"}.getStr == "duskwallow_coast"
+
+  test "route config is loaded transactionally":
+    var route = parseJson(readFile(repo / "lua" / "config" / "traverse_beats.json"))
+    check route{"version"}.getInt == 3
+    check route{"goal_id"}.getStr == "duskwallow_coast"
+    check route{"beats"}.len >= 12
 
   test "decide path is not subprocess (no TRAVERSE_LUA_BRIDGE binary)":
     # Structural: decide.nim imports petrel/embed only.

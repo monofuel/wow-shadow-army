@@ -115,12 +115,17 @@ This instrumentation exposed and fixed several assumption-driven errors:
 
 ## Current behavior
 
-The bot can enter the water and acquire Aquatic Form, but its liquid navigation
-is currently a short-horizon local heading chooser. It usually selects the
-straight bearing toward the next beat. When the first cliff enters its local
-horizon, the invalid depth gate rejects the available water and the policy
-stops. It has no proven longer-horizon route, coastal boundary following, or
-backtracking around that obstruction.
+The invalid depth gate has been removed. Liquid navigation now follows sparse
+successive bends extracted from the complete human route, with short-horizon
+collision sampling around each next bend. Offline comparison shows the sparse
+centerline fits the human trace closely, but there is not yet a live automated
+water success, so this remains implemented but unproven behavior.
+
+Current untouched 10x runs are failing before the water segment on the Tanaris
+land approach. Their durable traces show rendered-floor/navmesh mismatches and
+terrain residency failures. An evidence-based attempt to split the land route
+at observed positions made progress worse and was reverted. These failures are
+prerequisites, not evidence for changing the liquid policy.
 
 Fatigue work farther north remains unproven, but it is not the first blocker.
 The first blocker is that the current policy cannot navigate around the coastal
@@ -128,16 +133,12 @@ cliff after `water_entry`.
 
 ## Next investigation
 
-1. Remove modeled depth as a permission gate for established ocean swimming;
-   keep it as telemetry.
-2. Re-prove the actual transition conditions from ClientView: liquid present,
-   swimming, Aquatic Form, physical collision, progress, and fatigue.
-3. Replace straight local steering with navigation that can route around the
-   first coastal cliff, then rerun the `water_entry` checkpoint.
-4. Reach Merchant Bay once without a severe anomaly, then investigate any
+1. Obtain the first live desert-coast → Dustwallow trace with the sparse manual
+   centerline and inspect only its earliest supported divergence.
+2. Reach Dustwallow once without a severe anomaly, then investigate any
    remaining route-specific failures.
-5. Run five consecutive clean checkpoint successes, followed by three clean
-   untouched Tanaris-start successes. Keep the checkboxes in
+3. Run five consecutive clean segment successes before extending the scope to
+   Merchant Bay. Keep the checkboxes in
    `traverse-2026-08-06.md` open until those artifacts exist.
 
 Relevant implementation and investigation contracts are documented in
