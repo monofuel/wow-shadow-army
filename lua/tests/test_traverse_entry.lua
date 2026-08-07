@@ -14,7 +14,7 @@ check(entry.name == "traverse", "name")
 check(type(entry.decide) == "function", "decide")
 
 local start_x, start_y = -9187.0, -2530.25
-local water_x, water_y = -6784.5, -4833.9
+local water_x, water_y = -6784.5, -4920.0
 local merch_x, merch_y = -1533.7, -4056.5
 local land_spells = { known = { 783, 1066 } }
 
@@ -57,6 +57,19 @@ check(r.reason == "enter_water" or r.reason == "water_entry", "enter water beat"
 
 r = entry.decide({
   self_unit = {
+    x = water_x + 40, y = water_y - 10, z = 0.2, map_id = 1,
+    shapeshift_form_id = 3, is_swimming = false,
+    liquid_coverage_known = true, liquid_known = true,
+    liquid_surface_z = 0.5, liquid_submerged = false,
+  },
+  death = {}, spells = land_spells, view_id = 2,
+})
+check(r.kind == "navigate", "wading navigate")
+check(r.reason == "enter_water", "wading stays on wet leg")
+check(r.mode == "liquid_prefer", "wading uses liquid corridor")
+
+r = entry.decide({
+  self_unit = {
     x = water_x + 500, y = water_y, z = 5.0, map_id = 1,
     shapeshift_form_id = 3, is_swimming = false,
   },
@@ -87,6 +100,38 @@ check(r.mode == "liquid_prefer", "liquid mode")
 -- Sparse wet legs first; merchant only when nearby (pathfinding-plan).
 check(r.reason:find("swim_", 1, true) == 1, "swim_* wet leg")
 check(r.x > -5500 and r.x <= merch_x + 50, "wet leg north of early coast")
+
+r = entry.decide({
+  self_unit = {
+    x = -6140, y = -4932, z = -3.4, map_id = 1,
+    shapeshift_form_id = 4, shapeshift_form_spell_id = 1066,
+    is_swimming = true,
+  },
+  death = {}, spells = land_spells, view_id = 11,
+})
+check(r.kind == "navigate", "past wet leg navigate")
+check(r.beat_id == "wet_leg_b", "northing hysteresis does not reselect wet leg a")
+
+r = entry.decide({
+  self_unit = {
+    x = -6175, y = -4872, z = -3.0, map_id = 1,
+    shapeshift_form_id = 4, shapeshift_form_spell_id = 1066,
+    is_swimming = true,
+  },
+  death = {}, spells = land_spells, view_id = 11,
+})
+check(r.beat_id == "wet_leg_b", "shoreline correction cannot reopen wet leg a")
+
+r = entry.decide({
+  self_unit = {
+    x = -6710.0, y = -4834.0, z = 0.3, map_id = 1,
+    shapeshift_form_id = 3, is_swimming = false,
+    liquid_coverage_known = true, liquid_known = false,
+  },
+  death = {}, spells = land_spells, view_id = 11,
+})
+check(r.reason == "reenter_water" and r.beat_id == "wet_leg_a",
+  "past entry shoreline stays committed to first wet leg")
 
 r = entry.decide({
   self_unit = {

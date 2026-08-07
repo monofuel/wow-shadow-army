@@ -22,7 +22,6 @@ when appType == "lib":
     lastBatch: string
     lastTrace: string
     lastReload: string
-    castSeq: int
 
   proc petrel_decide(viewJson: cstring; repoPath: cstring): cstring
       {.exportc, dynlib, cdecl.} =
@@ -40,7 +39,11 @@ when appType == "lib":
       })
     result = lastResult.cstring
 
-  proc petrel_lower_cast(viewJson: cstring; spell: cint): cstring
+  proc petrel_lower_cast(
+    viewJson: cstring;
+    spell: cint;
+    sequence: culonglong
+  ): cstring
       {.exportc, dynlib, cdecl.} =
     ## ClientView JSON + form spell → ClientInputBatch JSON (stance/chat/bar).
     ## Uses traverse lowerer form path proven for Aquatic/Travel.
@@ -52,8 +55,7 @@ when appType == "lib":
         "spell": spell.int,
         "reason": "aquatic_form"
       }
-      inc castSeq
-      let batch = lowerIntent(view, intent, castSeq)
+      let batch = lowerIntent(view, intent, sequence.int)
       lastBatch = $batch
     except CatchableError as e:
       lastBatch = $(%*{

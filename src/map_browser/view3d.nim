@@ -1,76 +1,8 @@
-## Bird's-eye 3D zone view focus math (GL entry: src/tools/map_browser_3d.nim).
+## Fork player-asset linkage + client data resolution for the map viewer.
 
 import
-  std/[math, os, strformat, strutils],
-  vmath,
-  environment/client/common,
-  environment/client/world_catalogs/model,
-  environment/client/world_catalogs/world_map,
-  map_browser/[assets, surface]
-
-type
-  BirdseyeFocus* = object
-    mapId*: uint32
-    x*, y*, z*: float32
-    overhead*: float32
-    label*: string
-    fileName*: string
-
-proc zoneWorldSpan*(area: WorldMapAreaBounds): tuple[spanX, spanY, half: float32]
-    {.raises: [].} =
-  ## WorldMapArea is axis-aligned in world X/Y (see worldMapAreaLocation).
-  let
-    spanX = abs(area.bottom - area.top)
-    spanY = abs(area.right - area.left)
-  (spanX, spanY, max(spanX, spanY) * 0.5'f32)
-
-proc birdseyeOverhead*(halfExtent: float32): float32 {.raises: [].} =
-  ## Height so the zone roughly fills a bird's-eye frustum (pitch ≈ -75°).
-  clamp(halfExtent * 1.25'f32, 280.0'f32, 4200.0'f32)
-
-proc birdseyeFocusForArea*(
-  area: WorldMapAreaBounds;
-  label = "";
-  fileName = ""
-): BirdseyeFocus {.raises: [].} =
-  let
-    center = area.worldMapAreaLocation(vec2(0.5'f32, 0.5'f32), 0.0'f32)
-    span = area.zoneWorldSpan()
-  result = BirdseyeFocus(
-    mapId: uint32(area.mapId),
-    x: center.position.x,
-    y: center.position.y,
-    z: center.position.z,
-    overhead: birdseyeOverhead(span.half),
-    label:
-      if label.len > 0: label
-      elif area.name.len > 0: area.name
-      else: area.fileName,
-    fileName:
-      if fileName.len > 0: fileName
-      else: area.fileName
-  )
-
-proc birdseyeFocus*(state: SurfaceState): BirdseyeFocus {.raises: [].} =
-  ## Focus for the current zone (or continent) surface.
-  if state.surface.found:
-    birdseyeFocusForArea(state.surface.area, state.label, state.fileName)
-  else:
-    BirdseyeFocus(
-      label: state.label,
-      fileName: state.fileName,
-      overhead: 800.0'f32
-    )
-
-proc birdseyeCliArgs*(focus: BirdseyeFocus): seq[string] {.raises: [].} =
-  @[
-    &"--map:{focus.mapId}",
-    &"--x:{focus.x}",
-    &"--y:{focus.y}",
-    &"--z:{focus.z}",
-    &"--overhead:{focus.overhead}",
-    &"--label:{focus.label}"
-  ]
+  std/[os, strutils],
+  map_browser/assets
 
 proc linkIfMissing(linkPath, targetPath, label: string): bool {.raises: [].} =
   ## Create a symlink when missing; succeed if already present and usable.

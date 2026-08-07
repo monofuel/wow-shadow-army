@@ -27,7 +27,7 @@ local DEFAULT_BEATS = {
   },
   {
     id = "water_entry",
-    x = -6784.5, y = -4833.9, z = 0.7,
+    x = -6784.5, y = -4920.0, z = 0.7,
     radius = 50.0, mode = "land", require_wet = false,
   },
   {
@@ -91,6 +91,18 @@ local function is_swimming(frame)
   return me and me.is_swimming == true
 end
 
+local function is_wading(frame)
+  local me = frame and frame.self_unit
+  if not me or me.liquid_coverage_known ~= true or me.liquid_known ~= true then
+    return false
+  end
+  if me.liquid_submerged == true then return true end
+  if type(me.liquid_surface_z) ~= "number" or type(me.z) ~= "number" then
+    return false
+  end
+  return math.abs(me.liquid_surface_z - me.z) <= 3.0
+end
+
 local function in_travel_form(frame)
   local me = frame and frame.self_unit
   if not me then return false end
@@ -151,7 +163,10 @@ local function next_wet_beat(beats, me_x, me_y)
   if #wet == 0 then return nil end
   for _, b in ipairs(wet) do
     local r = b.radius or 60.0
-    if planar_dist(me_x, me_y, b.x, b.y) > r then
+    -- Stateless northing hysteresis: after crossing well into a beat's
+    -- acceptance band, lateral drift must not select that beat again.
+    local passed_northing = me_x >= (b.x + 20.0)
+    if not passed_northing and planar_dist(me_x, me_y, b.x, b.y) > r then
       -- Prefer beats still north of us (Kalimdor +X north) so we don't regress.
       if b.x + r >= me_x - 40.0 then
         return b
@@ -185,6 +200,7 @@ function M.decide(frame, args)
   local merch = beat_by_id(beats, "merchant") or beats[#beats]
   local map_id = me.map_id or 1
   local swimming = is_swimming(frame)
+  local wading = is_wading(frame)
   local merch_dist = planar_dist(me.x, me.y, merch.x, merch.y)
   local water_dist = planar_dist(me.x, me.y, water.x, water.y)
   local land_dist = planar_dist(me.x, me.y, land.x, land.y)
@@ -195,7 +211,10 @@ function M.decide(frame, args)
   end
 
   local near_water = water_dist <= ((water.radius or 50) + 120.0)
-  local mid_coast = me.x > (water.x + 80.0)
+  -- Once north of the entry beat's acceptance band, never retarget the beach.
+  -- The previous +80 boundary sat exactly on the observed shoreline and made
+  -- adjacent frames alternate between water_entry and the first wet leg.
+  local mid_coast = me.x > (water.x + 40.0)
 
   if swimming then
     if not in_aquatic_form(frame) then
@@ -239,6 +258,14 @@ function M.decide(frame, args)
       return navigate_to(wet, "swim_" .. (wet.id or "leg"), map_id)
     end
     return navigate_to(merch, "swim_merchant", map_id)
+  end
+
+
+  if wading then
+    local wet = beat_by_id(beats, "wet_leg_a") or next_wet_beat(beats, me.x, me.y)
+    if wet then
+      return navigate_to(wet, "enter_water", map_id)
+    end
   end
 
   if mid_coast then

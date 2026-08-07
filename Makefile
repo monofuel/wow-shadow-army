@@ -46,7 +46,7 @@ COMPOSE_FILE := infra/compose.vmangos.yml
 ACCOUNT_USER := monofuel
 ACCOUNT_PASS := password
 
-.PHONY: test test-lua test-nim system pin-check start-server stop-server server-logging logs account soap-account play play-classic play-classic-netlog play-xr traverse traverse-pol traverse-desert traverse-field traverse-replay traverse-pack-replay traverse-headed traverse-checkpoints army-debug-status army-debug-reload army-debug-hold army-debug-resume escort escort-army grind quest-data warlock-account warlock-bot botwarrior-bot tusk-account tusk-bot beru-account beru-bot party-army navmesh-helper navmesh-status map-browser map-browser-once map-browser-3d
+.PHONY: test test-lua test-nim system pin-check start-server stop-server server-logging logs account soap-account play play-classic play-classic-netlog play-xr traverse traverse-pol traverse-desert traverse-field traverse-replay traverse-pack-replay traverse-headed traverse-checkpoints army-debug-status army-debug-reload army-debug-hold army-debug-resume escort escort-army grind quest-data warlock-account warlock-bot botwarrior-bot tusk-account tusk-bot beru-account beru-bot party-army navmesh-helper navmesh-status map-browser map-browser-once map-browser-debug map-browser-probe
 
 # Unit tier: Lua tools + Nim host/system tests only (v2 DoD: no Python required
 # for bot correctness). If nim is missing, test-nim-soft skips rather than
@@ -165,6 +165,23 @@ map-browser:
 map-browser-once:
 	VANILLA_WOW_EXTRACTED_DATA_DIR="$(VANILLA_WOW_EXTRACTED_DATA_DIR)" \
 		MAP_BROWSER_ONCE=1 \
+		nix develop --command nim r src/tools/map_browser.nim
+
+# Debug run: per-second [mb-debug] lines + stats JSON for agents.
+map-browser-debug:
+	VANILLA_WOW_EXTRACTED_DATA_DIR="$(VANILLA_WOW_EXTRACTED_DATA_DIR)" \
+	VANILLA_WOW_CLIENT_DATA_DIR="$${VANILLA_WOW_CLIENT_DATA_DIR:-$(CLASSIC_CLIENT)}" \
+		MAP_BROWSER_DEBUG=1 \
+		MAP_BROWSER_STATS=local_data/map_browser_stats.json \
+		nix develop --command nim r src/tools/map_browser.nim
+
+# Autopilot probe: drill a zone, stream, screenshot + stats, exit nonzero on
+# failure. Override with MAP_BROWSER_AUTO="zone=...,seconds=...,screenshot=...".
+map-browser-probe:
+	VANILLA_WOW_EXTRACTED_DATA_DIR="$(VANILLA_WOW_EXTRACTED_DATA_DIR)" \
+	VANILLA_WOW_CLIENT_DATA_DIR="$${VANILLA_WOW_CLIENT_DATA_DIR:-$(CLASSIC_CLIENT)}" \
+		MAP_BROWSER_DEBUG=1 \
+		MAP_BROWSER_AUTO="$${MAP_BROWSER_AUTO:-zone=Durotar,seconds=10,screenshot=local_data/map_browser_probe.png}" \
 		nix develop --command nim r src/tools/map_browser.nim
 
 # Pin-drift only: HEAD of ../coworld-vanilla-wow must match upstream.lock.

@@ -1,6 +1,7 @@
 # Embed Lua into the Nim client (Petrel pathing plan)
 
-**Status:** implemented — in-process libpetrel + RPB nav feet (2026-08-06)  
+**Status:** embedding implemented; land uses RPB navigation, liquid pathfinding
+is not implemented (corrected 2026-08-07)  
 **Decision bias:** in-process Lua for **strategy**; Nim / RealPlayerBot stack for
 **navigation and keys**.  
 **Supersedes for feet:** the per-tick `TRAVERSE_LUA_BRIDGE` process-spawn hack
@@ -136,7 +137,10 @@ For Petrel: Lua does not press movement keys for pathing; it sets **intent**
   - `navigate { x, y, z?, map_id, stop_distance, mode = "land"|"liquid_prefer" }`
   - `cast_form { spell = 783|1066 }`
   - `hold { reason }`
-- [x] Nim maps `navigate` → `prepareRouteTo` / `advanceRouteTo` (or equivalent RPB entry) with **RealPlayerBotPolicy** state owned by the pilot  
+- [x] Nim owns `navigate` state in **RealPlayerBotPolicy** and uses
+  `advanceRouteTo` for land  
+- [ ] Route liquid intents through real navigation; the current custom
+  `appendSteering` corridor is only local steering  
 - [x] Forms: lower via existing bar/spellbook patterns (not Lua key simulation for movement)  
 - [x] Prove: land hop to water-entry **beat** without beaching on straight-line chord
 
@@ -148,8 +152,12 @@ For Petrel: Lua does not press movement keys for pathing; it sets **intent**
 
 ### Phase 4 — Wet / coast
 
-- [x] Use RPB liquid route / swim pitch path while swimming (upstream already owns this)  
-- [x] Prove wet merchant (or current week’s end beat) without land-cut victory if rules require wet  
+- [x] Expose client-owned liquid/collision observations while swimming  
+- [ ] Implement real liquid route planning around coastal terrain
+  - current RPB liquid lowering is a short-horizon heading chooser, not proven
+    pathfinding
+  - modeled seafloor depth is telemetry, not a swimmability gate
+- [ ] Prove wet merchant (or current week’s end beat) without land-cut victory if rules require wet  
 
 ### Phase 5 — Multi-comp reuse
 

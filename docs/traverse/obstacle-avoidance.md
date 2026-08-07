@@ -136,7 +136,8 @@ new tests belong on “next waypoint given mesh” and stuck recovery.
 - In-process bridge: can we call client navmesh from the bridge process, or only
   from inside the player (hook next to `TRAVERSE_LUA_BRIDGE`)?
 - Hosted image: same hook must see nav tiles / navigation service as RPB.
-- Swim legs: liquid route is a separate RPB path — land avoidance first.
+- Swim legs remain a gap: the current custom liquid steering is not an RPB
+  route and cannot plan around the first coastal cliff.
 
 ---
 

@@ -104,17 +104,20 @@ proc projectClientView*(view: JsonNode): JsonNode =
     selfUnit["breath_timer_active"] = %jbool(jget(player, "breath_timer_active"))
     selfUnit["breath_remaining_fraction"] = %jnum(jget(player, "breath_remaining_fraction"), 1.0)
     selfUnit["liquid_submerged"] = %jbool(jget(player, "liquid_submerged"))
+    selfUnit["liquid_coverage_known"] = %jbool(
+      jget(player, "liquid_coverage_known"))
+    selfUnit["liquid_known"] = %jbool(jget(player, "liquid_known"))
+    selfUnit["liquid_surface_z"] = %jnum(jget(player, "liquid_surface_z"))
   result["self_unit"] = selfUnit
 
-  # Fatigue is not a first-class ClientView field in current projection; policy
-  # uses coast-geometry bias instead. Expose placeholder when present later.
   var env = newJObject()
   if not player.isNil and player.kind == JObject:
-    if player.hasKey("fatigue_fraction"):
-      env["fatigue_fraction"] = %jnum(jget(player, "fatigue_fraction"))
-      env["fatigue_known"] = %true
-    else:
-      env["fatigue_known"] = %false
+    env["fatigue_active"] = %jbool(jget(player, "fatigue_timer_active"))
+    env["fatigue_remaining_fraction"] = %jnum(
+      jget(player, "fatigue_remaining_fraction"), 1.0)
+    env["fatigue_known"] = %true
+  else:
+    env["fatigue_known"] = %false
   result["environment"] = env
 
   var combat = newJObject()

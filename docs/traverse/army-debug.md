@@ -25,10 +25,22 @@ Each run contains:
   simulation-time pre-window, a 5-second post-window, and `frame.png` when capture
   succeeds
 - `run-summary.json`: exit code, final status, and anomaly count
+- `campaign-summary.json`: continuously updated Merchant Bay result with
+  furthest northing, beats reached, merchant distance, input rejections,
+  water/form transitions, fatigue exposure, turn reversals, unavailable time,
+  death, anomaly, and success state
 
 Breath and fatigue are represented as `active`, `remaining_fraction`, and
-`source`. An absent timer is explicitly recorded as assumed full, not observed.
+`source`. Fatigue is the typed ClientView projection of stock mirror-timer type
+0. An absent timer is explicitly recorded as assumed full, not observed.
 Water and form fields carry their corresponding `*_known` evidence.
+
+Modeled seafloor depth is diagnostic telemetry only. It must not be interpreted
+as proof that ocean water is unswimmable or used as a minimum-depth navigation
+gate. Swimmability and form retention come from live ClientView observations;
+physical obstruction comes from authoritative collision evidence. The invalid
+depth-gate incident is documented in
+[merchant-bay-progress-2026-08-07.md](merchant-bay-progress-2026-08-07.md).
 
 ## Automatic anomaly capture
 

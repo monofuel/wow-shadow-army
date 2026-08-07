@@ -25,6 +25,15 @@ suite "projectClientView":
     let p = projectClientView(view)
     check jbool(jget(jget(p, "self_unit"), "is_swimming")) == true
 
+  test "typed fatigue projection":
+    var view = parseJson(readFile(fixtures / "swimming.json"))
+    view["player"]["fatigue_timer_active"] = %true
+    view["player"]["fatigue_remaining_fraction"] = %0.42
+    let environment = projectClientView(view){"environment"}
+    check environment{"fatigue_known"}.getBool
+    check environment{"fatigue_active"}.getBool
+    check abs(environment{"fatigue_remaining_fraction"}.getFloat - 0.42) < 0.001
+
 suite "lowerIntent":
   test "cast_spell batch is well-formed for travel form":
     let view = parseJson(readFile(fixtures / "tanaris_land.json"))
@@ -32,6 +41,7 @@ suite "lowerIntent":
     let batch = lowerIntent(view, intent, 1)
     check jstr(jget(batch, "type")) == "client_input_batch"
     check jint(jget(batch, "expected_view_id")) == 42
+    check jint(jget(batch, "sequence")) == 1
     let events = jget(batch, "events")
     check events.kind == JArray
     # Fixture may lack stance-bar icons; empty events is ok for bare land fixture.

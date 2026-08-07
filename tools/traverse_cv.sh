@@ -221,6 +221,7 @@ if [[ -n "$CHECKPOINT_NAME" && -f "$ROOT/tools/traverse_checkpoint.py" ]]; then
   (
     export PYTHONUNBUFFERED=1
     python3 -u "$ROOT/tools/traverse_checkpoint.py" apply "$CHECKPOINT_NAME" \
+      --status "$STATUS_JSON" \
       --timeout "${TRAVERSE_CHECKPOINT_TIMEOUT:-480}" \
       --near "${TRAVERSE_CHECKPOINT_NEAR:-150}" \
       >>"$LOG" 2>&1 || echo "[traverse-cv] CHECKPOINT apply failed (see log)" >>"$LOG"
