@@ -65,13 +65,18 @@ Our tools need to be fast and robust. we only have a week for each coworld compe
   path that a stranger client on the live realm cannot take. When something
   is hard or stuck, **document the gap** and fix the real pipeline — do not
   paper over it with admin power.
-- **NO TELEPORT unless monofuel directly orders it.** Do not SOAP/GM/DB
-  teleport bots or the human player (Murist or any other seat), including
-  “just recovery,” “just setup,” mass army teles, or `UPDATE characters`
-  position writes. Stuck pathing, skybox glitches, wrong zones — fix code,
-  restart seats, or ask. **Only** tele when he explicitly says to tele
-  (named character(s) and destination). Same for summon/appear/goname and
-  equivalent.
+- **NO TELEPORT FOR MURIST unless monofuel directly orders it.** Do not
+  SOAP/GM/DB teleport the human player Murist, including “just recovery” or
+  “just setup,” and do not use summon/appear/goname or equivalent position
+  control on him. **Only** tele Murist when monofuel explicitly names him and
+  the destination.
+- **Scenario bots may use checkpoint teleports for local test setup.** Agents
+  may automatically position disposable scenario/test bots (for example
+  Northbound in Traverse) at named checkpoints to isolate and iterate on a
+  segment. A checkpointed run proves only that segment: never count it as an
+  untouched end-to-end run or tournament progress, and never use teleports to
+  bypass gameplay in a claimed progress result. This exception does not permit
+  GM level/XP/gold/items, quest completion, loot, or other progress cheats.
 - **FAIR PLAY — NO COLLUSION.** Seats play as strangers. In-party
   cooperation is legitimate ONLY through the game's own typed contracts
   (party membership, `VANILLA_WOW_RFC_ASSIGNMENT`) and live observations.
@@ -85,10 +90,11 @@ Our tools need to be fast and robust. we only have a week for each coworld compe
   and tell monofuel — he decides whether to report it.
 - **Respect the client/bot boundary.** Our layer sees typed frames and
   sends typed goals/actions. No database pokes for progress, no GM-command
-  gameplay, no memory reads. Local GM for **observation / testing setup**
-  is narrow: e.g. account create, server logs — **not** position control.
-  Never for levels, XP, quest completion, loot, or tele (see **NO TELEPORT**
-  above). When in doubt, do not use GM.
+  gameplay, no memory reads. Local GM for **observation / testing setup** is
+  narrow: e.g. account creation, server logs, and scenario-bot checkpoint
+  positioning under the rule above. Never use it for Murist position control
+  without his explicit order, or for levels, XP, quest completion, loot, or
+  claimed progress. When in doubt, do not use GM.
 - **Tests stay green and instant.** `make test` before every commit; unit
   tier has no network, no docker, no sleeps (testing doctrine:
   racha_notes `Programming/testing.md`). Integration tier may use the
