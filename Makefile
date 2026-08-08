@@ -21,6 +21,14 @@ UPSTREAM := $(abspath ../coworld-vanilla-wow)
 # Vendored NixOS client library env (from coworld-playbook/tools/wow_env.sh).
 WOW_ENV := $(CURDIR)/tools/wow_env.sh
 
+# Our fork of the client: hosts the lua-bot identity that runs lua/entry/*.lua.
+FORK_CLIENT := $(abspath ../monofuel-vanilla-wow)
+# Lua entry module driven by the accelerated targets.
+ENTRY ?= accelerated
+LUA_BOT_LAUNCH = nix develop $(FORK_CLIENT) --command \
+	nim r tools/launch_nim_player.nim -- --league=accelerated \
+	--bot=lua-bot --lua-repo=$(CURDIR) --lua-entry=$(ENTRY)
+
 # Local realm operator inputs (paths relative to UPSTREAM).
 export VANILLA_WOW_EXTRACTED_DATA_DIR := $(UPSTREAM)/local_data/vmangos-5875-data
 export VMANGOS_MYSQL_DUMPS_DIR := $(UPSTREAM)/local_data/vmangos-db/mysql-dump
@@ -268,6 +276,19 @@ env-host-status:
 
 # Nim army host (no Python decide loop). Binary: tools/army_host
 # --threads:on required for local debug admin (mummy HTTP+WS).
+.PHONY: accelerated accelerated-pol accelerated-headed
+# Headless accelerated run of the lua-bot (ENTRY=<module>, default accelerated).
+accelerated:
+	@cd $(FORK_CLIENT) && $(LUA_BOT_LAUNCH) --presentation=headless
+
+# Bounded proof-of-life receipt for the lua-bot: the league admission gate.
+accelerated-pol:
+	@cd $(FORK_CLIENT) && $(LUA_BOT_LAUNCH) --proof-of-life
+
+# Watch the lua-bot play (opens a window; run only when asked).
+accelerated-headed:
+	@cd $(FORK_CLIENT) && $(LUA_BOT_LAUNCH) --presentation=headed
+
 .PHONY: army-host army-host-build escort-army-nim grind-army-nim escort escort-army \
 	army-debug-status army-debug-reload army-debug-hold army-debug-resume
 army-host-build:
