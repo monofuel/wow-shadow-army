@@ -5,7 +5,7 @@
 #   systemctl --user status wow-system
 #   journalctl --user -u wow-system -f
 #
-# Runs from the local Documents checkout (high-steel workspace).
+# Runs from the wow-coworld monorepo checkout (~/src/wow-coworld).
 # Deploy = edit this repo, `systemctl --user restart wow-system`
 # (`nim r` recompiles on every start). Works with the realm up or down; realm
 # lifecycle goes through the dashboard.
@@ -17,8 +17,9 @@ StartLimitIntervalSec=60
 
 [Service]
 Type=simple
-WorkingDirectory=/home/monofuel/Documents/Projects/Softmax/wow-shadow-army
-ExecStart=/home/monofuel/Documents/Projects/Softmax/wow-shadow-army/tools/run_system.sh
+WorkingDirectory=/home/monofuel/src/wow-coworld/wow-shadow-army
+ExecStart=/home/monofuel/src/wow-coworld/wow-shadow-army/tools/run_system.sh
+Environment=SYSTEM_UPSTREAM_DIR=/home/monofuel/src/wow-coworld/monofuel-vanilla-wow
 Restart=always
 RestartSec=15
 Environment=PATH=/home/monofuel/bin:/etc/profiles/per-user/monofuel/bin:/run/wrappers/bin:/nix/var/nix/profiles/default/bin:/run/current-system/sw/bin
