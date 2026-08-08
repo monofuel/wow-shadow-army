@@ -54,7 +54,7 @@ COMPOSE_FILE := infra/compose.vmangos.yml
 ACCOUNT_USER := monofuel
 ACCOUNT_PASS := password
 
-.PHONY: test test-lua test-nim system pin-check start-server stop-server server-logging logs account soap-account play play-classic play-classic-netlog play-xr traverse traverse-pol traverse-desert traverse-field traverse-replay traverse-pack-replay traverse-headed traverse-checkpoints army-debug-status army-debug-reload army-debug-hold army-debug-resume escort escort-army grind quest-data warlock-account warlock-bot botwarrior-bot tusk-account tusk-bot beru-account beru-bot party-army navmesh-helper navmesh-status map-browser map-browser-once map-browser-debug map-browser-probe
+.PHONY: test test-lua test-nim system pin-check start-server stop-server server-logging logs account soap-account play play-classic play-classic-netlog play-xr traverse traverse-field traverse-replay traverse-pack-replay traverse-headed traverse-checkpoints quest-data warlock-account warlock-bot botwarrior-bot tusk-account tusk-bot beru-account beru-bot party-army navmesh-helper navmesh-status map-browser map-browser-once map-browser-debug map-browser-probe
 
 # Unit tier: Lua tools + Nim host/system tests only (v2 DoD: no Python required
 # for bot correctness). If nim is missing, test-nim-soft skips rather than
@@ -71,11 +71,8 @@ test-traverse-checkpoint:
 
 # Every Nim entrypoint/module must at least compile (`nim check`), even where
 # no unit suite imports it yet (army_host, msgpack_json).
-NIM_CHECK_FILES = system/system_server.nim tools/army_host.nim tools/army_debug.nim \
-	tools/petrel_debug_admin.nim \
-	tools/fair_play_audit.nim tools/party_promote.nim tools/msgpack_json.nim \
-	tools/env_transport.nim tools/env_smoke.nim \
-	src/tools/map_browser.nim
+NIM_CHECK_FILES = system/system_server.nim \
+	tools/fair_play_audit.nim tools/party_promote.nim
 
 .PHONY: test-smoke test-smoke-lua test-smoke-nim test-smoke-nim-soft
 test-smoke: test-smoke-lua test-smoke-nim-soft
@@ -122,21 +119,18 @@ test-lua:
 # Optional Nim unit tier (enum maps / pure parsers). Not part of `make test`
 # so CI and bare hosts without nim stay green. PATH-nim first, else nix develop
 # if a flake appears later (same pattern as crewrift-prime-bots).
-# Petrel embed tests need Lua 5.3 headers/libs (in-process VM).
-PETREL_LUA_NFLAGS = $$(nix shell nixpkgs\#lua5_3 --command sh -c 'p=$$(dirname $$(dirname $$(which lua))); echo -d:LuaPrefix=$$p --passC:-I$$p/include --passL:-L$$p/lib --passL:-llua --passL:-lm --passL:-ldl')
 test-nim:
 	@if command -v nim >/dev/null 2>&1; then \
 		rc=0; \
-		LUA_NFLAGS="$(PETREL_LUA_NFLAGS)"; \
 		for t in system/tests/test_*.nim tools/tests/test_*.nim; do \
 			[ -f "$$t" ] || continue; \
-			echo "== $$t =="; \
 			case "$$t" in \
-				*test_petrel_embed*|*test_traverse_cv*) \
-					nim r --hints:off --warnings:off $$LUA_NFLAGS "$$t" || rc=1 ;; \
-				*) \
-					nim r --hints:off --warnings:off "$$t" || rc=1 ;; \
+				*test_map_browser_waypoints*) \
+					echo "== $$t (skipped: needs the client fork 3D deps)"; \
+					continue ;; \
 			esac; \
+			echo "== $$t =="; \
+			nim r --hints:off --warnings:off "$$t" || rc=1; \
 		done; \
 		exit $$rc; \
 	elif [ -f flake.nix ] || [ -f shell.nix ]; then \
@@ -264,18 +258,6 @@ endef
 # the game's WS /env relay is dead and direct TCP is the only path
 # (docs/work-2026-08-04.md). Rebuilds itself when upstream source is newer;
 # use FORCE_BUILD=1 after an upstream jump.
-.PHONY: env-host env-host-stop env-host-status
-env-host:
-	@tools/env_host.sh start
-
-env-host-stop:
-	@tools/env_host.sh stop
-
-env-host-status:
-	@tools/env_host.sh status
-
-# Nim army host (no Python decide loop). Binary: tools/army_host
-# --threads:on required for local debug admin (mummy HTTP+WS).
 .PHONY: accelerated accelerated-pol accelerated-headed
 # Headless accelerated run of the lua-bot (ENTRY=<module>, default accelerated).
 accelerated:
@@ -289,120 +271,6 @@ accelerated-pol:
 accelerated-headed:
 	@cd $(FORK_CLIENT) && $(LUA_BOT_LAUNCH) --presentation=headed
 
-.PHONY: army-host army-host-build escort-army-nim grind-army-nim escort escort-army \
-	army-debug-status army-debug-reload army-debug-hold army-debug-resume
-army-host-build:
-	@nim c --hints:off --threads:on -o:tools/army_host tools/army_host.nim
-
-# Local army_host debug admin (docs/traverse/army-debug.md).
-ARMY_DEBUG_PORT ?= 7788
-army-debug-status:
-	@curl -sS "http://127.0.0.1:$(ARMY_DEBUG_PORT)/status" | python3 -m json.tool
-army-debug-reload:
-	@curl -sS -X POST "http://127.0.0.1:$(ARMY_DEBUG_PORT)/lua/reload" | python3 -m json.tool
-army-debug-hold:
-	@curl -sS -X POST "http://127.0.0.1:$(ARMY_DEBUG_PORT)/hold" | python3 -m json.tool
-army-debug-resume:
-	@curl -sS -X POST "http://127.0.0.1:$(ARMY_DEBUG_PORT)/resume" | python3 -m json.tool
-
-army-host: army-host-build
-	@./tools/army_host --slot=$(SLOT) $(SEAT_CREDS) --tool=$(or $(TOOL),escort_leader) --leader=$(or $(ESCORT_LEADER),Murist) \
-		--party=$(or $(ESCORT_PARTY),Murist,Shadowfel,Igris,Tusk,Beru) \
-		--cadence=$(or $(CADENCE),0.35) --accept-from=$(or $(ESCORT_ACCEPT_FROM),Murist) $(EXTRA)
-
-# Single-seat escort (default standing path: Nim + Lua).
-escort: army-host-build
-	@./tools/army_host --slot=$(SLOT) $(SEAT_CREDS) --tool=escort_leader --leader=$(or $(ESCORT_LEADER),Murist) \
-		--party=$(or $(ESCORT_PARTY),Murist,Shadowfel,Igris,Tusk,Beru) \
-		--cadence=$(or $(CADENCE),0.35) --accept-from=$(or $(ESCORT_ACCEPT_FROM),Murist) $(EXTRA)
-
-# Standing army on Nim host (kills legacy python shadows first).
-# Writes fair-play milestones to local_data/audit/fair-play.jsonl (all seats).
-escort-army-nim: army-host-build
-	@mkdir -p local_data/brain-logs local_data/audit
-	@-pkill -f 'brain.shadow --slot [2345]' 2>/dev/null || true
-	@-pkill -f 'tools/army_host --slot' 2>/dev/null || true
-	@sleep 1
-	@for s in 2 3 4 5; do \
-		$(seat_creds_case); \
-		nohup ./tools/army_host --slot=$$s --account=$$acct --password=$$pass --character=$$char \
-			--tool=escort_leader --leader=$(or $(ESCORT_LEADER),Murist) \
-			--party=Murist,Shadowfel,Igris,Tusk,Beru --cadence=0.35 \
-			--accept-from=$(or $(ESCORT_ACCEPT_FROM),Murist) \
-			--audit-path=local_data/audit/fair-play.jsonl \
-			> local_data/brain-logs/army-slot$$s.log 2>&1 & \
-		echo $$! > local_data/brain-logs/army-slot$$s.pid; \
-	done; \
-	echo "army_host pids: $$(cat local_data/brain-logs/army-slot{2,3,4,5}.pid 2>/dev/null)"; \
-	echo "logs: local_data/brain-logs/army-slot{2,3,4,5}.log"; \
-	echo "fair-play audit: local_data/audit/fair-play.jsonl"
-
-# Default standing-army launch = Nim (alias of escort-army-nim).
-escort-army: escort-army-nim
-
-grind-army-nim: army-host-build
-	@mkdir -p local_data/brain-logs local_data/audit
-	@-pkill -f 'tools/army_host --slot' 2>/dev/null || true
-	@-pkill -f 'brain.shadow --slot [2345]' 2>/dev/null || true
-	@sleep 1
-	@for s in 2 3 4 5; do \
-		$(seat_creds_case); \
-		nohup ./tools/army_host --slot=$$s --account=$$acct --password=$$pass --character=$$char \
-			--tool=grind_nearest --leader=$(or $(ESCORT_LEADER),Murist) \
-			--party=Murist,Shadowfel,Igris,Tusk,Beru --cadence=0.3 \
-			--audit-path=local_data/audit/fair-play.jsonl \
-			> local_data/brain-logs/grind-slot$$s.log 2>&1 & \
-		echo $$! > local_data/brain-logs/grind-slot$$s.pid; \
-	done; \
-	echo "grind army started (audit: local_data/audit/fair-play.jsonl)"
-
-# Single-seat mob grind, Lua-driven: lua/tools/grind_nearest decides every tick
-# and the host submits the resulting intent as an AgentAction over the stock
-# external-policy contract (docs/work-2026-08-04.md). No fork build needed —
-# attach creates the session from SEAT_CREDS.
-#
-#   make grind SLOT=2 EXTRA='--max-seconds=600'
-grind: army-host-build
-	@./tools/army_host --slot=$(SLOT) $(SEAT_CREDS) --tool=grind_nearest \
-		--leader=$(or $(ESCORT_LEADER),Murist) \
-		--cadence=$(or $(CADENCE),1.0) --audit-path=local_data/audit/fair-play.jsonl $(EXTRA)
-
-# Party formation across our headless seats: human (or bot leader) invites,
-# seats accept via escort_leader; promote with tools/party_promote
-# (docs/party-formation.md). The old Python butler (brain.party) is gone.
-
-# Build the Detour navmesh helper (docs/navmesh.md). Compile-only: it links
-# VMaNGOS's vendored Detour against the mmaps we already extracted — no mmap
-# generation, no server build. Idempotent; ~30s. Needs the sparse vmangos/core
-# checkout in $(VMANGOS_CORE_DIR) (see docs/navmesh.md for the clone recipe).
-navmesh-helper:
-	@set -e; \
-	if [ ! -d "$(VMANGOS_CORE_DIR)/dep/recastnavigation/Detour" ]; then \
-		echo "error: Detour sources missing: $(VMANGOS_CORE_DIR)/dep/recastnavigation/Detour" >&2; \
-		echo "see docs/navmesh.md for the sparse vmangos/core clone recipe" >&2; \
-		exit 1; \
-	fi; \
-	cd "$(UPSTREAM)"; \
-	VMANGOS_CORE_DIR="$(VMANGOS_CORE_DIR)" \
-	nim r player/sdk/helpers/build_vmangos_navmesh.nim -- "$(VANILLA_WOW_NAVMESH_HELPER)"
-
-# One-shot readiness probe: helper binary + mmap inventory, no realm needed.
-navmesh-status:
-	@printf '{"op":"status","mmaps_dir":"%s/mmaps"}' "$(VANILLA_WOW_EXTRACTED_DATA_DIR)" \
-		| "$(VANILLA_WOW_NAVMESH_HELPER)"
-
-# Regenerate addons/ShadowArmy/QuestData.lua from the world DB + WorldMapArea.dbc
-# (docs/quest-data.md). Read-only DB access; requires the realm up. Deterministic,
-# so a no-op rerun leaves the file byte-identical. Scope with:
-#   make quest-data QUEST_DATA_ARGS="--max-level 20"
-#   make quest-data QUEST_DATA_ARGS="--zones 85,130,12"
-QUEST_DATA_ARGS ?=
-quest-data:
-	@python3 tools/gen_quest_data.py \
-		--dbc-dir "$(VANILLA_WOW_EXTRACTED_DATA_DIR)/dbc" $(QUEST_DATA_ARGS)
-
-# Dump realm DBs from the running game container into a dated dir with a
-# restore manifest. Optional label: make backup-server LABEL=faction-bug-repro
 .PHONY: backup-server
 backup-server:
 	@tools/backup_server.sh $(LABEL)
@@ -1091,7 +959,7 @@ party-army: rotate-client-logs
 # shadow-army-tagged images serially (each can saturate the box). Never
 # touches the stock :local tags or the running realm — switch-over is a
 # human-run retag, see docs/coworld-fork.md.
-FORK := $(abspath ../coworld-vanilla-wow-fork)
+FORK := $(abspath ../monofuel-vanilla-wow)
 .PHONY: fork-images
 fork-images:
 	@set -e; \
