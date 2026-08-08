@@ -98,6 +98,8 @@ it in the act. Evidence first; no guess-fixes.
 | [duskwallow-plan.md](duskwallow-plan.md) | Isolated swim segment — water entry → Dustwallow; scoreboard + gates |
 | [traverse-2026-08-07.md](traverse-2026-08-07.md) | Real goal (Everlook) + bird variants (Petrel/Skua/Gannet) |
 | [traverse_wow.md](traverse_wow.md) | League scouting: rules, scoring, fixture, submission gates |
+| [realign-runs-2026-08-07.md](realign-runs-2026-08-07.md) | Realign run log — per-run progress, wedges, root causes |
+| [current-issues-2026-08-07.md](current-issues-2026-08-07.md) | Open issues as of 08-07 — stall class, swim corner-cutting, mob deaths, infra footguns |
 | [pathing.md](pathing.md) | Layers: sparse beats + nav A→B (fair play, multi-comp) |
 | [checkpointing.md](checkpointing.md) | Local wet debug: SOAP tele; Northbound2 free play |
 | [merchant-bay-progress-2026-08-07.md](merchant-bay-progress-2026-08-07.md) | Swim-run evidence + fatigue findings |
