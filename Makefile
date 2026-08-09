@@ -28,6 +28,10 @@ ENTRY ?= accelerated
 LUA_BOT_LAUNCH = nix develop $(FORK_CLIENT) --command \
 	nim r tools/launch_nim_player.nim -- --league=accelerated \
 	--bot=lua-bot --lua-repo=$(CURDIR) --lua-entry=$(ENTRY)
+# Same host, traverse league: Petrel runs as lua/entry/traverse.lua.
+TRAVERSE_LAUNCH = nix develop $(FORK_CLIENT) --command \
+	nim r tools/launch_nim_player.nim -- --league=traverse \
+	--bot=lua-bot --lua-repo=$(CURDIR) --lua-entry=traverse
 
 # Local realm operator inputs (paths relative to UPSTREAM).
 export VANILLA_WOW_EXTRACTED_DATA_DIR := $(UPSTREAM)/local_data/vmangos-5875-data
@@ -54,7 +58,7 @@ COMPOSE_FILE := infra/compose.vmangos.yml
 ACCOUNT_USER := monofuel
 ACCOUNT_PASS := password
 
-.PHONY: test test-lua test-nim system pin-check start-server stop-server server-logging logs account soap-account play play-classic play-classic-netlog play-xr traverse traverse-field traverse-replay traverse-pack-replay traverse-headed traverse-checkpoints quest-data warlock-account warlock-bot botwarrior-bot tusk-account tusk-bot beru-account beru-bot party-army navmesh-helper navmesh-status map-browser map-browser-once map-browser-debug map-browser-probe
+.PHONY: test test-lua test-nim system pin-check start-server stop-server server-logging logs account soap-account play play-classic play-classic-netlog play-xr traverse traverse-field traverse-replay traverse-pack-replay traverse-headed traverse-pol traverse-desert traverse-checkpoints quest-data warlock-account warlock-bot botwarrior-bot tusk-account tusk-bot beru-account beru-bot party-army navmesh-helper navmesh-status map-browser map-browser-once map-browser-debug map-browser-probe
 
 # Unit tier: Lua tools + Nim host/system tests only (v2 DoD: no Python required
 # for bot correctness). If nim is missing, test-nim-soft skips rather than
@@ -617,32 +621,26 @@ traverse-replay:
 traverse-pack-replay:
 	@tools/pack_traverse_replay.sh
 
-# ClientView Lua traverse (docs/traverse/clientview-migration.md).
-# Headless Xvfb player + TRAVERSE_LUA_BRIDGE → lua/entry/traverse.lua.
-# Not /env army_host. Not stock RealPlayerBot decide (bridge replaces it).
-# Optional local debug: CHECKPOINT=water_entry → SOAP tele after in-world
-# (docs/traverse/checkpointing.md). Omit CHECKPOINT for stock Tanaris spawn.
-TRAVERSE_OWNER ?= monofuel
-CHECKPOINT ?=
+# Petrel on the lua-bot host (docs/traverse/README.md). Headless full run.
 traverse:
-	@TRAVERSE_CHECKPOINT="$(CHECKPOINT)" tools/traverse_cv.sh headless
+	@cd $(FORK_CLIENT) && $(TRAVERSE_LAUNCH) --presentation=headless
 
-# Headed ClientView Lua traverse (same pilot as `make traverse`).
+# Headed Petrel run for manual verification (opens a window — human use).
 traverse-headed:
-	@TRAVERSE_CHECKPOINT="$(CHECKPOINT)" tools/traverse_cv.sh headed
+	@cd $(FORK_CLIENT) && $(TRAVERSE_LAUNCH) --presentation=headed
+
+# Fast regression: proof-of-life (level 60, map 1, movement + inputs).
+traverse-pol:
+	@cd $(FORK_CLIENT) && $(TRAVERSE_LAUNCH) --proof-of-life
+
+# Land-leg proof: spawn → desert ocean coast (water_entry), with client CPU
+# sampling for the streaming-starvation investigation. Readback at exit.
+traverse-desert:
+	@tools/traverse_desert.sh
 
 # List SOAP tele checkpoints (does not launch).
 traverse-checkpoints:
 	@python3 tools/traverse_checkpoint.py list
-
-# Legacy /env PoL (frozen). Prefer `make traverse`.
-traverse-pol:
-	@tools/traverse_pol.sh
-
-# Legacy desert /env checkpoint. Prefer `make traverse`.
-traverse-desert:
-	@TRAVERSE_POL_GOAL_RADIUS=50 TRAVERSE_POL_LOG=local_data/brain-logs/traverse-desert.log \
-		tools/traverse_pol.sh
 
 # Launch the GENUINE 1.12.1 client under wine against the local realm
 # (see docs/play-classic.md). First run assembles local_classic/ (Data/
