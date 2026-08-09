@@ -48,7 +48,11 @@ VMANGOS_CORE_DIR := $(UPSTREAM)/local_data/reference/vmangos-core
 # Realm lifecycle: tools/realm_op.sh discovers the upstream operator script and
 # adds --build when the local image lacks feature metadata. Same path The System
 # uses (dashboard Start server). Override with SYSTEM_UPSTREAM_DIR if needed.
-export SYSTEM_UPSTREAM_DIR ?= $(UPSTREAM)
+# Realm ops go through OUR fork's operator/compose: it carries the
+# VMANGOS_DB_DIR override that keeps the persistent realm database on a
+# plain host directory (see tools/realm_op.sh). The upstream checkout
+# stays a read-only data home.
+export SYSTEM_UPSTREAM_DIR ?= $(FORK_CLIENT)
 export SYSTEM_ARMY_DIR ?= $(CURDIR)
 REALM_OP := $(CURDIR)/tools/realm_op.sh
 # Direct operator still used by server-logging (write-config / smoke flags).
@@ -305,7 +309,7 @@ start-server:
 	echo "Ctrl-C detaches logs only — containers keep running."; \
 	echo "Stop cleanly with: make stop-server"; \
 	echo ""; \
-	cd "$(UPSTREAM)"; \
+	cd "$(SYSTEM_UPSTREAM_DIR)"; \
 	docker compose -f "$(COMPOSE_FILE)" --profile coworld logs -f coworld-game
 
 # Stop the coworld-game service (compose rm --stop). Does not wipe volumes

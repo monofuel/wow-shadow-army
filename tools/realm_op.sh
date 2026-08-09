@@ -27,6 +27,13 @@ else
 fi
 FEATURES_LABEL="${VMANGOS_FEATURES_LABEL:-ai.softmax.coworld.vmangos-features}"
 
+# The persistent realm database lives on a plain host directory (bind mount,
+# rsync/backup-friendly) instead of a docker named volume — volumes are how
+# the private world got wiped on 2026-08-07. Only realm_op exports this, so
+# ephemeral episode realms launched elsewhere keep their own named volumes
+# and can never write into the persistent database.
+export VMANGOS_DB_DIR="${VMANGOS_DB_DIR:-$ARMY_ROOT/../local_data/vmangos-db/data}"
+
 usage() {
   echo "usage: $0 <operator-verb> [args...]  (up auto-adds --build when needed)" >&2
   exit 2
