@@ -113,6 +113,10 @@ local function bot_status(view, pos, beat, extra)
     y = pos.y,
     dist_water = water and planar(pos.x, pos.y, water.x, water.y) or -1,
     swimming = view.is_swimming or false,
+    -- Deaths must arrive with a cause attached: mobs show up as combat and
+    -- sinking health well before the kill, falls do not.
+    health = view.health_known and view.health or -1,
+    in_combat = view.in_combat or false,
   }
   for k, v in pairs(extra or {}) do status[k] = v end
   return status
@@ -211,7 +215,12 @@ function M.decide(view)
         " — do not corpse-run; fix whatever stopped the movement")
     end
     wow.set_status("run over (died)")
-    return { kind = "hold", reason = "run_over" }
+    local status = { run_over = true }
+    if view.location_known and view.location then
+      status.x = view.location.position.x
+      status.y = view.location.position.y
+    end
+    return { kind = "hold", reason = "run_over", status = status }
   end
 
   if not view.location_known or not view.location then
