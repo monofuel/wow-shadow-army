@@ -26,15 +26,20 @@ local TRAVEL_FORM_ID = 3
 local AQUATIC_FORM_SPELL = 1066
 local AQUATIC_FORM_ID = 4
 
--- The host holds a pending form cast for 3s; retry slower than that.
-local FORM_RETRY_SECONDS = 4.0
+-- wow.time() is SIMULATION time, and league episodes run at 10x — a "6
+-- second" window in sim seconds elapses in 0.6 wall seconds. These windows
+-- are sim-scaled so they give the engine real wall time at 10x; at 1x
+-- (manual debugging) they are just patient.
+-- The host holds a pending form cast for 3 sim seconds; retry slower.
+local FORM_RETRY_SECONDS = 40.0
 -- No progress for this long while movement is ours = a stall worth shouting
 -- about (the suspected RPB-CPU/world-streaming blocker looks exactly like
--- this: route healthy, seat frozen).
-local STALL_SECONDS = 8.0
+-- this: route healthy, seat frozen). ~8 wall seconds at 10x.
+local STALL_SECONDS = 80.0
 -- A route the client cannot serve, with the walkout spent, gets this long
--- before the beat is skipped. Never faster than the engine can plan.
-local ROUTE_PATIENCE_SECONDS = 6.0
+-- before the beat is skipped. Never faster than the engine can plan a long
+-- corridor. ~6 wall seconds at 10x.
+local ROUTE_PATIENCE_SECONDS = 60.0
 local PROGRESS_YARDS = 3.0
 -- Northing hysteresis: once well past a beat's X band, never re-target it.
 local PASSED_YARDS = 20.0

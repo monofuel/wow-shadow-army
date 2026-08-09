@@ -54,12 +54,15 @@ local function view(x, y, extra)
   return v
 end
 
+-- All brain clocks run on wow.time(), which is SIMULATION time (10x in
+-- leagues) — windows in the brain are sim-scaled to match.
+
 -- Speed first: an unformed druid on dry open ground casts Travel Form.
 local spawn = view(-9187.0, -2530.25)
 local opener = petrel.decide(spawn)
 check(opener.kind == "cast_spell" and opener.spell == 783,
   "casts travel form at spawn")
-clock = clock + 1.0
+clock = clock + 10.0
 local throttled = petrel.decide(view(-9187.0, -2530.25))
 check(throttled.kind ~= "cast_spell", "does not spam the form cast")
 
@@ -102,11 +105,11 @@ check(mobbed.kind == "navigate", "keeps running when attacked")
 -- the stall is logged as evidence.
 local stuckAt = view(-8000.0, -3500.0, formed)
 petrel.decide(stuckAt)
-clock = clock + 10.0
+clock = clock + 100.0
 local stalled = petrel.decide(view(-8000.5, -3500.0, formed))
 check(stalled.kind == "navigate" and stalled.x == -7100.0,
   "a stall keeps the same goal")
-check(stalled.status.stalled_seconds > 8.0, "the stall is reported")
+check(stalled.status.stalled_seconds > 80.0, "the stall is reported")
 
 -- A route the client cannot serve, with the walkout spent, skips the beat
 -- after the patience window — and only then.
@@ -115,7 +118,7 @@ clock = clock + 5.0
 local patient = petrel.decide(view(-8000.0, -3500.0, formed))
 check(patient.kind == "navigate" and patient.x == -7100.0,
   "an unavailable route gets patience first")
-clock = clock + 7.0
+clock = clock + 65.0
 local skippingFrame = petrel.decide(view(-8000.0, -3500.0, formed))
 check(skippingFrame.kind == "hold" and skippingFrame.reason == "replanning",
   "a dead route is skipped after the patience window")
