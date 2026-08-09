@@ -85,7 +85,7 @@ check(coastward.kind == "navigate" and coastward.x == -6784.5,
 -- At the coast the land pass is complete: hold for the swim pass, do not
 -- enter the water.
 clock = clock + 5.0
-local arrived = petrel.decide(view(-6790.0, -4910.0, formed))
+local arrived = petrel.decide(view(-6790.0, -4840.0, formed))
 check(arrived.kind == "hold" and arrived.reason == "awaiting_swim_pass",
   "holds at the coast awaiting the swim pass")
 
