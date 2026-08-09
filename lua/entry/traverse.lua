@@ -256,10 +256,13 @@ function M.decide(view)
   if not SWIM then
     -- Land legs only: prove the seat can cross Tanaris to the coast.
     if water_dist <= water.radius then
+      -- Holding by choice is not a stall; keep the watchdog quiet here.
+      lastPos, lastProgressAt, stallSince = { x = pos.x, y = pos.y },
+        wow.time(), nil
       wow.set_status(string.format("at the coast (%.0fyd), awaiting swim pass",
         water_dist))
       return { kind = "hold", reason = "awaiting_swim_pass",
-        status = bot_status(view, pos, water, { stalled_seconds = stalled }) }
+        status = bot_status(view, pos, water) }
     end
     local beat = water
     if not skipped[land.id] and land_dist > land.radius and
