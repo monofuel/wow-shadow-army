@@ -590,15 +590,18 @@ PLAY_WS ?= ws://127.0.0.1:8080
 PLAY_SLOT ?= 0
 PLAY_TOKEN ?= token-0
 PLAY_OWNER ?= monofuel
+# Runs from OUR fork so human sessions carry the fork's client fixes
+# (F9 movement-evidence logging); data env vars above still point at the
+# upstream checkout's local_data.
 play:
 	@set -e; \
-	if [ ! -d "$(UPSTREAM)" ]; then \
-		echo "error: upstream checkout missing: $(UPSTREAM)" >&2; exit 1; \
+	if [ ! -d "$(FORK_CLIENT)" ]; then \
+		echo "error: fork checkout missing: $(FORK_CLIENT)" >&2; exit 1; \
 	fi; \
 	if [ ! -f "$(WOW_ENV)" ]; then \
 		echo "error: missing $(WOW_ENV)" >&2; exit 1; \
 	fi; \
-	cd "$(UPSTREAM)"; \
+	cd "$(FORK_CLIENT)"; \
 	nix shell nixpkgs\#nginx --command sh -c \
 		'. "$(WOW_ENV)"; \
 		export VANILLA_WOW_LOGIN_WS_URL="$(PLAY_WS)/tcp/realmd?slot=$(PLAY_SLOT)&token=$(PLAY_TOKEN)"; \
