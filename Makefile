@@ -258,7 +258,14 @@ endef
 # the game's WS /env relay is dead and direct TCP is the only path
 # (docs/work-2026-08-04.md). Rebuilds itself when upstream source is newer;
 # use FORCE_BUILD=1 after an upstream jump.
-.PHONY: accelerated accelerated-pol accelerated-headed
+.PHONY: accelerated accelerated-episode accelerated-pol accelerated-headed
+# Full-length league episode (720 wall seconds at 10x) with the final score
+# read back from the bot's own status file.
+accelerated-episode:
+	@cd $(FORK_CLIENT) && timeout 900 $(LUA_BOT_LAUNCH) --presentation=headless || true
+	@python3 -c "import json; d=json.load(open('$(CURDIR)/local_data/lua-bot-status.json')); b=d.get('bot') or {}; \
+	  lvl=b.get('level') or 0; xp=b.get('xp') or 0; nxt=b.get('next_level_xp') or 1; \
+	  print('episode score: %.3f (level %s, xp %s/%s)' % (lvl + xp/nxt, lvl, xp, nxt))"
 # Headless accelerated run of the lua-bot (ENTRY=<module>, default accelerated).
 accelerated:
 	@cd $(FORK_CLIENT) && $(LUA_BOT_LAUNCH) --presentation=headless
