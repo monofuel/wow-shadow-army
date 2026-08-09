@@ -39,8 +39,12 @@ run_pid=$!
   echo "# stamp pid pcpu rss etime comm"
   while kill -0 "$run_pid" 2>/dev/null; do
     now="$(date -u +%H:%M:%S)"
+    # ps %cpu is a lifetime average; the second top iteration is the
+    # instantaneous load, which is the number the starvation question needs.
+    top -b -d 1 -n 2 2>/dev/null | awk 'seen && ($NF == "player" || $NF ~ /mangosd/) { print "'"$now"' INST", $1, $9, $NF } /^top -/ { count++; seen = (count == 2) }'
     ps -eo pid,pcpu,rss,etime,args --no-headers |
-      grep -E 'build/player|launch_nim_player' | grep -v grep |
+      grep -E 'native_player_launcher/player|mangosd|launch_nim_player' |
+      grep -v grep |
       while read -r line; do echo "$now $line"; done
     # Bot status heartbeat alongside the CPU rows, for correlation.
     if [ -f "$STATUS" ]; then

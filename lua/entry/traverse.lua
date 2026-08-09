@@ -144,13 +144,18 @@ local function watch_progress(view, pos)
   return 0
 end
 
---- Skip a beat only when the client positively reports it cannot serve the
---- route and the host's walkout step is spent. A stall with a healthy route
---- is never grounds to change the plan — that is the underlying bug.
+--- Skip a beat only when the engine could never plan a corridor to it from
+--- a healthy pose (waypoint_count 0, no pinned pose failure). A pinned pose
+--- failure (`failed_here`) poisons ALL new planning — switching beats there
+--- discards the only corridor that exists (proven in the 2026-08-09 desert
+--- run: the skip turned an inching-but-alive route into a permanent wedge).
+--- A stall on a planned route is never grounds to change the plan either —
+--- that is the underlying bug, and it gets logged, not worked around.
 local function route_dead(beat)
   local now = wow.time()
   local nav = wow.nav_progress()
   local dead = nav.state == "unavailable" and not nav.walkout_available
+    and not nav.failed_here and (nav.waypoint_count or 0) == 0
   if not dead or unroutableBeat ~= beat.id then
     unroutableBeat = dead and beat.id or nil
     unroutableSince = dead and now or nil

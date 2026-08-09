@@ -111,17 +111,28 @@ check(stalled.kind == "navigate" and stalled.x == -7100.0,
   "a stall keeps the same goal")
 check(stalled.status.stalled_seconds > 80.0, "the stall is reported")
 
--- A route the client cannot serve, with the walkout spent, skips the beat
--- after the patience window — and only then.
-nav = { state = "unavailable", failed_here = true, walkout_available = false }
+-- A pinned pose failure poisons ALL new planning; switching beats there
+-- discards the only corridor that exists. The goal must stand no matter
+-- how long the failure lasts.
+nav = { state = "unavailable", failed_here = true, walkout_available = false,
+  waypoint_count = 883 }
+clock = clock + 200.0
+local pinned = petrel.decide(view(-8000.0, -3500.0, formed))
+check(pinned.kind == "navigate" and pinned.x == -7100.0,
+  "a pinned pose failure never rotates the goal")
+
+-- Only a beat the engine could never plan for, from a healthy pose, gets
+-- skipped — and only after the patience window.
+nav = { state = "unavailable", failed_here = false, walkout_available = false,
+  waypoint_count = 0 }
 clock = clock + 5.0
 local patient = petrel.decide(view(-8000.0, -3500.0, formed))
 check(patient.kind == "navigate" and patient.x == -7100.0,
-  "an unavailable route gets patience first")
+  "an unplannable beat gets patience first")
 clock = clock + 65.0
 local skippingFrame = petrel.decide(view(-8000.0, -3500.0, formed))
 check(skippingFrame.kind == "hold" and skippingFrame.reason == "replanning",
-  "a dead route is skipped after the patience window")
+  "an unplannable beat is skipped after the patience window")
 nav = { state = "following", failed_here = false, walkout_available = false }
 clock = clock + 1.0
 local rerouted = petrel.decide(view(-8000.0, -3500.0, formed))
