@@ -62,7 +62,7 @@ COMPOSE_FILE := infra/compose.vmangos.yml
 ACCOUNT_USER := monofuel
 ACCOUNT_PASS := password
 
-.PHONY: test test-lua test-nim system pin-check start-server stop-server server-logging logs account soap-account play play-classic play-classic-netlog play-xr traverse traverse-field traverse-replay traverse-pack-replay traverse-headed traverse-pol traverse-desert traverse-checkpoints quest-data warlock-account warlock-bot botwarrior-bot tusk-account tusk-bot beru-account beru-bot party-army navmesh-helper navmesh-status map-browser map-browser-once map-browser-debug map-browser-probe
+.PHONY: test test-lua test-nim system pin-check start-server stop-server server-logging logs account soap-account play play-classic play-classic-netlog play-xr traverse traverse-field traverse-replay traverse-pack-replay traverse-headed traverse-pol traverse-desert traverse-checkpoints lift-tele quest-data warlock-account warlock-bot botwarrior-bot tusk-account tusk-bot beru-account beru-bot party-army navmesh-helper navmesh-status map-browser map-browser-once map-browser-debug map-browser-probe
 
 # Unit tier: Lua tools + Nim host/system tests only (v2 DoD: no Python required
 # for bot correctness). If nim is missing, test-nim-soft skips rather than
@@ -645,6 +645,17 @@ traverse-desert:
 # List SOAP tele checkpoints (does not launch).
 traverse-checkpoints:
 	@python3 tools/traverse_checkpoint.py list
+
+# Great Lift reference session: tele a seeded bot character to a lift dock
+# on the 1x local realm (never a personal character). Then drive the headed
+# nim client yourself with:  make play ACCOUNT_USER=bot1 ACCOUNT_PASS=bot1
+# Ride up, ride down; logs land in the usual observer/journal paths.
+# Override: LIFT_CHARACTER=Botpriest LIFT_CHECKPOINT=great_lift_upper
+LIFT_CHARACTER ?= Botwarrior
+LIFT_CHECKPOINT ?= great_lift_lower
+lift-tele:
+	@python3 tools/traverse_checkpoint.py apply $(LIFT_CHECKPOINT) \
+		--character $(LIFT_CHARACTER) --no-wait
 
 # Launch the GENUINE 1.12.1 client under wine against the local realm
 # (see docs/play-classic.md). First run assembles local_classic/ (Data/
