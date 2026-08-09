@@ -93,6 +93,7 @@ it in the act. Evidence first; no guess-fixes.
 
 | Doc | What it is |
 |---|---|
+| [reference-logs.md](reference-logs.md) | Manual F9 recordings: the Great Lift rides (both platforms, up+down) and the 77 MB coast-swim run |
 | [petrel-plan.md](petrel-plan.md) | Plan of record — legs, fatigue, swim-north, weekend contender thesis |
 | [duskwallow-plan.md](duskwallow-plan.md) | Isolated swim segment — water entry → Dustwallow; scoreboard + gates |
 | [traverse-2026-08-07.md](traverse-2026-08-07.md) | Real goal (Everlook) + bird variants (Petrel/Skua/Gannet) |
