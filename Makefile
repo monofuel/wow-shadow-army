@@ -263,9 +263,7 @@ endef
 # read back from the bot's own status file.
 accelerated-episode:
 	@cd $(FORK_CLIENT) && timeout 900 $(LUA_BOT_LAUNCH) --presentation=headless || true
-	@python3 -c "import json; d=json.load(open('$(CURDIR)/local_data/lua-bot-status.json')); b=d.get('bot') or {}; \
-	  lvl=b.get('level') or 0; xp=b.get('xp') or 0; nxt=b.get('next_level_xp') or 1; \
-	  print('episode score: %.3f (level %s, xp %s/%s)' % (lvl + xp/nxt, lvl, xp, nxt))"
+	@python3 tools/episode_score.py
 # Headless accelerated run of the lua-bot (ENTRY=<module>, default accelerated).
 accelerated:
 	@cd $(FORK_CLIENT) && $(LUA_BOT_LAUNCH) --presentation=headless

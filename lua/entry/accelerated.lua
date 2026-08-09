@@ -361,13 +361,13 @@ function M.decide(view)
     return { kind = "release", reason = "died", status = progress_status(view) }
   end
   if view.resurrect_offer_guid and view.resurrect_offer_guid ~= 0 then
-    return { kind = "accept_rez", reason = "offered" }
+    return { kind = "accept_rez", reason = "offered", status = progress_status(view) }
   end
   if view.is_ghost then
     buffedAt = nil
     if view.can_reclaim_corpse then
       wow.set_status("ghost: reclaiming")
-      return { kind = "reclaim", reason = "at_corpse" }
+      return { kind = "reclaim", reason = "at_corpse", status = progress_status(view) }
     end
     if view.corpse_known and view.corpse_location then
       local corpse = view.corpse_location.position
@@ -382,7 +382,7 @@ function M.decide(view)
         status = progress_status(view),
       }
     end
-    return { kind = "hold", reason = "ghost_without_corpse" }
+    return { kind = "hold", reason = "ghost_without_corpse", status = progress_status(view) }
   end
 
   if not view.location_known or not view.location then
@@ -394,7 +394,7 @@ function M.decide(view)
   -- the swing that would have started the next fight.
   if holdsAfterKill > 0 then
     holdsAfterKill = holdsAfterKill - 1
-    return { kind = "hold", reason = "kill_settling" }
+    return { kind = "hold", reason = "kill_settling", status = progress_status(view) }
   end
 
   local health = health_pct(view)
@@ -419,7 +419,7 @@ function M.decide(view)
 
   if engaged and killed_target(view, engaged.guid) then
     holdsAfterKill = POST_KILL_HOLDS
-    return { kind = "hold", reason = "target_died" }
+    return { kind = "hold", reason = "target_died", status = progress_status(view) }
   end
 
   -- Break off a losing fight, unless the kill is one swing away.
@@ -448,7 +448,7 @@ function M.decide(view)
   if buff and not engaged and not view.in_combat and buffedAt ~= view.level and
       usable_spell(view, buff) then
     buffedAt = view.level
-    return { kind = "cast_spell", spell = buff, reason = "buff" }
+    return { kind = "cast_spell", spell = buff, reason = "buff", status = progress_status(view) }
   end
 
   -- Keep fighting what is already engaged; only fresh pulls face the gates.
