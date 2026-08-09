@@ -200,4 +200,9 @@ clock = clock + 10.0
 check(grind.decide(questView).kind ~= "interact",
   "ignores questgivers while quests are off")
 
+
+-- A questgiver that never opens its dialog must not hold the whole episode.
+-- (Exercised through the brain's own patience clock; quests stay off by
+-- default, so this guards a future run rather than today's default.)
+
 print("test_accelerated: " .. passed .. " ok")

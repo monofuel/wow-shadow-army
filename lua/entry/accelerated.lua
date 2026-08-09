@@ -18,6 +18,9 @@ local MARKER_AVAILABLE = 5
 local MARKER_REWARD = { [6] = true, [7] = true }
 local QUEST_LOG_LIMIT = 20
 local QUESTGIVER_YARDS = 60.0
+-- A giver that will not open its dialog is worth less than the mobs we are
+-- not killing while we stand there.
+local QUESTGIVER_PATIENCE = 45.0
 
 -- Opening nuke per class, highest rank first.
 local NUKES_BY_CLASS = {
@@ -70,6 +73,8 @@ local buffedAt = nil
 -- state changes and they might have something new.
 local exhausted = {}
 local questSignature = nil
+local pursuing = nil
+local pursuingSince = nil
 
 local function distance2d(ax, ay, bx, by)
   local dx, dy = ax - bx, ay - by
@@ -324,10 +329,21 @@ local function quest_step(view)
     end
   end
   if best then
+    local now = wow.time()
+    if pursuing ~= best.guid then
+      pursuing, pursuingSince = best.guid, now
+    elseif now - pursuingSince > QUESTGIVER_PATIENCE then
+      -- Give up on this one and go back to work.
+      exhausted[best.guid] = true
+      pursuing, pursuingSince = nil, nil
+      wow.log("gave up on questgiver " .. (best.name or "?"))
+      return nil
+    end
     wow.set_status("questgiver " .. (best.name or "?"))
     return { kind = "interact", guid = best.guid, route_profile = "prefer_ground",
       reason = "questgiver" }
   end
+  pursuing, pursuingSince = nil, nil
   return nil
 end
 
