@@ -180,7 +180,6 @@ check(first.x == second.x and first.y == second.y,
   "does not rotate faster than a route can plan")
 nav = { state = "following", failed_here = false, walkout_available = false }
 
-print("test_accelerated: " .. passed .. " ok")
 
 -- Quest work is off by default and must stay invisible until enabled.
 local questView = view({}, {
@@ -193,3 +192,5 @@ local questView = view({}, {
 clock = clock + 10.0
 check(grind.decide(questView).kind ~= "interact",
   "ignores questgivers while quests are off")
+
+print("test_accelerated: " .. passed .. " ok")
