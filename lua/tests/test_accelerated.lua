@@ -96,6 +96,8 @@ check(grind.decide(view({ unit(36, 5.0, 3, { summoner_guid = 99 }) })).kind == "
   "skips summoned pets")
 check(grind.decide(view({ unit(37, 5.0, 9) })).kind == "navigate",
   "refuses a fresh pull above the level ceiling")
+check(grind.decide(view({ unit(38, 5.0, 5) })).kind == "attack",
+  "takes a pull two levels up")
 
 -- Wounded or drained: walk to the next spawn instead of pulling.
 local drained = grind.decide(view({ unit(41, 6.0, 2) }, { powers = { 10 } }))
@@ -144,20 +146,38 @@ check(grind.decide(view({}, { resurrect_offer_guid = 5 })).kind == "accept_rez",
 -- A pinned failure rotates the patrol; movement we do not control does not.
 -- Dying cleared the buff, so take that cast out of the way first, and drop the
 -- buff from the bar to keep this section about navigation alone.
-local function patrolView()
-  return view({}, { action_buttons = {
+local function patrolViewAt(x, y)
+  local v = view({}, { action_buttons = {
     { slot = 1, spell_id = 5176, usable = true, usable_known = true },
   } })
+  v.location.position.x, v.location.position.y = x, y
+  return v
 end
+local function patrolView() return patrolViewAt(0.0, 0.0) end
 local before = grind.decide(patrolView())
 nav = { state = "unavailable", failed_here = true, walkout_available = false }
+clock = clock + 10.0
 local rotated = grind.decide(patrolView())
 check(rotated.x ~= before.x or rotated.y ~= before.y, "rotates when the pose is blocked")
+-- While the host still has a walkout step, the leg stands: keep the seat
+-- moving so this is about the walkout and not the stall timer.
 nav = { state = "unavailable", failed_here = true, walkout_available = true }
-local waiting = grind.decide(patrolView())
-local stillWaiting = grind.decide(patrolView())
+clock = clock + 10.0
+local waiting = grind.decide(patrolViewAt(0.0, 0.0))
+clock = clock + 1.0
+local stillWaiting = grind.decide(patrolViewAt(6.0, 0.0))
 check(waiting.x == stillWaiting.x and waiting.y == stillWaiting.y,
   "lets the walkout run before rotating")
+
+-- A leg gets time to work: an unavailable frame right after a rotation must
+-- not restart the route again.
+nav = { state = "unavailable", failed_here = true, walkout_available = false }
+clock = clock + 10.0
+local first = grind.decide(patrolViewAt(12.0, 0.0))
+clock = clock + 0.5
+local second = grind.decide(patrolViewAt(12.0, 0.0))
+check(first.x == second.x and first.y == second.y,
+  "does not rotate faster than a route can plan")
 nav = { state = "following", failed_here = false, walkout_available = false }
 
 print("test_accelerated: " .. passed .. " ok")

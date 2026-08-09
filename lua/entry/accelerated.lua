@@ -28,10 +28,12 @@ local BUFFS_BY_CLASS = {
 }
 
 local ENGAGE_YARDS = 4.0
-local SEARCH_YARDS = 30.0        -- upstream's fresh acquisition distance
+local SEARCH_YARDS = 40.0        -- a starting field is sparser than a road
 local PATROL_YARDS = 35.0
 local CORPSE_STOP_YARDS = 30.0   -- the reclaim radius is 39; stop short of it
 local STALL_SECONDS = 8.0
+-- Rotating a leg restarts the route, so a leg has to be given time to work.
+local LEG_MIN_SECONDS = 4.0
 local PROGRESS_YARDS = 3.0
 local POST_KILL_HOLDS = 2
 
@@ -51,6 +53,7 @@ local PATROL = {
 
 local anchor = nil
 local patrolLeg = 1
+local legStartedAt = nil
 local lastPos = nil
 local lastProgressAt = nil
 local holdsAfterKill = 0
@@ -97,7 +100,7 @@ local function huntable(view, unit, freshPull)
   if unit.summoner_guid and unit.summoner_guid ~= 0 then return false end
   if unit_distance(unit) > SEARCH_YARDS then return false end
   if unit.level_known then
-    local ceiling = (view.level or 1) + (freshPull and 1 or 5)
+    local ceiling = (view.level or 1) + (freshPull and 2 or 5)
     if unit.level > ceiling then return false end
   end
   return true
@@ -167,14 +170,17 @@ local function patrol_target(view, pos)
   end
 
   -- A pinned failure is not fixed by a different destination; the host takes
-  -- a walkout step from this pose. Rotate only once that is spent. Movement
-  -- we do not control is not a stall.
-  local blocked = nav.failed_here and not nav.walkout_available
+  -- a walkout step from this pose. Rotate only once that is spent, only on a
+  -- route the client reports it cannot serve right now, and never faster than
+  -- the route engine can plan one. Movement we do not control is not a stall.
+  if not legStartedAt then legStartedAt = now end
+  local unavailable = nav.state == "unavailable" and not nav.walkout_available
   local controllable = view.movement_allowed and not view.rooted
   local stalled = controllable and lastProgressAt and
     now - lastProgressAt > STALL_SECONDS
-  if blocked or stalled then
+  if (unavailable or stalled) and now - legStartedAt >= LEG_MIN_SECONDS then
     patrolLeg = patrolLeg % #PATROL + 1
+    legStartedAt = now
     lastPos, lastProgressAt = { x = pos.x, y = pos.y }, now
   end
 
@@ -182,6 +188,7 @@ local function patrol_target(view, pos)
   local tx, ty = anchor.x + leg.dx, anchor.y + leg.dy
   if distance2d(pos.x, pos.y, tx, ty) <= ENGAGE_YARDS then
     patrolLeg = patrolLeg % #PATROL + 1
+    legStartedAt = now
     leg = PATROL[patrolLeg]
     tx, ty = anchor.x + leg.dx, anchor.y + leg.dy
   end
