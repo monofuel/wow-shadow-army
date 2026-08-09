@@ -10,23 +10,20 @@ layers: knowledgebase / Lua tool library / LLM planner).
 
 ## Where this sits
 
-We do NOT fork the game client. The upstream repo-owned Nim client handles
-the WoW 1.12 protocol, perception (typed environment frames), and execution
-(pathing, combat, looting) via its `BotController`. Our layer speaks the
-sole mutable out-of-process boundary, `vanilla_wow.nim_control.v2`:
-typed goals (leader/party/roster) + hold/resume/cancel directives in,
-control status + MessagePack environment frames out. **v2 has no external
-action selection** — per-frame policy runs in-process upstream
-(`docs/nim-control-v2-external-select.md`); our host installs goals, observes,
-watchdogs, and audits.
+Our bots run inside `../monofuel-vanilla-wow` — a thin fork of the upstream
+Nim client kept as close to upstream as possible. The fork adds one generic
+**lua-bot** identity (`bots/lua_bot/`, gated behind `-d:luaBotVm`) that
+embeds a Lua 5.3 VM, mirrors the typed Observation into a snake_case view,
+and executes declarative intents through upstream capabilities (the
+RealPlayerBot route engine does all pathing). The brains live here, in
+`lua/entry/*.lua`; flexibility belongs in the Lua, not the host.
 
 ```
 knowledgebase (kb/)          <- bot memory: reserved, empty, unbuilt
 LLM planner (later)          <- goal selection, toolsmithing
-Lua tool library (lua/)      <- named intents (dormant until upstream re-exposes a select surface)
-Nim host (tools/army_host)   <- goal install + watchdogs + fair-play audit
-────────── nim_control.v2 socket ──────────
-upstream Nim client          <- perception + policy + execution (pinned; fixes via ../coworld-vanilla-wow-fork)
+Lua brains (lua/entry/)      <- decide(view) -> typed intents, per league
+────────── embedded Lua 5.3 VM (-d:luaBotVm) ──────────
+lua-bot host                 <- ../monofuel-vanilla-wow bots/lua_bot/: view, intent, execution
 ────────── WoW 1.12 protocol over ws bridge ──────────
 VMaNGOS realm
 ```
@@ -41,7 +38,7 @@ against. The upstream checkout lives as a sibling:
 
 - `lua/tools/` — named-intent tool library (the LLM-facing language)
 - `lua/tests/` — fast unit tests, run by `make test` (must stay instant)
-- `tools/` — Nim host (`army_host.nim`), party promote, fair-play audit
+- `tools/` — party promote, fair-play audit, traverse/replay tooling
 - `kb/` — bot memory for the future LLM planner (map facts, quest ids, tool
   reliability). **Empty on purpose** — see `kb/README.md`
 - `docs/` — everything written for humans/agents on this repo: design notes,

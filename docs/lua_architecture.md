@@ -20,8 +20,8 @@ Hard constraints (no Python policy, fair play, frozen frame table): `AGENTS.md`.
 └────────────────────────────┬────────────────────────────────┘
                              │ intent tables
 ┌────────────────────────────▼────────────────────────────────┐
-│  Host adapter (Nim) — transport + projection + mapIntent    │
-│  tools/army_host.nim (local) · league player image (hosted) │
+│  Host adapter (Nim) — lua-bot pilot: view + intent + exec   │
+│  monofuel-vanilla-wow/bots/lua_bot/ (in-process, -d:luaBotVm)│
 └────────────────────────────┬────────────────────────────────┘
                              │ AgentFrame / AgentAction
 ┌────────────────────────────▼────────────────────────────────┐
@@ -90,18 +90,21 @@ lua/
     tools/
 ```
 
-Host selection:
+Host selection (current: the **lua-bot** host in `monofuel-vanilla-wow`;
+`army_host` and its `/env` transport were deleted in `1454caa`):
 
 | Context | Mode selection |
 |---|---|
-| Local Shadow Army | `army_host --tool=<name>` (legacy) or `--mode=shadow_army` when that entry exists |
-| Local traverse PoL | `army_host --mode=traverse` (see `make traverse-pol`) |
-| League player image | Env or image CMD maps to one entry (one image, five modes preferred) |
-| Tests | Unit-test tools; entry tests assert thin goal→intent paths |
+| Local accelerated | `--bot=lua-bot --lua-entry=accelerated` (`make accelerated-pol`) |
+| Local traverse (Petrel) | `--bot=lua-bot --lua-entry=traverse` (`make traverse-pol`) |
+| League player image | Container maps to one entry per league |
+| Tests | `lua/tests/test_*.lua` fake `_G.wow` and assert on intent tables |
 
-`army_host --mode=<name>` loads `lua/entry/<name>.lua` and calls `entry.decide`.
-`--tool=<name>` loads a registered tool under `lua/tools/`. Mode wins when both
-are set. Destination moves use Lua intent `kind = "move"` (also `move_to`).
+The lua-bot host loads `lua/entry/<name>.lua` and calls `entry.decide(view)`
+each frame. Intent kinds: `hold`, `navigate`, `cast_spell`, `attack`,
+`release`, `reclaim`, `accept_rez`, `interact`, `ui_press`, `quest_cmd`
+(`monofuel-vanilla-wow/bots/lua_bot/intent.nim`). The old `army_host`
+`kind = "move"` dialect is gone.
 
 ## Mode goals
 

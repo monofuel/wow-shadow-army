@@ -1,5 +1,10 @@
 # Petrel ↔ upstream realign inventory
 
+> **Historical (2026-08-09):** this realign targeted the `.so`/`petrel_pilot`
+> era, which was superseded by the generic lua-bot host on
+> `monofuel-vanilla-wow` `monofuel/master`. Kept for the commit archaeology;
+> see [README.md](README.md) for how Petrel is hosted now.
+
 **Policy:** prefer Metta `upstream/main`. Petrel stays a thin client layer on a
 feature branch. Rollback tag on the fork: `petrel-pre-realign-20260807` →
 `8df20dbd5` (`embedded-lua-client`).

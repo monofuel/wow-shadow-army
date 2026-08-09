@@ -1,5 +1,10 @@
 # Traverse pathing architecture
 
+> **Hosting note (2026-08-09):** the beats-vs-nav layering below is still
+> doctrine, but the pilot/file references (ClientView bridge, `lower.nim`,
+> `traverse_lua_bridge.nim`) describe plumbing deleted in `1454caa`. Petrel
+> now runs on the lua-bot host — see [README.md](README.md).
+
 **Status:** design locked for V1+ (not fully implemented)  
 **Audience:** engineers on Petrel / ClientView traverse and any later league that
 reuses the same feet.  
