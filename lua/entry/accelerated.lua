@@ -13,6 +13,12 @@ local M = {}
 
 local QUESTS = false
 
+-- Quest marker status as the server reports it.
+local MARKER_AVAILABLE = 5
+local MARKER_REWARD = { [6] = true, [7] = true }
+local QUEST_LOG_LIMIT = 20
+local QUESTGIVER_YARDS = 60.0
+
 -- Opening nuke per class, highest rank first.
 local NUKES_BY_CLASS = {
   [11] = { 5177, 5176 }, -- druid: Wrath r2/r1
@@ -58,6 +64,10 @@ local lastPos = nil
 local lastProgressAt = nil
 local holdsAfterKill = 0
 local buffedAt = nil
+-- Questgivers with nothing left for us, forgotten again whenever our quest
+-- state changes and they might have something new.
+local exhausted = {}
+local questSignature = nil
 
 local function distance2d(ax, ay, bx, by)
   local dx, dy = ax - bx, ay - by
@@ -119,13 +129,17 @@ local function engaged_unit(view)
 end
 
 local function pick_target(view, freshPull)
-  local best, bestDistance = nil, nil
+  local best, bestScore = nil, nil
   for i = 1, #(view.units or {}) do
     local unit = view.units[i]
     if huntable(view, unit, freshPull) then
-      local d = unit_distance(unit)
-      if not bestDistance or d < bestDistance then
-        best, bestDistance = unit, d
+      -- Distance decides, but a mob on an active objective is worth a walk.
+      local score = unit_distance(unit)
+      if QUESTS and credits_objective(view, unit) then
+        score = score - 25.0
+      end
+      if not bestScore or score < bestScore then
+        best, bestScore = unit, score
       end
     end
   end
@@ -195,6 +209,130 @@ local function patrol_target(view, pos)
   return tx, ty
 end
 
+-- Quest work. Every step is a dialog panel answer or one interface control,
+-- so none of it touches the world-click path.
+local function quest_signature(view)
+  return string.format("%d:%d:%d",
+    view.level or 0,
+    #(view.accepted_quests or {}),
+    #(view.completed_quest_ids or {}))
+end
+
+local function marker_status(view, guid)
+  for i = 1, #(view.quest_markers or {}) do
+    local marker = view.quest_markers[i]
+    if marker.questgiver_guid == guid then return marker.status end
+  end
+  return 0
+end
+
+local function greeting_row(view)
+  local rows = view.quest_frame and view.quest_frame.greeting_rows or {}
+  -- A turn-in is worth more than a new quest, so answer active rows first.
+  for i = 1, #rows do
+    if rows[i].active then return rows[i].quest_id end
+  end
+  if rows[1] then return rows[1].quest_id end
+  return nil
+end
+
+local function gossip_row(view)
+  local offers = view.quest_offers or {}
+  local guid = view.gossip_guid or 0
+  for i = 1, #offers do
+    if offers[i].questgiver_guid == guid then return offers[i].quest_id end
+  end
+  return nil
+end
+
+local function control_for(view, reference)
+  for i = 1, #(view.ui_nodes or {}) do
+    local node = view.ui_nodes[i]
+    if node.reference_id == reference and node.enabled and node.hit_testable then
+      return reference
+    end
+  end
+  return nil
+end
+
+-- Answer whatever dialog is open, then look for a giver worth walking to.
+local function quest_step(view)
+  local frame = view.quest_frame or {}
+  if frame.open then
+    if frame.panel == "reward" then
+      return { kind = "quest_cmd", command = "/questreward", reason = "turn_in" }
+    end
+    if frame.panel == "progress" then
+      if frame.can_complete then
+        return { kind = "quest_cmd", command = "/questcomplete", reason = "complete" }
+      end
+      return { kind = "ui_press", control = "QuestFrameGoodbyeButton",
+        reason = "unfinished" }
+    end
+    if frame.panel == "details" then
+      if #(view.accepted_quests or {}) >= QUEST_LOG_LIMIT then
+        return { kind = "ui_press", control = "QuestFrameDeclineButton",
+          reason = "log_full" }
+      end
+      return { kind = "quest_cmd", command = "/questaccept", reason = "accept" }
+    end
+    if frame.panel == "greeting" then
+      local questId = greeting_row(view)
+      local reference = questId and control_for(view, "quest-greeting:" .. questId)
+      if reference then
+        return { kind = "ui_press", reference = reference, reason = "greeting_row" }
+      end
+      return { kind = "ui_press", control = "QuestFrameGreetingGoodbyeButton",
+        reason = "nothing_offered" }
+    end
+  end
+  if view.gossip_open then
+    local questId = gossip_row(view)
+    local reference = questId and control_for(view, "gossip-quest:" .. questId)
+    if reference then
+      return { kind = "ui_press", reference = reference, reason = "gossip_row" }
+    end
+    exhausted[view.gossip_guid or 0] = true
+    return { kind = "ui_press", control = "GossipFrameGreetingGoodbyeButton",
+      reason = "gossip_done" }
+  end
+
+  local best, bestDistance = nil, nil
+  for i = 1, #(view.units or {}) do
+    local unit = view.units[i]
+    local status = marker_status(view, unit.guid)
+    local wanted = MARKER_REWARD[status] or
+      (status == MARKER_AVAILABLE and
+        #(view.accepted_quests or {}) < QUEST_LOG_LIMIT)
+    if wanted and not exhausted[unit.guid] and
+        not (unit.death_known and unit.is_dead) then
+      local d = unit_distance(unit)
+      if d <= QUESTGIVER_YARDS and (not bestDistance or d < bestDistance) then
+        best, bestDistance = unit, d
+      end
+    end
+  end
+  if best then
+    wow.set_status("questgiver " .. (best.name or "?"))
+    return { kind = "interact", guid = best.guid, route_profile = "prefer_ground",
+      reason = "questgiver" }
+  end
+  return nil
+end
+
+-- A mob that pays an objective is worth more than an equally close one that
+-- does not.
+local function credits_objective(view, unit)
+  for i = 1, #(view.quest_objectives or {}) do
+    local objective = view.quest_objectives[i]
+    if not objective.complete and objective.entry ~= 0 and
+        objective.entry == unit.entry then
+      return true
+    end
+  end
+  return false
+end
+
 local function progress_status(view)
   return {
     level = view.level,
@@ -254,6 +392,22 @@ function M.decide(view)
   local health = health_pct(view)
   local mana = mana_pct(view)
   local engaged = engaged_unit(view)
+
+  if QUESTS then
+    local signature = quest_signature(view)
+    if signature ~= questSignature then
+      -- Our quest state moved, so a giver we gave up on may have new work.
+      exhausted = {}
+      questSignature = signature
+    end
+    if not engaged and not view.in_combat then
+      local step = quest_step(view)
+      if step then
+        step.status = progress_status(view)
+        return step
+      end
+    end
+  end
 
   if engaged and killed_target(view, engaged.guid) then
     holdsAfterKill = POST_KILL_HOLDS

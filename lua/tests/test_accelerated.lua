@@ -181,3 +181,15 @@ check(first.x == second.x and first.y == second.y,
 nav = { state = "following", failed_here = false, walkout_available = false }
 
 print("test_accelerated: " .. passed .. " ok")
+
+-- Quest work is off by default and must stay invisible until enabled.
+local questView = view({}, {
+  quest_markers = { { questgiver_guid = 900, status = 5 } },
+  units = { unit(900, 10.0, 3) },
+  quest_frame = { open = false },
+  accepted_quests = {}, quest_objectives = {}, completed_quest_ids = {},
+  ui_nodes = {},
+})
+clock = clock + 10.0
+check(grind.decide(questView).kind ~= "interact",
+  "ignores questgivers while quests are off")
