@@ -1,137 +1,98 @@
--- Petrel strategy: sparse beats + forms + wet-only prove.
--- Feet/pathfinding (mesh + recover) live in Nim RPB — see pathfinding-plan.md.
+-- Petrel: the traverse speedrun brain. Kalimdor south to north; score is
+-- pure X-northing toward Everlook, 270 wall seconds at 10x.
 --
--- Intent kinds only:
---   navigate { x, y, z?, map_id, stop_distance, mode, reason, beat_id }
---   cast_spell { spell, reason }
---   hold { reason }
+-- SPEEDRUN RULES (non-negotiable, from monofuel's manual run):
+--   * NEVER fight. No attack intents, ever. The run is running and swimming.
+--   * NEVER corpse-run. Death means the run is over: hold "run_over", stop.
+--     Do not add corpse recovery here — if the bot died, the bug is whatever
+--     let it stop moving (pathfinding, streaming), and that is what gets
+--     fixed. A moving bot does not die to mobs.
+--   * Keep moving. A stall is evidence to log loudly, not a state to farm.
 --
--- Never: hop polylines, L/R thrash, one straight swim across the ocean.
+-- Route: sparse beats in lua/config/traverse_beats.lua — a land approach to
+-- the Tanaris coast, then the manual-run cheese ribbon to the Dustwallow
+-- coast. This pass drives only the land legs; SWIM gates the wet chain until
+-- the swim segment is proven separately (see docs/traverse/README.md).
 
-local M = {
-  name = "traverse",
-  goal = "Maximize Kalimdor northing under fair play.",
-}
+local M = { name = "petrel" }
+
+local ROUTE = require("config.traverse_beats")
+
+-- Wet-chain gate: flip once the land legs are proven on the lua-bot host.
+local SWIM = false
 
 local TRAVEL_FORM_SPELL = 783
 local TRAVEL_FORM_ID = 3
 local AQUATIC_FORM_SPELL = 1066
 local AQUATIC_FORM_ID = 4
 
-local function is_corpse(frame)
-  local d = frame and frame.death
-  if d then
-    if d.is_ghost == true or d.ghost == true then return false end
-    if d.is_dead == true or d.dead == true then return true end
-  end
-  local c = frame and frame.combat
-  if c and type(c.health_pct) == "number" and c.health_pct <= 0 then
-    local g = d and (d.is_ghost == true or d.ghost == true)
-    if not g then return true end
-  end
-  return false
-end
+-- The host holds a pending form cast for 3s; retry slower than that.
+local FORM_RETRY_SECONDS = 4.0
+-- No progress for this long while movement is ours = a stall worth shouting
+-- about (the suspected RPB-CPU/world-streaming blocker looks exactly like
+-- this: route healthy, seat frozen).
+local STALL_SECONDS = 8.0
+-- A route the client cannot serve, with the walkout spent, gets this long
+-- before the beat is skipped. Never faster than the engine can plan.
+local ROUTE_PATIENCE_SECONDS = 6.0
+local PROGRESS_YARDS = 3.0
+-- Northing hysteresis: once well past a beat's X band, never re-target it.
+local PASSED_YARDS = 20.0
 
-local function is_ghost(frame)
-  local d = frame and frame.death
-  if not d then return false end
-  return d.is_ghost == true or d.ghost == true
-end
+local lastPos = nil
+local lastProgressAt = nil
+local stallSince = nil
+local unroutableSince = nil
+local unroutableBeat = nil
+local skipped = {}
+local lastFormCastAt = nil
+local deathLogged = false
 
-local function knows_spell(frame, spellId)
-  local known = frame and frame.spells and frame.spells.known
-  if type(known) ~= "table" then return false end
-  for _, s in ipairs(known) do
-    if s == spellId then return true end
-  end
-  return false
-end
-
-local function is_swimming(frame)
-  local me = frame and frame.self_unit
-  return me and me.is_swimming == true
-end
-
-local function is_wading(frame)
-  local me = frame and frame.self_unit
-  if not me or me.liquid_coverage_known ~= true or me.liquid_known ~= true then
-    return false
-  end
-  if me.liquid_submerged == true then return true end
-  if type(me.liquid_surface_z) ~= "number" or type(me.z) ~= "number" then
-    return false
-  end
-  return math.abs(me.liquid_surface_z - me.z) <= 3.0
-end
-
-local function in_travel_form(frame)
-  local me = frame and frame.self_unit
-  if not me then return false end
-  if me.shapeshift_form_id == TRAVEL_FORM_ID then return true end
-  if me.shapeshift_form_spell_id == TRAVEL_FORM_SPELL then return true end
-  return false
-end
-
-local function in_aquatic_form(frame)
-  local me = frame and frame.self_unit
-  if not me then return false end
-  if me.shapeshift_form_id == AQUATIC_FORM_ID then return true end
-  if me.shapeshift_form_spell_id == AQUATIC_FORM_SPELL then return true end
-  return false
-end
-
-local function planar_dist(x0, y0, x1, y1)
-  local dx, dy = x1 - x0, y1 - y0
+local function planar(ax, ay, bx, by)
+  local dx, dy = ax - bx, ay - by
   return math.sqrt(dx * dx + dy * dy)
 end
 
-local function navigate_to(beat, reason, map_id, reference)
-  local intent = {
-    kind = "navigate",
-    map_id = map_id or 1,
-    x = beat.x,
-    y = beat.y,
-    z = beat.z,
-    stop_distance = beat.radius or 8.0,
-    mode = beat.mode or "land",
-    reason = reason or beat.id or "navigate",
-    beat_id = beat.id,
-  }
-  if reference then intent.route_reference = reference end
-  return intent
-end
-
-local function load_beats(args)
-  if args and type(args.beats) == "table" and #args.beats > 0 then
-    return args.beats
-  end
-  return nil
-end
-
-local function beat_by_id(beats, id)
-  for _, b in ipairs(beats) do
+local function beat_by_id(id)
+  for _, b in ipairs(ROUTE.beats) do
     if b.id == id then return b end
   end
   return nil
 end
 
---- First wet beat not yet reached (by northing / planar). Sparse open-water chain.
-local function next_wet_beat(beats, me_x, me_y)
+local function in_travel_form(view)
+  return view.shapeshift_form_id == TRAVEL_FORM_ID or
+    view.shapeshift_form_spell_id == TRAVEL_FORM_SPELL
+end
+
+local function in_aquatic_form(view)
+  return view.shapeshift_form_id == AQUATIC_FORM_ID or
+    view.shapeshift_form_spell_id == AQUATIC_FORM_SPELL
+end
+
+local function wading(view, pos)
+  if not view.liquid_coverage_known or not view.liquid_known then
+    return false
+  end
+  if view.liquid_submerged then return true end
+  if type(view.liquid_surface_z) ~= "number" then return false end
+  return math.abs(view.liquid_surface_z - pos.z) <= 3.0
+end
+
+--- First wet beat still ahead of us. Stateless: after crossing well into a
+--- beat's X band, lateral drift must not select that beat again, and beats
+--- behind us (Kalimdor +X is north) never regress the run.
+local function next_wet_beat(x, y)
   local wet = {}
-  for _, b in ipairs(beats) do
-    if b.require_wet or b.mode == "liquid_prefer" then
-      wet[#wet + 1] = b
-    end
+  for _, b in ipairs(ROUTE.beats) do
+    if b.wet then wet[#wet + 1] = b end
   end
   if #wet == 0 then return nil end
   for _, b in ipairs(wet) do
-    local r = b.radius or 60.0
-    -- Stateless northing hysteresis: after crossing well into a beat's
-    -- acceptance band, lateral drift must not select that beat again.
-    local passed_northing = me_x >= (b.x + 20.0)
-    if not passed_northing and planar_dist(me_x, me_y, b.x, b.y) > r then
-      -- Prefer beats still north of us (Kalimdor +X north) so we don't regress.
-      if b.x + r >= me_x - 40.0 then
+    local passed = x >= (b.x + PASSED_YARDS)
+    if not skipped[b.id] and not passed and
+        planar(x, y, b.x, b.y) > b.radius then
+      if b.x + b.radius >= x - 40.0 then
         return b
       end
     end
@@ -139,188 +100,204 @@ local function next_wet_beat(beats, me_x, me_y)
   return wet[#wet]
 end
 
-local function route_reference(beats, me_x, me_y)
-  local wet = {}
-  for _, b in ipairs(beats) do
-    if b.require_wet or b.mode == "liquid_prefer" then
-      wet[#wet + 1] = b
-    end
-  end
-  if #wet == 0 then return nil end
-  if #wet == 1 then
-    return {
-      segment_index = 1,
-      cross_track_yards = planar_dist(me_x, me_y, wet[1].x, wet[1].y),
-      along_route_yards = 0.0,
-      total_route_yards = 0.0,
-    }
-  end
-
-  local best_dist2, best_along, best_segment = nil, 0.0, 1
-  local cumulative, total = 0.0, 0.0
-  for i = 1, #wet - 1 do
-    local a, b = wet[i], wet[i + 1]
-    local dx, dy = b.x - a.x, b.y - a.y
-    local len2 = dx * dx + dy * dy
-    local len = math.sqrt(len2)
-    local t = 0.0
-    if len2 > 0 then
-      t = ((me_x - a.x) * dx + (me_y - a.y) * dy) / len2
-      if t < 0 then t = 0 elseif t > 1 then t = 1 end
-    end
-    local qx, qy = a.x + t * dx, a.y + t * dy
-    local ex, ey = me_x - qx, me_y - qy
-    local dist2 = ex * ex + ey * ey
-    if best_dist2 == nil or dist2 < best_dist2 then
-      best_dist2 = dist2
-      best_along = cumulative + t * len
-      best_segment = i
-    end
-    cumulative = cumulative + len
-  end
-  total = cumulative
-  return {
-    segment_index = best_segment,
-    cross_track_yards = math.sqrt(best_dist2 or 0.0),
-    along_route_yards = best_along,
-    total_route_yards = total,
+local function bot_status(view, pos, beat, extra)
+  local water = beat_by_id("water_entry")
+  local status = {
+    beat = beat and beat.id or "?",
+    x = pos.x,
+    y = pos.y,
+    dist_water = water and planar(pos.x, pos.y, water.x, water.y) or -1,
+    swimming = view.is_swimming or false,
   }
+  for k, v in pairs(extra or {}) do status[k] = v end
+  return status
 end
 
-function M.decide(frame, args)
-  args = args or {}
-  local me = frame and frame.self_unit
-  if not me or me.x == nil or me.y == nil then
-    return { kind = "hold", reason = "no_self_position" }
+--- Progress watchdog. Returns stall seconds (0 when moving) and logs the
+--- transition once — a healthy route with a frozen seat is the evidence the
+--- CPU/streaming investigation needs, so make it unmissable.
+local function watch_progress(view, pos)
+  local now = wow.time()
+  if lastPos == nil or
+      planar(pos.x, pos.y, lastPos.x, lastPos.y) >= PROGRESS_YARDS then
+    lastPos, lastProgressAt = { x = pos.x, y = pos.y }, now
+    stallSince = nil
+    return 0
   end
+  local controllable = view.movement_allowed and not view.rooted
+  if not controllable or lastProgressAt == nil then return 0 end
+  local stalled = now - lastProgressAt
+  if stalled > STALL_SECONDS then
+    if stallSince == nil then
+      stallSince = now
+      wow.log(string.format(
+        "STALL: no progress for %.0fs at (%.1f, %.1f), nav=%s",
+        stalled, pos.x, pos.y, wow.nav_progress().state))
+    end
+    return stalled
+  end
+  return 0
+end
 
-  if is_corpse(frame) then
-    return { kind = "hold", reason = "release_spirit" }
+--- Skip a beat only when the client positively reports it cannot serve the
+--- route and the host's walkout step is spent. A stall with a healthy route
+--- is never grounds to change the plan — that is the underlying bug.
+local function route_dead(beat)
+  local now = wow.time()
+  local nav = wow.nav_progress()
+  local dead = nav.state == "unavailable" and not nav.walkout_available
+  if not dead or unroutableBeat ~= beat.id then
+    unroutableBeat = dead and beat.id or nil
+    unroutableSince = dead and now or nil
+    return false
   end
-  if is_ghost(frame) then
-    return { kind = "hold", reason = "dead_reset" }
-  end
-  local death = frame.death or {}
-  if death.can_reclaim_corpse == true then
-    return { kind = "hold", reason = "reclaim_corpse" }
-  end
+  if now - unroutableSince < ROUTE_PATIENCE_SECONDS then return false end
+  skipped[beat.id] = true
+  unroutableBeat, unroutableSince = nil, nil
+  wow.log("route unavailable, skipping beat " .. beat.id)
+  return true
+end
 
-  local beats = load_beats(args)
-  if not beats then
-    return { kind = "hold", reason = "route_config_missing" }
+local function navigate_to(view, pos, beat, reason, opts)
+  opts = opts or {}
+  if route_dead(beat) then return nil end
+  local intent = {
+    kind = "navigate",
+    x = beat.x,
+    y = beat.y,
+    map_id = math.floor(view.location.map_id or ROUTE.map_id),
+    stop_distance = beat.radius,
+    route_profile = "prefer_ground",
+    reason = reason or beat.id,
+    status = bot_status(view, pos, beat, opts.status),
+  }
+  -- Swim legs omit z: an unknown target Z makes the host surface-ride
+  -- (held JUMP) instead of pitching toward the seabed.
+  if not opts.surface then intent.z = beat.z end
+  return intent
+end
+
+local function want_form(view, pos, spell, label)
+  local now = wow.time()
+  if lastFormCastAt and now - lastFormCastAt < FORM_RETRY_SECONDS then
+    return nil
   end
-  local land = beat_by_id(beats, "land_approach") or beats[1]
-  local water = beat_by_id(beats, "water_entry") or beats[2] or land
-  local goal_id = args.goal_id or "duskwallow_coast"
-  local goal = beat_by_id(beats, goal_id) or beats[#beats]
-  local map_id = me.map_id or 1
-  local swimming = is_swimming(frame)
-  local wading = is_wading(frame)
-  local goal_dist = planar_dist(me.x, me.y, goal.x, goal.y)
-  local water_dist = planar_dist(me.x, me.y, water.x, water.y)
-  local land_dist = planar_dist(me.x, me.y, land.x, land.y)
-  local reference = route_reference(beats, me.x, me.y)
+  lastFormCastAt = now
+  return { kind = "cast_spell", spell = spell, reason = label,
+    status = bot_status(view, pos, nil) }
+end
 
-  local phase = 0
-  if type(frame.view_id) == "number" then
-    phase = math.floor(frame.view_id)
-  end
-
-  local near_water = water_dist <= ((water.radius or 50) + 120.0)
-  -- Once north of the entry beat's acceptance band, never retarget the beach.
-  -- The previous +80 boundary sat exactly on the observed shoreline and made
-  -- adjacent frames alternate between water_entry and the first wet leg.
-  local mid_coast = me.x > (water.x + 40.0)
-
-  if swimming then
-    if not in_aquatic_form(frame) then
-      local known = frame.spells and frame.spells.known
-      if known == nil or knows_spell(frame, AQUATIC_FORM_SPELL) then
-        return {
-          kind = "cast_spell",
-          spell = AQUATIC_FORM_SPELL,
-          reason = "aquatic_form",
-        }
-      else
-        return { kind = "hold", reason = "aquatic_form_unknown" }
+function M.decide(view)
+  -- Death = the speedrun is over. No release, no corpse run, no recovery.
+  if view.is_dead or view.is_ghost then
+    if not deathLogged then
+      deathLogged = true
+      local where = "?"
+      if view.location_known and view.location then
+        where = string.format("(%.1f, %.1f)",
+          view.location.position.x, view.location.position.y)
       end
+      wow.log("SPEEDRUN OVER: died at " .. where ..
+        " — do not corpse-run; fix whatever stopped the movement")
+    end
+    wow.set_status("run over (died)")
+    return { kind = "hold", reason = "run_over" }
+  end
+
+  if not view.location_known or not view.location then
+    return { kind = "hold", reason = "no_position" }
+  end
+  local pos = view.location.position
+  local stalled = watch_progress(view, pos)
+
+  local land = beat_by_id("land_approach")
+  local water = beat_by_id("water_entry")
+  local goal = beat_by_id(ROUTE.goal_id)
+  local water_dist = planar(pos.x, pos.y, water.x, water.y)
+  local land_dist = planar(pos.x, pos.y, land.x, land.y)
+  local swimming = view.is_swimming == true
+  local near_water = water_dist <= water.radius + 120.0
+  -- North of the entry band: never re-target the beach.
+  local mid_coast = pos.x > water.x + 40.0
+
+  -- Forms are speed, and speed is the score. Aquatic whenever wet (even off
+  -- plan — drowning slower is still better); Travel on dry open ground.
+  if swimming then
+    if not in_aquatic_form(view) then
+      local cast = want_form(view, pos, AQUATIC_FORM_SPELL, "aquatic_form")
+      if cast then return cast end
     end
   elseif not near_water and not mid_coast then
-    if not in_travel_form(frame) then
-      local known = frame.spells and frame.spells.known
-      if known == nil or knows_spell(frame, TRAVEL_FORM_SPELL) then
-        local fid = me.shapeshift_form_id
-        if (fid == nil or fid == 0) and (phase % 3) == 0 then
-          return {
-            kind = "cast_spell",
-            spell = TRAVEL_FORM_SPELL,
-            reason = "travel_form",
-          }
-        end
-      else
-        return { kind = "hold", reason = "travel_form_unknown" }
+    if not in_travel_form(view) then
+      local cast = want_form(view, pos, TRAVEL_FORM_SPELL, "travel_form")
+      if cast then return cast end
+    end
+  end
+
+  if not SWIM then
+    -- Land legs only: prove the seat can cross Tanaris to the coast.
+    if water_dist <= water.radius then
+      wow.set_status(string.format("at the coast (%.0fyd), awaiting swim pass",
+        water_dist))
+      return { kind = "hold", reason = "awaiting_swim_pass",
+        status = bot_status(view, pos, water, { stalled_seconds = stalled }) }
+    end
+    local beat = water
+    if not skipped[land.id] and land_dist > land.radius and
+        water_dist > 400.0 and pos.x < land.x + PASSED_YARDS then
+      beat = land
+    end
+    local intent = navigate_to(view, pos, beat, beat.id,
+      { status = { stalled_seconds = stalled } })
+    if intent then
+      wow.set_status(string.format("%s %.0fyd%s", beat.id,
+        planar(pos.x, pos.y, beat.x, beat.y),
+        stalled > 0 and string.format(" STALLED %.0fs", stalled) or ""))
+      return intent
+    end
+    -- Beat just skipped; next frame re-plans against what is left.
+    return { kind = "hold", reason = "replanning",
+      status = bot_status(view, pos, beat) }
+  end
+
+  -- Wet chain (SWIM=true): the manual-run ribbon, one sparse beat at a time,
+  -- never a single ocean chord.
+  if swimming and planar(pos.x, pos.y, goal.x, goal.y) <= goal.radius then
+    wow.set_status("goal: " .. ROUTE.goal_id)
+    return { kind = "hold", reason = ROUTE.goal_id,
+      status = bot_status(view, pos, goal) }
+  end
+
+  if swimming or wading(view, pos) or mid_coast then
+    local wet = next_wet_beat(pos.x, pos.y)
+    if wet then
+      local reason = swimming and ("swim_" .. wet.id) or "enter_water"
+      local intent = navigate_to(view, pos, wet, reason,
+        { surface = swimming, status = { stalled_seconds = stalled } })
+      if intent then
+        wow.set_status(reason)
+        return intent
       end
     end
+    local intent = navigate_to(view, pos, goal, "swim_" .. ROUTE.goal_id,
+      { surface = true })
+    if intent then return intent end
   end
 
-  if swimming and goal_dist <= (goal.radius or 100.0) then
-    return {
-      kind = "hold",
-      reason = goal_id,
-      beat_id = goal.id,
-      route_reference = reference,
-    }
+  -- Dry approach, same shape as the land-only phase.
+  local beat = water
+  if not skipped[land.id] and land_dist > land.radius and
+      water_dist > 400.0 and pos.x < land.x + PASSED_YARDS then
+    beat = land
   end
-
-  -- Wet: next manual-route beat only (never one ocean chord).
-  if swimming then
-    local wet = next_wet_beat(beats, me.x, me.y)
-    if wet then
-      return navigate_to(
-        wet, "swim_" .. (wet.id or "leg"), map_id, reference)
-    end
-    return navigate_to(goal, "swim_" .. goal_id, map_id, reference)
+  local intent = navigate_to(view, pos, beat, beat.id,
+    { status = { stalled_seconds = stalled } })
+  if intent then
+    wow.set_status(beat.id)
+    return intent
   end
-
-
-  if wading then
-    local wet = next_wet_beat(beats, me.x, me.y)
-    if wet then
-      return navigate_to(wet, "enter_water", map_id, reference)
-    end
-  end
-
-  if mid_coast then
-    -- Dry past entry: rejoin the next manual-route beat, never the first beat.
-    local wet = next_wet_beat(beats, me.x, me.y)
-    if wet then
-      return navigate_to(wet, "reenter_water", map_id, reference)
-    end
-    return navigate_to(water, "reenter_water", map_id)
-  end
-
-  if water_dist <= ((water.radius or 50) + 25.0) then
-    -- Into first wet open-water beat so we leave the beach.
-    local wet = next_wet_beat(beats, me.x, me.y)
-    if wet then
-      return navigate_to(wet, "enter_water", map_id, reference)
-    end
-    local into = {
-      id = "enter_water",
-      x = water.x + 150.0,
-      y = water.y - 80.0,
-      z = -5.0,
-      radius = 25.0,
-      mode = "land",
-    }
-    return navigate_to(into, "enter_water", map_id)
-  end
-
-  if land_dist > (land.radius or 80) and water_dist > 400.0 then
-    return navigate_to(land, "land_approach", map_id)
-  end
-
-  return navigate_to(water, "water_entry", map_id)
+  return { kind = "hold", reason = "replanning",
+    status = bot_status(view, pos, beat) }
 end
 
 return M
