@@ -35,7 +35,7 @@ local BUFFS_BY_CLASS = {
 
 local ENGAGE_YARDS = 4.0
 local SEARCH_YARDS = 40.0        -- a starting field is sparser than a road
-local PATROL_YARDS = 35.0
+local ROAM_YARDS = 70.0          -- a leg long enough to reach new spawns
 local CORPSE_STOP_YARDS = 30.0   -- the reclaim radius is 39; stop short of it
 local STALL_SECONDS = 8.0
 -- Rotating a leg restarts the route, so a leg has to be given time to work.
@@ -50,15 +50,17 @@ local RETREAT_HEALTH_PCT = 20.0
 local FINISH_TARGET_HEALTH_PCT = 20.0
 local NUKE_MANA_FLOOR_PCT = 35.0
 
-local PATROL = {
-  { dx = PATROL_YARDS, dy = 0.0 },
-  { dx = 0.0, dy = PATROL_YARDS },
-  { dx = -PATROL_YARDS, dy = 0.0 },
-  { dx = 0.0, dy = -PATROL_YARDS },
+-- Headings walked in turn. Legs start from wherever the seat is standing, so
+-- clearing one patch of ground leads onto the next instead of pacing a box.
+local HEADINGS = {
+  { dx = 1.0, dy = 0.0 },
+  { dx = 0.0, dy = 1.0 },
+  { dx = -1.0, dy = 0.0 },
+  { dx = 0.0, dy = -1.0 },
 }
 
-local anchor = nil
-local patrolLeg = 1
+local heading = 1
+local legTarget = nil
 local legStartedAt = nil
 local lastPos = nil
 local lastProgressAt = nil
@@ -174,39 +176,48 @@ local function killed_target(view, guid)
   return false
 end
 
-local function patrol_target(view, pos)
+local function start_leg(pos, now)
+  local step = HEADINGS[heading]
+  legTarget = {
+    x = pos.x + step.dx * ROAM_YARDS,
+    y = pos.y + step.dy * ROAM_YARDS,
+  }
+  legStartedAt = now
+  lastPos, lastProgressAt = { x = pos.x, y = pos.y }, now
+end
+
+local function turn(pos, now)
+  heading = heading % #HEADINGS + 1
+  start_leg(pos, now)
+end
+
+-- Roam for fresh spawns: a cleared patch has nothing left to kill, so each
+-- leg leaves from where the seat stands rather than pacing a fixed box.
+local function roam_target(view, pos)
   local now = wow.time()
   local nav = wow.nav_progress()
+  if not legTarget then start_leg(pos, now) end
+
   local moved = lastPos and
     distance2d(pos.x, pos.y, lastPos.x, lastPos.y) >= PROGRESS_YARDS
-  if moved or not lastPos then
+  if moved then
     lastPos, lastProgressAt = { x = pos.x, y = pos.y }, now
   end
 
   -- A pinned failure is not fixed by a different destination; the host takes
-  -- a walkout step from this pose. Rotate only once that is spent, only on a
+  -- a walkout step from this pose. Turn only once that is spent, only on a
   -- route the client reports it cannot serve right now, and never faster than
   -- the route engine can plan one. Movement we do not control is not a stall.
-  if not legStartedAt then legStartedAt = now end
   local unavailable = nav.state == "unavailable" and not nav.walkout_available
   local controllable = view.movement_allowed and not view.rooted
   local stalled = controllable and lastProgressAt and
     now - lastProgressAt > STALL_SECONDS
   if (unavailable or stalled) and now - legStartedAt >= LEG_MIN_SECONDS then
-    patrolLeg = patrolLeg % #PATROL + 1
-    legStartedAt = now
-    lastPos, lastProgressAt = { x = pos.x, y = pos.y }, now
+    turn(pos, now)
+  elseif distance2d(pos.x, pos.y, legTarget.x, legTarget.y) <= ENGAGE_YARDS then
+    turn(pos, now)
   end
-
-  local leg = PATROL[patrolLeg]
-  local tx, ty = anchor.x + leg.dx, anchor.y + leg.dy
-  if distance2d(pos.x, pos.y, tx, ty) <= ENGAGE_YARDS then
-    patrolLeg = patrolLeg % #PATROL + 1
-    legStartedAt = now
-    leg = PATROL[patrolLeg]
-    tx, ty = anchor.x + leg.dx, anchor.y + leg.dy
-  end
-  return tx, ty
+  return legTarget.x, legTarget.y
 end
 
 -- Quest work. Every step is a dialog panel answer or one interface control,
@@ -378,9 +389,6 @@ function M.decide(view)
     return { kind = "hold", reason = "no_position" }
   end
   local pos = view.location.position
-  if not anchor then
-    anchor = { x = pos.x, y = pos.y, z = pos.z }
-  end
 
   -- The server's combat bit lags a kill; re-acquiring into a corpse wastes
   -- the swing that would have started the next fight.
@@ -420,9 +428,9 @@ function M.decide(view)
       percent(engaged.health, engaged.max_health) <= FINISH_TARGET_HEALTH_PCT
     if not nearlyDead then
       wow.set_status(string.format("retreat at %d%% hp", math.floor(health)))
-      local away = distance2d(pos.x, pos.y, anchor.x, anchor.y)
-      local tx = anchor.x + (pos.x - anchor.x) * (away > 1.0 and -1.0 or 1.0)
-      local ty = anchor.y + (pos.y - anchor.y) * (away > 1.0 and -1.0 or 1.0)
+      local step = HEADINGS[heading % #HEADINGS + 1]
+      local tx = pos.x + step.dx * ROAM_YARDS * 0.25
+      local ty = pos.y + step.dy * ROAM_YARDS * 0.25
       return {
         kind = "navigate",
         x = tx, y = ty, z = pos.z,
@@ -450,7 +458,7 @@ function M.decide(view)
     if not view.in_combat and not rested then
       -- Travel satisfies the five second rule, so walking to the next spawn
       -- regenerates for free where standing still would not.
-      local tx, ty = patrol_target(view, pos)
+      local tx, ty = roam_target(view, pos)
       wow.set_status(string.format("recover %d%% hp %d%% mana",
         math.floor(health), math.floor(mana)))
       return {
@@ -487,15 +495,15 @@ function M.decide(view)
     }
   end
 
-  local tx, ty = patrol_target(view, pos)
-  wow.set_status(string.format("patrol leg %d", patrolLeg))
+  local tx, ty = roam_target(view, pos)
+  wow.set_status(string.format("roam heading %d", heading))
   return {
     kind = "navigate",
     x = tx, y = ty, z = pos.z,
     map_id = math.floor(view.location.map_id or 0),
     stop_distance = ENGAGE_YARDS,
     route_profile = "prefer_ground",
-    reason = "patrol_leg_" .. patrolLeg,
+    reason = "roam_" .. heading,
     status = progress_status(view),
   }
 end

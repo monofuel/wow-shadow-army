@@ -158,7 +158,7 @@ local before = grind.decide(patrolView())
 nav = { state = "unavailable", failed_here = true, walkout_available = false }
 clock = clock + 10.0
 local rotated = grind.decide(patrolView())
-check(rotated.x ~= before.x or rotated.y ~= before.y, "rotates when the pose is blocked")
+check(rotated.x ~= before.x or rotated.y ~= before.y, "turns when the pose is blocked")
 -- While the host still has a walkout step, the leg stands: keep the seat
 -- moving so this is about the walkout and not the stall timer.
 nav = { state = "unavailable", failed_here = true, walkout_available = true }
@@ -177,7 +177,14 @@ local first = grind.decide(patrolViewAt(12.0, 0.0))
 clock = clock + 0.5
 local second = grind.decide(patrolViewAt(12.0, 0.0))
 check(first.x == second.x and first.y == second.y,
-  "does not rotate faster than a route can plan")
+  "does not turn faster than a route can plan")
+
+-- Roaming leaves from where the seat stands, so a cleared patch leads on to
+-- new ground instead of pacing the same box.
+clock = clock + 30.0
+local farAway = grind.decide(patrolViewAt(500.0, 500.0))
+check(farAway.x > 400.0 and farAway.y > 400.0,
+  "roams onward from the current position")
 nav = { state = "following", failed_here = false, walkout_available = false }
 
 
