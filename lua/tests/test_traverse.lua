@@ -27,7 +27,7 @@ local petrel = require("traverse")
 check(route.goal_id == "duskwallow_coast", "route keeps the segment goal")
 -- The north land phase is a SPARSE strategy-beat list (fair play): one beat
 -- per road decision point, strictly increasing x, ending at the cave mouth.
-check(landRoute.goal_id == "felwood_cave_entrance" and #landRoute.beats == 12,
+check(landRoute.goal_id == "felwood_cave_entrance" and #landRoute.beats == 14,
   "land route is sparse and ends at the Timbermaw cave mouth")
 for i = 2, #landRoute.beats do
   check(landRoute.beats[i].x > landRoute.beats[i - 1].x,
@@ -189,6 +189,29 @@ local hurt = petrel.decide(view(5600.0, -1000.0, {
 }))
 check(hurt.kind == "navigate",
   "low health in combat still just runs — never heals, never stops")
+
+-- Collision snag: pinned pose (unavailable + failed_here + no walkout) with
+-- a frozen seat opens a short perpendicular hop window — the goal itself
+-- never rotates, and the hop resumes the same beat after the window.
+nav = { state = "unavailable", failed_here = true, walkout_available = false,
+  waypoint_count = 0 }
+clock = clock + 5.0
+petrel.decide(view(3322.0, -1640.0, formed))
+for _ = 1, 8 do
+  clock = clock + 1.0
+  petrel.decide(view(3322.0, -1640.0, formed))
+end
+local hop = petrel.decide(view(3322.0, -1640.0, formed))
+check(hop.kind == "navigate" and hop.reason == "snag_hop",
+  "a pinned frozen seat hops sideways")
+local hopDx, hopDy = hop.x - 3322.0, hop.y - (-1640.0)
+check(math.sqrt(hopDx * hopDx + hopDy * hopDy) > 10.0,
+  "the hop target is a genuine sidestep")
+nav = { state = "following", failed_here = false, walkout_available = false }
+clock = clock + 7.0
+local resumed = petrel.decide(view(3330.0, -1655.0, formed))
+check(resumed.kind == "navigate" and resumed.reason ~= "snag_hop",
+  "after the hop window the same beat resumes")
 
 -- The cave mouth is the segment goal: hold there, alive.
 clock = clock + 5.0

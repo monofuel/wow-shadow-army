@@ -83,6 +83,12 @@ local parkCheckPos = nil
 local parkCheckAt = nil
 local parkCheckFrames = nil
 local surfaceUntil = nil
+local snagCheckPos = nil
+local snagCheckAt = nil
+local snagCheckFrames = nil
+local snagUntil = nil
+local snagTarget = nil
+local snagSide = 1
 
 local function planar(ax, ay, bx, by)
   local dx, dy = ax - bx, ay - by
@@ -420,6 +426,26 @@ function M.decide(view)
   -- the Timbermaw cave mouth. Sparse road beats + mesh navigation, always
   -- moving; never fight, never heal, never stop.
   if land_phase then
+    -- TEMP LANDDBG: Ashenvale-pass wedge investigation (2026-08-10). The
+    -- first segment run froze 74 yd from ashenvale_pass with nav=planning
+    -- then route-unavailable while the offline mesh serves a full corridor
+    -- from the same pose. Log the whole nav_progress whenever the route is
+    -- not actively following. Remove after.
+    do
+      local nav = wow.nav_progress()
+      if nav.state ~= "following" then
+        local now = wow.time()
+        if lastWetDbgAt == nil or now - lastWetDbgAt > 10.0 then
+          lastWetDbgAt = now
+          wow.log(string.format(
+            "LANDDBG pos=(%.1f,%.1f,%.1f) nav=%s failed_here=%s walkout=%s wp=%s/%s err=%s",
+            pos.x, pos.y, pos.z or -99, tostring(nav.state),
+            tostring(nav.failed_here), tostring(nav.walkout_available),
+            tostring(nav.waypoint), tostring(nav.waypoint_count),
+            tostring(nav.error)))
+        end
+      end
+    end
     local lgoal = LAND.beats[#LAND.beats]
     if planar(pos.x, pos.y, lgoal.x, lgoal.y) <= lgoal.radius then
       -- Holding at the segment goal by choice is not a stall.
@@ -430,6 +456,60 @@ function M.decide(view)
         status = bot_status(view, pos, lgoal, { phase = "north_land" }) }
     end
     local beat = next_land_beat(pos.x, pos.y)
+
+    -- Snag hop: the nim client's collision can pin the seat on a road-side
+    -- point object — corridor planned, but every ground input toward it is
+    -- rejected ("no productive ground input", failed_here, no walkout) and
+    -- the seat freezes to the millimeter (run 2 wedge at (3322,-1640),
+    -- 2026-08-10). The goal NEVER rotates: open a short window that steps
+    -- ~18 yd perpendicular to the beat bearing (alternating sides) purely
+    -- to change the physical contact, then resume the same beat. Land twin
+    -- of the wet park detector's surface-ride window.
+    local now = wow.time()
+    if snagUntil and now < snagUntil and snagTarget then
+      return { kind = "navigate", x = snagTarget.x, y = snagTarget.y,
+        z = pos.z, map_id = math.floor(view.location.map_id or ROUTE.map_id),
+        stop_distance = 4.0, route_profile = "prefer_ground",
+        reason = "snag_hop",
+        status = bot_status(view, pos, beat,
+          { phase = "north_land", snag_hop = true }) }
+    end
+    snagUntil, snagTarget = nil, nil
+    -- Trigger on the FROZEN SEAT itself, not on any nav-state combination:
+    -- the run-2 death froze under nav=walkout ("input returned to the same
+    -- pose") while a mob train burned 138 hp/sim-s — the seat was pinned
+    -- but the walkout machinery still claimed progress was possible.
+    local pinned = view.movement_allowed and not view.rooted
+    if pinned then
+      if snagCheckPos == nil or
+          planar(pos.x, pos.y, snagCheckPos.x, snagCheckPos.y) > 1.0 then
+        snagCheckPos, snagCheckAt, snagCheckFrames =
+          { x = pos.x, y = pos.y }, now, 0
+      else
+        snagCheckFrames = (snagCheckFrames or 0) + 1
+        -- 5 sim-s clears a pilot form-cast pause; 8 real frames keeps
+        -- jumpy test clocks from tripping it.
+        if now - snagCheckAt > 5.0 and snagCheckFrames >= 8 then
+          local dx, dy = beat.x - pos.x, beat.y - pos.y
+          local len = math.sqrt(dx * dx + dy * dy)
+          if len > 0.1 then
+            local ux, uy = dx / len, dy / len
+            snagSide = -snagSide
+            snagTarget = { x = pos.x - uy * 18.0 * snagSide,
+              y = pos.y + ux * 18.0 * snagSide }
+            snagUntil = now + 6.0
+            snagCheckPos, snagCheckAt, snagCheckFrames = nil, nil, nil
+            wow.log(string.format(
+              "SNAG: pinned at (%.1f, %.1f) — hopping %s to (%.1f, %.1f)",
+              pos.x, pos.y, snagSide > 0 and "left" or "right",
+              snagTarget.x, snagTarget.y))
+          end
+        end
+      end
+    else
+      snagCheckPos, snagCheckAt, snagCheckFrames = nil, nil, nil
+    end
+
     local intent = navigate_to(view, pos, beat, beat.id,
       { stop = 8.0,
         status = { phase = "north_land", stalled_seconds = stalled } })
