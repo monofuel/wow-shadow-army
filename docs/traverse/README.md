@@ -25,6 +25,23 @@ monofuel's manual run of the course:
    `STALL` line (position + nav state) and holds its goal. It never
    thrashes destinations to escape a stall — a healthy route with a frozen
    seat is a host/client bug to diagnose, not a brain state to farm.
+4. **Never heal, never defensive-cast.** Casting means standing still, and
+   standing still is the only way this bot dies. In-combat heals are
+   strictly worse than running: vanilla spell pushback rewinds the cast bar
+   on every hit while the mob keeps swinging. Travel Form + motion is the
+   entire defense; the only casts the brain may ever emit are the two
+   forms. (Cautionary tale: GPT 5.6 Sol's Felwood heal stack, 2026-08-10 —
+   Nature's Grasp/Barkskin/Rejuv/Healing Touch on four timers turned the
+   run into stop-cast-die. Third AI to try some form of this. The lua test
+   suite now carries a doctrine guard that fails on any heal/defensive
+   spell ID in the brain.)
+5. **`/cancelform` does not exist in 1.12.** At least three AIs have now
+   hallucinated this command; typing it does nothing and the host machinery
+   built around it stands the bot still until a timeout. Forms drop
+   automatically when relevant (Travel Form on entering water) and toggle
+   by recasting — nothing on this run ever needs a form canceled. Any plan
+   containing `/cancelform` or mid-run healing is wrong by construction;
+   the doctrine guard in `lua/tests/test_traverse.lua` fails on the string.
 
 ## Mission facts
 
