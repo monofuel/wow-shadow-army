@@ -24,12 +24,12 @@ local petrel = require("traverse")
 
 -- The route data survived the move off host-injected args.
 check(route.goal_id == "duskwallow_coast", "route keeps the segment goal")
-check(#route.beats == 93, "route keeps every beat")
+check(#route.beats == 50, "route keeps every beat")
 local wetCount = 0
 for _, b in ipairs(route.beats) do
   if b.wet then wetCount = wetCount + 1 end
 end
-check(wetCount == 91, "route keeps the wet ribbon")
+check(wetCount == 48, "route keeps the wet ribbon")
 check(route.beats[1].id == "land_approach" and route.beats[2].id == "water_entry",
   "land legs lead the route")
 

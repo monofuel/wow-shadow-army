@@ -54,14 +54,18 @@ local PASSED_YARDS = 20.0
 -- Chords must never exceed beat spacing — and a beat once entered is
 -- reached forever, or the selection flip-flops on the boundary (run 7
 -- orbited the start blob doing exactly that).
-local WET_SELECT_YARDS = 20.0
+-- 10 on a 25-yd carpet keeps cross-track under ~10 yd: the fatigue weave
+-- only refills when the body genuinely touches the safe band, and 20-yd
+-- capture let the seat skirt those touches (run 22 arrived at the wall
+-- bypass drained and died mid-sprint; run 21, tracing truer, crossed it
+-- full).
+local WET_SELECT_YARDS = 10.0
 -- No dive span: 15 wet-lab runs proved z-following at 10x tunnels the
 -- seat through world collision at random (void falls in the early ribbon,
 -- the -5675 wall face, and the cheese_26-28 basin), while the surface
 -- ride never tunneled once. The one surface blocker — the -5675 wall
 -- spur — is bypassed seaward by the v7 route (cheese_21/22). Keep the
 -- machinery: a future route may need a dive window again.
-local DIVE_THROUGH_INDEX = 0
 
 local lastPos = nil
 local lastProgressAt = nil
@@ -74,6 +78,10 @@ local deathLogged = false
 local gateLogged = false
 local lastWetDbgAt = nil
 local actionBarLogged = false
+local parkCheckPos = nil
+local parkCheckAt = nil
+local parkCheckFrames = nil
+local surfaceUntil = nil
 
 local function planar(ax, ay, bx, by)
   local dx, dy = ax - bx, ay - by
@@ -222,23 +230,19 @@ local function navigate_to(view, pos, beat, reason, opts)
     reason = reason or beat.id,
     status = bot_status(view, pos, beat, opts.status),
   }
-  -- Depth policy from 12 wet-lab runs: surface-ride (omit z, host holds
-  -- JUMP) everywhere EXCEPT the -5675,-4770 crest window, where the human
-  -- line dives 5-9 yd under a wall the surface path pins on. z-following
-  -- outside the window is actively dangerous: the host pitch integrates
-  -- ~1 rad per frame at 10x against a 0.06 rad dead zone (bang-bang), so
-  -- chasing deep beats slams the seabed and tunnels through the world
-  -- (runs 9/11/12 all fell to the graveyard in the cheese_26-28 basin).
-  -- Aquatic Form makes the dive window free (no breath).
-  if not opts.surface then
-    if not beat.wet then
-      intent.z = beat.z
-    else
-      local n = beat.id:match("^cheese_(%d+)$")
-      if n and tonumber(n) <= DIVE_THROUGH_INDEX then
-        intent.z = beat.z
-      end
-    end
+  -- Wet beats swim the human run's z profile: it is the only line that
+  -- threads the -5675 wall's under-gap, and the fatigue-priced seaward
+  -- bypass is unaffordable (~a full bar per crossing, wet-lab run 26).
+  -- Descent safety is owned by client physics now — a swimmer's descent
+  -- requires floor evidence — so the void-fall roulette that once forced
+  -- surface-only riding is gone. Aquatic Form makes depth free.
+  -- Anti-park: the 10x pitch controller can freeze translation chasing a
+  -- depth (run 27 died parked at a beat, full stop, in drain water). While
+  -- the override window is open, omit z — surface-ride input (held JUMP +
+  -- forward) always translates.
+  if not opts.surface and
+      not (beat.wet and surfaceUntil and wow.time() < surfaceUntil) then
+    intent.z = beat.z
   end
   return intent
 end
@@ -285,10 +289,42 @@ function M.decide(view)
   local pos = view.location.position
   local stalled = watch_progress(view, pos)
 
+  -- Park detector: a swimming seat that has not moved ~a body length for 3
+  -- sim-seconds of real frames is frozen (pitch bang-bang, bank graze) —
+  -- and a frozen swimmer in DRAIN water is dying for nothing (run 27).
+  -- Open a short surface-ride window; held JUMP + forward always
+  -- translates. Requires sustained frames so test harnesses with jumpy
+  -- clocks cannot trip it, and active fatigue so safe-water pauses (form
+  -- casts, beat handoffs) are left alone.
+  if SWIM and view.is_swimming then
+    local now = wow.time()
+    if parkCheckPos == nil or
+        planar(pos.x, pos.y, parkCheckPos.x, parkCheckPos.y) > 2.0 then
+      parkCheckPos, parkCheckAt, parkCheckFrames =
+        { x = pos.x, y = pos.y }, now, 0
+    else
+      parkCheckFrames = (parkCheckFrames or 0) + 1
+      if now - parkCheckAt > 3.0 and parkCheckFrames >= 10 and
+          view.fatigue_timer and view.fatigue_timer.active and
+          not (surfaceUntil and now < surfaceUntil) then
+        surfaceUntil = now + 8.0
+        parkCheckPos, parkCheckAt, parkCheckFrames =
+          { x = pos.x, y = pos.y }, now, 0
+        wow.log(string.format(
+          "PARK: frozen swimmer at (%.1f, %.1f) — surfacing to unstick",
+          pos.x, pos.y))
+      end
+    end
+  else
+    parkCheckPos, parkCheckAt, parkCheckFrames = nil, nil, nil
+  end
+
   -- TEMP WETDBG: frozen-swimmer investigation (2026-08-10). Remove after.
   if SWIM and view.is_swimming then
     local now = wow.time()
-    if lastWetDbgAt == nil or now - lastWetDbgAt > 50.0 then
+    -- Fine-grained inside the wall corridor: the parks live there.
+    local dbg_window = pos.x > -5760.0 and pos.x < -5540.0
+    if lastWetDbgAt == nil or now - lastWetDbgAt > (dbg_window and 5.0 or 50.0) then
       lastWetDbgAt = now
       wow.log(string.format(
         "WETDBG pos=(%.2f,%.2f,%.2f,o=%.3f) mode=%s spd=%s/%.2f form=%s/%s breath=%s/%.2f fat=%s/%.2f sub=%s surf=%s",
@@ -301,7 +337,8 @@ function M.decide(view)
         (view.breath_timer and view.breath_timer.remaining_fraction) or -1,
         tostring(view.fatigue_timer and view.fatigue_timer.active),
         (view.fatigue_timer and view.fatigue_timer.remaining_fraction) or -1,
-        tostring(view.liquid_submerged), tostring(view.liquid_surface_z)))
+        tostring(view.liquid_submerged), tostring(view.liquid_surface_z))
+        .. string.format(" nav=%s", wow.nav_progress().state))
     end
     if not actionBarLogged and view.action_bar_known then
       actionBarLogged = true
@@ -391,7 +428,7 @@ function M.decide(view)
     local wet = next_wet_beat(pos.x, pos.y)
     if wet then
       local intent = navigate_to(view, pos, wet, reason,
-        { stop = WET_SELECT_YARDS - 5.0,
+        { stop = WET_SELECT_YARDS - 4.0,
           status = { stalled_seconds = stalled } })
       if intent then
         wow.set_status(string.format("%s %s %.0fyd", reason, wet.id,
