@@ -60,8 +60,8 @@ local aquatic = { shapeshift_form_id = 4 }
 local entry = petrel.decide(view(-6790.0, -4840.0, { shapeshift_form_id = 3 }))
 check(entry.kind == "navigate", "gate on: no awaiting_swim_pass hold")
 check(entry.reason == "enter_water", "dry entry uses the entry reason")
-check(entry.x == -6711.38, "dry entry targets the first wet beat")
-check(entry.z == nil, "wet beats always omit z (surface ride)")
+check(entry.x == -6737.63, "dry entry targets the first wet beat")
+check(entry.z == nil, "wet beats surface-ride (no dive span)")
 check(entry.status and entry.status.dist_goal and entry.status.dist_goal > 0,
   "status carries planar distance to the goal")
 
@@ -88,15 +88,15 @@ local swim = petrel.decide(view(-6600.0, -4865.0,
   { shapeshift_form_id = 4, is_swimming = true }))
 check(swim.kind == "navigate" and swim.reason == "swim_ribbon",
   "swimming uses the ribbon goal key")
-check(swim.x == -6544.85, "targets the next unpassed beat outside radius")
-check(swim.z == nil, "swim legs omit z")
+check(swim.x == -6560.03, "targets the next unpassed beat outside radius")
+check(swim.z == nil, "open-water legs omit z")
 
 clock = clock + 5.0
 local later = petrel.decide(view(-6400.0, -4920.0,
   { shapeshift_form_id = 4, is_swimming = true }))
 check(later.kind == "navigate" and later.reason == "swim_ribbon",
   "the goal key is constant across beat handoffs")
-check(later.x == -6331.54, "beat advance follows the ribbon")
+check(later.x == -6361.44, "beat advance follows the ribbon")
 
 -- A swim-flag flicker mid-coast (stock clears swimming before the body has
 -- left the liquid) must keep the same goal key, or the engine's shoreline
@@ -117,7 +117,7 @@ petrel.decide(view(-6400.0, -4920.0,
 clock = clock + 200.0
 local held = petrel.decide(view(-6400.0, -4920.0,
   { shapeshift_form_id = 4, is_swimming = true }))
-check(held.kind == "navigate" and held.x == -6331.54,
+check(held.kind == "navigate" and held.x == -6361.44,
   "wet beats are never skipped while swimming")
 nav = { state = "following", failed_here = false, walkout_available = false }
 

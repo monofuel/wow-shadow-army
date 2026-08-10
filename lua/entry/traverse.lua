@@ -31,8 +31,11 @@ local AQUATIC_FORM_ID = 4
 -- second" window in sim seconds elapses in 0.6 wall seconds. These windows
 -- are sim-scaled so they give the engine real wall time at 10x; at 1x
 -- (manual debugging) they are just patient.
--- The host holds a pending form cast for 3 sim seconds; retry slower.
-local FORM_RETRY_SECONDS = 40.0
+-- The host holds a pending form cast for 3 sim seconds; retry slower — but
+-- not much slower: water exit/entry auto-cancels forms, and every formless
+-- sim-second in the fatigue ocean is swum at stock speed (run 4 died of
+-- exactly that: fatigue exhaustion at 4.72 yd/s).
+local FORM_RETRY_SECONDS = 15.0
 -- No progress for this long while movement is ours = a stall worth shouting
 -- about (the suspected RPB-CPU/world-streaming blocker looks exactly like
 -- this: route healthy, seat frozen). ~8 wall seconds at 10x.
@@ -44,6 +47,21 @@ local ROUTE_PATIENCE_SECONDS = 60.0
 local PROGRESS_YARDS = 3.0
 -- Northing hysteresis: once well past a beat's X band, never re-target it.
 local PASSED_YARDS = 20.0
+-- Wet-beat select/arrive distance. The cheese carpet zigzags around
+-- headlands; selecting the next beat at full beat radius (35) strings
+-- 90+ yd chords that cut the corners the human line swims around (run 6
+-- died pinned on the -5675,-4771 headland off exactly such a chord).
+-- Chords must never exceed beat spacing — and a beat once entered is
+-- reached forever, or the selection flip-flops on the boundary (run 7
+-- orbited the start blob doing exactly that).
+local WET_SELECT_YARDS = 20.0
+-- No dive span: 15 wet-lab runs proved z-following at 10x tunnels the
+-- seat through world collision at random (void falls in the early ribbon,
+-- the -5675 wall face, and the cheese_26-28 basin), while the surface
+-- ride never tunneled once. The one surface blocker — the -5675 wall
+-- spur — is bypassed seaward by the v7 route (cheese_21/22). Keep the
+-- machinery: a future route may need a dive window again.
+local DIVE_THROUGH_INDEX = 0
 
 local lastPos = nil
 local lastProgressAt = nil
@@ -54,6 +72,8 @@ local skipped = {}
 local lastFormCastAt = nil
 local deathLogged = false
 local gateLogged = false
+local lastWetDbgAt = nil
+local actionBarLogged = false
 
 local function planar(ax, ay, bx, by)
   local dx, dy = ax - bx, ay - by
@@ -97,8 +117,12 @@ local function next_wet_beat(x, y)
   if #wet == 0 then return nil end
   for _, b in ipairs(wet) do
     local passed = x >= (b.x + PASSED_YARDS)
-    if not skipped[b.id] and not passed and
-        planar(x, y, b.x, b.y) > b.radius then
+    -- Entering a beat's capture zone retires it permanently: monotonic
+    -- selection, no boundary flip-flop.
+    if not skipped[b.id] and planar(x, y, b.x, b.y) <= WET_SELECT_YARDS then
+      skipped[b.id] = true
+    end
+    if not skipped[b.id] and not passed then
       if b.x + b.radius >= x - 40.0 then
         return b
       end
@@ -117,6 +141,8 @@ local function bot_status(view, pos, beat, extra)
     dist_water = water and planar(pos.x, pos.y, water.x, water.y) or -1,
     dist_goal = goal and planar(pos.x, pos.y, goal.x, goal.y) or -1,
     swimming = view.is_swimming or false,
+    fatigue = (view.fatigue_timer and view.fatigue_timer.active) and
+      view.fatigue_timer.remaining_fraction or 1.0,
     -- Deaths must arrive with a cause attached: mobs show up as combat and
     -- sinking health well before the kill, falls do not.
     health = view.health_known and view.health or -1,
@@ -191,14 +217,29 @@ local function navigate_to(view, pos, beat, reason, opts)
     x = beat.x,
     y = beat.y,
     map_id = math.floor(view.location.map_id or ROUTE.map_id),
-    stop_distance = beat.radius,
+    stop_distance = opts.stop or beat.radius,
     route_profile = "prefer_ground",
     reason = reason or beat.id,
     status = bot_status(view, pos, beat, opts.status),
   }
-  -- Swim legs omit z: an unknown target Z makes the host surface-ride
-  -- (held JUMP) instead of pitching toward the seabed.
-  if not opts.surface then intent.z = beat.z end
+  -- Depth policy from 12 wet-lab runs: surface-ride (omit z, host holds
+  -- JUMP) everywhere EXCEPT the -5675,-4770 crest window, where the human
+  -- line dives 5-9 yd under a wall the surface path pins on. z-following
+  -- outside the window is actively dangerous: the host pitch integrates
+  -- ~1 rad per frame at 10x against a 0.06 rad dead zone (bang-bang), so
+  -- chasing deep beats slams the seabed and tunnels through the world
+  -- (runs 9/11/12 all fell to the graveyard in the cheese_26-28 basin).
+  -- Aquatic Form makes the dive window free (no breath).
+  if not opts.surface then
+    if not beat.wet then
+      intent.z = beat.z
+    else
+      local n = beat.id:match("^cheese_(%d+)$")
+      if n and tonumber(n) <= DIVE_THROUGH_INDEX then
+        intent.z = beat.z
+      end
+    end
+  end
   return intent
 end
 
@@ -243,6 +284,37 @@ function M.decide(view)
   end
   local pos = view.location.position
   local stalled = watch_progress(view, pos)
+
+  -- TEMP WETDBG: frozen-swimmer investigation (2026-08-10). Remove after.
+  if SWIM and view.is_swimming then
+    local now = wow.time()
+    if lastWetDbgAt == nil or now - lastWetDbgAt > 50.0 then
+      lastWetDbgAt = now
+      wow.log(string.format(
+        "WETDBG pos=(%.2f,%.2f,%.2f,o=%.3f) mode=%s spd=%s/%.2f form=%s/%s breath=%s/%.2f fat=%s/%.2f sub=%s surf=%s",
+        pos.x, pos.y, pos.z or -99, pos.o or -99,
+        tostring(view.movement_mode),
+        tostring(view.movement_speed_known), view.movement_speed or -1,
+        tostring(view.shapeshift_form_id),
+        tostring(view.shapeshift_form_spell_id),
+        tostring(view.breath_timer and view.breath_timer.active),
+        (view.breath_timer and view.breath_timer.remaining_fraction) or -1,
+        tostring(view.fatigue_timer and view.fatigue_timer.active),
+        (view.fatigue_timer and view.fatigue_timer.remaining_fraction) or -1,
+        tostring(view.liquid_submerged), tostring(view.liquid_surface_z)))
+    end
+    if not actionBarLogged and view.action_bar_known then
+      actionBarLogged = true
+      local slots = {}
+      for _, b in ipairs(view.action_buttons or {}) do
+        if b.spell_id and b.spell_id > 0 then
+          slots[#slots + 1] = string.format("%d=%d", b.slot or -1, b.spell_id)
+        end
+      end
+      wow.log("WETDBG action_bar: " ..
+        (#slots > 0 and table.concat(slots, " ") or "empty"))
+    end
+  end
 
   local land = beat_by_id("land_approach")
   local water = beat_by_id("water_entry")
@@ -314,19 +386,20 @@ function M.decide(view)
     -- clause requires the incoming goal key to match the stored one to
     -- bridge frames where stock clears the swim flag before the body has
     -- left the liquid. Per-beat keys would drop retention exactly at a
-    -- beat handoff. Wet beats always omit z (surface ride).
+    -- beat handoff. Wet beats carry the human run's z (see navigate_to).
     local reason = (swimming or mid_coast) and "swim_ribbon" or "enter_water"
     local wet = next_wet_beat(pos.x, pos.y)
     if wet then
       local intent = navigate_to(view, pos, wet, reason,
-        { surface = true, status = { stalled_seconds = stalled } })
+        { stop = WET_SELECT_YARDS - 5.0,
+          status = { stalled_seconds = stalled } })
       if intent then
         wow.set_status(string.format("%s %s %.0fyd", reason, wet.id,
           planar(pos.x, pos.y, wet.x, wet.y)))
         return intent
       end
     end
-    local intent = navigate_to(view, pos, goal, reason, { surface = true })
+    local intent = navigate_to(view, pos, goal, reason, {})
     if intent then return intent end
   end
 
