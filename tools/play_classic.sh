@@ -12,8 +12,9 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-SNAPSHOT="/home/monofuel/Documents/Projects/Softmax/wow-classic-data/Coworld-WoW-Classic/client"
-LOCAL="$REPO_ROOT/local_classic"
+WORKSPACE_ROOT="${WOW_WORKSPACE_ROOT:-$(cd "$REPO_ROOT/.." && pwd)}"
+SNAPSHOT="${WOW_CLASSIC_SNAPSHOT:-$WORKSPACE_ROOT/wow-classic-data/Coworld-WoW-Classic/client}"
+LOCAL="${WOW_CLASSIC_LOCAL:-$REPO_ROOT/local_classic}"
 CLIENT="$LOCAL/client"
 export WINEPREFIX="$LOCAL/wineprefix"
 # Skip wine-mono/gecko installers: WoW 1.12 needs neither, and the wineboot
@@ -29,6 +30,23 @@ command -v wine >/dev/null 2>&1 || {
   exit 1
 }
 
+# Create or repair links owned by this launcher. A stale link whose old target
+# still exists must be compared by target, not merely skipped by `-e`. Real
+# files/directories are human overrides and are deliberately preserved.
+reconcile_link() {
+  local target=$1
+  local dest=$2
+  if [ -L "$dest" ]; then
+    if [ "$(readlink "$dest")" != "$target" ]; then
+      ln -sfn "$target" "$dest"
+      echo "[play-classic] relinked $dest -> $target"
+    fi
+  elif [ ! -e "$dest" ]; then
+    ln -s "$target" "$dest"
+    echo "[play-classic] linked $dest -> $target"
+  fi
+}
+
 # --- one-time local client assembly (idempotent) ---------------------------
 mkdir -p "$CLIENT"
 # Data/ is a REAL dir of per-entry symlinks (not one symlink to the snapshot):
@@ -41,7 +59,7 @@ fi
 mkdir -p "$CLIENT/Data"
 for f in "$SNAPSHOT/Data"/*; do
   base="$(basename "$f")"
-  [ -e "$CLIENT/Data/$base" ] || ln -s "$f" "$CLIENT/Data/$base"
+  reconcile_link "$f" "$CLIENT/Data/$base"
 done
 for item in WTF Interface WoW.exe dbghelp.dll fmod.dll ijl15.dll unicows.dll DivxDecoder.dll; do
   if [ ! -e "$CLIENT/$item" ] && [ -e "$SNAPSHOT/$item" ]; then
@@ -56,13 +74,17 @@ printf 'set realmlist 127.0.0.1\n' > "$CLIENT/realmlist.wtf"
 # Our addons: symlink each addons/* into the client (repo is the source of
 # truth; wine follows host symlinks). New addons still need a client restart
 # once (TOC scan at launch); code edits only need /console reloadui.
+mkdir -p "$CLIENT/Interface/AddOns"
 for addon in "$REPO_ROOT"/addons/*/; do
   name="$(basename "$addon")"
-  if [ ! -e "$CLIENT/Interface/AddOns/$name" ]; then
-    ln -s "${addon%/}" "$CLIENT/Interface/AddOns/$name"
-    echo "[play-classic] linked addon $name"
-  fi
+  reconcile_link "${addon%/}" "$CLIENT/Interface/AddOns/$name"
 done
+
+# Non-GUI verification hook for the idempotent assembly/relink phase.
+if [ "${PLAY_CLASSIC_PREPARE_ONLY:-0}" = "1" ]; then
+  echo "[play-classic] preparation complete"
+  exit 0
+fi
 
 # Graphics API: Direct3D under wine (gxApi d3d, no -opengl flag).
 # Was hard-forced to OpenGL; monofuel 2026-07-26 A/B — GL + weather particles

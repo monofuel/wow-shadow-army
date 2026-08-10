@@ -18,6 +18,8 @@ ramp **stops at instruments** until the Nim addon seat exists.
 Companion docs: `advisor-autopilot.md` (levels + decision);
 `command-channel.md` — same chat bus, opposite direction. Commands flow
 human→shadows; advice flows shadows→human.
+**5875 Lua / slash reference:** `docs/vanilla-addons/` (stock commands,
+`/cancelform` does **not** exist, Lua 5.0 traps).
 
 ## The unfair advantage: ground truth in mariadb
 
@@ -100,29 +102,27 @@ advice:
 - **Nim client (current path):** no addon/Lua surface at all. Advice
   arrives as chat text from the advisor shadow. Zero new stack; works
   today.
-- **Real 1.12 client (option):** full vanilla addon sandbox — the
-  protected-function lockdown came in 2.0, so 1.12 addons may freely call
-  `ReloadUI()`, register slash commands, and react to chat events. A thin
-  advisor addon could parse the shadow's whispers (structured text) and
-  render them as a HUD: quest arrows, route lines, danger flashes —
-  Questie-grade UX instead of chat spam. Cost: a second client stack to
-  babysit, and `(verify)` that the real client runs at all under
-  wine/NixOS against our realm.
+- **Real 1.12 client (option):** vanilla addon sandbox without retail
+  SecureTemplates — slash commands, frames, chat events work. **Caveat
+  (measured on wine 5875):** many action APIs including `ReloadUI` and
+  `CastSpellByName` are still **hardware-event gated** (click/keybind OK;
+  pure timer often no-ops). See `docs/vanilla-addons/`,
+  `docs/advisor-sandbox-gates.md`. Thin advisor HUD is still viable as
+  **L0 instruments**. Cost: second client stack under wine.
 
 ### Live iteration loop (the exciting part)
 
-1.12's addon environment makes mid-session improvement automatable:
-`ReloadUI()` re-reads all addon Lua from disk without leaving the game,
-and an addon can trigger it itself — e.g. on a `!reload` whisper from a
-trusted sender. So the loop becomes:
+Mid-session improvement is automatable, but **not** “free `ReloadUI()` from
+any Lua context.” Shipped path (`docs/the-system-loop.md`, AGENTS.md):
 
 1. Human, in-game, asks for help or a change in party chat ("advisor,
    show gather nodes on the minimap").
 2. The LLM tier (Racha / The System) edits the advisor's code on disk —
    addon Lua for the HUD rendering, and/or the shadow-side tool that
    generates the recommendation objects.
-3. Advisor whispers `!reload` handled by the addon → `ReloadUI()` → the
-   human sees the improvement seconds later, without leaving the game.
+3. The System SOAP-announces `<SYS> reload` → addon tries `ReloadUI()`;
+   if gated, **Reload!** button / next action-bar press applies it.
+   (Do not depend on a whisper `!reload` as the product path.)
 4. The improved *generation* logic (the structured recommendation side)
    trickles down to bot policies for free — bots consume the objects
    directly, per the transfer hedge above. Only the HUD rendering is

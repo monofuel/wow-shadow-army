@@ -6,12 +6,555 @@
 
 ShadowArmy = ShadowArmy or {}
 
+-- Pure live quest checklist + optional waypoint enrichment. This lives in
+-- the already-loaded core file because vanilla caches the TOC file list for
+-- the whole client session; adding a new Lua filename would require a client
+-- restart instead of the advisor's automatic ReloadUI path.
+local QuestModel = {}
+
+-- Lua 5.0 has table.getn but no # operator; Lua 5.3 tests have # but removed
+-- table.getn. Walking dense arrays is valid in both.
+local function questGetn(t)
+  local n = 0
+  while t[n + 1] ~= nil do n = n + 1 end
+  return n
+end
+
+QuestModel.colors = {
+  {0.85, 0.40, 1.00}, {0.20, 0.90, 1.00},
+  {1.00, 0.55, 0.12}, {1.00, 0.88, 0.20},
+  {1.00, 0.40, 0.65}, {0.35, 0.65, 1.00},
+  {0.35, 1.00, 0.50}, {1.00, 0.40, 0.35},
+}
+
+local function questLower(s) return string.lower(s or "") end
+
+local function questMatchObjective(objectives, board, idx)
+  if not objectives then return nil end
+  local text = questLower(board and board.text)
+  local i = 1
+  while i <= questGetn(objectives) do
+    local label = objectives[i].label
+    if label and string.find(text, questLower(label), 1, true) then
+      return objectives[i]
+    end
+    i = i + 1
+  end
+  return objectives[idx]
+end
+
+local function questZoneHere(q, spotZone, header, currentZone, zoneNames)
+  if currentZone == "" then return false end
+  if spotZone and zoneNames and zoneNames[spotZone] == currentZone then
+    return true
+  end
+  if header == currentZone and q then
+    return (not spotZone) or spotZone == q.zone
+  end
+  return false
+end
+
+local function questDistance(x, y, px, py, yardsX, yardsY)
+  local dx = x - px
+  local dy = y - py
+  local ux = dx / 100 * yardsX
+  local uy = dy / 100 * yardsY
+  return math.sqrt(ux * ux + uy * uy), dx, dy
+end
+
+local function questModelListCmp(a, b)
+  if a.tracked ~= b.tracked then return a.tracked end
+  if a.minDist ~= b.minDist then return a.minDist < b.minDist end
+  return a.logOrder < b.logOrder
+end
+
+local function questModelCandCmp(a, b)
+  if a.dist ~= b.dist then return a.dist < b.dist end
+  if a.qNum ~= b.qNum then return a.qNum < b.qNum end
+  return a.seq < b.seq
+end
+
+-- Injected API keeps collapsed-header and selection restoration testable
+-- without loading the WoW UI.
+function QuestModel.readLog(api)
+  local selectedIndex = api.selection and api.selection() or 0
+  local selectedTitle = nil
+  if selectedIndex > 0 then
+    local title, _, _, isHeader = api.title(selectedIndex)
+    if not isHeader then selectedTitle = title end
+  end
+
+  local collapsed = {}
+  if api.expand then
+    local i = 1
+    while i <= (api.numEntries() or 0) do
+      local title, _, _, isHeader, isCollapsed = api.title(i)
+      if isHeader and isCollapsed then
+        title = title or ""
+        collapsed[title] = (collapsed[title] or 0) + 1
+        api.expand(i)
+      end
+      i = i + 1
+    end
+  end
+
+  local live, sig = {}, ""
+  local ok, err = pcall(function()
+    local watched = api.watched and api.watched() or {}
+    local header = ""
+    local i = 1
+    while i <= (api.numEntries() or 0) do
+      local title, _, _, isHeader, _, isComplete = api.title(i)
+      if isHeader then
+        header = title or ""
+      elseif title then
+        local boards, nb = api.boards(i)
+        local objectives = {}
+        local bi = 1
+        while bi <= nb do
+          objectives[bi] = boards[bi]
+          sig = sig .. ":" .. (boards[bi].text or "")
+          bi = bi + 1
+        end
+        live[questGetn(live) + 1] = {
+          key = i, title = title, header = header,
+          tracked = watched[i] and true or false,
+          complete = isComplete == 1,
+          failed = isComplete == -1,
+          objectives = objectives,
+        }
+        local state = isComplete == 1 and "!" or (isComplete == -1 and "x" or "-")
+        sig = sig .. "|" .. title .. state
+      end
+      i = i + 1
+    end
+  end)
+
+  if api.collapse then
+    local i = api.numEntries() or 0
+    while i >= 1 do
+      local title, _, _, isHeader = api.title(i)
+      if isHeader and collapsed[title or ""] and collapsed[title or ""] > 0 then
+        collapsed[title or ""] = collapsed[title or ""] - 1
+        api.collapse(i)
+      end
+      i = i - 1
+    end
+  end
+  if api.select then
+    local restored = false
+    if selectedTitle and selectedTitle ~= "" then
+      local i = 1
+      while i <= (api.numEntries() or 0) do
+        local title, _, _, isHeader = api.title(i)
+        if not isHeader and title == selectedTitle then
+          api.select(i)
+          restored = true
+          break
+        end
+        i = i + 1
+      end
+    end
+    if not restored and selectedIndex > 0 and selectedIndex <= (api.numEntries() or 0) then
+      api.select(selectedIndex)
+    end
+  end
+  if not ok then error(err) end
+  return live, sig
+end
+
+function QuestModel.build(opts)
+  opts = opts or {}
+  local live = opts.quests or {}
+  local data = opts.data or {}
+  local zoneNames = opts.zoneNames
+  local currentZone = opts.currentZone or ""
+  local pos = opts.pos
+  local yardsX = opts.yardsX or 3500
+  local yardsY = opts.yardsY or 2333
+  local palette = opts.colors or QuestModel.colors
+  local nColors = questGetn(palette)
+  local list, candidates = {}, {}
+  local seq = 0
+
+  local qi = 1
+  while qi <= questGetn(live) do
+    local lq = live[qi]
+    local color = palette[((qi - 1) - math.floor((qi - 1) / nColors) * nColors) + 1]
+    local entry = {
+      key = lq.key or qi, num = qi, title = lq.title or "?",
+      tracked = lq.tracked and true or false,
+      complete = lq.complete and true or false,
+      failed = lq.failed and true or false,
+      logOrder = qi, r = color[1], g = color[2], b = color[3],
+      minDist = 1e9, objs = {},
+    }
+    local q = data[entry.title]
+
+    if entry.complete then
+      local obj = {
+        label = "Ready to turn in", text = "Ready to turn in",
+        done = true, turnIn = true,
+      }
+      local w = q and q.turnIn
+      if w then
+        obj.label = w.label or obj.label
+        obj.text = "Turn in: " .. obj.label
+        obj.zoneName = zoneNames and w.zone and zoneNames[w.zone] or nil
+        if pos and w.x and w.y
+            and questZoneHere(q, w.zone, lq.header or "", currentZone, zoneNames) then
+          obj.dist, obj.dx, obj.dy = questDistance(
+            w.x, w.y, pos.x, pos.y, yardsX, yardsY)
+          entry.minDist = obj.dist
+          seq = seq + 1
+          candidates[questGetn(candidates) + 1] = {
+            questKey = entry.key, title = entry.title, label = obj.label,
+            x = w.x, y = w.y, dx = obj.dx, dy = obj.dy, dist = obj.dist,
+            turnIn = true, tracked = entry.tracked, seq = seq,
+          }
+        end
+      end
+      entry.objs[1] = obj
+    else
+      local boards = lq.objectives or {}
+      local bi = 1
+      local nBoards = questGetn(boards)
+      while bi <= nBoards do
+        local board = boards[bi]
+        local generated = q and questMatchObjective(q.objectives, board, bi) or nil
+        local obj = {
+          label = (generated and generated.label) or board.text or "Objective",
+          text = board.text or (generated and generated.label) or "Objective",
+          have = board.have, need = board.need,
+          done = board.done and true or false, turnIn = false,
+        }
+        local spots = generated and generated.spots
+        if spots and questGetn(spots) > 0 then
+          local first = spots[1]
+          obj.zoneName = zoneNames and first.zone and zoneNames[first.zone] or nil
+          if pos and not obj.done and not entry.failed then
+            local si = 1
+            while si <= questGetn(spots) do
+              local s = spots[si]
+              if s.x and s.y
+                  and questZoneHere(q, s.zone, lq.header or "", currentZone, zoneNames) then
+                local dist, dx, dy = questDistance(
+                  s.x, s.y, pos.x, pos.y, yardsX, yardsY)
+                if not obj.dist or dist < obj.dist then
+                  obj.dist, obj.dx, obj.dy = dist, dx, dy
+                end
+                seq = seq + 1
+                candidates[questGetn(candidates) + 1] = {
+                  questKey = entry.key, title = entry.title, label = obj.label,
+                  have = obj.have, need = obj.need,
+                  x = s.x, y = s.y, dx = dx, dy = dy, dist = dist,
+                  turnIn = false, tracked = entry.tracked, seq = seq,
+                }
+              end
+              si = si + 1
+            end
+          end
+        end
+        if obj.dist and obj.dist < entry.minDist then entry.minDist = obj.dist end
+        entry.objs[bi] = obj
+        bi = bi + 1
+      end
+      if entry.failed then
+        entry.status = "Failed"
+      elseif nBoards == 0 then
+        entry.status = "In progress"
+      end
+    end
+    list[qi] = entry
+    qi = qi + 1
+  end
+
+  if questGetn(list) > 1 then table.sort(list, questModelListCmp) end
+  local byKey = {}
+  qi = 1
+  while qi <= questGetn(list) do
+    list[qi].num = qi
+    byKey[list[qi].key] = list[qi]
+    qi = qi + 1
+  end
+
+  local kept = {}
+  local ci = 1
+  while ci <= questGetn(candidates) do
+    local c = candidates[ci]
+    local entry = byKey[c.questKey]
+    if entry then
+      c.qNum, c.r, c.g, c.b = entry.num, entry.r, entry.g, entry.b
+      kept[questGetn(kept) + 1] = c
+    end
+    ci = ci + 1
+  end
+  if questGetn(kept) > 1 then table.sort(kept, questModelCandCmp) end
+  return { list = list, candidates = kept }
+end
+
+ShadowArmy.questModel = QuestModel
+
+--------------------------------------------------------------------------
+-- Pure combat-coach model. Like QuestModel, this stays above the WoW UI
+-- guard so ordinary Lua tests can exercise priorities and error handling.
+-- The live adapter below supplies only facts exposed by the 1.12 API.
+--------------------------------------------------------------------------
+
+local CombatModel = {}
+
+CombatModel.actions = {
+  WARLOCK = {
+    { id = "drainlife", label = "Drain Life", kind = "spell", spell = "Drain Life", target = "hostile", cast = true, debuff = true },
+    { id = "fear", label = "Fear", kind = "spell", spell = "Fear", target = "hostile", cast = true, debuff = true },
+    { id = "lifetap", label = "Life Tap", kind = "spell", spell = "Life Tap", target = "self" },
+    { id = "corruption", label = "Corruption", kind = "spell", spell = "Corruption", target = "hostile", debuff = true },
+    { id = "agony", label = "Curse of Agony", kind = "spell", spell = "Curse of Agony", target = "hostile", debuff = true },
+    { id = "immolate", label = "Immolate", kind = "spell", spell = "Immolate", target = "hostile", cast = true, debuff = true },
+    { id = "shadowbolt", label = "Shadow Bolt", kind = "spell", spell = "Shadow Bolt", target = "hostile", cast = true },
+    { id = "shoot", label = "Shoot", kind = "spell", spell = "Shoot", target = "hostile" },
+    { id = "melee", label = "Melee Attack", kind = "melee", target = "hostile" },
+  },
+  DRUID = {
+    { id = "healingtouch", label = "Healing Touch", kind = "spell", spell = "Healing Touch", target = "self", selfCast = true, cast = true },
+    { id = "rejuvenation", label = "Rejuvenation", kind = "spell", spell = "Rejuvenation", target = "self", selfCast = true, buff = true },
+    { id = "moonfire", label = "Moonfire", kind = "spell", spell = "Moonfire", target = "hostile", debuff = true },
+    { id = "faeriefire", label = "Faerie Fire", kind = "spell", spell = "Faerie Fire", target = "hostile", debuff = true },
+    { id = "wrath", label = "Wrath", kind = "spell", spell = "Wrath", target = "hostile", cast = true },
+    { id = "catform", label = "Cat Form", kind = "spell", spell = "Cat Form", target = "self", setsForm = "cat" },
+    { id = "bearform", label = "Bear Form", kind = "spell", spell = "Bear Form", target = "self", setsForm = "bear" },
+    { id = "rip", label = "Rip", kind = "spell", spell = "Rip", target = "hostile", form = "cat", debuff = true },
+    { id = "rake", label = "Rake", kind = "spell", spell = "Rake", target = "hostile", form = "cat", debuff = true },
+    { id = "claw", label = "Claw", kind = "spell", spell = "Claw", target = "hostile", form = "cat" },
+    { id = "tigersfury", label = "Tiger's Fury", kind = "spell", spell = "Tiger's Fury", target = "self", form = "cat", buff = true },
+    { id = "demoroar", label = "Demoralizing Roar", kind = "spell", spell = "Demoralizing Roar", target = "hostile", form = "bear", debuff = true },
+    { id = "maul", label = "Maul", kind = "spell", spell = "Maul", target = "hostile", form = "bear" },
+    { id = "melee", label = "Melee Attack", kind = "melee", target = "hostile" },
+  },
+}
+
+local function combatGetn(t)
+  local n = 0
+  while t and t[n + 1] ~= nil do n = n + 1 end
+  return n
+end
+
+local function combatDefs(classToken)
+  return CombatModel.actions[classToken or ""] or {}
+end
+
+function CombatModel.action(classToken, id)
+  local defs = combatDefs(classToken)
+  local i = 1
+  while i <= combatGetn(defs) do
+    if defs[i].id == id then return defs[i] end
+    i = i + 1
+  end
+  return nil
+end
+
+local function combatTargetBlock(snapshot, def)
+  if def.target ~= "hostile" then return nil end
+  if not snapshot.hostile then
+    if snapshot.targetDead then return "target dead" end
+    if snapshot.hasTarget then return "not hostile" end
+    return "need target"
+  end
+  return nil
+end
+
+local function combatAdd(snapshot, result, id, want, idleReason)
+  local def = CombatModel.action(snapshot.classToken, id)
+  if not def then return nil end
+  local state = snapshot.actions and snapshot.actions[id] or nil
+  if not state or not state.known then return nil end
+
+  local row = {
+    id = id, label = def.label, spell = def.spell, kind = def.kind,
+    target = def.target, texture = state.texture, slot = state.slot,
+    range = state.range or "na", cooldown = state.cooldown or 0,
+    gcd = state.gcd and true or false,
+    exact = state.slot and true or false, usable = true, ready = false,
+  }
+  local reason = combatTargetBlock(snapshot, def)
+  if snapshot.playerDead then reason = "player dead" end
+  if not reason and def.form and snapshot.form ~= def.form then
+    reason = "wrong form"
+  end
+  if not reason and state.active then reason = state.activeReason or "active" end
+  if not reason and def.cast and snapshot.moving then reason = "stand still" end
+  if not reason and row.cooldown > 0.1 and not row.gcd then
+    reason = string.format("cooldown %.1fs", row.cooldown)
+  end
+  if not reason and state.noResource then reason = state.resourceReason or "resource low" end
+  if not reason and state.usable == false then reason = state.unusableReason or "unavailable" end
+  if not reason and state.range == "out" then reason = "out of range" end
+
+  if reason then
+    row.usable = false
+    row.reason = reason
+  elseif want then
+    row.ready = true
+    row.reason = idleReason or "ready"
+    if not result.nextId then result.nextId = id end
+  else
+    row.reason = idleReason or "ready"
+  end
+  result.rows[combatGetn(result.rows) + 1] = row
+  return row
+end
+
+local function combatWarlock(snapshot, result)
+  local hp = snapshot.hpPct or 100
+  local mana = snapshot.powerPct or 100
+  local targetHp = snapshot.targetHpPct or 100
+  local actions = snapshot.actions or {}
+
+  combatAdd(snapshot, result, "drainlife", hp <= 45, hp <= 45 and "recover health" or "health OK")
+  combatAdd(snapshot, result, "fear", snapshot.danger and hp < 50,
+    snapshot.danger and "defensive option" or "defensive")
+  combatAdd(snapshot, result, "lifetap",
+    snapshot.hostile and mana < 20 and hp > 65,
+    (hp <= 65 and mana < 20) and "health too low" or "mana OK")
+  combatAdd(snapshot, result, "corruption",
+    snapshot.hostile and not (actions.corruption and actions.corruption.debuff),
+    (actions.corruption and actions.corruption.debuff) and "already up" or "DoT")
+  combatAdd(snapshot, result, "agony",
+    snapshot.hostile and targetHp > 50 and not (actions.agony and actions.agony.debuff),
+    targetHp <= 50 and "target low" or ((actions.agony and actions.agony.debuff) and "already up" or "curse"))
+  combatAdd(snapshot, result, "immolate",
+    snapshot.hostile and targetHp > 65 and mana > 45
+      and not (actions.immolate and actions.immolate.debuff),
+    targetHp <= 65 and "target low" or ((actions.immolate and actions.immolate.debuff) and "already up" or "mana reserve"))
+  combatAdd(snapshot, result, "shadowbolt", snapshot.hostile and mana > 35,
+    mana <= 35 and "save mana" or "nuke")
+  combatAdd(snapshot, result, "shoot", snapshot.hostile and snapshot.hasWand,
+    snapshot.shooting and "firing" or (snapshot.hasWand and "wand" or "no wand"))
+  combatAdd(snapshot, result, "melee", snapshot.hostile,
+    snapshot.melee and "swinging" or "last resort")
+end
+
+local function combatDruidHumanoid(snapshot, result)
+  local hp = snapshot.hpPct or 100
+  local mana = snapshot.powerPct or 100
+  local targetHp = snapshot.targetHpPct or 100
+  local actions = snapshot.actions or {}
+  combatAdd(snapshot, result, "healingtouch", hp < 45, hp < 45 and "emergency heal" or "health OK")
+  combatAdd(snapshot, result, "rejuvenation",
+    hp < 70 and not (actions.rejuvenation and actions.rejuvenation.buff),
+    (actions.rejuvenation and actions.rejuvenation.buff) and "already up" or "health OK")
+  combatAdd(snapshot, result, "moonfire",
+    snapshot.hostile and targetHp > 35 and not (actions.moonfire and actions.moonfire.debuff),
+    targetHp <= 35 and "target low" or ((actions.moonfire and actions.moonfire.debuff) and "already up" or "DoT"))
+  combatAdd(snapshot, result, "faeriefire",
+    snapshot.hostile and snapshot.danger and not (actions.faeriefire and actions.faeriefire.debuff),
+    (actions.faeriefire and actions.faeriefire.debuff) and "already up" or "elite armor")
+  combatAdd(snapshot, result, "wrath", snapshot.hostile and mana > 30,
+    mana <= 30 and "save mana" or "nuke")
+  combatAdd(snapshot, result, "catform", false, "form option")
+  combatAdd(snapshot, result, "bearform", false, "form option")
+  combatAdd(snapshot, result, "melee", snapshot.hostile, "fallback")
+end
+
+local function combatDruidCat(snapshot, result)
+  local actions = snapshot.actions or {}
+  local combo = snapshot.combo or 0
+  combatAdd(snapshot, result, "rip",
+    snapshot.hostile and combo >= 4 and not (actions.rip and actions.rip.debuff),
+    (actions.rip and actions.rip.debuff) and "already up" or (combo < 4 and (tostring(combo) .. " combo") or "finisher"))
+  combatAdd(snapshot, result, "rake",
+    snapshot.hostile and not (actions.rake and actions.rake.debuff),
+    (actions.rake and actions.rake.debuff) and "already up" or "bleed")
+  combatAdd(snapshot, result, "claw", snapshot.hostile, "builder")
+  combatAdd(snapshot, result, "tigersfury", false,
+    (actions.tigersfury and actions.tigersfury.buff) and "already up" or "damage boost")
+  combatAdd(snapshot, result, "bearform", false, "form option")
+  combatAdd(snapshot, result, "melee", snapshot.hostile, "auto attack")
+  if (snapshot.hpPct or 100) < 30 then result.warning = "low health — leave form to heal" end
+end
+
+local function combatDruidBear(snapshot, result)
+  local actions = snapshot.actions or {}
+  combatAdd(snapshot, result, "demoroar",
+    snapshot.hostile and not (actions.demoroar and actions.demoroar.debuff),
+    (actions.demoroar and actions.demoroar.debuff) and "already up" or "reduce damage")
+  combatAdd(snapshot, result, "maul", snapshot.hostile, "rage attack")
+  combatAdd(snapshot, result, "catform", false, "form option")
+  combatAdd(snapshot, result, "melee", snapshot.hostile, "auto attack")
+  if (snapshot.hpPct or 100) < 30 then result.warning = "low health — leave form to heal" end
+end
+
+-- The coach is a recommendation display, so the current recommendation owns
+-- row one. Everything else keeps its class-profile order. Transient cast/GCD
+-- state is deliberately excluded from nextId selection, which prevents the
+-- table from shuffling away and snapping back while an action completes.
+local function combatPromoteNext(result)
+  if not result.nextId then return end
+  local found = nil
+  local i = 1
+  while i <= combatGetn(result.rows) do
+    if result.rows[i].id == result.nextId then found = i; break end
+    i = i + 1
+  end
+  if not found or found == 1 then return end
+  local nextRow = result.rows[found]
+  i = found
+  while i > 1 do
+    result.rows[i] = result.rows[i - 1]
+    i = i - 1
+  end
+  result.rows[1] = nextRow
+end
+
+function CombatModel.evaluate(snapshot)
+  snapshot = snapshot or {}
+  local result = { rows = {}, nextId = nil, warning = nil }
+  if snapshot.classToken == "WARLOCK" then
+    combatWarlock(snapshot, result)
+  elseif snapshot.classToken == "DRUID" then
+    if snapshot.form == "cat" then
+      combatDruidCat(snapshot, result)
+    elseif snapshot.form == "bear" then
+      combatDruidBear(snapshot, result)
+    else
+      combatDruidHumanoid(snapshot, result)
+    end
+  else
+    result.warning = "no combat profile for this class"
+  end
+  combatPromoteNext(result)
+  return result
+end
+
+CombatModel.failureLabels = {
+  facing = "turn to face target",
+  los = "move into line of sight",
+  range = "move into range",
+  moving = "stand still",
+  mana = "not enough mana",
+  rage = "not enough rage",
+  energy = "not enough energy",
+  cooldown = "ability not ready",
+  target = "invalid target",
+}
+
+function CombatModel.classifyFailure(message, messageCodes)
+  local code = messageCodes and messageCodes[message or ""] or nil
+  if not code then return nil end
+  return { code = code, label = CombatModel.failureLabels[code] or code }
+end
+
+ShadowArmy.combatModel = CombatModel
+
+-- Unit tests load this file without the WoW UI and stop after the pure model.
+if not CreateFrame then return end
+
 -- Lua 5.0 hard limit: 200 locals per function. Helpers live on F.
 local F = {}
 
 -- Bump on every edit. The System watches Chat.log for "<SA> loaded rev=..."
 -- after sending a reload — a new rev proves the edit actually loaded.
-local REV = "r32"
+local REV = "r40"
 
 -- Log window (r16): every F.say()/F.emit() line also lands here with a
 -- timestamp, so errors survive chat scroll-off and can be reviewed in-game.
@@ -206,21 +749,17 @@ local line6 = questLines[1]
 -- something the default UI can't. Full-auto combat qualifies.)
 
 --------------------------------------------------------------------------
--- Combat coach (r26): L0 suggestions only — vanilla action APIs are
--- click/software gated, so we do NOT auto-cast. Opens a window of
--- priority abilities for the human to press. Warlock leveling priority
--- (Corruption → Shadow Bolt → wand → melee), spellbook-gated.
--- See docs/advisor-autopilot.md (vanilla = L0 only).
+--------------------------------------------------------------------------
+-- Combat coach (r38): recommendation-first advice table with the most exact
+-- state the stock 1.12 API exposes. Range/usability/cooldown are exact when a spell is
+-- on any action slot; fallbacks are explicitly approximate.
 --------------------------------------------------------------------------
 
 local auto = {
-  casting = false,
-  castingSince = 0,
-  gcdUntil = 0,      -- used only by legacy F.armorTick if it still casts
-  failUntil = 0,
-  shooting = false,  -- wand auto-repeat observed via events
-  melee = false,     -- auto-attack swing observed via events
-  known = {},        -- lowercase spell name -> true
+  casting = false, castingSince = 0, gcdUntil = 0, failUntil = 0,
+  shooting = false, melee = false,
+  known = {}, spells = {}, actionSlots = {},
+  classToken = nil, classLabel = nil, failure = nil, lastAttempt = nil,
 }
 
 -- 1.12 has no IsMoving(); sample map position deltas for cast vs wand tips.
@@ -240,194 +779,331 @@ function F.updateMoving()
   end
 end
 
-function F.scanSpellbook()
-  auto.known = {}
-  local i = 1
-  while true do
-    local name = GetSpellName(i, "spell")
-    if not name then break end
-    auto.known[string.lower(name)] = true
-    i = i + 1
+function F.combatDefs()
+  return CombatModel.actions[auto.classToken or ""] or {}
+end
+
+function F.scanCombatActions()
+  auto.actionSlots = {}
+  local defs = F.combatDefs()
+  local slot = 1
+  while slot <= 120 do
+    if HasAction(slot) and (not IsConsumableAction or not IsConsumableAction(slot)) then
+      local texture = GetActionTexture(slot)
+      if texture then
+        local i = 1
+        while i <= table.getn(defs) do
+          local def = defs[i]
+          local book = def.spell and auto.spells[string.lower(def.spell)] or nil
+          if book and book.texture == texture and not auto.actionSlots[string.lower(def.spell)] then
+            auto.actionSlots[string.lower(def.spell)] = slot
+          end
+          i = i + 1
+        end
+      end
+    end
+    slot = slot + 1
   end
 end
 
--- 1.12 UnitDebuff returns the TEXTURE first; names aren't exposed.
-local CORRUPTION_TEX = "Interface\\Icons\\Spell_Shadow_AbominationExplosion"
-
-function F.targetHasDebuff(texture)
+function F.scanSpellbook()
+  auto.known, auto.spells = {}, {}
+  local classLabel, classToken = UnitClass("player")
+  auto.classLabel = classLabel or "Unknown"
+  -- Vanilla's second return is the English class name, not guaranteed to
+  -- be the uppercase token used by later clients.
+  auto.classToken = string.upper(classToken or classLabel or "")
   local i = 1
   while true do
-    local tex = UnitDebuff("target", i)
+    local name, rank = GetSpellName(i, "spell")
+    if not name then break end
+    local key = string.lower(name)
+    auto.known[key] = true
+    auto.spells[key] = {
+      name = name, rank = rank, index = i,
+      texture = GetSpellTexture(i, "spell"),
+    }
+    i = i + 1
+  end
+  F.scanCombatActions()
+end
+
+function F.unitHasTexture(unit, helpful, texture)
+  if not texture then return false end
+  local i = 1
+  while i <= 32 do
+    local tex
+    if helpful then tex = UnitBuff(unit, i) else tex = UnitDebuff(unit, i) end
     if not tex then return false end
     if tex == texture then return true end
     i = i + 1
   end
+  return false
 end
 
--- Shared by F.armorTick legacy path (cast still gated on this client).
-function F.castNow(spell)
-  F.dtrace("cast " .. spell)
-  CastSpellByName(spell)
-  auto.gcdUntil = GetTime() + 1.6
+function F.targetHasDebuff(texture)
+  return F.unitHasTexture("target", false, texture)
 end
 
--- Warlock ability buttons (fixed order). Click = hardware event = cast works.
--- No pet button: imp is on Aggressive — it engages without PetAttack.
-local COMBAT_ABILITIES = {
-  { id = "corruption", label = "Corruption",  kind = "spell", spell = "Corruption", book = "corruption" },
-  { id = "shadowbolt", label = "Shadow Bolt", kind = "spell", spell = "Shadow Bolt", book = "shadow bolt" },
-  { id = "shoot",      label = "Shoot",       kind = "spell", spell = "Shoot", book = "shoot" },
-  { id = "melee",      label = "Melee Attack", kind = "melee" },
-}
-
--- Evaluate each ability: ready (priority pick), usable (click ok), reason text.
--- Returns status line, nextId, and rows[id] = { usable, ready, reason }.
-function F.combatAdvice()
-  local rows = {}
-  local nextId = nil
-  local function set(id, usable, ready, reason)
-    rows[id] = { usable = usable, ready = ready, reason = reason or "" }
-    if ready and not nextId then
-      nextId = id
-    end
-  end
-
-  local status
-  if not UnitExists("target") then
-    status = "|cFFFFAA00No target|r"
-    local i = 1
-    while i <= table.getn(COMBAT_ABILITIES) do
-      set(COMBAT_ABILITIES[i].id, false, false, "need target")
-      i = i + 1
-    end
-    return status, nil, rows
-  end
-  if UnitIsDeadOrGhost("target") then
-    status = "|cFFFFAA00Target dead|r"
-    local i = 1
-    while i <= table.getn(COMBAT_ABILITIES) do
-      set(COMBAT_ABILITIES[i].id, false, false, "target dead")
-      i = i + 1
-    end
-    return status, nil, rows
-  end
-  if not UnitCanAttack("player", "target") then
-    status = "|cFFFFAA00Friendly target|r"
-    local i = 1
-    while i <= table.getn(COMBAT_ABILITIES) do
-      set(COMBAT_ABILITIES[i].id, false, false, "not hostile")
-      i = i + 1
-    end
-    return status, nil, rows
-  end
-
-  local tName = UnitName("target") or "?"
-  local manaPct = 0
-  if UnitManaMax("player") > 0 then
-    manaPct = UnitMana("player") / UnitManaMax("player") * 100
-  end
-  local in28 = CheckInteractDistance("target", 4) and true or false
-  local in10 = CheckInteractDistance("target", 3) and true or false
-  local hasWand = GetInventoryItemLink("player", 18) and true or false
-  local corrUp = F.targetHasDebuff(CORRUPTION_TEX)
-  local casting = auto.casting
-  if casting and GetTime() - auto.castingSince > 4 then
-    casting = false
-  end
-
-  status = string.format(
-    "|cFF9482C9%s|r  mana %d%%  %s%s",
-    tName, math.floor(manaPct),
-    move.moving and "moving  " or "still  ",
-    casting and "|cFFFFFF00casting|r" or "")
-
-  -- Corruption
-  if not auto.known["corruption"] then
-    set("corruption", false, false, "not trained")
-  elseif corrUp then
-    set("corruption", true, false, "already up")
-  elseif not in28 then
-    set("corruption", true, false, "out of range")
-  elseif manaPct <= 25 then
-    set("corruption", true, false, "mana low")
-  else
-    set("corruption", true, true, "DoT")
-  end
-
-  -- Shadow Bolt
-  if not auto.known["shadow bolt"] then
-    set("shadowbolt", false, false, "not trained")
-  elseif move.moving then
-    set("shadowbolt", true, false, "stand still")
-  elseif casting then
-    set("shadowbolt", true, false, "casting")
-  elseif not in28 then
-    set("shadowbolt", true, false, "out of range")
-  elseif manaPct <= 35 then
-    set("shadowbolt", true, false, "mana low")
-  else
-    set("shadowbolt", true, true, "nuke")
-  end
-
-  -- Shoot
-  if not auto.known["shoot"] then
-    set("shoot", false, false, "not trained")
-  elseif not hasWand then
-    set("shoot", false, false, "no wand")
-  elseif auto.shooting then
-    set("shoot", true, false, "firing")
-  elseif not in28 then
-    set("shoot", true, false, "out of range")
-  else
-    set("shoot", true, true, "wand")
-  end
-
-  -- Melee
-  if auto.melee then
-    set("melee", true, false, "swinging")
-  elseif not in10 then
-    set("melee", true, false, "not in melee")
-  else
-    set("melee", true, true, "last resort")
-  end
-
-  if not nextId then
-    if casting then
-      status = status .. "  |cFFFFFF00finish cast|r"
-    elseif auto.shooting then
-      status = status .. "  |cFFAAAAAAwanding|r"
-    end
-  end
-  return status, nextId, rows
+function F.cooldownRemaining(start, duration, enable)
+  if not start or not duration or duration <= 0 or enable == 0 then return 0 end
+  local left = start + duration - GetTime()
+  if left < 0 then return 0 end
+  return left
 end
 
--- Fire ability from a button OnClick (hardware event — casts work).
-function F.combatUse(id)
+function F.currentDruidForm()
+  if auto.classToken ~= "DRUID" then return "humanoid" end
   local i = 1
-  while i <= table.getn(COMBAT_ABILITIES) do
-    local a = COMBAT_ABILITIES[i]
-    if a.id == id then
-      if a.kind == "melee" then
-        if UnitExists("target") and UnitCanAttack("player", "target")
-            and not UnitIsDeadOrGhost("target") then
-          AttackTarget()
-        end
-      elseif a.kind == "spell" and a.spell then
-        if a.book and not auto.known[a.book] then
-          return
-        end
-        F.castNow(a.spell)
-      end
-      return
+  while i <= (GetNumShapeshiftForms() or 0) do
+    local texture, name, active = GetShapeshiftFormInfo(i)
+    if active then
+      local lower = string.lower(name or texture or "")
+      if string.find(lower, "cat", 1, true) then return "cat" end
+      if string.find(lower, "bear", 1, true) then return "bear" end
+      if string.find(lower, "moonkin", 1, true) then return "humanoid" end
+      return "other"
     end
     i = i + 1
   end
+  return "humanoid"
 end
 
--- Combat coach UI: clickable ability buttons
+function F.combatActionState(def, snapshot)
+  local state = { known = false, range = "na", cooldown = 0 }
+  if def.kind == "melee" then
+    state.known = true
+    state.active = auto.melee
+    state.activeReason = "swinging"
+    if snapshot.hostile then
+      state.range = CheckInteractDistance("target", 3) and "approx_in" or "approx_far"
+    end
+    return state
+  end
+  local key = string.lower(def.spell or "")
+  local book = auto.spells[key]
+  if not book then return state end
+  state.known, state.texture = true, book.texture
+  state.slot = auto.actionSlots[key]
+  if state.slot then
+    local usable, noResource = IsUsableAction(state.slot)
+    state.usable = usable and true or false
+    state.noResource = noResource and true or false
+    local start, duration, enable = GetActionCooldown(state.slot)
+    state.cooldown = F.cooldownRemaining(start, duration, enable)
+    state.gcd = duration and duration > 0 and duration <= 1.6 and state.cooldown > 0
+    if state.gcd then snapshot.gcd = true end
+    state.active = (IsCurrentAction(state.slot) or IsAutoRepeatAction(state.slot)) and true or false
+    if def.target == "hostile" and ActionHasRange(state.slot) then
+      local inRange = IsActionInRange(state.slot)
+      if inRange == 1 then state.range = "in"
+      elseif inRange == 0 then state.range = "out"
+      else state.range = "unknown" end
+    end
+  else
+    state.usable = true
+    local start, duration, enable = GetSpellCooldown(book.index, "spell")
+    state.cooldown = F.cooldownRemaining(start, duration, enable)
+    state.gcd = duration and duration > 0 and duration <= 1.6 and state.cooldown > 0
+    if state.gcd then snapshot.gcd = true end
+    if def.target == "hostile" and snapshot.hostile then
+      state.range = CheckInteractDistance("target", 4) and "approx_in" or "approx_far"
+    end
+  end
+  if def.id == "shoot" then
+    state.active = auto.shooting
+    state.activeReason = "firing"
+    if not snapshot.hasWand then
+      state.usable = false
+      state.unusableReason = "no wand"
+    end
+  end
+  if state.noResource then state.resourceReason = snapshot.resourceLowReason end
+  if def.debuff and snapshot.hostile then state.debuff = F.targetHasDebuff(book.texture) end
+  if def.buff then state.buff = F.unitHasTexture("player", true, book.texture) end
+  if def.setsForm and snapshot.form == def.setsForm then
+    state.active = true
+    state.activeReason = "active form"
+  end
+  return state
+end
+
+function F.combatDanger()
+  if not UnitExists("target") or not UnitCanAttack("player", "target") then return false, nil end
+  local class = UnitClassification("target")
+  if class == "worldboss" then return true, "BOSS" end
+  if class == "elite" or class == "rareelite" then return true, "ELITE" end
+  local level = UnitLevel("target") or 0
+  if level < 0 then return true, "SKULL" end
+  if level >= UnitLevel("player") + 3 then return true, "+3 LEVEL" end
+  if UnitIsTapped("target") and not UnitIsTappedByPlayer("target") then return true, "TAPPED" end
+  return false, nil
+end
+
+function F.combatSnapshot()
+  local hasTarget = UnitExists("target") and true or false
+  local targetDead = hasTarget and UnitIsDeadOrGhost("target") and true or false
+  local hostile = hasTarget and not targetDead and UnitCanAttack("player", "target") and true or false
+  local hpMax, powerMax = UnitHealthMax("player"), UnitManaMax("player")
+  local powerType = UnitPowerType("player") or 0
+  local resourceNames = { [0] = "mana", [1] = "rage", [3] = "energy" }
+  local resourceName = resourceNames[powerType] or "power"
+  local danger, dangerLabel = F.combatDanger()
+  local snapshot = {
+    classToken = auto.classToken, classLabel = auto.classLabel,
+    form = F.currentDruidForm(),
+    playerDead = UnitIsDeadOrGhost("player") and true or false,
+    hpPct = hpMax > 0 and UnitHealth("player") / hpMax * 100 or 0,
+    powerPct = powerMax > 0 and UnitMana("player") / powerMax * 100 or 0,
+    resourceName = resourceName, resourceLowReason = resourceName .. " low",
+    moving = move.moving, casting = auto.casting,
+    hasTarget = hasTarget, targetDead = targetDead, hostile = hostile,
+    targetName = hasTarget and (UnitName("target") or "?") or nil,
+    targetLevel = hasTarget and UnitLevel("target") or nil,
+    targetHpPct = hasTarget and UnitHealthMax("target") > 0
+      and UnitHealth("target") / UnitHealthMax("target") * 100 or 0,
+    danger = danger, dangerLabel = dangerLabel,
+    combo = GetComboPoints() or 0,
+    hasWand = GetInventoryItemLink("player", 18) and true or false,
+    shooting = auto.shooting, melee = auto.melee,
+    actions = {},
+  }
+  local defs = F.combatDefs()
+  local i = 1
+  while i <= table.getn(defs) do
+    snapshot.actions[defs[i].id] = F.combatActionState(defs[i], snapshot)
+    i = i + 1
+  end
+  return snapshot
+end
+
+function F.combatFailureCodes()
+  local codes = {}
+  local function add(value, code) if value then codes[value] = code end end
+  add(ERR_BADATTACKFACING, "facing")
+  add(ERR_USE_BAD_ANGLE, "facing")
+  add(ERR_WRONG_DIRECTION_FOR_ATTACK, "facing")
+  add(SPELL_FAILED_NOT_INFRONT, "facing")
+  add(SPELL_FAILED_UNIT_NOT_INFRONT, "facing")
+  add(SPELL_FAILED_LINE_OF_SIGHT, "los")
+  add(SPELL_FAILED_OUT_OF_RANGE, "range")
+  add(ERR_BADATTACKPOS, "range")
+  add(SPELL_FAILED_MOVING, "moving")
+  add(ERR_OUT_OF_MANA, "mana")
+  add(ERR_OUT_OF_RAGE, "rage")
+  add(ERR_OUT_OF_ENERGY, "energy")
+  add(SPELL_FAILED_NOT_READY, "cooldown")
+  add(SPELL_FAILED_BAD_TARGETS, "target")
+  add(SPELL_FAILED_TARGETS_DEAD, "target")
+  return codes
+end
+
+function F.combatRecordFailure(message)
+  local failure = CombatModel.classifyFailure(message, F.combatFailureCodes())
+  if failure then
+    failure.at = GetTime()
+    failure.actionId = auto.lastAttempt and auto.lastAttempt.id or nil
+    auto.failure = failure
+    if F.addLog then F.addLog("combat", failure.label) end
+  end
+end
+
+function F.combatFailure()
+  if auto.failure and GetTime() - auto.failure.at <= 2.5 then return auto.failure end
+  auto.failure = nil
+  return nil
+end
+
+-- Shared by the combat buttons and the legacy armor path.
+function F.castNow(spell, onSelf)
+  F.dtrace("cast " .. spell)
+  CastSpellByName(spell, onSelf)
+  auto.gcdUntil = GetTime() + 1.6
+end
+
+function F.combatUse(id)
+  if auto.casting then return end
+  local def = CombatModel.action(auto.classToken, id)
+  if not def then return end
+  auto.lastAttempt = { id = id, at = GetTime(), target = UnitName("target") }
+  if def.kind == "melee" then
+    if UnitExists("target") and UnitCanAttack("player", "target")
+        and not UnitIsDeadOrGhost("target") then AttackTarget() end
+  elseif def.kind == "spell" and def.spell and auto.known[string.lower(def.spell)] then
+    F.castNow(def.spell, def.selfCast and 1 or nil)
+  end
+end
+
+local suggestedKeySeen = false
+
+-- Called from the stock ACTIONBUTTON1 key-release path, which preserves the
+-- real hardware event. Re-evaluate at press time instead of trusting the last
+-- rendered row: target, range, resources, or recommendation may have changed.
+function ShadowArmy.UseSuggested()
+  if auto.casting then return end
+  F.updateMoving()
+  local snapshot = F.combatSnapshot()
+  local result = CombatModel.evaluate(snapshot)
+  if result.nextId then
+    if not suggestedKeySeen then
+      suggestedKeySeen = true
+      F.emit("bindpress", "key=1 suggested=" .. result.nextId)
+    end
+    F.combatUse(result.nextId)
+  end
+end
+
+local stockActionButtonDown = ActionButtonDown
+local stockActionButtonUp = ActionButtonUp
+
+function F.installSuggestedKeyHook()
+  if not stockActionButtonDown or not stockActionButtonUp then
+    F.emit("err", "bind ACTIONBUTTON1 hook unavailable")
+    return false
+  end
+  -- Down remains stock so the first action button visibly depresses. On key
+  -- release, reset that visual without UseAction(slot 1), then use the coach.
+  ActionButtonDown = function(id)
+    stockActionButtonDown(id)
+  end
+  ActionButtonUp = function(id, onSelf)
+    if id ~= 1 then
+      stockActionButtonUp(id, onSelf)
+      return
+    end
+    local button
+    if BonusActionBarFrame and BonusActionBarFrame:IsShown() then
+      button = getglobal("BonusActionButton1")
+    else
+      button = getglobal("ActionButton1")
+    end
+    if button and button:GetButtonState() == "PUSHED" then
+      button:SetButtonState("NORMAL")
+    end
+    ShadowArmy.UseSuggested()
+  end
+  return true
+end
+
+function F.bindSuggestedKey()
+  local command = "ACTIONBUTTON1"
+  if not SetBinding or not SetBinding("1", command) then
+    F.say("could not bind suggested ability to 1")
+    F.emit("err", "bind key=1 failed")
+    return false
+  end
+  if SaveBindings and GetCurrentBindingSet then
+    SaveBindings(GetCurrentBindingSet())
+  end
+  F.say("1 = suggested ability")
+  F.emit("bind", "key=1 action=" .. tostring(GetBindingAction and GetBindingAction("1"))
+    .. " driver=advisor-hook")
+  return true
+end
+
 local combatFrame = CreateFrame("Frame", "ShadowArmyCombatFrame", UIParent)
-combatFrame:SetWidth(260)
-combatFrame:SetHeight(174) -- 4 ability buttons (no pet)
+combatFrame:SetWidth(340)
+combatFrame:SetHeight(180)
 combatFrame:SetPoint("CENTER", UIParent, "CENTER", 120, 20)
 combatFrame:SetBackdrop({
   bgFile = "Interface\\Tooltips\\UI-Tooltip-Background",
@@ -454,108 +1130,139 @@ combatClose:SetPoint("TOPRIGHT", combatFrame, "TOPRIGHT", -2, -2)
 local combatStatus = combatFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
 combatStatus:SetPoint("TOPLEFT", combatFrame, "TOPLEFT", 12, -28)
 combatStatus:SetPoint("TOPRIGHT", combatFrame, "TOPRIGHT", -12, -28)
+combatStatus:SetHeight(32)
 combatStatus:SetJustifyH("LEFT")
+combatStatus:SetJustifyV("TOP")
 combatStatus:SetText("")
 
+local combatAbilityHead = combatFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+combatAbilityHead:SetPoint("TOPLEFT", combatFrame, "TOPLEFT", 18, -64)
+combatAbilityHead:SetText("|cFF777777ABILITY|r")
+local combatRangeHead = combatFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+combatRangeHead:SetPoint("TOPLEFT", combatFrame, "TOPLEFT", 184, -64)
+combatRangeHead:SetText("|cFF777777RANGE|r")
+local combatStateHead = combatFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+combatStateHead:SetPoint("TOPLEFT", combatFrame, "TOPLEFT", 236, -64)
+combatStateHead:SetText("|cFF777777STATE|r")
+
+local COMBAT_MAX_ROWS = 10
 local combatBtns = {}
 local cbi = 1
-while cbi <= table.getn(COMBAT_ABILITIES) do
-  local ab = COMBAT_ABILITIES[cbi]
-  local b = CreateFrame("Button", "ShadowArmyCombatBtn" .. ab.id, combatFrame, "UIPanelButtonTemplate")
-  b:SetWidth(232)
+while cbi <= COMBAT_MAX_ROWS do
+  local b = CreateFrame("Button", "ShadowArmyCombatRow" .. cbi, combatFrame)
+  b:SetWidth(316)
   b:SetHeight(22)
-  b:SetPoint("TOP", combatFrame, "TOP", 0, -44 - (cbi - 1) * 26)
-  b:SetText(ab.label)
-  b.abilityId = ab.id
+  b:SetPoint("TOP", combatFrame, "TOP", 0, -78 - (cbi - 1) * 23)
+  b.bg = b:CreateTexture(nil, "BACKGROUND")
+  b.bg:SetPoint("TOPLEFT", b, "TOPLEFT", 0, 0)
+  b.bg:SetPoint("BOTTOMRIGHT", b, "BOTTOMRIGHT", 0, 0)
+  b.bg:SetTexture(0.10, 0.07, 0.12, 0.82)
+  b.icon = b:CreateTexture(nil, "OVERLAY")
+  b.icon:SetWidth(18)
+  b.icon:SetHeight(18)
+  b.icon:SetPoint("LEFT", b, "LEFT", 4, 0)
+  b.nameText = b:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+  b.nameText:SetPoint("LEFT", b, "LEFT", 27, 0)
+  b.nameText:SetWidth(140)
+  b.nameText:SetJustifyH("LEFT")
+  b.rangeText = b:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+  b.rangeText:SetPoint("LEFT", b, "LEFT", 170, 0)
+  b.rangeText:SetWidth(50)
+  b.rangeText:SetJustifyH("CENTER")
+  b.stateText = b:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+  b.stateText:SetPoint("LEFT", b, "LEFT", 224, 0)
+  b.stateText:SetWidth(88)
+  b.stateText:SetJustifyH("LEFT")
   b:SetScript("OnClick", function()
-    F.combatUse(this.abilityId)
+    if this.clickable and this.abilityId then F.combatUse(this.abilityId) end
   end)
-  combatBtns[ab.id] = b
+  b:SetScript("OnEnter", function()
+    if this.clickable then this.bg:SetTexture(0.20, 0.13, 0.24, 0.95) end
+  end)
+  b:SetScript("OnLeave", function()
+    this.bg:SetTexture(this.bgR or 0.10, this.bgG or 0.07, this.bgB or 0.12, 0.82)
+  end)
+  b:Hide()
+  combatBtns[cbi] = b
   cbi = cbi + 1
 end
 
--- Sort key: 0 = recommended next, 1 = usable (ready or not), 2 = grey/unusable.
--- Within a tier, keep the warlock priority order from COMBAT_ABILITIES.
-function F.combatSortRank(id, nextId, rows)
-  local r = rows and rows[id]
-  if not r then return 9 end
-  if nextId and id == nextId then return 0 end
-  if r.usable then return 1 end
-  return 2
+function F.combatRangeTag(range)
+  if range == "in" then return "|cFF44FF44IN|r" end
+  if range == "out" then return "|cFFFF4444OUT|r" end
+  if range == "approx_in" then return "|cFFFFFF44~IN|r" end
+  if range == "approx_far" then return "|cFFFFAA44~FAR|r" end
+  if range == "unknown" then return "|cFF888888?|r" end
+  return ""
+end
+
+function F.combatStatusText(snapshot, result)
+  local form = snapshot.classToken == "DRUID" and (" " .. snapshot.form) or ""
+  local line1 = string.format("%s%s  hp %d%%  %s %d%%",
+    snapshot.classLabel or "?", form, math.floor(snapshot.hpPct),
+    snapshot.resourceName, math.floor(snapshot.powerPct))
+  local line2
+  if snapshot.hasTarget then
+    local level = snapshot.targetLevel and snapshot.targetLevel >= 0 and tostring(snapshot.targetLevel) or "??"
+    line2 = string.format("%s lvl %s", snapshot.targetName or "?", level)
+    if snapshot.dangerLabel then line2 = line2 .. "  |cFFFF6644" .. snapshot.dangerLabel .. "|r" end
+  else
+    line2 = "|cFF888888No target|r"
+  end
+  if snapshot.moving then line2 = line2 .. "  moving" end
+  if snapshot.casting then line2 = line2 .. "  |cFFFFFF00casting|r" end
+  if snapshot.gcd then line2 = line2 .. "  |cFFAAAAAAGCD|r" end
+  local failure = F.combatFailure()
+  if failure then line2 = "|cFFFF4444" .. failure.label .. "|r" end
+  if result.warning then line2 = line2 .. "  |cFFFFAA00" .. result.warning .. "|r" end
+  return line1 .. "\n" .. line2
 end
 
 local combatAcc = 0
 function F.combatRefresh()
   if not combatFrame:IsShown() then return end
-  local status, nextId, rows = F.combatAdvice()
-  combatStatus:SetText(status or "")
+  local snapshot = F.combatSnapshot()
+  local result = CombatModel.evaluate(snapshot)
+  combatStatus:SetText(F.combatStatusText(snapshot, result))
 
-  -- Build ordered list of ability indices (stable within tier).
-  local order = {}
-  local n = table.getn(COMBAT_ABILITIES)
+  local n = table.getn(result.rows)
   local i = 1
-  while i <= n do
-    order[i] = i
-    i = i + 1
-  end
-  -- Insertion sort (Lua 5.0, tiny n).
-  local a = 2
-  while a <= n do
-    local key = order[a]
-    local keyId = COMBAT_ABILITIES[key].id
-    local keyRank = F.combatSortRank(keyId, nextId, rows)
-    local b = a - 1
-    while b >= 1 do
-      local otherId = COMBAT_ABILITIES[order[b]].id
-      local otherRank = F.combatSortRank(otherId, nextId, rows)
-      -- Lower rank first; same rank keeps original priority (order[b] < key).
-      if otherRank < keyRank or (otherRank == keyRank and order[b] < key) then
-        break
-      end
-      order[b + 1] = order[b]
-      b = b - 1
-    end
-    order[b + 1] = key
-    a = a + 1
-  end
-
-  i = 1
-  while i <= n do
-    local ab = COMBAT_ABILITIES[order[i]]
-    local btn = combatBtns[ab.id]
-    local r = rows and rows[ab.id]
-    if btn and r then
-      local label = ab.label
-      if r.reason and r.reason ~= "" then
-        label = ab.label .. "  |cFF888888" .. r.reason .. "|r"
-      end
-      if nextId == ab.id then
-        btn:SetText("|cFF44FF44→ " .. label .. "|r")
-      elseif r.usable then
-        btn:SetText("|cFFCCCCCC" .. label .. "|r")
+  while i <= COMBAT_MAX_ROWS do
+    local btn = combatBtns[i]
+    local row = i <= n and result.rows[i] or nil
+    if row then
+      btn.abilityId = row.id
+      btn.clickable = row.usable and true or false
+      if row.id == result.nextId then
+        btn.nameText:SetText("|cFF44FF44→ " .. row.label .. "|r")
+        btn.bgR, btn.bgG, btn.bgB = 0.08, 0.20, 0.10
+      elseif row.usable then
+        btn.nameText:SetText("|cFFDDDDDD" .. row.label .. "|r")
+        btn.bgR, btn.bgG, btn.bgB = 0.10, 0.07, 0.12
       else
-        btn:SetText("|cFF666666" .. label .. "|r")
+        btn.nameText:SetText("|cFF888888" .. row.label .. "|r")
+        btn.bgR, btn.bgG, btn.bgB = 0.07, 0.06, 0.08
       end
-      if r.usable then
-        btn:Enable()
-      else
-        btn:Disable()
-      end
-      -- Re-stack top → bottom by importance every refresh.
-      btn:ClearAllPoints()
-      btn:SetPoint("TOP", combatFrame, "TOP", 0, -44 - (i - 1) * 26)
+      btn.bg:SetTexture(btn.bgR, btn.bgG, btn.bgB, 0.82)
+      btn.rangeText:SetText(F.combatRangeTag(row.range))
+      btn.stateText:SetText(row.reason or "")
+      if row.usable then btn.stateText:SetTextColor(0.72, 0.72, 0.72)
+      else btn.stateText:SetTextColor(0.45, 0.45, 0.45) end
+      if row.texture then btn.icon:SetTexture(row.texture); btn.icon:Show() else btn.icon:Hide() end
+      btn:Show()
+    else
+      btn.abilityId = nil
+      btn.clickable = false
+      btn:Hide()
     end
     i = i + 1
   end
+  combatFrame:SetHeight(88 + math.max(1, math.min(n, COMBAT_MAX_ROWS)) * 23)
 end
 
 function F.combatToggle()
-  if combatFrame:IsShown() then
-    combatFrame:Hide()
-  else
-    combatFrame:Show()
-    F.combatRefresh()
-  end
+  if combatFrame:IsShown() then combatFrame:Hide()
+  else combatFrame:Show(); F.combatRefresh() end
 end
 
 combatClose:SetScript("OnClick", function() combatFrame:Hide() end)
@@ -563,12 +1270,9 @@ combatClose:SetScript("OnClick", function() combatFrame:Hide() end)
 local combatBtn = CreateFrame("Button", "ShadowArmyCombatBtn", panel, "UIPanelButtonTemplate")
 combatBtn:SetWidth(118)
 combatBtn:SetHeight(20)
-combatBtn:SetPoint("BOTTOMLEFT", panel, "BOTTOMLEFT", 8, 56) -- top button row
+combatBtn:SetPoint("BOTTOMLEFT", panel, "BOTTOMLEFT", 8, 56)
 combatBtn:SetText("|cFF9482C9Combat|r")
-combatBtn:SetScript("OnClick", function()
-  F.combatToggle()
-end)
-
+combatBtn:SetScript("OnClick", function() F.combatToggle() end)
 -- Remote-reload button: hidden until The System requests a reload. It must
 -- be a click because this build ignores programmatic ReloadUI (see the
 -- driver notes) — a mouse click is the hardware event that makes it legal.
@@ -2136,39 +2840,15 @@ tinsert(UISpecialFrames, "ShadowBagsFrame")
 -- kill-vs-turnin). Gold soup is gone. Panel lists quests with nested objective
 -- progress; pins use that quest's color so multi-quest zones are readable.
 --
--- If the data file is absent the whole feature no-ops after exactly one
--- `err quest data missing` line. Nothing below may ever depend on it existing.
+-- If the data file is absent, accepted quests and live objectives still work;
+-- only coordinate enrichment no-ops after one `err quest data missing` line.
 --
--- ZONE IDENTITY IS THE HARD PART, and it is why this section looks paranoid.
--- The data file speaks AreaTable ids (85 = Tirisfal Glades). The 1.12 client
--- hands an addon zone NAMES (GetZoneText/GetRealZoneText) and world-map
--- dropdown INDICES (GetCurrentMapZone) — never AreaTable ids, and there is no
--- API that converts between them. A hand-written name->id table would be the
--- only bridge, and one wrong row in it parks an arrow on a mob three zones
--- over, which is worse than no arrow at all.
---
--- So we never convert. A waypoint is drawn only when BOTH hold:
---   (1) the quest's own quest-log HEADER name equals the player's current
---       zone name. The log groups quests by zone, and that grouping comes
---       from the same server the coordinates were mined against — it is a
---       string compare between two things the client itself produced.
---   (2) the waypoint's `zone` id equals its quest's `zone` id. Both numbers
---       come out of the data file, so the client is not involved in that
---       comparison at all.
--- Anything we cannot prove sits in the current zone is simply NOT DRAWN.
--- Fails safe: a missing arrow costs a few seconds of reading the quest log,
--- a wrong arrow costs a corpse run.
---
--- Deliberate consequence: an objective that lives in a neighbouring zone
--- stays hidden until you walk into that zone. (2) is what makes multi-zone
--- quests degrade quietly instead of pointing at the wrong patch of map.
---
--- Second, opportunistic path: every time (1) holds we LEARN `zone id -> zone
--- name` from that quest, and afterwards a waypoint carrying a learned id is
--- allowed through even when its quest headers somewhere else. Conflicting
--- evidence for an id POISONS that id permanently (it goes back to unknown),
--- because a learned mapping that is wrong is worse than no mapping. The table
--- is rebuilt from scratch every reload; it is a cache, never a source.
+-- The live quest log is authoritative. Generated QuestData can enrich a live
+-- objective with coordinates, but missing data, a subzone quest-log header,
+-- or an unavailable player map position must never hide the accepted quest.
+-- ShadowArmyQuestZones is generated beside QuestData and maps its AreaTable
+-- ids to the parent-zone names returned by GetRealZoneText(). This is what
+-- makes a Red Cloud Mesa quest safely resolve to the Mulgore map.
 --------------------------------------------------------------------------
 
 local QUEST_TICK_EVERY = 0.5   -- recompute the nearest objective this often
@@ -2176,21 +2856,6 @@ local QUEST_MARKER_EVERY = 0.2 -- WORLD_MAP_UPDATE repaint throttle
 local QUEST_MAX_CAND = 60      -- bound on waypoints considered per scan
 local QUEST_MAX_BLIPS = 8      -- minimap dots (created once, reused forever)
 local QUEST_MAX_MARKERS = 30   -- world map dots
-local QUEST_MAX_LIST = 6       -- max quests on the checklist
-local QUEST_MAX_OBJ_LINES = 3  -- max objective rows under one quest header
-
--- Distinct hues per quest (cycled). Identity is the quest, not kill/turn-in.
-local QUEST_COLORS = {
-  {0.85, 0.40, 1.00}, -- purple
-  {0.20, 0.90, 1.00}, -- cyan
-  {1.00, 0.55, 0.12}, -- orange
-  {1.00, 0.88, 0.20}, -- yellow
-  {1.00, 0.40, 0.65}, -- pink
-  {0.35, 0.65, 1.00}, -- blue
-  {0.35, 1.00, 0.50}, -- mint
-  {1.00, 0.40, 0.35}, -- coral
-}
-local QUEST_N_COLORS = 8
 
 -- Zone dimensions are NOT exposed in 1.12 (no zone size API, and no world
 -- coordinates for anything but yourself), so a percentage delta cannot be
@@ -2221,7 +2886,7 @@ local QUEST_MARK_TURNIN = "<<"
 local COMPASS_TAN22 = 0.4142 -- tan(22.5 deg): the 8-point octant boundary
 
 local quest = {
-  enabled = true,
+  markersEnabled = true,
   dataWarned = false,   -- the one-and-only "no data file" F.emit
   nextTickAt = 0,
   nextMarkerAt = 0,
@@ -2229,14 +2894,13 @@ local quest = {
   logSig = "",          -- change detector for the debug-only log trace
   target = nil,         -- nearest "go here" waypoint (tracked wins)
   spots = {},           -- drawable waypoints (blip-priority order)
-  list = {},            -- checklist: {num,title,r,g,b,tracked,objs={...}}
-  status = nil,         -- idle reason string when list is empty
-  learned = {},         -- zone id -> zone name, or false once poisoned
+  list = {},            -- complete live checklist from QuestModel
+  status = nil,         -- idle/error reason string when list is empty
   zoneName = "",
   px = 0, py = 0, posOK = false,
 }
 
-local questBtn -- created below; F.questSetEnabled closes over this local
+local questBtn -- created below; opens the complete quest checklist window
 
 function F.questData()
   if ShadowArmyQuestData then return ShadowArmyQuestData end
@@ -2538,7 +3202,9 @@ function F.questStampSpots(spots, list)
   end
 end
 
-function F.questScan()
+-- Kept as a named historical implementation while r33 transitions the
+-- scanner below to the live-log-first quest model.
+function F.questScanMappedOnlyLegacy()
   local data = F.questData()
   local zone = GetRealZoneText() or ""
   quest.zoneName = zone
@@ -2714,11 +3380,145 @@ function F.questScan()
   end
 end
 
+-- Expand hidden quest-log sections before reading them. Vanilla omits the
+-- quests under a collapsed header from GetNumQuestLogEntries(), so failing to
+-- do this makes accepted quests disappear based on a Blizzard UI preference.
+function F.questExpandHeaders()
+  local collapsed = {}
+  if not ExpandQuestHeader then return collapsed end
+  local i = 1
+  while i <= (GetNumQuestLogEntries() or 0) do
+    local title, _, _, isHeader, isCollapsed = GetQuestLogTitle(i)
+    if isHeader and isCollapsed then
+      title = title or ""
+      collapsed[title] = (collapsed[title] or 0) + 1
+      ExpandQuestHeader(i)
+    end
+    i = i + 1
+  end
+  return collapsed
+end
+
+function F.questRestoreLog(collapsed, selectedTitle, selectedIndex)
+  if CollapseQuestHeader then
+    local i = GetNumQuestLogEntries() or 0
+    while i >= 1 do
+      local title, _, _, isHeader = GetQuestLogTitle(i)
+      if isHeader and collapsed[title or ""] and collapsed[title or ""] > 0 then
+        collapsed[title or ""] = collapsed[title or ""] - 1
+        CollapseQuestHeader(i)
+      end
+      i = i - 1
+    end
+  end
+  if selectedTitle and selectedTitle ~= "" then
+    local i = 1
+    while i <= (GetNumQuestLogEntries() or 0) do
+      local title, _, _, isHeader = GetQuestLogTitle(i)
+      if not isHeader and title == selectedTitle then
+        SelectQuestLogEntry(i)
+        return
+      end
+      i = i + 1
+    end
+  end
+  if selectedIndex and selectedIndex > 0
+      and selectedIndex <= (GetNumQuestLogEntries() or 0) then
+    SelectQuestLogEntry(selectedIndex)
+  end
+end
+
+function F.questReadLiveLog()
+  local model = ShadowArmy and ShadowArmy.questModel
+  if not model then error("quest model unavailable") end
+  return model.readLog({
+    selection = function()
+      return GetQuestLogSelection and GetQuestLogSelection() or 0
+    end,
+    numEntries = function() return GetNumQuestLogEntries() or 0 end,
+    title = function(i) return GetQuestLogTitle(i) end,
+    expand = ExpandQuestHeader and function(i) ExpandQuestHeader(i) end or nil,
+    collapse = CollapseQuestHeader and function(i) CollapseQuestHeader(i) end or nil,
+    select = function(i) SelectQuestLogEntry(i) end,
+    boards = function(i) return F.questBoards(i) end,
+    watched = function()
+      local watched = {}
+      local nw = GetNumQuestWatches and GetNumQuestWatches() or 0
+      local wi = 1
+      while wi <= nw do
+        local index = GetQuestIndexForWatch(wi)
+        if index then watched[index] = true end
+        wi = wi + 1
+      end
+      return watched
+    end,
+  })
+end
+
+-- r33 scanner: accepted quests and their live objectives always make the
+-- checklist. Optional QuestData only contributes trusted, current-zone
+-- waypoints to that model.
+function F.questScan()
+  local zone = GetRealZoneText() or ""
+  quest.zoneName = zone
+
+  -- Do not move the human's quest selection while the quest log is on screen.
+  -- The previous complete scan remains visible until the window closes.
+  if QuestLogFrame and QuestLogFrame:IsVisible() then return end
+
+  local live, sig = F.questReadLiveLog()
+  local model = ShadowArmy and ShadowArmy.questModel
+  if not model then
+    quest.spots, quest.target, quest.list = {}, nil, {}
+    quest.status = "quests: model unavailable"
+    return
+  end
+
+  local pos = nil
+  if quest.posOK then pos = { x = quest.px, y = quest.py } end
+  local built = model.build({
+    quests = live,
+    data = F.questData() or {},
+    zoneNames = ShadowArmyQuestZones,
+    currentZone = zone,
+    pos = pos,
+    yardsX = QUEST_ZONE_YARDS_X,
+    yardsY = QUEST_ZONE_YARDS_Y,
+  })
+
+  local cand = {}
+  local nc = table.getn(built.candidates)
+  if nc > QUEST_MAX_CAND then nc = QUEST_MAX_CAND end
+  local i = 1
+  while i <= nc do
+    cand[i] = built.candidates[i]
+    i = i + 1
+  end
+
+  quest.list = built.list
+  quest.spots = F.questPickSpots(cand, nc, QUEST_MAX_MARKERS)
+  local pick = nil
+  i = 1
+  while i <= nc do
+    if cand[i].tracked then pick = cand[i]; break end
+    i = i + 1
+  end
+  if not pick then pick = cand[1] end
+  quest.target = pick
+  quest.status = table.getn(quest.list) == 0 and "quests: none accepted" or nil
+
+  if sig ~= quest.logSig then
+    quest.logSig = sig
+    F.dtrace("quest " .. nc .. " waypoint(s) / "
+      .. table.getn(quest.list) .. " accepted quest(s) in " .. zone)
+  end
+end
+
 --------------------------------------------------------------------------
 -- Drawing. Textures are created once and parked (1.12 frames and their
 -- regions cannot be destroyed), and SetTexture is called with COLOR numbers
 -- rather than an art path — a solid dot cannot 404 on a private-server build
--- the way a guessed Interface\\ path can. Color = quest identity (r32).
+-- the way a guessed Interface\\ path can. Color = quest identity (r33).
 --------------------------------------------------------------------------
 
 local questBlips = {}
@@ -2739,7 +3539,7 @@ function F.questDrawBlips()
   local halfW = Minimap:GetWidth() / 2
   local halfH = Minimap:GetHeight() / 2
   local rim = halfW - 4
-  local show = quest.enabled and quest.posOK
+  local show = quest.markersEnabled and quest.posOK
   local i = 1
   while i <= QUEST_MAX_BLIPS do
     local s = quest.spots[i]
@@ -2794,7 +3594,7 @@ end
 -- index math, and it cannot be fooled into decorating the wrong continent.
 function F.questDrawMarkers()
   if not WorldMapDetailFrame then return end
-  local show = quest.enabled and quest.posOK
+  local show = quest.markersEnabled and quest.posOK
     and WorldMapFrame and WorldMapFrame:IsVisible()
   local w = WorldMapDetailFrame:GetWidth()
   local h = WorldMapDetailFrame:GetHeight()
@@ -2853,7 +3653,6 @@ end
 
 function F.questChecklistRows()
   local rows, nr = {}, 0
-  if not quest.enabled then return rows end
   if quest.status then
     rows[1] = "|cFF777777" .. quest.status .. "|r"
     return rows
@@ -2861,7 +3660,7 @@ function F.questChecklistRows()
   local list = quest.list
   local nList = table.getn(list)
   if nList == 0 then
-    rows[1] = "|cFF777777quests: nothing mapped here|r"
+    rows[1] = "|cFF777777quests: none accepted|r"
     return rows
   end
   local goTitle = quest.target and quest.target.title
@@ -2872,13 +3671,15 @@ function F.questChecklistRows()
     local e = list[qi]
     local hex = F.questHex(e.r, e.g, e.b)
     nr = nr + 1
-    rows[nr] = string.format("|c%s%d. %s|r", hex, e.num, F.questShort(e.title, 22))
+    local failed = e.failed and " [failed]" or ""
+    rows[nr] = string.format("|c%s%d. %s%s|r", hex, e.num,
+      F.questShort(e.title, e.failed and 13 or 22), failed)
     local oi = 1
     local nObj = table.getn(e.objs)
     while oi <= nObj and nr < QUEST_PANEL_LINES do
       local o = e.objs[oi]
-      local dir = F.questBearing(o.dx, o.dy)
-      local yards = math.floor(o.dist + 0.5)
+      local dir = o.dist and F.questBearing(o.dx, o.dy) or nil
+      local yards = o.dist and math.floor(o.dist + 0.5) or nil
       local isGo = (e.title == goTitle)
         and ((goTurn and o.turnIn) or ((not goTurn) and (not o.turnIn)
           and o.label == goLabel))
@@ -2887,18 +3688,27 @@ function F.questChecklistRows()
         prog = string.format(" %d/%d", o.have or 0, o.need)
       end
       local lab = F.questShort(o.label, 16)
-      if o.turnIn then
+      if o.turnIn and yards then
         -- mark is >>/<< only for the active "go" row; otherwise a space.
         local prefix = isGo and QUEST_MARK_TURNIN or ("  " .. QUEST_MARK_TURNIN)
         nr = nr + 1
         rows[nr] = string.format(
           "|c%s  %s %s|r |cFFAAAAAA~%dy %s|r",
           hex, prefix, lab, yards, dir)
-      else
+      elseif yards then
         nr = nr + 1
         rows[nr] = string.format(
           "|c%s  %s%s%s|r |cFFAAAAAA~%dy %s|r",
           hex, isGo and (QUEST_MARK_GO .. " ") or "  ", lab, prog, yards, dir)
+      elseif o.turnIn then
+        nr = nr + 1
+        rows[nr] = string.format("|c%s  %s %s|r", hex,
+          QUEST_MARK_TURNIN, F.questShort(o.label or "Ready to turn in", 18))
+      else
+        local mark = o.done and "[x] " or ""
+        nr = nr + 1
+        rows[nr] = string.format("|c%s  %s%s|r", hex, mark,
+          F.questShort(o.text or o.label, 20))
       end
       oi = oi + 1
     end
@@ -2913,15 +3723,142 @@ function F.questRefreshPanel()
     F.questPaintLines({ corpseLine })
     return
   end
-  if not quest.enabled then
-    F.questClearLines()
-    return
-  end
   F.questPaintLines(F.questChecklistRows())
 end
 
+-- Complete scrollable quest checklist. The compact advisor panel remains an
+-- at-a-glance summary; this window is the authoritative view of every live
+-- quest and objective.
+local questFrame = CreateFrame("Frame", "ShadowArmyQuestFrame", UIParent)
+questFrame:SetWidth(430)
+questFrame:SetHeight(360)
+questFrame:SetPoint("CENTER", UIParent, "CENTER", 180, 0)
+questFrame:SetFrameStrata("HIGH")
+questFrame:SetBackdrop({
+  bgFile = "Interface\\Tooltips\\UI-Tooltip-Background",
+  edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+  tile = true, tileSize = 16, edgeSize = 16,
+  insets = { left = 4, right = 4, top = 4, bottom = 4 },
+})
+questFrame:SetBackdropColor(0.05, 0.02, 0.10, 0.92)
+questFrame:EnableMouse(true)
+questFrame:SetMovable(true)
+questFrame:RegisterForDrag("LeftButton")
+questFrame:SetScript("OnDragStart", function() questFrame:StartMoving() end)
+questFrame:SetScript("OnDragStop", function() questFrame:StopMovingOrSizing() end)
+questFrame:Hide()
+tinsert(UISpecialFrames, "ShadowArmyQuestFrame")
+
+local questTitle = questFrame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+questTitle:SetPoint("TOP", questFrame, "TOP", 0, -9)
+questTitle:SetText("|cFF9482C9Quest Advisor|r")
+
+local questClose = CreateFrame("Button", nil, questFrame, "UIPanelCloseButton")
+questClose:SetPoint("TOPRIGHT", questFrame, "TOPRIGHT", -2, -2)
+
+local questScroll = CreateFrame(
+  "ScrollFrame", "ShadowArmyQuestScroll", questFrame, "UIPanelScrollFrameTemplate")
+questScroll:SetPoint("TOPLEFT", questFrame, "TOPLEFT", 12, -30)
+questScroll:SetPoint("BOTTOMRIGHT", questFrame, "BOTTOMRIGHT", -30, 38)
+
+local questScrollChild = CreateFrame("Frame", "ShadowArmyQuestScrollChild", questScroll)
+questScrollChild:SetWidth(376)
+questScrollChild:SetHeight(1)
+questScroll:SetScrollChild(questScrollChild)
+
+local questWindowLines = {}
+function F.questWindowLine(i)
+  local line = questWindowLines[i]
+  if line then return line end
+  line = questScrollChild:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+  line:SetWidth(370)
+  line:SetHeight(14)
+  line:SetJustifyH("LEFT")
+  line:SetPoint("TOPLEFT", questScrollChild, "TOPLEFT", 0, -((i - 1) * 14))
+  line:SetText("")
+  questWindowLines[i] = line
+  return line
+end
+
+function F.questWindowRows()
+  local rows = {}
+  if quest.status then
+    rows[1] = "|cFF777777" .. quest.status .. "|r"
+    return rows
+  end
+  local list = quest.list or {}
+  local qi = 1
+  while qi <= table.getn(list) do
+    local entry = list[qi]
+    local hex = F.questHex(entry.r, entry.g, entry.b)
+    local tracked = entry.tracked and " [tracked]" or ""
+    local failed = entry.failed and " [failed]" or ""
+    rows[table.getn(rows) + 1] = string.format(
+      "|c%s%d. %s%s%s|r", hex, entry.num, entry.title, tracked, failed)
+    local oi = 1
+    while oi <= table.getn(entry.objs) do
+      local obj = entry.objs[oi]
+      local prefix = obj.turnIn and QUEST_MARK_TURNIN or (obj.done and "[x]" or "[ ]")
+      local text = obj.text or obj.label or "Objective"
+      local suffix = ""
+      if obj.dist then
+        suffix = string.format("  |cFFAAAAAA~%dy %s|r",
+          math.floor(obj.dist + 0.5), F.questBearing(obj.dx, obj.dy))
+      elseif obj.zoneName and obj.zoneName ~= quest.zoneName then
+        suffix = "  |cFF888888" .. obj.zoneName .. "|r"
+      end
+      rows[table.getn(rows) + 1] = string.format(
+        "|c%s  %s %s|r%s", hex, prefix, text, suffix)
+      oi = oi + 1
+    end
+    if table.getn(entry.objs) == 0 then
+      rows[table.getn(rows) + 1] = "|cFF999999  " .. (entry.status or "In progress") .. "|r"
+    end
+    qi = qi + 1
+  end
+  return rows
+end
+
+function F.questRefreshWindow()
+  if not questFrame:IsShown() then return end
+  local rows = F.questWindowRows()
+  local i = 1
+  while i <= table.getn(rows) do
+    F.questWindowLine(i):SetText(rows[i])
+    i = i + 1
+  end
+  while i <= table.getn(questWindowLines) do
+    questWindowLines[i]:SetText("")
+    i = i + 1
+  end
+  local height = table.getn(rows) * 14
+  if height < 1 then height = 1 end
+  questScrollChild:SetHeight(height)
+  if questScroll.UpdateScrollChildRect then questScroll:UpdateScrollChildRect() end
+end
+
+local questMarkersBtn = CreateFrame("Button", nil, questFrame, "UIPanelButtonTemplate")
+questMarkersBtn:SetWidth(120)
+questMarkersBtn:SetHeight(20)
+questMarkersBtn:SetPoint("BOTTOMLEFT", questFrame, "BOTTOMLEFT", 12, 10)
+
+function F.questSetMarkers(on)
+  quest.markersEnabled = on and true or false
+  questMarkersBtn:SetText(quest.markersEnabled
+    and "|cFF44FF44Markers on|r" or "|cFF999999Markers off|r")
+  if quest.markersEnabled then
+    quest.nextTickAt = 0
+  else
+    pcall(F.questDrawBlips)
+    pcall(F.questDrawMarkers)
+  end
+end
+questMarkersBtn:SetScript("OnClick", function()
+  F.questSetMarkers(not quest.markersEnabled)
+end)
+F.questSetMarkers(true)
+
 function F.questTick()
-  if not quest.enabled then return end
   local now = GetTime()
   if now < quest.nextTickAt then return end
   quest.nextTickAt = now + QUEST_TICK_EVERY
@@ -2929,46 +3866,32 @@ function F.questTick()
   F.questScan()
   F.questDrawBlips()
   F.questDrawMarkers()
-end
-
-function F.questSetEnabled(on)
-  quest.enabled = on and true or false
-  if questBtn then
-    -- Label fixed; state is the colour. Green on, grey off.
-    questBtn:SetText(quest.enabled and "|cFF44FF44Quests|r" or "|cFF999999Quests|r")
-  end
-  if quest.enabled then
-    quest.nextTickAt = 0
-  else
-    quest.spots = {}
-    quest.target = nil
-    quest.list = {}
-    quest.status = nil
-    pcall(F.questDrawBlips)
-    pcall(F.questDrawMarkers)
-    pcall(F.questClearLines)
-  end
+  F.questRefreshWindow()
 end
 
 questBtn = CreateFrame("Button", "ShadowArmyQuestBtn", panel, "UIPanelButtonTemplate")
 questBtn:SetWidth(93) -- 8 + 93 + 8 + 93 + 8 = 210 = panel width
 questBtn:SetHeight(20)
 questBtn:SetPoint("BOTTOMRIGHT", panel, "BOTTOMRIGHT", -8, 32) -- middle row, right of Log
-questBtn:SetText("|cFF44FF44Quests|r")
+questBtn:SetText("|cFF9482C9Quests|r")
 questBtn:SetScript("OnClick", function()
-  F.questSetEnabled(not quest.enabled)
+  if questFrame:IsShown() then
+    questFrame:Hide()
+  else
+    questFrame:Show()
+    F.questRefreshWindow()
+  end
 end)
 
 -- WORLD_MAP_UPDATE fires on pan/zoom/zone-switch and can arrive every frame
 -- while the map is open, so the repaint is throttled; the 0.5s tick repaints
 -- anyway, this just keeps markers from lagging a zone change visibly.
--- ZONE_CHANGED_NEW_AREA forces an immediate rescan because rule (1) is a
--- comparison against the zone NAME, which just changed.
+-- ZONE_CHANGED_NEW_AREA forces an immediate rescan because waypoint
+-- enrichment compares generated zone names against the player's parent zone.
 local questEvents = CreateFrame("Frame", "ShadowArmyQuestEvents", UIParent)
 questEvents:RegisterEvent("WORLD_MAP_UPDATE")
 questEvents:RegisterEvent("ZONE_CHANGED_NEW_AREA")
 questEvents:SetScript("OnEvent", function()
-  if not quest.enabled then return end
   if event == "ZONE_CHANGED_NEW_AREA" then
     quest.nextTickAt = 0
     return
@@ -2982,8 +3905,8 @@ end)
 
 --------------------------------------------------------------------------
 -- CREW / CORPSE BLIPS (r21): party members + own corpse on minimap + world
--- map. Independent of the quest helper — corpse runs still need a compass
--- when quests are toggled off.
+-- map. Independent of quest marker visibility — corpse runs still need a
+-- compass when quest markers are toggled off.
 --
 -- APIs (vanilla 1.12):
 --   GetPlayerMapPosition("party1".."party4") — unit map % (0,0 = unknown /
@@ -3189,13 +4112,9 @@ function F.crewTick()
   local now = GetTime()
   if now < crew.nextTickAt then return end
   crew.nextTickAt = now + CREW_TICK_EVERY
-  -- Keep map fixed when quests are off (F.questTick is the usual fixer).
-  if quest.enabled then
-    if quest.posOK then
-      crew.px, crew.py, crew.posOK = quest.px, quest.py, true
-    else
-      F.crewPosition()
-    end
+  -- Reuse the current-zone sample maintained by the always-live quest scan.
+  if quest.posOK then
+    crew.px, crew.py, crew.posOK = quest.px, quest.py, true
   else
     F.crewPosition()
   end
@@ -3338,18 +4257,16 @@ driver:SetScript("OnUpdate", function()
       pcall(F.sortStop, "error")
     end
   end
-  -- r18: quest waypoints.
-  if quest.enabled then
-    local qok, qerr = pcall(F.questTick)
-    if not qok then F.emit("err", "questTick: " .. tostring(qerr)) end
-  end
+  -- r33: the quest checklist is always live; markers have their own toggle.
+  local qok, qerr = pcall(F.questTick)
+  if not qok then F.emit("err", "questTick: " .. tostring(qerr)) end
   -- r21: party + corpse blips.
   if crew.enabled then
     local cok, cerr = pcall(F.crewTick)
     if not cok then F.emit("err", "crewTick: " .. tostring(cerr)) end
   end
   if loot.active then F.lootTick() end
-  -- r26: combat coach panel refresh (~4 Hz when open). Display only.
+  -- r35: combat coach panel refresh (~4 Hz when open). Display only.
   if combatFrame:IsShown() then
     combatAcc = combatAcc + (arg1 or 0)
     if combatAcc >= 0.25 then
@@ -3427,6 +4344,11 @@ end
 local frame = CreateFrame("Frame", "ShadowArmyFrame", UIParent)
 frame:RegisterEvent("PLAYER_ENTERING_WORLD")
 frame:RegisterEvent("LEARNED_SPELL_IN_TAB")
+frame:RegisterEvent("ACTIONBAR_SLOT_CHANGED")
+frame:RegisterEvent("ACTIONBAR_PAGE_CHANGED")
+frame:RegisterEvent("PLAYER_AURAS_CHANGED")
+frame:RegisterEvent("PLAYER_TARGET_CHANGED")
+frame:RegisterEvent("UI_ERROR_MESSAGE")
 -- cast-time spell window (Shadow Bolt): don't stack cast requests
 frame:RegisterEvent("SPELLCAST_START")
 frame:RegisterEvent("SPELLCAST_STOP")
@@ -3452,6 +4374,8 @@ frame:SetScript("OnEvent", function()
     grind.startTime = GetTime()
     grind.startXP = UnitXP("player")
     F.scanSpellbook()
+    F.installSuggestedKeyHook()
+    F.bindSuggestedKey()
     -- QoL defaults the advisor asserts on every login:
     -- F.instantQuestText() DISABLED (r14): prime remaining suspect for the
     -- reproducible crash+lockup on Complete Quest (it nils the quest
@@ -3462,13 +4386,25 @@ frame:SetScript("OnEvent", function()
     F.say("ARISE. Advisor online for " .. UnitName("player") .. " — /sa help (rev=" .. REV .. ")")
     F.emit("loaded", "rev=" .. REV)
     if not ShadowArmyQuestData then
-      F.say("quest data missing (QuestData.lua failed to load) — panel still works")
+      F.say("quest directions unavailable (QuestData.lua failed to load) — live objectives still work")
     end
   elseif event == "LEARNED_SPELL_IN_TAB" then
     F.scanSpellbook()
+  elseif event == "ACTIONBAR_SLOT_CHANGED" or event == "ACTIONBAR_PAGE_CHANGED" then
+    F.scanCombatActions()
+  elseif event == "PLAYER_AURAS_CHANGED" then
+    -- Druid forms page a different action-bar bank. Re-scan so exact range
+    -- and usability follow the active form instead of the login bar.
+    if auto.classToken == "DRUID" then F.scanCombatActions() end
+  elseif event == "PLAYER_TARGET_CHANGED" then
+    auto.failure = nil
+    auto.lastAttempt = nil
+  elseif event == "UI_ERROR_MESSAGE" then
+    F.combatRecordFailure(arg1 or "")
   elseif event == "SPELLCAST_START" then
     auto.casting = true
     auto.castingSince = GetTime()
+    auto.failure = nil
   elseif event == "SPELLCAST_STOP" then
     auto.casting = false
   elseif event == "SPELLCAST_FAILED" or event == "SPELLCAST_INTERRUPTED" then
@@ -3576,7 +4512,7 @@ function F.saHelp()
   F.say("  /sa combat     toggle combat coach (ability suggestions)")
   F.say("  /sa debug      toggle API probe panel (context gates)")
   F.say("  /sa bags       open ShadowBags")
-  F.say("  /sa quests     toggle quest helper (map blips / objectives)")
+  F.say("  /sa quests     toggle the complete quest window")
   F.say("  /sa crew       toggle party + corpse map blips")
   F.say("  /sa reload     ReloadUI() — pick up disk edits")
 end
@@ -3607,8 +4543,8 @@ SlashCmdList["SHADOWARMY"] = function(msg)
     return
   end
   if msg == "quests" then
-    F.questSetEnabled(not quest.enabled)
-    F.say("quest helper " .. (quest.enabled and "ON" or "OFF"))
+    if questFrame:IsShown() then questFrame:Hide() else questFrame:Show() end
+    F.questRefreshWindow()
     return
   end
   if msg == "crew" then

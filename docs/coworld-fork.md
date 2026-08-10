@@ -1,11 +1,11 @@
-# coworld-vanilla-wow-fork
+# monofuel-vanilla-wow
 
 Private Gitea mirror of Metta-AI `coworld-vanilla-wow` for client customizations.
 Upstream checkout `../coworld-vanilla-wow` stays READ-ONLY per `AGENTS.md`.
 
 | | |
 |---|---|
-| Worktree | `/home/monofuel/Documents/Projects/Softmax/coworld-vanilla-wow-fork` |
+| Worktree | `/home/monofuel/src/wow-coworld/monofuel-vanilla-wow` |
 | Gitea | `ssh://git@10.11.4.11:222/Monolab/coworld-vanilla-wow.git` |
 | Web | https://gitea.solution-nine.monofuel.dev/Monolab/coworld-vanilla-wow |
 | Branch `main` | **should** mirror Metta-AI `main` (stock upstream) — currently polluted with Petrel history; use `upstream-mirror` until force-with-lease |
@@ -41,7 +41,7 @@ on the new contract, not `git merge` thrash.
 ## Sync upstream → Gitea
 
 ```bash
-cd /home/monofuel/Documents/Projects/Softmax/coworld-vanilla-wow-fork
+cd /home/monofuel/src/wow-coworld/monofuel-vanilla-wow
 
 git fetch upstream
 git checkout -B upstream-mirror upstream/main
