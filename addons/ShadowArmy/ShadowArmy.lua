@@ -6,12 +6,304 @@
 
 ShadowArmy = ShadowArmy or {}
 
+-- Pure live quest checklist + optional waypoint enrichment. This lives in
+-- the already-loaded core file because vanilla caches the TOC file list for
+-- the whole client session; adding a new Lua filename would require a client
+-- restart instead of the advisor's automatic ReloadUI path.
+local QuestModel = {}
+
+-- Lua 5.0 has table.getn but no # operator; Lua 5.3 tests have # but removed
+-- table.getn. Walking dense arrays is valid in both.
+local function questGetn(t)
+  local n = 0
+  while t[n + 1] ~= nil do n = n + 1 end
+  return n
+end
+
+QuestModel.colors = {
+  {0.85, 0.40, 1.00}, {0.20, 0.90, 1.00},
+  {1.00, 0.55, 0.12}, {1.00, 0.88, 0.20},
+  {1.00, 0.40, 0.65}, {0.35, 0.65, 1.00},
+  {0.35, 1.00, 0.50}, {1.00, 0.40, 0.35},
+}
+
+local function questLower(s) return string.lower(s or "") end
+
+local function questMatchObjective(objectives, board, idx)
+  if not objectives then return nil end
+  local text = questLower(board and board.text)
+  local i = 1
+  while i <= questGetn(objectives) do
+    local label = objectives[i].label
+    if label and string.find(text, questLower(label), 1, true) then
+      return objectives[i]
+    end
+    i = i + 1
+  end
+  return objectives[idx]
+end
+
+local function questZoneHere(q, spotZone, header, currentZone, zoneNames)
+  if currentZone == "" then return false end
+  if spotZone and zoneNames and zoneNames[spotZone] == currentZone then
+    return true
+  end
+  if header == currentZone and q then
+    return (not spotZone) or spotZone == q.zone
+  end
+  return false
+end
+
+local function questDistance(x, y, px, py, yardsX, yardsY)
+  local dx = x - px
+  local dy = y - py
+  local ux = dx / 100 * yardsX
+  local uy = dy / 100 * yardsY
+  return math.sqrt(ux * ux + uy * uy), dx, dy
+end
+
+local function questModelListCmp(a, b)
+  if a.tracked ~= b.tracked then return a.tracked end
+  if a.minDist ~= b.minDist then return a.minDist < b.minDist end
+  return a.logOrder < b.logOrder
+end
+
+local function questModelCandCmp(a, b)
+  if a.dist ~= b.dist then return a.dist < b.dist end
+  if a.qNum ~= b.qNum then return a.qNum < b.qNum end
+  return a.seq < b.seq
+end
+
+-- Injected API keeps collapsed-header and selection restoration testable
+-- without loading the WoW UI.
+function QuestModel.readLog(api)
+  local selectedIndex = api.selection and api.selection() or 0
+  local selectedTitle = nil
+  if selectedIndex > 0 then
+    local title, _, _, isHeader = api.title(selectedIndex)
+    if not isHeader then selectedTitle = title end
+  end
+
+  local collapsed = {}
+  if api.expand then
+    local i = 1
+    while i <= (api.numEntries() or 0) do
+      local title, _, _, isHeader, isCollapsed = api.title(i)
+      if isHeader and isCollapsed then
+        title = title or ""
+        collapsed[title] = (collapsed[title] or 0) + 1
+        api.expand(i)
+      end
+      i = i + 1
+    end
+  end
+
+  local live, sig = {}, ""
+  local ok, err = pcall(function()
+    local watched = api.watched and api.watched() or {}
+    local header = ""
+    local i = 1
+    while i <= (api.numEntries() or 0) do
+      local title, _, _, isHeader, _, isComplete = api.title(i)
+      if isHeader then
+        header = title or ""
+      elseif title then
+        local boards, nb = api.boards(i)
+        local objectives = {}
+        local bi = 1
+        while bi <= nb do
+          objectives[bi] = boards[bi]
+          sig = sig .. ":" .. (boards[bi].text or "")
+          bi = bi + 1
+        end
+        live[questGetn(live) + 1] = {
+          key = i, title = title, header = header,
+          tracked = watched[i] and true or false,
+          complete = isComplete == 1,
+          failed = isComplete == -1,
+          objectives = objectives,
+        }
+        local state = isComplete == 1 and "!" or (isComplete == -1 and "x" or "-")
+        sig = sig .. "|" .. title .. state
+      end
+      i = i + 1
+    end
+  end)
+
+  if api.collapse then
+    local i = api.numEntries() or 0
+    while i >= 1 do
+      local title, _, _, isHeader = api.title(i)
+      if isHeader and collapsed[title or ""] and collapsed[title or ""] > 0 then
+        collapsed[title or ""] = collapsed[title or ""] - 1
+        api.collapse(i)
+      end
+      i = i - 1
+    end
+  end
+  if api.select then
+    local restored = false
+    if selectedTitle and selectedTitle ~= "" then
+      local i = 1
+      while i <= (api.numEntries() or 0) do
+        local title, _, _, isHeader = api.title(i)
+        if not isHeader and title == selectedTitle then
+          api.select(i)
+          restored = true
+          break
+        end
+        i = i + 1
+      end
+    end
+    if not restored and selectedIndex > 0 and selectedIndex <= (api.numEntries() or 0) then
+      api.select(selectedIndex)
+    end
+  end
+  if not ok then error(err) end
+  return live, sig
+end
+
+function QuestModel.build(opts)
+  opts = opts or {}
+  local live = opts.quests or {}
+  local data = opts.data or {}
+  local zoneNames = opts.zoneNames
+  local currentZone = opts.currentZone or ""
+  local pos = opts.pos
+  local yardsX = opts.yardsX or 3500
+  local yardsY = opts.yardsY or 2333
+  local palette = opts.colors or QuestModel.colors
+  local nColors = questGetn(palette)
+  local list, candidates = {}, {}
+  local seq = 0
+
+  local qi = 1
+  while qi <= questGetn(live) do
+    local lq = live[qi]
+    local color = palette[((qi - 1) - math.floor((qi - 1) / nColors) * nColors) + 1]
+    local entry = {
+      key = lq.key or qi, num = qi, title = lq.title or "?",
+      tracked = lq.tracked and true or false,
+      complete = lq.complete and true or false,
+      failed = lq.failed and true or false,
+      logOrder = qi, r = color[1], g = color[2], b = color[3],
+      minDist = 1e9, objs = {},
+    }
+    local q = data[entry.title]
+
+    if entry.complete then
+      local obj = {
+        label = "Ready to turn in", text = "Ready to turn in",
+        done = true, turnIn = true,
+      }
+      local w = q and q.turnIn
+      if w then
+        obj.label = w.label or obj.label
+        obj.text = "Turn in: " .. obj.label
+        obj.zoneName = zoneNames and w.zone and zoneNames[w.zone] or nil
+        if pos and w.x and w.y
+            and questZoneHere(q, w.zone, lq.header or "", currentZone, zoneNames) then
+          obj.dist, obj.dx, obj.dy = questDistance(
+            w.x, w.y, pos.x, pos.y, yardsX, yardsY)
+          entry.minDist = obj.dist
+          seq = seq + 1
+          candidates[questGetn(candidates) + 1] = {
+            questKey = entry.key, title = entry.title, label = obj.label,
+            x = w.x, y = w.y, dx = obj.dx, dy = obj.dy, dist = obj.dist,
+            turnIn = true, tracked = entry.tracked, seq = seq,
+          }
+        end
+      end
+      entry.objs[1] = obj
+    else
+      local boards = lq.objectives or {}
+      local bi = 1
+      local nBoards = questGetn(boards)
+      while bi <= nBoards do
+        local board = boards[bi]
+        local generated = q and questMatchObjective(q.objectives, board, bi) or nil
+        local obj = {
+          label = (generated and generated.label) or board.text or "Objective",
+          text = board.text or (generated and generated.label) or "Objective",
+          have = board.have, need = board.need,
+          done = board.done and true or false, turnIn = false,
+        }
+        local spots = generated and generated.spots
+        if spots and questGetn(spots) > 0 then
+          local first = spots[1]
+          obj.zoneName = zoneNames and first.zone and zoneNames[first.zone] or nil
+          if pos and not obj.done and not entry.failed then
+            local si = 1
+            while si <= questGetn(spots) do
+              local s = spots[si]
+              if s.x and s.y
+                  and questZoneHere(q, s.zone, lq.header or "", currentZone, zoneNames) then
+                local dist, dx, dy = questDistance(
+                  s.x, s.y, pos.x, pos.y, yardsX, yardsY)
+                if not obj.dist or dist < obj.dist then
+                  obj.dist, obj.dx, obj.dy = dist, dx, dy
+                end
+                seq = seq + 1
+                candidates[questGetn(candidates) + 1] = {
+                  questKey = entry.key, title = entry.title, label = obj.label,
+                  have = obj.have, need = obj.need,
+                  x = s.x, y = s.y, dx = dx, dy = dy, dist = dist,
+                  turnIn = false, tracked = entry.tracked, seq = seq,
+                }
+              end
+              si = si + 1
+            end
+          end
+        end
+        if obj.dist and obj.dist < entry.minDist then entry.minDist = obj.dist end
+        entry.objs[bi] = obj
+        bi = bi + 1
+      end
+      if entry.failed then
+        entry.status = "Failed"
+      elseif nBoards == 0 then
+        entry.status = "In progress"
+      end
+    end
+    list[qi] = entry
+    qi = qi + 1
+  end
+
+  if questGetn(list) > 1 then table.sort(list, questModelListCmp) end
+  local byKey = {}
+  qi = 1
+  while qi <= questGetn(list) do
+    list[qi].num = qi
+    byKey[list[qi].key] = list[qi]
+    qi = qi + 1
+  end
+
+  local kept = {}
+  local ci = 1
+  while ci <= questGetn(candidates) do
+    local c = candidates[ci]
+    local entry = byKey[c.questKey]
+    if entry then
+      c.qNum, c.r, c.g, c.b = entry.num, entry.r, entry.g, entry.b
+      kept[questGetn(kept) + 1] = c
+    end
+    ci = ci + 1
+  end
+  if questGetn(kept) > 1 then table.sort(kept, questModelCandCmp) end
+  return { list = list, candidates = kept }
+end
+
+ShadowArmy.questModel = QuestModel
+
+-- Unit tests load this file without the WoW UI and stop after the pure model.
+if not CreateFrame then return end
+
 -- Lua 5.0 hard limit: 200 locals per function. Helpers live on F.
 local F = {}
 
 -- Bump on every edit. The System watches Chat.log for "<SA> loaded rev=..."
 -- after sending a reload — a new rev proves the edit actually loaded.
-local REV = "r32"
+local REV = "r34"
 
 -- Log window (r16): every F.say()/F.emit() line also lands here with a
 -- timestamp, so errors survive chat scroll-off and can be reviewed in-game.
@@ -2136,39 +2428,15 @@ tinsert(UISpecialFrames, "ShadowBagsFrame")
 -- kill-vs-turnin). Gold soup is gone. Panel lists quests with nested objective
 -- progress; pins use that quest's color so multi-quest zones are readable.
 --
--- If the data file is absent the whole feature no-ops after exactly one
--- `err quest data missing` line. Nothing below may ever depend on it existing.
+-- If the data file is absent, accepted quests and live objectives still work;
+-- only coordinate enrichment no-ops after one `err quest data missing` line.
 --
--- ZONE IDENTITY IS THE HARD PART, and it is why this section looks paranoid.
--- The data file speaks AreaTable ids (85 = Tirisfal Glades). The 1.12 client
--- hands an addon zone NAMES (GetZoneText/GetRealZoneText) and world-map
--- dropdown INDICES (GetCurrentMapZone) — never AreaTable ids, and there is no
--- API that converts between them. A hand-written name->id table would be the
--- only bridge, and one wrong row in it parks an arrow on a mob three zones
--- over, which is worse than no arrow at all.
---
--- So we never convert. A waypoint is drawn only when BOTH hold:
---   (1) the quest's own quest-log HEADER name equals the player's current
---       zone name. The log groups quests by zone, and that grouping comes
---       from the same server the coordinates were mined against — it is a
---       string compare between two things the client itself produced.
---   (2) the waypoint's `zone` id equals its quest's `zone` id. Both numbers
---       come out of the data file, so the client is not involved in that
---       comparison at all.
--- Anything we cannot prove sits in the current zone is simply NOT DRAWN.
--- Fails safe: a missing arrow costs a few seconds of reading the quest log,
--- a wrong arrow costs a corpse run.
---
--- Deliberate consequence: an objective that lives in a neighbouring zone
--- stays hidden until you walk into that zone. (2) is what makes multi-zone
--- quests degrade quietly instead of pointing at the wrong patch of map.
---
--- Second, opportunistic path: every time (1) holds we LEARN `zone id -> zone
--- name` from that quest, and afterwards a waypoint carrying a learned id is
--- allowed through even when its quest headers somewhere else. Conflicting
--- evidence for an id POISONS that id permanently (it goes back to unknown),
--- because a learned mapping that is wrong is worse than no mapping. The table
--- is rebuilt from scratch every reload; it is a cache, never a source.
+-- The live quest log is authoritative. Generated QuestData can enrich a live
+-- objective with coordinates, but missing data, a subzone quest-log header,
+-- or an unavailable player map position must never hide the accepted quest.
+-- ShadowArmyQuestZones is generated beside QuestData and maps its AreaTable
+-- ids to the parent-zone names returned by GetRealZoneText(). This is what
+-- makes a Red Cloud Mesa quest safely resolve to the Mulgore map.
 --------------------------------------------------------------------------
 
 local QUEST_TICK_EVERY = 0.5   -- recompute the nearest objective this often
@@ -2176,21 +2444,6 @@ local QUEST_MARKER_EVERY = 0.2 -- WORLD_MAP_UPDATE repaint throttle
 local QUEST_MAX_CAND = 60      -- bound on waypoints considered per scan
 local QUEST_MAX_BLIPS = 8      -- minimap dots (created once, reused forever)
 local QUEST_MAX_MARKERS = 30   -- world map dots
-local QUEST_MAX_LIST = 6       -- max quests on the checklist
-local QUEST_MAX_OBJ_LINES = 3  -- max objective rows under one quest header
-
--- Distinct hues per quest (cycled). Identity is the quest, not kill/turn-in.
-local QUEST_COLORS = {
-  {0.85, 0.40, 1.00}, -- purple
-  {0.20, 0.90, 1.00}, -- cyan
-  {1.00, 0.55, 0.12}, -- orange
-  {1.00, 0.88, 0.20}, -- yellow
-  {1.00, 0.40, 0.65}, -- pink
-  {0.35, 0.65, 1.00}, -- blue
-  {0.35, 1.00, 0.50}, -- mint
-  {1.00, 0.40, 0.35}, -- coral
-}
-local QUEST_N_COLORS = 8
 
 -- Zone dimensions are NOT exposed in 1.12 (no zone size API, and no world
 -- coordinates for anything but yourself), so a percentage delta cannot be
@@ -2221,7 +2474,7 @@ local QUEST_MARK_TURNIN = "<<"
 local COMPASS_TAN22 = 0.4142 -- tan(22.5 deg): the 8-point octant boundary
 
 local quest = {
-  enabled = true,
+  markersEnabled = true,
   dataWarned = false,   -- the one-and-only "no data file" F.emit
   nextTickAt = 0,
   nextMarkerAt = 0,
@@ -2229,14 +2482,13 @@ local quest = {
   logSig = "",          -- change detector for the debug-only log trace
   target = nil,         -- nearest "go here" waypoint (tracked wins)
   spots = {},           -- drawable waypoints (blip-priority order)
-  list = {},            -- checklist: {num,title,r,g,b,tracked,objs={...}}
-  status = nil,         -- idle reason string when list is empty
-  learned = {},         -- zone id -> zone name, or false once poisoned
+  list = {},            -- complete live checklist from QuestModel
+  status = nil,         -- idle/error reason string when list is empty
   zoneName = "",
   px = 0, py = 0, posOK = false,
 }
 
-local questBtn -- created below; F.questSetEnabled closes over this local
+local questBtn -- created below; opens the complete quest checklist window
 
 function F.questData()
   if ShadowArmyQuestData then return ShadowArmyQuestData end
@@ -2538,7 +2790,9 @@ function F.questStampSpots(spots, list)
   end
 end
 
-function F.questScan()
+-- Kept as a named historical implementation while r33 transitions the
+-- scanner below to the live-log-first quest model.
+function F.questScanMappedOnlyLegacy()
   local data = F.questData()
   local zone = GetRealZoneText() or ""
   quest.zoneName = zone
@@ -2714,11 +2968,145 @@ function F.questScan()
   end
 end
 
+-- Expand hidden quest-log sections before reading them. Vanilla omits the
+-- quests under a collapsed header from GetNumQuestLogEntries(), so failing to
+-- do this makes accepted quests disappear based on a Blizzard UI preference.
+function F.questExpandHeaders()
+  local collapsed = {}
+  if not ExpandQuestHeader then return collapsed end
+  local i = 1
+  while i <= (GetNumQuestLogEntries() or 0) do
+    local title, _, _, isHeader, isCollapsed = GetQuestLogTitle(i)
+    if isHeader and isCollapsed then
+      title = title or ""
+      collapsed[title] = (collapsed[title] or 0) + 1
+      ExpandQuestHeader(i)
+    end
+    i = i + 1
+  end
+  return collapsed
+end
+
+function F.questRestoreLog(collapsed, selectedTitle, selectedIndex)
+  if CollapseQuestHeader then
+    local i = GetNumQuestLogEntries() or 0
+    while i >= 1 do
+      local title, _, _, isHeader = GetQuestLogTitle(i)
+      if isHeader and collapsed[title or ""] and collapsed[title or ""] > 0 then
+        collapsed[title or ""] = collapsed[title or ""] - 1
+        CollapseQuestHeader(i)
+      end
+      i = i - 1
+    end
+  end
+  if selectedTitle and selectedTitle ~= "" then
+    local i = 1
+    while i <= (GetNumQuestLogEntries() or 0) do
+      local title, _, _, isHeader = GetQuestLogTitle(i)
+      if not isHeader and title == selectedTitle then
+        SelectQuestLogEntry(i)
+        return
+      end
+      i = i + 1
+    end
+  end
+  if selectedIndex and selectedIndex > 0
+      and selectedIndex <= (GetNumQuestLogEntries() or 0) then
+    SelectQuestLogEntry(selectedIndex)
+  end
+end
+
+function F.questReadLiveLog()
+  local model = ShadowArmy and ShadowArmy.questModel
+  if not model then error("quest model unavailable") end
+  return model.readLog({
+    selection = function()
+      return GetQuestLogSelection and GetQuestLogSelection() or 0
+    end,
+    numEntries = function() return GetNumQuestLogEntries() or 0 end,
+    title = function(i) return GetQuestLogTitle(i) end,
+    expand = ExpandQuestHeader and function(i) ExpandQuestHeader(i) end or nil,
+    collapse = CollapseQuestHeader and function(i) CollapseQuestHeader(i) end or nil,
+    select = function(i) SelectQuestLogEntry(i) end,
+    boards = function(i) return F.questBoards(i) end,
+    watched = function()
+      local watched = {}
+      local nw = GetNumQuestWatches and GetNumQuestWatches() or 0
+      local wi = 1
+      while wi <= nw do
+        local index = GetQuestIndexForWatch(wi)
+        if index then watched[index] = true end
+        wi = wi + 1
+      end
+      return watched
+    end,
+  })
+end
+
+-- r33 scanner: accepted quests and their live objectives always make the
+-- checklist. Optional QuestData only contributes trusted, current-zone
+-- waypoints to that model.
+function F.questScan()
+  local zone = GetRealZoneText() or ""
+  quest.zoneName = zone
+
+  -- Do not move the human's quest selection while the quest log is on screen.
+  -- The previous complete scan remains visible until the window closes.
+  if QuestLogFrame and QuestLogFrame:IsVisible() then return end
+
+  local live, sig = F.questReadLiveLog()
+  local model = ShadowArmy and ShadowArmy.questModel
+  if not model then
+    quest.spots, quest.target, quest.list = {}, nil, {}
+    quest.status = "quests: model unavailable"
+    return
+  end
+
+  local pos = nil
+  if quest.posOK then pos = { x = quest.px, y = quest.py } end
+  local built = model.build({
+    quests = live,
+    data = F.questData() or {},
+    zoneNames = ShadowArmyQuestZones,
+    currentZone = zone,
+    pos = pos,
+    yardsX = QUEST_ZONE_YARDS_X,
+    yardsY = QUEST_ZONE_YARDS_Y,
+  })
+
+  local cand = {}
+  local nc = table.getn(built.candidates)
+  if nc > QUEST_MAX_CAND then nc = QUEST_MAX_CAND end
+  local i = 1
+  while i <= nc do
+    cand[i] = built.candidates[i]
+    i = i + 1
+  end
+
+  quest.list = built.list
+  quest.spots = F.questPickSpots(cand, nc, QUEST_MAX_MARKERS)
+  local pick = nil
+  i = 1
+  while i <= nc do
+    if cand[i].tracked then pick = cand[i]; break end
+    i = i + 1
+  end
+  if not pick then pick = cand[1] end
+  quest.target = pick
+  quest.status = table.getn(quest.list) == 0 and "quests: none accepted" or nil
+
+  if sig ~= quest.logSig then
+    quest.logSig = sig
+    F.dtrace("quest " .. nc .. " waypoint(s) / "
+      .. table.getn(quest.list) .. " accepted quest(s) in " .. zone)
+  end
+end
+
 --------------------------------------------------------------------------
 -- Drawing. Textures are created once and parked (1.12 frames and their
 -- regions cannot be destroyed), and SetTexture is called with COLOR numbers
 -- rather than an art path — a solid dot cannot 404 on a private-server build
--- the way a guessed Interface\\ path can. Color = quest identity (r32).
+-- the way a guessed Interface\\ path can. Color = quest identity (r33).
 --------------------------------------------------------------------------
 
 local questBlips = {}
@@ -2739,7 +3127,7 @@ function F.questDrawBlips()
   local halfW = Minimap:GetWidth() / 2
   local halfH = Minimap:GetHeight() / 2
   local rim = halfW - 4
-  local show = quest.enabled and quest.posOK
+  local show = quest.markersEnabled and quest.posOK
   local i = 1
   while i <= QUEST_MAX_BLIPS do
     local s = quest.spots[i]
@@ -2794,7 +3182,7 @@ end
 -- index math, and it cannot be fooled into decorating the wrong continent.
 function F.questDrawMarkers()
   if not WorldMapDetailFrame then return end
-  local show = quest.enabled and quest.posOK
+  local show = quest.markersEnabled and quest.posOK
     and WorldMapFrame and WorldMapFrame:IsVisible()
   local w = WorldMapDetailFrame:GetWidth()
   local h = WorldMapDetailFrame:GetHeight()
@@ -2853,7 +3241,6 @@ end
 
 function F.questChecklistRows()
   local rows, nr = {}, 0
-  if not quest.enabled then return rows end
   if quest.status then
     rows[1] = "|cFF777777" .. quest.status .. "|r"
     return rows
@@ -2861,7 +3248,7 @@ function F.questChecklistRows()
   local list = quest.list
   local nList = table.getn(list)
   if nList == 0 then
-    rows[1] = "|cFF777777quests: nothing mapped here|r"
+    rows[1] = "|cFF777777quests: none accepted|r"
     return rows
   end
   local goTitle = quest.target and quest.target.title
@@ -2872,13 +3259,15 @@ function F.questChecklistRows()
     local e = list[qi]
     local hex = F.questHex(e.r, e.g, e.b)
     nr = nr + 1
-    rows[nr] = string.format("|c%s%d. %s|r", hex, e.num, F.questShort(e.title, 22))
+    local failed = e.failed and " [failed]" or ""
+    rows[nr] = string.format("|c%s%d. %s%s|r", hex, e.num,
+      F.questShort(e.title, e.failed and 13 or 22), failed)
     local oi = 1
     local nObj = table.getn(e.objs)
     while oi <= nObj and nr < QUEST_PANEL_LINES do
       local o = e.objs[oi]
-      local dir = F.questBearing(o.dx, o.dy)
-      local yards = math.floor(o.dist + 0.5)
+      local dir = o.dist and F.questBearing(o.dx, o.dy) or nil
+      local yards = o.dist and math.floor(o.dist + 0.5) or nil
       local isGo = (e.title == goTitle)
         and ((goTurn and o.turnIn) or ((not goTurn) and (not o.turnIn)
           and o.label == goLabel))
@@ -2887,18 +3276,27 @@ function F.questChecklistRows()
         prog = string.format(" %d/%d", o.have or 0, o.need)
       end
       local lab = F.questShort(o.label, 16)
-      if o.turnIn then
+      if o.turnIn and yards then
         -- mark is >>/<< only for the active "go" row; otherwise a space.
         local prefix = isGo and QUEST_MARK_TURNIN or ("  " .. QUEST_MARK_TURNIN)
         nr = nr + 1
         rows[nr] = string.format(
           "|c%s  %s %s|r |cFFAAAAAA~%dy %s|r",
           hex, prefix, lab, yards, dir)
-      else
+      elseif yards then
         nr = nr + 1
         rows[nr] = string.format(
           "|c%s  %s%s%s|r |cFFAAAAAA~%dy %s|r",
           hex, isGo and (QUEST_MARK_GO .. " ") or "  ", lab, prog, yards, dir)
+      elseif o.turnIn then
+        nr = nr + 1
+        rows[nr] = string.format("|c%s  %s %s|r", hex,
+          QUEST_MARK_TURNIN, F.questShort(o.label or "Ready to turn in", 18))
+      else
+        local mark = o.done and "[x] " or ""
+        nr = nr + 1
+        rows[nr] = string.format("|c%s  %s%s|r", hex, mark,
+          F.questShort(o.text or o.label, 20))
       end
       oi = oi + 1
     end
@@ -2913,15 +3311,142 @@ function F.questRefreshPanel()
     F.questPaintLines({ corpseLine })
     return
   end
-  if not quest.enabled then
-    F.questClearLines()
-    return
-  end
   F.questPaintLines(F.questChecklistRows())
 end
 
+-- Complete scrollable quest checklist. The compact advisor panel remains an
+-- at-a-glance summary; this window is the authoritative view of every live
+-- quest and objective.
+local questFrame = CreateFrame("Frame", "ShadowArmyQuestFrame", UIParent)
+questFrame:SetWidth(430)
+questFrame:SetHeight(360)
+questFrame:SetPoint("CENTER", UIParent, "CENTER", 180, 0)
+questFrame:SetFrameStrata("HIGH")
+questFrame:SetBackdrop({
+  bgFile = "Interface\\Tooltips\\UI-Tooltip-Background",
+  edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+  tile = true, tileSize = 16, edgeSize = 16,
+  insets = { left = 4, right = 4, top = 4, bottom = 4 },
+})
+questFrame:SetBackdropColor(0.05, 0.02, 0.10, 0.92)
+questFrame:EnableMouse(true)
+questFrame:SetMovable(true)
+questFrame:RegisterForDrag("LeftButton")
+questFrame:SetScript("OnDragStart", function() questFrame:StartMoving() end)
+questFrame:SetScript("OnDragStop", function() questFrame:StopMovingOrSizing() end)
+questFrame:Hide()
+tinsert(UISpecialFrames, "ShadowArmyQuestFrame")
+
+local questTitle = questFrame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+questTitle:SetPoint("TOP", questFrame, "TOP", 0, -9)
+questTitle:SetText("|cFF9482C9Quest Advisor|r")
+
+local questClose = CreateFrame("Button", nil, questFrame, "UIPanelCloseButton")
+questClose:SetPoint("TOPRIGHT", questFrame, "TOPRIGHT", -2, -2)
+
+local questScroll = CreateFrame(
+  "ScrollFrame", "ShadowArmyQuestScroll", questFrame, "UIPanelScrollFrameTemplate")
+questScroll:SetPoint("TOPLEFT", questFrame, "TOPLEFT", 12, -30)
+questScroll:SetPoint("BOTTOMRIGHT", questFrame, "BOTTOMRIGHT", -30, 38)
+
+local questScrollChild = CreateFrame("Frame", "ShadowArmyQuestScrollChild", questScroll)
+questScrollChild:SetWidth(376)
+questScrollChild:SetHeight(1)
+questScroll:SetScrollChild(questScrollChild)
+
+local questWindowLines = {}
+function F.questWindowLine(i)
+  local line = questWindowLines[i]
+  if line then return line end
+  line = questScrollChild:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+  line:SetWidth(370)
+  line:SetHeight(14)
+  line:SetJustifyH("LEFT")
+  line:SetPoint("TOPLEFT", questScrollChild, "TOPLEFT", 0, -((i - 1) * 14))
+  line:SetText("")
+  questWindowLines[i] = line
+  return line
+end
+
+function F.questWindowRows()
+  local rows = {}
+  if quest.status then
+    rows[1] = "|cFF777777" .. quest.status .. "|r"
+    return rows
+  end
+  local list = quest.list or {}
+  local qi = 1
+  while qi <= table.getn(list) do
+    local entry = list[qi]
+    local hex = F.questHex(entry.r, entry.g, entry.b)
+    local tracked = entry.tracked and " [tracked]" or ""
+    local failed = entry.failed and " [failed]" or ""
+    rows[table.getn(rows) + 1] = string.format(
+      "|c%s%d. %s%s%s|r", hex, entry.num, entry.title, tracked, failed)
+    local oi = 1
+    while oi <= table.getn(entry.objs) do
+      local obj = entry.objs[oi]
+      local prefix = obj.turnIn and QUEST_MARK_TURNIN or (obj.done and "[x]" or "[ ]")
+      local text = obj.text or obj.label or "Objective"
+      local suffix = ""
+      if obj.dist then
+        suffix = string.format("  |cFFAAAAAA~%dy %s|r",
+          math.floor(obj.dist + 0.5), F.questBearing(obj.dx, obj.dy))
+      elseif obj.zoneName and obj.zoneName ~= quest.zoneName then
+        suffix = "  |cFF888888" .. obj.zoneName .. "|r"
+      end
+      rows[table.getn(rows) + 1] = string.format(
+        "|c%s  %s %s|r%s", hex, prefix, text, suffix)
+      oi = oi + 1
+    end
+    if table.getn(entry.objs) == 0 then
+      rows[table.getn(rows) + 1] = "|cFF999999  " .. (entry.status or "In progress") .. "|r"
+    end
+    qi = qi + 1
+  end
+  return rows
+end
+
+function F.questRefreshWindow()
+  if not questFrame:IsShown() then return end
+  local rows = F.questWindowRows()
+  local i = 1
+  while i <= table.getn(rows) do
+    F.questWindowLine(i):SetText(rows[i])
+    i = i + 1
+  end
+  while i <= table.getn(questWindowLines) do
+    questWindowLines[i]:SetText("")
+    i = i + 1
+  end
+  local height = table.getn(rows) * 14
+  if height < 1 then height = 1 end
+  questScrollChild:SetHeight(height)
+  if questScroll.UpdateScrollChildRect then questScroll:UpdateScrollChildRect() end
+end
+
+local questMarkersBtn = CreateFrame("Button", nil, questFrame, "UIPanelButtonTemplate")
+questMarkersBtn:SetWidth(120)
+questMarkersBtn:SetHeight(20)
+questMarkersBtn:SetPoint("BOTTOMLEFT", questFrame, "BOTTOMLEFT", 12, 10)
+
+function F.questSetMarkers(on)
+  quest.markersEnabled = on and true or false
+  questMarkersBtn:SetText(quest.markersEnabled
+    and "|cFF44FF44Markers on|r" or "|cFF999999Markers off|r")
+  if quest.markersEnabled then
+    quest.nextTickAt = 0
+  else
+    pcall(F.questDrawBlips)
+    pcall(F.questDrawMarkers)
+  end
+end
+questMarkersBtn:SetScript("OnClick", function()
+  F.questSetMarkers(not quest.markersEnabled)
+end)
+F.questSetMarkers(true)
+
 function F.questTick()
-  if not quest.enabled then return end
   local now = GetTime()
   if now < quest.nextTickAt then return end
   quest.nextTickAt = now + QUEST_TICK_EVERY
@@ -2929,46 +3454,32 @@ function F.questTick()
   F.questScan()
   F.questDrawBlips()
   F.questDrawMarkers()
-end
-
-function F.questSetEnabled(on)
-  quest.enabled = on and true or false
-  if questBtn then
-    -- Label fixed; state is the colour. Green on, grey off.
-    questBtn:SetText(quest.enabled and "|cFF44FF44Quests|r" or "|cFF999999Quests|r")
-  end
-  if quest.enabled then
-    quest.nextTickAt = 0
-  else
-    quest.spots = {}
-    quest.target = nil
-    quest.list = {}
-    quest.status = nil
-    pcall(F.questDrawBlips)
-    pcall(F.questDrawMarkers)
-    pcall(F.questClearLines)
-  end
+  F.questRefreshWindow()
 end
 
 questBtn = CreateFrame("Button", "ShadowArmyQuestBtn", panel, "UIPanelButtonTemplate")
 questBtn:SetWidth(93) -- 8 + 93 + 8 + 93 + 8 = 210 = panel width
 questBtn:SetHeight(20)
 questBtn:SetPoint("BOTTOMRIGHT", panel, "BOTTOMRIGHT", -8, 32) -- middle row, right of Log
-questBtn:SetText("|cFF44FF44Quests|r")
+questBtn:SetText("|cFF9482C9Quests|r")
 questBtn:SetScript("OnClick", function()
-  F.questSetEnabled(not quest.enabled)
+  if questFrame:IsShown() then
+    questFrame:Hide()
+  else
+    questFrame:Show()
+    F.questRefreshWindow()
+  end
 end)
 
 -- WORLD_MAP_UPDATE fires on pan/zoom/zone-switch and can arrive every frame
 -- while the map is open, so the repaint is throttled; the 0.5s tick repaints
 -- anyway, this just keeps markers from lagging a zone change visibly.
--- ZONE_CHANGED_NEW_AREA forces an immediate rescan because rule (1) is a
--- comparison against the zone NAME, which just changed.
+-- ZONE_CHANGED_NEW_AREA forces an immediate rescan because waypoint
+-- enrichment compares generated zone names against the player's parent zone.
 local questEvents = CreateFrame("Frame", "ShadowArmyQuestEvents", UIParent)
 questEvents:RegisterEvent("WORLD_MAP_UPDATE")
 questEvents:RegisterEvent("ZONE_CHANGED_NEW_AREA")
 questEvents:SetScript("OnEvent", function()
-  if not quest.enabled then return end
   if event == "ZONE_CHANGED_NEW_AREA" then
     quest.nextTickAt = 0
     return
@@ -2982,8 +3493,8 @@ end)
 
 --------------------------------------------------------------------------
 -- CREW / CORPSE BLIPS (r21): party members + own corpse on minimap + world
--- map. Independent of the quest helper — corpse runs still need a compass
--- when quests are toggled off.
+-- map. Independent of quest marker visibility — corpse runs still need a
+-- compass when quest markers are toggled off.
 --
 -- APIs (vanilla 1.12):
 --   GetPlayerMapPosition("party1".."party4") — unit map % (0,0 = unknown /
@@ -3189,13 +3700,9 @@ function F.crewTick()
   local now = GetTime()
   if now < crew.nextTickAt then return end
   crew.nextTickAt = now + CREW_TICK_EVERY
-  -- Keep map fixed when quests are off (F.questTick is the usual fixer).
-  if quest.enabled then
-    if quest.posOK then
-      crew.px, crew.py, crew.posOK = quest.px, quest.py, true
-    else
-      F.crewPosition()
-    end
+  -- Reuse the current-zone sample maintained by the always-live quest scan.
+  if quest.posOK then
+    crew.px, crew.py, crew.posOK = quest.px, quest.py, true
   else
     F.crewPosition()
   end
@@ -3338,11 +3845,9 @@ driver:SetScript("OnUpdate", function()
       pcall(F.sortStop, "error")
     end
   end
-  -- r18: quest waypoints.
-  if quest.enabled then
-    local qok, qerr = pcall(F.questTick)
-    if not qok then F.emit("err", "questTick: " .. tostring(qerr)) end
-  end
+  -- r33: the quest checklist is always live; markers have their own toggle.
+  local qok, qerr = pcall(F.questTick)
+  if not qok then F.emit("err", "questTick: " .. tostring(qerr)) end
   -- r21: party + corpse blips.
   if crew.enabled then
     local cok, cerr = pcall(F.crewTick)
@@ -3462,7 +3967,7 @@ frame:SetScript("OnEvent", function()
     F.say("ARISE. Advisor online for " .. UnitName("player") .. " — /sa help (rev=" .. REV .. ")")
     F.emit("loaded", "rev=" .. REV)
     if not ShadowArmyQuestData then
-      F.say("quest data missing (QuestData.lua failed to load) — panel still works")
+      F.say("quest directions unavailable (QuestData.lua failed to load) — live objectives still work")
     end
   elseif event == "LEARNED_SPELL_IN_TAB" then
     F.scanSpellbook()
@@ -3576,7 +4081,7 @@ function F.saHelp()
   F.say("  /sa combat     toggle combat coach (ability suggestions)")
   F.say("  /sa debug      toggle API probe panel (context gates)")
   F.say("  /sa bags       open ShadowBags")
-  F.say("  /sa quests     toggle quest helper (map blips / objectives)")
+  F.say("  /sa quests     toggle the complete quest window")
   F.say("  /sa crew       toggle party + corpse map blips")
   F.say("  /sa reload     ReloadUI() — pick up disk edits")
 end
@@ -3607,8 +4112,8 @@ SlashCmdList["SHADOWARMY"] = function(msg)
     return
   end
   if msg == "quests" then
-    F.questSetEnabled(not quest.enabled)
-    F.say("quest helper " .. (quest.enabled and "ON" or "OFF"))
+    if questFrame:IsShown() then questFrame:Hide() else questFrame:Show() end
+    F.questRefreshWindow()
     return
   end
   if msg == "crew" then

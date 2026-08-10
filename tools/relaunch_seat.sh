@@ -2,6 +2,8 @@
 # relaunch_seat.sh <slot> <account> <character> <class> <binary>
 set -eu
 cd "$(dirname "$0")/.."
+WORKSPACE_ROOT=$(cd .. && pwd)
+UPSTREAM_ROOT="$WORKSPACE_ROOT/coworld-vanilla-wow"
 SLOT=$1; ACCT=$2; CHAR=$3; CLASS=$4; BIN=$5
 LDP=$(cat local_data/slot2.ldpath)
 setsid nohup env \
@@ -18,8 +20,8 @@ setsid nohup env \
   WOW_SDK_NIM_RUNTIME_SLOT="$SLOT" \
   WOW_SDK_NIM_RUNTIME_DIR="$PWD/local_data/nim-runtime-slot$SLOT" \
   WOW_SDK_NIM_CONTROL_HOST=127.0.0.1 \
-  VANILLA_WOW_NAVMESH_HELPER=/home/monofuel/Documents/Projects/Softmax/coworld-vanilla-wow/tmp/vmangos-navmesh-helper \
-  VANILLA_WOW_EXTRACTED_DATA_DIR=/home/monofuel/Documents/Projects/Softmax/coworld-vanilla-wow/local_data/vmangos-5875-data \
+  VANILLA_WOW_NAVMESH_HELPER="$UPSTREAM_ROOT/tmp/vmangos-navmesh-helper" \
+  VANILLA_WOW_EXTRACTED_DATA_DIR="$UPSTREAM_ROOT/local_data/vmangos-5875-data" \
   "./local_data/$BIN" --scenario=nim-control \
   > "local_data/brain-logs/seat-slot$SLOT.log" 2>&1 < /dev/null &
 echo "slot $SLOT ($CHAR) launched with $BIN"

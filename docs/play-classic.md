@@ -14,8 +14,9 @@ clients either way.
   32-bit; that package ships both arches). `make play-classic` =
   `nix develop --command tools/play_classic.sh`.
 - **local_classic/** (gitignored) is assembled idempotently on first run:
-  - `client/Data` → **symlink** into the wow-classic-data snapshot
-    (~8GB of MPQs, immutable — the game only reads these).
+  - `client/Data` is a real directory whose entries are **symlinks** into the
+    wow-classic-data snapshot (~8GB of MPQs, immutable). The launcher repairs
+    stale relocation links while preserving real loose-file overrides.
   - `client/WTF/`, `client/Interface/`, `WoW.exe` + dlls → **copies**,
     because the game writes settings into WTF/ and addons live in
     Interface/AddOns/. The snapshot repo must never be written to

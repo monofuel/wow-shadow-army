@@ -18,6 +18,7 @@
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
+WORKSPACE_ROOT=$(cd "$ROOT/.." && pwd)
 OUTDIR="$ROOT/local_data/traverse"
 LOGDIR="$ROOT/local_data/brain-logs"
 mkdir -p "$OUTDIR" "$LOGDIR"
@@ -25,7 +26,7 @@ mkdir -p "$OUTDIR" "$LOGDIR"
 LEAGUE=${TRAVERSE_LEAGUE:-league_0f38d762-930a-41d3-9979-1858dd52c1ae}
 DIV=${TRAVERSE_DIVISION:-div_b50e0091-514d-4406-837a-420ef9c372ca}
 LIMIT=${TRAVERSE_EPISODE_LIMIT:-200}
-BOTS_REPO=${COWORLD_BOTS_REPO:-/home/monofuel/Documents/Projects/Softmax/crewrift-prime-bots}
+BOTS_REPO=${COWORLD_BOTS_REPO:-$WORKSPACE_ROOT/crewrift-prime-bots}
 LOCK="$LOGDIR/traverse-field-pull.lock"
 
 exec 9>"$LOCK"
