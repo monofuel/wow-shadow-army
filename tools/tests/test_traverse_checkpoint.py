@@ -22,6 +22,25 @@ class TestTraverseCheckpoint(unittest.TestCase):
         self.assertEqual(pose["map_id"], 1)
         self.assertEqual(pose["tele_name"], "petrel_water_entry")
 
+    def test_primary_course_checkpoints(self) -> None:
+        expected = {
+            "water_entry": (-6784.5, -4833.9, 0.7),
+            "duskwallow_coast": (-4627.01, -4869.45, -2.37),
+            "merchant_coast": (-1533.7, -4056.5, -12.3),
+            "top_barrens": (1071.6, -2303.4, 91.7),
+            "everlook": (6687.333052, -4647.667, 721.678),
+        }
+        for name, coordinates in expected.items():
+            with self.subTest(checkpoint=name):
+                pose = tc.resolve_checkpoint(name)
+                self.assertEqual(
+                    (pose["x"], pose["y"], pose["z"]), coordinates
+                )
+                self.assertEqual(pose["map_id"], 1)
+                self.assertTrue(pose["tele_name"])
+
+        # TODO: add the difficult Everlook cave entrance after capturing its pose.
+
     def test_spawn_has_no_tele(self) -> None:
         pose = tc.resolve_checkpoint("spawn")
         self.assertIsNone(pose.get("tele_name"))
