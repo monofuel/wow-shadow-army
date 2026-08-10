@@ -20,10 +20,19 @@ _G.wow = {
 }
 
 local route = require("config.traverse_beats")
+local landRoute = require("config.traverse_land_beats")
 local petrel = require("traverse")
 
 -- The route data survived the move off host-injected args.
 check(route.goal_id == "duskwallow_coast", "route keeps the segment goal")
+-- The north land phase is a SPARSE strategy-beat list (fair play): one beat
+-- per road decision point, strictly increasing x, ending at the cave mouth.
+check(landRoute.goal_id == "felwood_cave_entrance" and #landRoute.beats == 12,
+  "land route is sparse and ends at the Timbermaw cave mouth")
+for i = 2, #landRoute.beats do
+  check(landRoute.beats[i].x > landRoute.beats[i - 1].x,
+    "land beats march north monotonically")
+end
 check(#route.beats == 50, "route keeps every beat")
 local wetCount = 0
 for _, b in ipairs(route.beats) do
@@ -148,6 +157,58 @@ local wet = petrel.decide(view(-6700.0, -4870.0, {
 }))
 check(wet.kind == "cast_spell" and wet.spell == 1066,
   "casts aquatic form when wet")
+
+-- NORTH LAND PHASE: a checkpoint start at the top of the Barrens takes
+-- Travel Form and runs the sparse road beats toward the Timbermaw cave.
+clock = clock + 20.0
+local northUnformed = petrel.decide(view(1071.6, -2303.4))
+check(northUnformed.kind == "cast_spell" and northUnformed.spell == 783,
+  "top-of-Barrens start casts Travel Form (mid_coast guard lifted)")
+clock = clock + 20.0
+local north1 = petrel.decide(view(1071.6, -2303.4, formed))
+check(north1.kind == "navigate" and north1.x == 1191.7,
+  "first land beat is the Ashenvale south road")
+check(north1.status and north1.status.phase == "north_land",
+  "land phase is visible in status")
+check(north1.route_profile == "prefer_ground" and north1.stop_distance == 8.0,
+  "land legs ground-route with a decisive stop")
+
+-- Selection is monotonic: mid-Felwood picks the next beat ahead, never one
+-- behind, without having visited any earlier beat.
+clock = clock + 5.0
+local mid = petrel.decide(view(5600.0, -1000.0, formed))
+check(mid.kind == "navigate" and mid.x == 5792.0,
+  "mid-Felwood selects the next road beat ahead")
+
+-- SPEEDRUN DOCTRINE: hurt and in combat on the Felwood road, the answer is
+-- still only to keep running — no heal, no defensive cast, no stopping.
+clock = clock + 5.0
+local hurt = petrel.decide(view(5600.0, -1000.0, {
+  shapeshift_form_id = 3, in_combat = true,
+  health_known = true, health = 900, max_health = 2754,
+}))
+check(hurt.kind == "navigate",
+  "low health in combat still just runs — never heals, never stops")
+
+-- The cave mouth is the segment goal: hold there, alive.
+clock = clock + 5.0
+local atCave = petrel.decide(view(6500.0, -2060.0, formed))
+check(atCave.kind == "hold" and atCave.reason == "felwood_cave_entrance",
+  "holds at the Timbermaw cave mouth")
+
+-- DOCTRINE GUARD: the brain must never contain form-cancel chat commands or
+-- heal/defensive spells. Multiple AIs have now tried both; both are fatal
+-- on a speedrun (casting stands still, and the cancel command does not
+-- exist in 1.12). See docs/traverse/README.md.
+local srcFile = assert(io.open("lua/entry/traverse.lua", "r"))
+local src = srcFile:read("*a")
+srcFile:close()
+check(not src:lower():find("cancelform"),
+  "doctrine guard: no form-cancel command in the brain")
+for _, spellId in ipairs({ 25297, 25299, 22812, 17329, 5185, 774 }) do
+  check(not src:find("%f[%d]" .. spellId .. "%f[%D]"),
+    "doctrine guard: no heal/defensive spell " .. spellId .. " in the brain")
+end
 
 -- SPEEDRUN RULE: death is the end of the run. No release, no corpse run,
 -- no reclaim — ever. The fix for dying lives in the pathfinding, not here.

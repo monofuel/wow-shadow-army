@@ -17,6 +17,7 @@
 local M = { name = "petrel" }
 
 local ROUTE = require("config.traverse_beats")
+local LAND = require("config.traverse_land_beats")
 
 -- Wet-chain gate: PETREL_SWIM=1 opts a run into the wet chain. Default off
 -- keeps traverse-desert's land-only PASS semantics ("awaiting_swim_pass").
@@ -141,6 +142,23 @@ local function next_wet_beat(x, y, fatigued)
     end
   end
   return wet[#wet]
+end
+
+--- First land beat still ahead of us, same monotonic shape as the wet
+--- selection: capture retires a beat forever, and a beat well behind our X
+--- never regresses the run. Land capture is the full beat radius — roads
+--- have no fatigue mechanic, so a 25 yd pass-by counts and the seat never
+--- dwells at a beat center.
+local function next_land_beat(x, y)
+  for _, b in ipairs(LAND.beats) do
+    if not skipped[b.id] and planar(x, y, b.x, b.y) <= b.radius then
+      skipped[b.id] = true
+    end
+    if not skipped[b.id] and x < b.x + PASSED_YARDS then
+      return b
+    end
+  end
+  return LAND.beats[#LAND.beats]
 end
 
 local function bot_status(view, pos, beat, extra)
@@ -375,19 +393,53 @@ function M.decide(view)
   local near_water = water_dist <= water.radius + 120.0
   -- North of the entry band: never re-target the beach.
   local mid_coast = pos.x > water.x + 40.0
+  -- At/past the top of the Barrens the run is on roads: the north land
+  -- phase owns it (the mid_coast guard below is about the Tanaris beach and
+  -- must not block Travel Form recasts up here).
+  local land_phase = pos.x >= LAND.start_x
 
   -- Forms are speed, and speed is the score. Aquatic whenever wet (even off
   -- plan — drowning slower is still better); Travel on dry open ground.
+  -- Forms are also the ONLY casts this brain ever emits: no heals, no
+  -- defensive cooldowns, no form canceling — casting means standing still,
+  -- and standing still is the only way this bot dies (doctrine,
+  -- docs/traverse/README.md).
   if swimming then
     if not in_aquatic_form(view) then
       local cast = want_form(view, pos, AQUATIC_FORM_SPELL, "aquatic_form")
       if cast then return cast end
     end
-  elseif not near_water and not mid_coast then
+  elseif land_phase or (not near_water and not mid_coast) then
     if not in_travel_form(view) then
       local cast = want_form(view, pos, TRAVEL_FORM_SPELL, "travel_form")
       if cast then return cast end
     end
+  end
+
+  -- North land phase: top of the Barrens through Ashenvale and Felwood to
+  -- the Timbermaw cave mouth. Sparse road beats + mesh navigation, always
+  -- moving; never fight, never heal, never stop.
+  if land_phase then
+    local lgoal = LAND.beats[#LAND.beats]
+    if planar(pos.x, pos.y, lgoal.x, lgoal.y) <= lgoal.radius then
+      -- Holding at the segment goal by choice is not a stall.
+      lastPos, lastProgressAt, stallSince = { x = pos.x, y = pos.y },
+        wow.time(), nil
+      wow.set_status("goal: " .. LAND.goal_id)
+      return { kind = "hold", reason = LAND.goal_id,
+        status = bot_status(view, pos, lgoal, { phase = "north_land" }) }
+    end
+    local beat = next_land_beat(pos.x, pos.y)
+    local intent = navigate_to(view, pos, beat, beat.id,
+      { stop = 8.0,
+        status = { phase = "north_land", stalled_seconds = stalled } })
+    if intent then
+      wow.set_status(string.format("north_land %s %.0fyd", beat.id,
+        planar(pos.x, pos.y, beat.x, beat.y)))
+      return intent
+    end
+    return { kind = "hold", reason = "replanning",
+      status = bot_status(view, pos, beat, { phase = "north_land" }) }
   end
 
   if not SWIM then
