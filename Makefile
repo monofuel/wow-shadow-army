@@ -276,6 +276,36 @@ accelerated-pol:
 accelerated-headed:
 	@cd $(FORK_CLIENT) && $(LUA_BOT_LAUNCH) --presentation=headed
 
+# ---------------------------------------------------------------------------
+# Peregrine: hosted Accelerated policy image (rendered lua-bot + this lua/).
+# Base binary from monofuel-vanilla-wow target lua_bot_player_runtime; this
+# worktree only bakes lua/ and locks --lua-entry=accelerated.
+# Does NOT upload or submit — see playbooks/upload-bot.md.
+# ---------------------------------------------------------------------------
+LUA_BOT_PLAYER_IMAGE ?= coworld-lua-bot-player:latest
+PEREGRINE_IMAGE ?= peregrine:latest
+.PHONY: lua-bot-player-image peregrine-image
+lua-bot-player-image:
+	@set -e; \
+	if [ ! -d "$(FORK_CLIENT)" ]; then \
+		echo "error: fork checkout missing: $(FORK_CLIENT)" >&2; exit 1; \
+	fi; \
+	cd "$(FORK_CLIENT)"; \
+	docker build --platform linux/amd64 --ssh default \
+		-f player/Dockerfile \
+		--target lua_bot_player_runtime \
+		-t $(LUA_BOT_PLAYER_IMAGE) .; \
+	test "$$(docker image inspect $(LUA_BOT_PLAYER_IMAGE) --format '{{.Architecture}}')" = amd64
+
+peregrine-image: lua-bot-player-image
+	@set -e; \
+	docker build --platform linux/amd64 \
+		-f Dockerfile.peregrine \
+		--build-arg LUA_BOT_PLAYER_IMAGE=$(LUA_BOT_PLAYER_IMAGE) \
+		-t $(PEREGRINE_IMAGE) .; \
+	test "$$(docker image inspect $(PEREGRINE_IMAGE) --format '{{.Architecture}}')" = amd64; \
+	echo "built $(PEREGRINE_IMAGE) (policy name: peregrine)"
+
 .PHONY: backup-server
 backup-server:
 	@tools/backup_server.sh $(LABEL)
