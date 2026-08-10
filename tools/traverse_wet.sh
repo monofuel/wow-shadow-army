@@ -54,7 +54,11 @@ run_pid=$!
     kill -0 "$run_pid" 2>/dev/null || exit 0
     sleep 2
   done
-  python3 "$ROOT/tools/traverse_checkpoint.py" apply water_entry \
+  # wet_start lands 1 yd under the surface at the cheese_01 pose: the lab
+  # tests the swim, not the shoreline entry (which the lua-bot host cannot
+  # do from the dry water_entry tele — no entry path; see the 2026-08-10
+  # baseline run). The dry entry is the full-run problem.
+  python3 "$ROOT/tools/traverse_checkpoint.py" apply "${TRAVERSE_WET_CHECKPOINT:-wet_start}" \
     --character Northbound --status "$STATUS" --timeout 300
 ) >"$TELE_LOG" 2>&1 &
 tele_pid=$!
