@@ -25,8 +25,9 @@ WOW_ENV := $(CURDIR)/tools/wow_env.sh
 FORK_CLIENT := $(abspath ../monofuel-vanilla-wow)
 # Lua entry module driven by the accelerated targets.
 ENTRY ?= accelerated
+# Hosted league is still "accelerated"; local launcher profile is ten-x.
 LUA_BOT_LAUNCH = nix develop $(FORK_CLIENT) --command \
-	nim r tools/launch_nim_player.nim -- --league=accelerated \
+	nim r tools/launch_nim_player.nim -- --league=ten-x \
 	--bot=lua-bot --lua-repo=$(CURDIR) --lua-entry=$(ENTRY)
 
 # Local realm operator inputs (paths relative to UPSTREAM).
