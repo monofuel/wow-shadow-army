@@ -622,7 +622,9 @@ traverse-pack-replay:
 	@tools/pack_traverse_replay.sh
 
 # Petrel on the lua-bot host (docs/traverse/README.md). Headless full run.
-# SWIM=1 opts the brain into the wet chain (PETREL_SWIM env gate).
+# The wet chain runs by default: traverse/traverse-headed attempt the
+# ENTIRE course (desert + swim). SWIM=0 opts out; traverse-desert and
+# traverse-pol pin land-only semantics themselves.
 SWIM ?=
 # CHECKPOINT=<name> SOAP-teleports the character after login (local debug;
 # names from `make traverse-checkpoints`). The episode realm is recreated
@@ -633,14 +635,16 @@ SWIM ?=
 # on the sand (the shoreline entry is a known-open gap on the lua-bot
 # host — you will see the bot work the waterline, not the ribbon).
 CHECKPOINT ?=
-TRAVERSE_SWIM_EFFECTIVE = $(or $(SWIM),$(if $(CHECKPOINT),1,))
+TRAVERSE_SWIM_EFFECTIVE = $(or $(SWIM),1)
 define TRAVERSE_CHECKPOINT_PRELUDE
 	if [ -n "$(CHECKPOINT)" ]; then \
 		rm -f local_data/lua-bot-status.json; \
+		prior_cid="$$(docker ps --format '{{.ID}} {{.Names}}' 2>/dev/null | grep 'traverse.*coworld-game' | awk '{print $$1}' | head -1)"; \
 		VMANGOS_MANGOSD_CONFIG_OVERRIDES="$$(python3 tools/traverse_soap.py env)"; \
 		export VMANGOS_MANGOSD_CONFIG_OVERRIDES; \
-		( for _ in $$(seq 1 150); do \
-			docker ps --format '{{.Names}}' 2>/dev/null | grep -q 'traverse.*coworld-game' && break; \
+		( for _ in $$(seq 1 200); do \
+			cid="$$(docker ps --format '{{.ID}} {{.Names}}' 2>/dev/null | grep 'traverse.*coworld-game' | awk '{print $$1}' | head -1)"; \
+			if [ -n "$$cid" ] && [ "$$cid" != "$$prior_cid" ]; then break; fi; \
 			sleep 2; \
 		  done; \
 		  python3 tools/traverse_checkpoint.py apply "$(CHECKPOINT)" \
@@ -660,7 +664,7 @@ traverse-headed:
 
 # Fast regression: proof-of-life (level 60, map 1, movement + inputs).
 traverse-pol:
-	@cd $(FORK_CLIENT) && $(TRAVERSE_LAUNCH) --proof-of-life
+	@cd $(FORK_CLIENT) && PETREL_SWIM=0 $(TRAVERSE_LAUNCH) --proof-of-life
 
 # Land-leg proof: spawn → desert ocean coast (water_entry), with client CPU
 # sampling for the streaming-starvation investigation. Readback at exit.

@@ -25,7 +25,7 @@ rm -f "$STATUS"
 echo "traverse-desert: $RUN_SECONDS s headless run -> $RUN_LOG"
 (
   cd "$FORK" &&
-  nix develop "$FORK" --command \
+  PETREL_SWIM=0 nix develop "$FORK" --command \
     timeout "$RUN_SECONDS" nim r tools/launch_nim_player.nim -- \
     --league=traverse --bot=lua-bot \
     --lua-repo="$ROOT" --lua-entry=traverse \

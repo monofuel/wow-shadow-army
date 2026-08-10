@@ -244,6 +244,11 @@ local function navigate_to(view, pos, beat, reason, opts)
       not (beat.wet and surfaceUntil and wow.time() < surfaceUntil) then
     intent.z = beat.z
   end
+  -- Wet beats are declared water goals: the host commits to the water
+  -- (wade steering at the bearing until the swim flag flips) instead of
+  -- asking ground planning for a corridor it will never grant. This is a
+  -- speedrun — walk INTO the water, no inching on walkout crumbs.
+  if beat.wet then intent.water = true end
   return intent
 end
 
