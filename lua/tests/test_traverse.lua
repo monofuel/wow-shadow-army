@@ -24,12 +24,12 @@ local petrel = require("traverse")
 
 -- The route data survived the move off host-injected args.
 check(route.goal_id == "duskwallow_coast", "route keeps the segment goal")
-check(#route.beats == 43, "route keeps every beat")
+check(#route.beats == 50, "route keeps every beat")
 local wetCount = 0
 for _, b in ipairs(route.beats) do
   if b.wet then wetCount = wetCount + 1 end
 end
-check(wetCount == 41, "route keeps the wet ribbon")
+check(wetCount == 48, "route keeps the wet ribbon")
 check(route.beats[1].id == "land_approach" and route.beats[2].id == "water_entry",
   "land legs lead the route")
 
@@ -74,6 +74,8 @@ check(leg.x == -7100.0 and leg.y == -4600.0, "first leg is the land approach")
 check(leg.route_profile == "prefer_ground", "land legs prefer walkable ground")
 check(leg.z ~= nil, "land legs keep their z")
 check(leg.status and leg.status.beat == "land_approach", "status names the beat")
+check(leg.status.dist_goal and leg.status.dist_goal > 0,
+  "status carries planar distance to the goal")
 
 -- Past the approach band, the target is the water entry, never the beach
 -- behind us.

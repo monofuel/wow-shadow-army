@@ -28,7 +28,9 @@ from xml.sax.saxutils import escape
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_TABLE = ROOT / "tools" / "traverse_checkpoints.json"
-DEFAULT_STATUS = ROOT / "local_data" / "traverse-cv-status.json"
+# The live status file is written by the lua-bot host every frame; the old
+# traverse-cv-status.json died with the ClientView bridge (1454caa).
+DEFAULT_STATUS = ROOT / "local_data" / "lua-bot-status.json"
 DEFAULT_CHAR = os.environ.get("TRAVERSE_CHARACTER", "Northbound")
 DEFAULT_SOAP_USER = os.environ.get("TRAVERSE_SOAP_USER", "COWCAM")
 DEFAULT_SOAP_PASS = os.environ.get("TRAVERSE_SOAP_PASS", "COWCAM")
@@ -369,7 +371,22 @@ def apply_checkpoint(
 
     if not skip_wait:
         print(f"[traverse-checkpoint] waiting for in-world status (timeout={wait_timeout}s)…")
-        wait_for_in_world(status_path=sp, timeout=wait_timeout)
+        st = wait_for_in_world(status_path=sp, timeout=wait_timeout)
+        # Never teleport a corpse: a late apply that moves a dead bot just
+        # parks a zombie at the checkpoint (its run_over hold never acts).
+        if st.get("intent_reason") == "run_over":
+            print(
+                "[traverse-checkpoint] REFUSED: the bot is already dead "
+                "(run_over) — a teleported corpse would sit at the "
+                "checkpoint doing nothing. Restart the run.",
+                flush=True,
+            )
+            return {
+                "ok": False,
+                "checkpoint": name,
+                "reason": "bot dead (run_over); refusing to teleport a corpse",
+                "status": st,
+            }
 
     # Tele and re-tele until live status is near the checkpoint.
     # Offline tele alone does not move an already-logged-in body.
@@ -406,6 +423,18 @@ def apply_checkpoint(
             st = read_status(sp)
             if not st or not isinstance(st.get("x"), (int, float)):
                 continue
+            if st.get("intent_reason") == "run_over":
+                print(
+                    "[traverse-checkpoint] REFUSED: bot died during apply "
+                    "— not re-teleporting a corpse. Restart the run.",
+                    flush=True,
+                )
+                return {
+                    "ok": False,
+                    "checkpoint": name,
+                    "reason": "bot died during apply",
+                    "status": st,
+                }
             d = pose_dist_to_checkpoint(st, pose)
             if d < best_d:
                 best_d = d

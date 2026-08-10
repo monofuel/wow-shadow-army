@@ -62,7 +62,7 @@ COMPOSE_FILE := infra/compose.vmangos.yml
 ACCOUNT_USER := monofuel
 ACCOUNT_PASS := password
 
-.PHONY: test test-lua test-nim system pin-check start-server stop-server server-logging logs account soap-account play play-classic play-classic-netlog play-xr traverse traverse-field traverse-replay traverse-pack-replay traverse-headed traverse-pol traverse-desert traverse-checkpoints lift-tele quest-data warlock-account warlock-bot botwarrior-bot tusk-account tusk-bot beru-account beru-bot party-army navmesh-helper navmesh-status map-browser map-browser-once map-browser-debug map-browser-probe
+.PHONY: test test-lua test-nim system pin-check start-server stop-server server-logging logs account soap-account play play-classic play-classic-netlog play-xr traverse traverse-field traverse-replay traverse-pack-replay traverse-headed traverse-pol traverse-desert traverse-wet traverse-checkpoints lift-tele quest-data warlock-account warlock-bot botwarrior-bot tusk-account tusk-bot beru-account beru-bot party-army navmesh-helper navmesh-status map-browser map-browser-once map-browser-debug map-browser-probe
 
 # Unit tier: Lua tools + Nim host/system tests only (v2 DoD: no Python required
 # for bot correctness). If nim is missing, test-nim-soft skips rather than
@@ -629,21 +629,59 @@ traverse-pack-replay:
 	@tools/pack_traverse_replay.sh
 
 # Petrel on the lua-bot host (docs/traverse/README.md). Headless full run.
+# The wet chain runs by default: traverse/traverse-headed attempt the
+# ENTIRE course (desert + swim). SWIM=0 opts out; traverse-desert and
+# traverse-pol pin land-only semantics themselves.
+SWIM ?=
+# CHECKPOINT=<name> SOAP-teleports the character after login (local debug;
+# names from `make traverse-checkpoints`). The episode realm is recreated
+# per launch, so SOAP is enabled at birth and a background watcher waits
+# for the traverse container before applying — it never touches the
+# persistent realm. A checkpoint run is a wet run: PETREL_SWIM defaults on
+# (override with SWIM=0). wet_start lands swimming; water_entry lands DRY
+# on the sand (the shoreline entry is a known-open gap on the lua-bot
+# host — you will see the bot work the waterline, not the ribbon).
+CHECKPOINT ?=
+TRAVERSE_SWIM_EFFECTIVE = $(or $(SWIM),1)
+define TRAVERSE_CHECKPOINT_PRELUDE
+	if [ -n "$(CHECKPOINT)" ]; then \
+		rm -f local_data/lua-bot-status.json; \
+		prior_cid="$$(docker ps --format '{{.ID}} {{.Names}}' 2>/dev/null | grep 'traverse.*coworld-game' | awk '{print $$1}' | head -1)"; \
+		VMANGOS_MANGOSD_CONFIG_OVERRIDES="$$(python3 tools/traverse_soap.py env)"; \
+		export VMANGOS_MANGOSD_CONFIG_OVERRIDES; \
+		( for _ in $$(seq 1 200); do \
+			cid="$$(docker ps --format '{{.ID}} {{.Names}}' 2>/dev/null | grep 'traverse.*coworld-game' | awk '{print $$1}' | head -1)"; \
+			if [ -n "$$cid" ] && [ "$$cid" != "$$prior_cid" ]; then break; fi; \
+			sleep 2; \
+		  done; \
+		  python3 tools/traverse_checkpoint.py apply "$(CHECKPOINT)" \
+			--character Northbound >> local_data/health-logs/traverse-tele.log 2>&1 ) & \
+	fi
+endef
 traverse:
-	@cd $(FORK_CLIENT) && $(TRAVERSE_LAUNCH) --presentation=headless
+	@mkdir -p local_data/health-logs
+	@$(TRAVERSE_CHECKPOINT_PRELUDE); \
+	cd $(FORK_CLIENT) && PETREL_SWIM=$(TRAVERSE_SWIM_EFFECTIVE) $(TRAVERSE_LAUNCH) --presentation=headless
 
 # Headed Petrel run for manual verification (opens a window — human use).
 traverse-headed:
-	@cd $(FORK_CLIENT) && $(TRAVERSE_LAUNCH) --presentation=headed
+	@mkdir -p local_data/health-logs
+	@$(TRAVERSE_CHECKPOINT_PRELUDE); \
+	cd $(FORK_CLIENT) && PETREL_SWIM=$(TRAVERSE_SWIM_EFFECTIVE) $(TRAVERSE_LAUNCH) --presentation=headed
 
 # Fast regression: proof-of-life (level 60, map 1, movement + inputs).
 traverse-pol:
-	@cd $(FORK_CLIENT) && $(TRAVERSE_LAUNCH) --proof-of-life
+	@cd $(FORK_CLIENT) && PETREL_SWIM=0 $(TRAVERSE_LAUNCH) --proof-of-life
 
 # Land-leg proof: spawn → desert ocean coast (water_entry), with client CPU
 # sampling for the streaming-starvation investigation. Readback at exit.
 traverse-desert:
 	@tools/traverse_desert.sh
+
+# Wet lab: SOAP-tele to water_entry, swim the cheese ribbon to Dustwallow.
+# Local debug only; reports best_planar_to_duskwallow_wet at exit.
+traverse-wet:
+	@tools/traverse_wet.sh
 
 # List SOAP tele checkpoints (does not launch).
 traverse-checkpoints:

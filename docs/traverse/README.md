@@ -46,8 +46,8 @@ monofuel's manual run of the course:
 
 | Segment | Beats | Status |
 |---|---|---|
-| Land approach: spawn → desert ocean coast | `land_approach`, `water_entry` | **This pass** — `make traverse-desert` |
-| Swim: water entry → Dustwallow coast (~2,160 yd) | `cheese_01..40`, `duskwallow_coast` | Data preserved, gated behind `SWIM = false` in the brain; test separately |
+| Land approach: spawn → desert ocean coast | `land_approach`, `water_entry` | **Proven** — `make traverse-desert` (2 consecutive PASSes 2026-08-09) |
+| Swim: water entry → Dustwallow coast (~2,160 yd) | `ribbon_001..N` (v12, F9-resampled), `duskwallow_coast` | **Active** — `make traverse-wet` (PETREL_SWIM=1); best 295.8 yd from goal, endgame falls under investigation ([duskwallow-plan.md](duskwallow-plan.md) §7) |
 | Land run: Dustwallow → Everlook | none yet | Later; upstream RPB's road route (`bots/real_playerbot/policy/world_catalog.nim:295-345`) is transcribable |
 
 Beats live in `lua/config/traverse_beats.lua` (the brain's copy) and
