@@ -242,7 +242,11 @@ local function navigate_to(view, pos, beat, reason, opts)
   -- forward) always translates.
   if not opts.surface and
       not (beat.wet and surfaceUntil and wow.time() < surfaceUntil) then
-    intent.z = beat.z
+    -- Draft floor on wet beats: never command shallower than 2.5 yd. The
+    -- host's ascent toward a near-surface target is what launched the bot
+    -- clear of the water (Aquatic auto-cancel, breath panic) — monofuel
+    -- watched it happen repeatedly. Dive depths pass through untouched.
+    intent.z = beat.wet and math.min(beat.z, -2.5) or beat.z
   end
   -- Wet beats are declared water goals: the host commits to the water
   -- (wade steering at the bearing until the swim flag flips) instead of

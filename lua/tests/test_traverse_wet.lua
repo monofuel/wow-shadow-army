@@ -61,7 +61,7 @@ local entry = petrel.decide(view(-6790.0, -4840.0, { shapeshift_form_id = 3 }))
 check(entry.kind == "navigate", "gate on: no awaiting_swim_pass hold")
 check(entry.reason == "enter_water", "dry entry uses the entry reason")
 check(entry.x == -6737.63, "dry entry targets the first wet beat")
-check(entry.z == -2.1, "wet beats swim the human depth profile")
+check(entry.z == -2.5, "shallow wet beats sink to the 2.5 yd draft floor")
 check(entry.status and entry.status.dist_goal and entry.status.dist_goal > 0,
   "status carries planar distance to the goal")
 
