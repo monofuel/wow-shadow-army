@@ -519,6 +519,23 @@ Score is still max northing X; this file does not optimize for Everlook.
 | **Baseline run id** | health-log stamp `20260810T024114Z` (v8 dense carpet); current line v12 `20260810T033603Z` = 403.1 |
 | G1 / G2 | ✗ / ✗ on the lua-bot host (historical G1: `20260807T183426Z-790239`, old stack, §3) |
 
+### 2026-08-10 robustness campaign (batteries 1-5)
+
+Fixture repair (headed targets restored: full course by default,
+CHECKPOINT tele on time, corpse-refusal) then robustness: no-breach
+surfacing (JUMP releases within 2 yd of the surface), cliff slide-off
+reflex, swim collision sub-stepping (0.8 yd), v13 refill beats (one per
+human safe-bout entry, tight capture while the bar drains), and a
+walk-to-waterline recovery leg (releases on observable liquid).
+
+Gate history: **segment gate MET in battery 3 (2 consecutive PASSes,
+24.6/23.7 yd)**; full course has PASSed once headless (24.3 yd) and twice
+under monofuel's eyes (headed), but per-battery variance remains: battery
+5 threw three far-graveyard deaths on the same code. Open: late-route
+(~x -5400..-4700) mortality — fatigue deaths at hp 1 and residual falls —
+needs a dedicated autopsy of that stretch. Regressions held: desert PASS
+in every battery.
+
 ### 2026-08-10 wet-lab campaign (29 runs, lua-bot host)
 
 Number progression: 2158 (never wet) → 1418 → 1298 → 1155 → 821 → 295.8
