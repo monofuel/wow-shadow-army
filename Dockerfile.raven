@@ -1,0 +1,22 @@
+# Raven — Persistent Leveling policy (rendered lua-bot + general leveler).
+#
+# Same packaging as Peregrine; character prefs at submit are undead warlock.
+# Entry module is the shared general leveler (accelerated.lua).
+#
+#   make raven-image
+#   uv run coworld upload-policy raven:latest --name raven
+#   uv run --extra dev vanilla-wow submit raven:vN \
+#     --league league_778f16b8-1247-488e-a993-b48d6928b137 \
+#     --race undead --character-class warlock --gender male --json
+
+# syntax=docker/dockerfile:1.7
+
+ARG LUA_BOT_PLAYER_IMAGE=coworld-lua-bot-player:latest
+FROM ${LUA_BOT_PLAYER_IMAGE}
+
+COPY lua/ /opt/policy/lua/
+
+ENV COWORLD_LUA_REPO=/opt/policy
+ENV COWORLD_LUA_ENTRY=accelerated
+
+CMD ["tini", "--", "/usr/local/bin/lua_bot_entry.sh"]

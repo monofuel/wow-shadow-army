@@ -25,9 +25,13 @@ WOW_ENV := $(CURDIR)/tools/wow_env.sh
 FORK_CLIENT := $(abspath ../monofuel-vanilla-wow)
 # Lua entry module driven by the accelerated targets.
 ENTRY ?= accelerated
-# Hosted league is still "accelerated"; local launcher profile is ten-x.
+# Hosted Accelerated is "accelerated"; local 10x launcher profile is ten-x.
 LUA_BOT_LAUNCH = nix develop $(FORK_CLIENT) --command \
 	nim r tools/launch_nim_player.nim -- --league=ten-x \
+	--bot=lua-bot --lua-repo=$(CURDIR) --lua-entry=$(ENTRY)
+# Persistent league local proof / smoke (1x durable profile).
+PERSISTENT_LAUNCH = nix develop $(FORK_CLIENT) --command \
+	nim r tools/launch_nim_player.nim -- --league=persistent \
 	--bot=lua-bot --lua-repo=$(CURDIR) --lua-entry=$(ENTRY)
 # Same host, traverse league: Petrel runs as lua/entry/traverse.lua.
 TRAVERSE_LAUNCH = nix develop $(FORK_CLIENT) --command \
@@ -314,6 +318,29 @@ peregrine-image: lua-bot-player-image
 		-t $(PEREGRINE_IMAGE) .; \
 	test "$$(docker image inspect $(PEREGRINE_IMAGE) --format '{{.Architecture}}')" = amd64; \
 	echo "built $(PEREGRINE_IMAGE) (policy name: peregrine)"
+
+# ---------------------------------------------------------------------------
+# Raven: hosted Persistent policy (same lua leveler; undead warlock at submit).
+# ---------------------------------------------------------------------------
+RAVEN_IMAGE ?= raven:latest
+.PHONY: raven-image persistent-pol persistent persistent-headed
+raven-image: lua-bot-player-image
+	@set -e; \
+	docker build --platform linux/amd64 \
+		-f Dockerfile.raven \
+		--build-arg LUA_BOT_PLAYER_IMAGE=$(LUA_BOT_PLAYER_IMAGE) \
+		-t $(RAVEN_IMAGE) .; \
+	test "$$(docker image inspect $(RAVEN_IMAGE) --format '{{.Architecture}}')" = amd64; \
+	echo "built $(RAVEN_IMAGE) (policy name: raven; submit undead/warlock)"
+
+persistent-pol:
+	@cd $(FORK_CLIENT) && $(PERSISTENT_LAUNCH) --proof-of-life
+
+persistent:
+	@cd $(FORK_CLIENT) && $(PERSISTENT_LAUNCH) --presentation=headless
+
+persistent-headed:
+	@cd $(FORK_CLIENT) && $(PERSISTENT_LAUNCH) --presentation=headed
 
 .PHONY: backup-server
 backup-server:
