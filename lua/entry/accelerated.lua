@@ -5,13 +5,19 @@
 -- mana, so auto-attack is the backbone and the nuke is an opener and a filler;
 -- a brain that only casts spends most of each fight doing nothing.
 --
--- Quests are off by default: upstream measured their own quest work delaying
--- the first kill and costing score. Flip QUESTS once the grind baseline is
--- recorded and compare the two on the same course.
+-- Soft-quest code is present but off by default after measuring 2.009 < B0
+-- 4.791. When enabled: budget/patience, no travel while huntables nearby,
+-- no new accepts before lvl 2, lua-bot dialog verbs only (not RPB quest FSM).
 
 local M = {}
 
+-- Soft-quest gates measured 2026-08-10: score 2.009 < B0 4.791. Keep code;
+-- leave off until a candidate beats grind-only. Tests flip via M.set_quests.
 local QUESTS = false
+
+function M.set_quests(on)
+  QUESTS = not not on
+end
 
 -- Quest marker status as the server reports it.
 local MARKER_AVAILABLE = 5
@@ -21,6 +27,13 @@ local QUESTGIVER_YARDS = 60.0
 -- A giver that will not open its dialog is worth less than the mobs we are
 -- not killing while we stand there.
 local QUESTGIVER_PATIENCE = 45.0
+-- Hard cap on continuous quest travel/interact so a stuck giver cannot eat
+-- the whole 720s episode even if patience is reset by marker noise.
+local QUEST_BUDGET_SECONDS = 25.0
+-- Stop close enough that /interact can open the panel (default nav stop is wider).
+local QUEST_INTERACT_STOP = 3.5
+-- Do not walk to *new* quests until we have a kill's worth of level progress.
+local QUEST_TRAVEL_MIN_LEVEL = 2
 
 -- Opening nuke per class, highest rank first.
 local NUKES_BY_CLASS = {
@@ -75,6 +88,8 @@ local exhausted = {}
 local questSignature = nil
 local pursuing = nil
 local pursuingSince = nil
+-- Wall-clock start of the current continuous quest-travel streak (nil = idle).
+local questBudgetSince = nil
 
 local function distance2d(ax, ay, bx, by)
   local dx, dy = ax - bx, ay - by
@@ -133,6 +148,19 @@ local function engaged_unit(view)
     end
   end
   return nil
+end
+
+-- A mob that pays an objective is worth more than an equally close one that
+-- does not. Defined before pick_target so the local binding is visible.
+local function credits_objective(view, unit)
+  for i = 1, #(view.quest_objectives or {}) do
+    local objective = view.quest_objectives[i]
+    if not objective.complete and objective.entry ~= 0 and
+        objective.entry == unit.entry then
+      return true
+    end
+  end
+  return false
 end
 
 local function pick_target(view, freshPull)
@@ -271,10 +299,33 @@ local function control_for(view, reference)
   return nil
 end
 
--- Answer whatever dialog is open, then look for a giver worth walking to.
-local function quest_step(view)
+local function dialog_open(view)
+  local frame = view.quest_frame or {}
+  if frame.open then return true end
+  if view.gossip_open then return true end
+  return false
+end
+
+local function has_reward_marker(view)
+  for i = 1, #(view.quest_markers or {}) do
+    local marker = view.quest_markers[i]
+    if MARKER_REWARD[marker.status] then return true end
+  end
+  return false
+end
+
+-- Walk to givers only after we have some XP, unless a turn-in is waiting.
+local function allow_quest_travel(view)
+  if has_reward_marker(view) then return true end
+  return (view.level or 1) >= QUEST_TRAVEL_MIN_LEVEL
+end
+
+-- Answer whatever dialog is open, then (optionally) look for a giver to walk to.
+-- allowTravel=false keeps dialog answers but never starts a new approach.
+local function quest_step(view, allowTravel)
   local frame = view.quest_frame or {}
   if frame.open then
+    questBudgetSince = nil
     if frame.panel == "reward" then
       return { kind = "quest_cmd", command = "/questreward", reason = "turn_in" }
     end
@@ -303,6 +354,7 @@ local function quest_step(view)
     end
   end
   if view.gossip_open then
+    questBudgetSince = nil
     local questId = gossip_row(view)
     local reference = questId and control_for(view, "gossip-quest:" .. questId)
     if reference then
@@ -313,18 +365,29 @@ local function quest_step(view)
       reason = "gossip_done" }
   end
 
-  local best, bestDistance = nil, nil
+  if not allowTravel then
+    pursuing, pursuingSince, questBudgetSince = nil, nil, nil
+    return nil
+  end
+
+  -- Prefer turn-in (reward) markers over new accepts when ranking givers.
+  local best, bestDistance, bestRank = nil, nil, nil
   for i = 1, #(view.units or {}) do
     local unit = view.units[i]
     local status = marker_status(view, unit.guid)
-    local wanted = MARKER_REWARD[status] or
-      (status == MARKER_AVAILABLE and
-        #(view.accepted_quests or {}) < QUEST_LOG_LIMIT)
-    if wanted and not exhausted[unit.guid] and
+    local rank = nil
+    if MARKER_REWARD[status] then
+      rank = 0
+    elseif status == MARKER_AVAILABLE and
+        #(view.accepted_quests or {}) < QUEST_LOG_LIMIT then
+      rank = 1
+    end
+    if rank and not exhausted[unit.guid] and
         not (unit.death_known and unit.is_dead) then
       local d = unit_distance(unit)
-      if d <= QUESTGIVER_YARDS and (not bestDistance or d < bestDistance) then
-        best, bestDistance = unit, d
+      if d <= QUESTGIVER_YARDS and
+          (not best or rank < bestRank or (rank == bestRank and d < bestDistance)) then
+        best, bestDistance, bestRank = unit, d, rank
       end
     end
   end
@@ -332,32 +395,31 @@ local function quest_step(view)
     local now = wow.time()
     if pursuing ~= best.guid then
       pursuing, pursuingSince = best.guid, now
-    elseif now - pursuingSince > QUESTGIVER_PATIENCE then
-      -- Give up on this one and go back to work.
+      questBudgetSince = now
+    end
+    if questBudgetSince and now - questBudgetSince > QUEST_BUDGET_SECONDS then
       exhausted[best.guid] = true
-      pursuing, pursuingSince = nil, nil
+      pursuing, pursuingSince, questBudgetSince = nil, nil, nil
+      wow.log("quest budget exhausted on " .. (best.name or "?"))
+      return nil
+    end
+    if now - pursuingSince > QUESTGIVER_PATIENCE then
+      exhausted[best.guid] = true
+      pursuing, pursuingSince, questBudgetSince = nil, nil, nil
       wow.log("gave up on questgiver " .. (best.name or "?"))
       return nil
     end
     wow.set_status("questgiver " .. (best.name or "?"))
-    return { kind = "interact", guid = best.guid, route_profile = "prefer_ground",
-      reason = "questgiver" }
+    return {
+      kind = "interact",
+      guid = best.guid,
+      stop_distance = QUEST_INTERACT_STOP,
+      route_profile = "prefer_ground",
+      reason = "questgiver",
+    }
   end
-  pursuing, pursuingSince = nil, nil
+  pursuing, pursuingSince, questBudgetSince = nil, nil, nil
   return nil
-end
-
--- A mob that pays an objective is worth more than an equally close one that
--- does not.
-local function credits_objective(view, unit)
-  for i = 1, #(view.quest_objectives or {}) do
-    local objective = view.quest_objectives[i]
-    if not objective.complete and objective.entry ~= 0 and
-        objective.entry == unit.entry then
-      return true
-    end
-  end
-  return false
 end
 
 local function progress_status(view)
@@ -425,8 +487,12 @@ function M.decide(view)
       questSignature = signature
     end
     if not engaged and not view.in_combat then
-      local step = quest_step(view)
-      if step then
+      -- Always finish an open dialog (free XP / log space). Only *walk* to
+      -- givers when nothing huntable is nearby and travel is allowed.
+      local nearbyHunt = pick_target(view, true)
+      local allowTravel = allow_quest_travel(view) and not nearbyHunt
+      local step = quest_step(view, allowTravel)
+      if step and not (step.kind == "interact" and not allowTravel) then
         step.status = progress_status(view)
         return step
       end

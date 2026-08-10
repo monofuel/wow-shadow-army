@@ -3,26 +3,26 @@
 Full 720-second league episodes (10x simulation). Score is
 `level + xp / next_level_xp`, the league's own formula.
 
-How to regenerate: `make accelerated-episode` (grind), or flip `QUESTS` at the
-top of `lua/entry/accelerated.lua` and run it again. Upstream's Kobold bot
-reaches ~5.28 in this league, which is the number worth chasing.
+How to regenerate: `make accelerated-episode` (720 wall seconds, local
+`--league=ten-x`). Score is from `tools/episode_score.py`. Upstream's Kobold
+bot reaches ~5.28 in this league, which is the number worth chasing.
 
 | date | brain | score | level | notes |
 |---|---|---|---|---|
 | 2026-08-08 | grind (fixed patrol box) | 1.385 | 1 | cleared its 35yd square in the opening minutes, then patrolled an empty clearing: zero attacks in 1346 decisions |
-| 2026-08-08 | grind (roaming) | **4.791** | 4 | 67% of decisions were attacks, 55 kills, no run-ending death |
-| 2026-08-08 | grind + quests | 1.000 | 1 | wedged on one questgiver for all 1380 decisions and never fought; see below |
+| 2026-08-08 | grind (roaming) | **4.791** | 4 | 67% of decisions were attacks, 55 kills, no run-ending death — **B0 ship bar** |
+| 2026-08-08 | grind + quests (naive) | 1.000 | 1 | wedged on one questgiver for all 1380 decisions and never fought |
+| 2026-08-10 | soft quests (budgeted) | **2.009** | 2 | **worse than B0** — budget killed Hawkwind lock but still burned travel; logged budget exhaust + Grull give-up; do not ship |
 
-## Why quests are off
+## Soft quests (2026-08-10)
 
-Turning `QUESTS` on cost the entire episode. The bot picked Chief Hawkwind,
-never got a dialog open, and stood there — zero kills, zero XP. Upstream hit
-the same wall from the other direction and disabled their own accelerated
-quest work after it delayed the first kill.
+Naive `QUESTS=true` zeroed the run (Chief Hawkwind, no dialog). Soft mode keeps
+lua-bot dialog verbs (`/questaccept` etc., not RPB quest FSM / scene proofs) and
+adds gates so grind always resumes:
 
-The dialog machinery itself is proven at the unit level (accept, turn-in,
-row selection, and the guard that refuses anything outside the dialog verbs),
-so what is missing is the approach: reaching interaction range and confirming
-the client opened something. A questgiver now gets 45 seconds of patience
-before the brain writes it off, so a future attempt cannot cost a whole run,
-but the flag stays off until an episode says otherwise.
+- do not walk to **new** accepts until level ≥ 2 (turn-ins still allowed)
+- do not walk to givers while a huntable mob is in search range
+- 45s per-giver patience and 25s continuous quest budget
+- interact stop distance 3.5 yd
+
+Ship only if a full episode score **beats 4.791**.

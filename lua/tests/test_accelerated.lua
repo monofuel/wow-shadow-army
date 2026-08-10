@@ -188,21 +188,99 @@ check(farAway.x > 400.0 and farAway.y > 400.0,
 nav = { state = "following", failed_here = false, walkout_available = false }
 
 
--- Quest work is off by default and must stay invisible until enabled.
-local questView = view({}, {
+-- Soft quests: no travel to accepts at level 1, and no travel while a hunt
+-- is available. Open dialogs still get answered.
+local function giver(guid, distance, name)
+  return unit(guid, distance, 3, {
+    name = name or "Giver",
+    player_can_attack = false,
+  })
+end
+
+-- Soft-quest unit tests force the flag on (default is off after 2.009 score).
+grind.set_quests(true)
+
+local lowLevelGiver = view({
+  giver(900, 10.0, "Chief"),
+}, {
+  level = 1,
   quest_markers = { { questgiver_guid = 900, status = 5 } },
-  units = { unit(900, 10.0, 3) },
   quest_frame = { open = false },
   accepted_quests = {}, quest_objectives = {}, completed_quest_ids = {},
   ui_nodes = {},
+  action_buttons = {
+    { slot = 1, spell_id = 5176, usable = true, usable_known = true },
+  },
 })
 clock = clock + 10.0
-check(grind.decide(questView).kind ~= "interact",
-  "ignores questgivers while quests are off")
+check(grind.decide(lowLevelGiver).kind ~= "interact",
+  "does not walk to new quests at level 1")
 
+local huntAndGiver = view({
+  unit(901, 8.0, 3),
+  giver(900, 10.0, "Chief"),
+}, {
+  level = 3,
+  quest_markers = { { questgiver_guid = 900, status = 5 } },
+  quest_frame = { open = false },
+  accepted_quests = {}, quest_objectives = {}, completed_quest_ids = {},
+  ui_nodes = {},
+  action_buttons = {
+    { slot = 1, spell_id = 5176, usable = true, usable_known = true },
+  },
+})
+check(grind.decide(huntAndGiver).kind == "attack",
+  "prefers grinding when a huntable mob is nearby")
 
--- A questgiver that never opens its dialog must not hold the whole episode.
--- (Exercised through the brain's own patience clock; quests stay off by
--- default, so this guards a future run rather than today's default.)
+local openDialog = view({}, {
+  level = 3,
+  quest_frame = { open = true, panel = "details" },
+  accepted_quests = {}, quest_objectives = {}, completed_quest_ids = {},
+  ui_nodes = {},
+  action_buttons = {
+    { slot = 1, spell_id = 5176, usable = true, usable_known = true },
+  },
+})
+local accept = grind.decide(openDialog)
+check(accept.kind == "quest_cmd" and accept.command == "/questaccept",
+  "accepts when the details panel is open")
+
+local turnInOnly = view({
+  giver(902, 12.0, "TurnIn"),
+}, {
+  level = 1,
+  quest_markers = { { questgiver_guid = 902, status = 6 } },
+  quest_frame = { open = false },
+  accepted_quests = { 1 }, quest_objectives = {}, completed_quest_ids = {},
+  ui_nodes = {},
+  action_buttons = {
+    { slot = 1, spell_id = 5176, usable = true, usable_known = true },
+  },
+})
+local turnInWalk = grind.decide(turnInOnly)
+check(turnInWalk.kind == "interact" and turnInWalk.guid == 902,
+  "walks to reward markers even at level 1")
+check(turnInWalk.stop_distance and turnInWalk.stop_distance <= 4.0,
+  "stops close enough to interact")
+
+-- Patience: a giver that never opens is exhausted and grind resumes.
+local stuckGiver = view({
+  giver(903, 5.0, "Stuck"),
+}, {
+  level = 3,
+  quest_markers = { { questgiver_guid = 903, status = 5 } },
+  quest_frame = { open = false },
+  accepted_quests = {}, quest_objectives = {}, completed_quest_ids = {},
+  ui_nodes = {},
+  action_buttons = {
+    { slot = 1, spell_id = 5176, usable = true, usable_known = true },
+  },
+})
+local firstTry = grind.decide(stuckGiver)
+check(firstTry.kind == "interact", "approaches a questgiver when idle at level 3")
+clock = clock + 50.0
+local afterPatience = grind.decide(stuckGiver)
+check(afterPatience.kind ~= "interact" or afterPatience.guid ~= 903,
+  "gives up on a questgiver after patience")
 
 print("test_accelerated: " .. passed .. " ok")
