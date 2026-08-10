@@ -58,7 +58,7 @@ COMPOSE_FILE := infra/compose.vmangos.yml
 ACCOUNT_USER := monofuel
 ACCOUNT_PASS := password
 
-.PHONY: test test-lua test-nim system pin-check start-server stop-server server-logging logs account soap-account play play-classic play-classic-netlog play-xr traverse traverse-field traverse-replay traverse-pack-replay traverse-headed traverse-pol traverse-desert traverse-checkpoints quest-data warlock-account warlock-bot botwarrior-bot tusk-account tusk-bot beru-account beru-bot party-army navmesh-helper navmesh-status map-browser map-browser-once map-browser-debug map-browser-probe
+.PHONY: test test-lua test-nim system pin-check start-server stop-server server-logging logs account soap-account play play-classic play-classic-netlog play-xr traverse traverse-field traverse-replay traverse-pack-replay traverse-headed traverse-pol traverse-desert traverse-wet traverse-checkpoints quest-data warlock-account warlock-bot botwarrior-bot tusk-account tusk-bot beru-account beru-bot party-army navmesh-helper navmesh-status map-browser map-browser-once map-browser-debug map-browser-probe
 
 # Unit tier: Lua tools + Nim host/system tests only (v2 DoD: no Python required
 # for bot correctness). If nim is missing, test-nim-soft skips rather than
@@ -622,12 +622,14 @@ traverse-pack-replay:
 	@tools/pack_traverse_replay.sh
 
 # Petrel on the lua-bot host (docs/traverse/README.md). Headless full run.
+# SWIM=1 opts the brain into the wet chain (PETREL_SWIM env gate).
+SWIM ?=
 traverse:
-	@cd $(FORK_CLIENT) && $(TRAVERSE_LAUNCH) --presentation=headless
+	@cd $(FORK_CLIENT) && PETREL_SWIM=$(SWIM) $(TRAVERSE_LAUNCH) --presentation=headless
 
 # Headed Petrel run for manual verification (opens a window — human use).
 traverse-headed:
-	@cd $(FORK_CLIENT) && $(TRAVERSE_LAUNCH) --presentation=headed
+	@cd $(FORK_CLIENT) && PETREL_SWIM=$(SWIM) $(TRAVERSE_LAUNCH) --presentation=headed
 
 # Fast regression: proof-of-life (level 60, map 1, movement + inputs).
 traverse-pol:
@@ -637,6 +639,11 @@ traverse-pol:
 # sampling for the streaming-starvation investigation. Readback at exit.
 traverse-desert:
 	@tools/traverse_desert.sh
+
+# Wet lab: SOAP-tele to water_entry, swim the cheese ribbon to Dustwallow.
+# Local debug only; reports best_planar_to_duskwallow_wet at exit.
+traverse-wet:
+	@tools/traverse_wet.sh
 
 # List SOAP tele checkpoints (does not launch).
 traverse-checkpoints:
