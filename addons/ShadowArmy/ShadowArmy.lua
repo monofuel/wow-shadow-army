@@ -295,6 +295,257 @@ end
 
 ShadowArmy.questModel = QuestModel
 
+--------------------------------------------------------------------------
+-- Pure combat-coach model. Like QuestModel, this stays above the WoW UI
+-- guard so ordinary Lua tests can exercise priorities and error handling.
+-- The live adapter below supplies only facts exposed by the 1.12 API.
+--------------------------------------------------------------------------
+
+local CombatModel = {}
+
+CombatModel.actions = {
+  WARLOCK = {
+    { id = "drainlife", label = "Drain Life", kind = "spell", spell = "Drain Life", target = "hostile", cast = true, debuff = true },
+    { id = "fear", label = "Fear", kind = "spell", spell = "Fear", target = "hostile", cast = true, debuff = true },
+    { id = "lifetap", label = "Life Tap", kind = "spell", spell = "Life Tap", target = "self" },
+    { id = "corruption", label = "Corruption", kind = "spell", spell = "Corruption", target = "hostile", debuff = true },
+    { id = "agony", label = "Curse of Agony", kind = "spell", spell = "Curse of Agony", target = "hostile", debuff = true },
+    { id = "immolate", label = "Immolate", kind = "spell", spell = "Immolate", target = "hostile", cast = true, debuff = true },
+    { id = "shadowbolt", label = "Shadow Bolt", kind = "spell", spell = "Shadow Bolt", target = "hostile", cast = true },
+    { id = "shoot", label = "Shoot", kind = "spell", spell = "Shoot", target = "hostile" },
+    { id = "melee", label = "Melee Attack", kind = "melee", target = "hostile" },
+  },
+  DRUID = {
+    { id = "healingtouch", label = "Healing Touch", kind = "spell", spell = "Healing Touch", target = "self", selfCast = true, cast = true },
+    { id = "rejuvenation", label = "Rejuvenation", kind = "spell", spell = "Rejuvenation", target = "self", selfCast = true, buff = true },
+    { id = "moonfire", label = "Moonfire", kind = "spell", spell = "Moonfire", target = "hostile", debuff = true },
+    { id = "faeriefire", label = "Faerie Fire", kind = "spell", spell = "Faerie Fire", target = "hostile", debuff = true },
+    { id = "wrath", label = "Wrath", kind = "spell", spell = "Wrath", target = "hostile", cast = true },
+    { id = "catform", label = "Cat Form", kind = "spell", spell = "Cat Form", target = "self", setsForm = "cat" },
+    { id = "bearform", label = "Bear Form", kind = "spell", spell = "Bear Form", target = "self", setsForm = "bear" },
+    { id = "rip", label = "Rip", kind = "spell", spell = "Rip", target = "hostile", form = "cat", debuff = true },
+    { id = "rake", label = "Rake", kind = "spell", spell = "Rake", target = "hostile", form = "cat", debuff = true },
+    { id = "claw", label = "Claw", kind = "spell", spell = "Claw", target = "hostile", form = "cat" },
+    { id = "tigersfury", label = "Tiger's Fury", kind = "spell", spell = "Tiger's Fury", target = "self", form = "cat", buff = true },
+    { id = "demoroar", label = "Demoralizing Roar", kind = "spell", spell = "Demoralizing Roar", target = "hostile", form = "bear", debuff = true },
+    { id = "maul", label = "Maul", kind = "spell", spell = "Maul", target = "hostile", form = "bear" },
+    { id = "melee", label = "Melee Attack", kind = "melee", target = "hostile" },
+  },
+}
+
+local function combatGetn(t)
+  local n = 0
+  while t and t[n + 1] ~= nil do n = n + 1 end
+  return n
+end
+
+local function combatDefs(classToken)
+  return CombatModel.actions[classToken or ""] or {}
+end
+
+function CombatModel.action(classToken, id)
+  local defs = combatDefs(classToken)
+  local i = 1
+  while i <= combatGetn(defs) do
+    if defs[i].id == id then return defs[i] end
+    i = i + 1
+  end
+  return nil
+end
+
+local function combatTargetBlock(snapshot, def)
+  if def.target ~= "hostile" then return nil end
+  if not snapshot.hostile then
+    if snapshot.targetDead then return "target dead" end
+    if snapshot.hasTarget then return "not hostile" end
+    return "need target"
+  end
+  return nil
+end
+
+local function combatAdd(snapshot, result, id, want, idleReason)
+  local def = CombatModel.action(snapshot.classToken, id)
+  if not def then return nil end
+  local state = snapshot.actions and snapshot.actions[id] or nil
+  if not state or not state.known then return nil end
+
+  local row = {
+    id = id, label = def.label, spell = def.spell, kind = def.kind,
+    target = def.target, texture = state.texture, slot = state.slot,
+    range = state.range or "na", cooldown = state.cooldown or 0,
+    gcd = state.gcd and true or false,
+    exact = state.slot and true or false, usable = true, ready = false,
+  }
+  local reason = combatTargetBlock(snapshot, def)
+  if snapshot.playerDead then reason = "player dead" end
+  if not reason and def.form and snapshot.form ~= def.form then
+    reason = "wrong form"
+  end
+  if not reason and state.active then reason = state.activeReason or "active" end
+  if not reason and def.cast and snapshot.moving then reason = "stand still" end
+  if not reason and row.cooldown > 0.1 and not row.gcd then
+    reason = string.format("cooldown %.1fs", row.cooldown)
+  end
+  if not reason and state.noResource then reason = state.resourceReason or "resource low" end
+  if not reason and state.usable == false then reason = state.unusableReason or "unavailable" end
+  if not reason and state.range == "out" then reason = "out of range" end
+
+  if reason then
+    row.usable = false
+    row.reason = reason
+  elseif want then
+    row.ready = true
+    row.reason = idleReason or "ready"
+    if not result.nextId then result.nextId = id end
+  else
+    row.reason = idleReason or "ready"
+  end
+  result.rows[combatGetn(result.rows) + 1] = row
+  return row
+end
+
+local function combatWarlock(snapshot, result)
+  local hp = snapshot.hpPct or 100
+  local mana = snapshot.powerPct or 100
+  local targetHp = snapshot.targetHpPct or 100
+  local actions = snapshot.actions or {}
+
+  combatAdd(snapshot, result, "drainlife", hp <= 45, hp <= 45 and "recover health" or "health OK")
+  combatAdd(snapshot, result, "fear", snapshot.danger and hp < 50,
+    snapshot.danger and "defensive option" or "defensive")
+  combatAdd(snapshot, result, "lifetap",
+    snapshot.hostile and mana < 20 and hp > 65,
+    (hp <= 65 and mana < 20) and "health too low" or "mana OK")
+  combatAdd(snapshot, result, "corruption",
+    snapshot.hostile and not (actions.corruption and actions.corruption.debuff),
+    (actions.corruption and actions.corruption.debuff) and "already up" or "DoT")
+  combatAdd(snapshot, result, "agony",
+    snapshot.hostile and targetHp > 50 and not (actions.agony and actions.agony.debuff),
+    targetHp <= 50 and "target low" or ((actions.agony and actions.agony.debuff) and "already up" or "curse"))
+  combatAdd(snapshot, result, "immolate",
+    snapshot.hostile and targetHp > 65 and mana > 45
+      and not (actions.immolate and actions.immolate.debuff),
+    targetHp <= 65 and "target low" or ((actions.immolate and actions.immolate.debuff) and "already up" or "mana reserve"))
+  combatAdd(snapshot, result, "shadowbolt", snapshot.hostile and mana > 35,
+    mana <= 35 and "save mana" or "nuke")
+  combatAdd(snapshot, result, "shoot", snapshot.hostile and snapshot.hasWand,
+    snapshot.shooting and "firing" or (snapshot.hasWand and "wand" or "no wand"))
+  combatAdd(snapshot, result, "melee", snapshot.hostile,
+    snapshot.melee and "swinging" or "last resort")
+end
+
+local function combatDruidHumanoid(snapshot, result)
+  local hp = snapshot.hpPct or 100
+  local mana = snapshot.powerPct or 100
+  local targetHp = snapshot.targetHpPct or 100
+  local actions = snapshot.actions or {}
+  combatAdd(snapshot, result, "healingtouch", hp < 45, hp < 45 and "emergency heal" or "health OK")
+  combatAdd(snapshot, result, "rejuvenation",
+    hp < 70 and not (actions.rejuvenation and actions.rejuvenation.buff),
+    (actions.rejuvenation and actions.rejuvenation.buff) and "already up" or "health OK")
+  combatAdd(snapshot, result, "moonfire",
+    snapshot.hostile and targetHp > 35 and not (actions.moonfire and actions.moonfire.debuff),
+    targetHp <= 35 and "target low" or ((actions.moonfire and actions.moonfire.debuff) and "already up" or "DoT"))
+  combatAdd(snapshot, result, "faeriefire",
+    snapshot.hostile and snapshot.danger and not (actions.faeriefire and actions.faeriefire.debuff),
+    (actions.faeriefire and actions.faeriefire.debuff) and "already up" or "elite armor")
+  combatAdd(snapshot, result, "wrath", snapshot.hostile and mana > 30,
+    mana <= 30 and "save mana" or "nuke")
+  combatAdd(snapshot, result, "catform", false, "form option")
+  combatAdd(snapshot, result, "bearform", false, "form option")
+  combatAdd(snapshot, result, "melee", snapshot.hostile, "fallback")
+end
+
+local function combatDruidCat(snapshot, result)
+  local actions = snapshot.actions or {}
+  local combo = snapshot.combo or 0
+  combatAdd(snapshot, result, "rip",
+    snapshot.hostile and combo >= 4 and not (actions.rip and actions.rip.debuff),
+    (actions.rip and actions.rip.debuff) and "already up" or (combo < 4 and (tostring(combo) .. " combo") or "finisher"))
+  combatAdd(snapshot, result, "rake",
+    snapshot.hostile and not (actions.rake and actions.rake.debuff),
+    (actions.rake and actions.rake.debuff) and "already up" or "bleed")
+  combatAdd(snapshot, result, "claw", snapshot.hostile, "builder")
+  combatAdd(snapshot, result, "tigersfury", false,
+    (actions.tigersfury and actions.tigersfury.buff) and "already up" or "damage boost")
+  combatAdd(snapshot, result, "bearform", false, "form option")
+  combatAdd(snapshot, result, "melee", snapshot.hostile, "auto attack")
+  if (snapshot.hpPct or 100) < 30 then result.warning = "low health — leave form to heal" end
+end
+
+local function combatDruidBear(snapshot, result)
+  local actions = snapshot.actions or {}
+  combatAdd(snapshot, result, "demoroar",
+    snapshot.hostile and not (actions.demoroar and actions.demoroar.debuff),
+    (actions.demoroar and actions.demoroar.debuff) and "already up" or "reduce damage")
+  combatAdd(snapshot, result, "maul", snapshot.hostile, "rage attack")
+  combatAdd(snapshot, result, "catform", false, "form option")
+  combatAdd(snapshot, result, "melee", snapshot.hostile, "auto attack")
+  if (snapshot.hpPct or 100) < 30 then result.warning = "low health — leave form to heal" end
+end
+
+-- The coach is a recommendation display, so the current recommendation owns
+-- row one. Everything else keeps its class-profile order. Transient cast/GCD
+-- state is deliberately excluded from nextId selection, which prevents the
+-- table from shuffling away and snapping back while an action completes.
+local function combatPromoteNext(result)
+  if not result.nextId then return end
+  local found = nil
+  local i = 1
+  while i <= combatGetn(result.rows) do
+    if result.rows[i].id == result.nextId then found = i; break end
+    i = i + 1
+  end
+  if not found or found == 1 then return end
+  local nextRow = result.rows[found]
+  i = found
+  while i > 1 do
+    result.rows[i] = result.rows[i - 1]
+    i = i - 1
+  end
+  result.rows[1] = nextRow
+end
+
+function CombatModel.evaluate(snapshot)
+  snapshot = snapshot or {}
+  local result = { rows = {}, nextId = nil, warning = nil }
+  if snapshot.classToken == "WARLOCK" then
+    combatWarlock(snapshot, result)
+  elseif snapshot.classToken == "DRUID" then
+    if snapshot.form == "cat" then
+      combatDruidCat(snapshot, result)
+    elseif snapshot.form == "bear" then
+      combatDruidBear(snapshot, result)
+    else
+      combatDruidHumanoid(snapshot, result)
+    end
+  else
+    result.warning = "no combat profile for this class"
+  end
+  combatPromoteNext(result)
+  return result
+end
+
+CombatModel.failureLabels = {
+  facing = "turn to face target",
+  los = "move into line of sight",
+  range = "move into range",
+  moving = "stand still",
+  mana = "not enough mana",
+  rage = "not enough rage",
+  energy = "not enough energy",
+  cooldown = "ability not ready",
+  target = "invalid target",
+}
+
+function CombatModel.classifyFailure(message, messageCodes)
+  local code = messageCodes and messageCodes[message or ""] or nil
+  if not code then return nil end
+  return { code = code, label = CombatModel.failureLabels[code] or code }
+end
+
+ShadowArmy.combatModel = CombatModel
+
 -- Unit tests load this file without the WoW UI and stop after the pure model.
 if not CreateFrame then return end
 
@@ -303,7 +554,7 @@ local F = {}
 
 -- Bump on every edit. The System watches Chat.log for "<SA> loaded rev=..."
 -- after sending a reload — a new rev proves the edit actually loaded.
-local REV = "r34"
+local REV = "r40"
 
 -- Log window (r16): every F.say()/F.emit() line also lands here with a
 -- timestamp, so errors survive chat scroll-off and can be reviewed in-game.
@@ -498,21 +749,17 @@ local line6 = questLines[1]
 -- something the default UI can't. Full-auto combat qualifies.)
 
 --------------------------------------------------------------------------
--- Combat coach (r26): L0 suggestions only — vanilla action APIs are
--- click/software gated, so we do NOT auto-cast. Opens a window of
--- priority abilities for the human to press. Warlock leveling priority
--- (Corruption → Shadow Bolt → wand → melee), spellbook-gated.
--- See docs/advisor-autopilot.md (vanilla = L0 only).
+--------------------------------------------------------------------------
+-- Combat coach (r38): recommendation-first advice table with the most exact
+-- state the stock 1.12 API exposes. Range/usability/cooldown are exact when a spell is
+-- on any action slot; fallbacks are explicitly approximate.
 --------------------------------------------------------------------------
 
 local auto = {
-  casting = false,
-  castingSince = 0,
-  gcdUntil = 0,      -- used only by legacy F.armorTick if it still casts
-  failUntil = 0,
-  shooting = false,  -- wand auto-repeat observed via events
-  melee = false,     -- auto-attack swing observed via events
-  known = {},        -- lowercase spell name -> true
+  casting = false, castingSince = 0, gcdUntil = 0, failUntil = 0,
+  shooting = false, melee = false,
+  known = {}, spells = {}, actionSlots = {},
+  classToken = nil, classLabel = nil, failure = nil, lastAttempt = nil,
 }
 
 -- 1.12 has no IsMoving(); sample map position deltas for cast vs wand tips.
@@ -532,194 +779,331 @@ function F.updateMoving()
   end
 end
 
-function F.scanSpellbook()
-  auto.known = {}
-  local i = 1
-  while true do
-    local name = GetSpellName(i, "spell")
-    if not name then break end
-    auto.known[string.lower(name)] = true
-    i = i + 1
+function F.combatDefs()
+  return CombatModel.actions[auto.classToken or ""] or {}
+end
+
+function F.scanCombatActions()
+  auto.actionSlots = {}
+  local defs = F.combatDefs()
+  local slot = 1
+  while slot <= 120 do
+    if HasAction(slot) and (not IsConsumableAction or not IsConsumableAction(slot)) then
+      local texture = GetActionTexture(slot)
+      if texture then
+        local i = 1
+        while i <= table.getn(defs) do
+          local def = defs[i]
+          local book = def.spell and auto.spells[string.lower(def.spell)] or nil
+          if book and book.texture == texture and not auto.actionSlots[string.lower(def.spell)] then
+            auto.actionSlots[string.lower(def.spell)] = slot
+          end
+          i = i + 1
+        end
+      end
+    end
+    slot = slot + 1
   end
 end
 
--- 1.12 UnitDebuff returns the TEXTURE first; names aren't exposed.
-local CORRUPTION_TEX = "Interface\\Icons\\Spell_Shadow_AbominationExplosion"
-
-function F.targetHasDebuff(texture)
+function F.scanSpellbook()
+  auto.known, auto.spells = {}, {}
+  local classLabel, classToken = UnitClass("player")
+  auto.classLabel = classLabel or "Unknown"
+  -- Vanilla's second return is the English class name, not guaranteed to
+  -- be the uppercase token used by later clients.
+  auto.classToken = string.upper(classToken or classLabel or "")
   local i = 1
   while true do
-    local tex = UnitDebuff("target", i)
+    local name, rank = GetSpellName(i, "spell")
+    if not name then break end
+    local key = string.lower(name)
+    auto.known[key] = true
+    auto.spells[key] = {
+      name = name, rank = rank, index = i,
+      texture = GetSpellTexture(i, "spell"),
+    }
+    i = i + 1
+  end
+  F.scanCombatActions()
+end
+
+function F.unitHasTexture(unit, helpful, texture)
+  if not texture then return false end
+  local i = 1
+  while i <= 32 do
+    local tex
+    if helpful then tex = UnitBuff(unit, i) else tex = UnitDebuff(unit, i) end
     if not tex then return false end
     if tex == texture then return true end
     i = i + 1
   end
+  return false
 end
 
--- Shared by F.armorTick legacy path (cast still gated on this client).
-function F.castNow(spell)
-  F.dtrace("cast " .. spell)
-  CastSpellByName(spell)
-  auto.gcdUntil = GetTime() + 1.6
+function F.targetHasDebuff(texture)
+  return F.unitHasTexture("target", false, texture)
 end
 
--- Warlock ability buttons (fixed order). Click = hardware event = cast works.
--- No pet button: imp is on Aggressive — it engages without PetAttack.
-local COMBAT_ABILITIES = {
-  { id = "corruption", label = "Corruption",  kind = "spell", spell = "Corruption", book = "corruption" },
-  { id = "shadowbolt", label = "Shadow Bolt", kind = "spell", spell = "Shadow Bolt", book = "shadow bolt" },
-  { id = "shoot",      label = "Shoot",       kind = "spell", spell = "Shoot", book = "shoot" },
-  { id = "melee",      label = "Melee Attack", kind = "melee" },
-}
-
--- Evaluate each ability: ready (priority pick), usable (click ok), reason text.
--- Returns status line, nextId, and rows[id] = { usable, ready, reason }.
-function F.combatAdvice()
-  local rows = {}
-  local nextId = nil
-  local function set(id, usable, ready, reason)
-    rows[id] = { usable = usable, ready = ready, reason = reason or "" }
-    if ready and not nextId then
-      nextId = id
-    end
-  end
-
-  local status
-  if not UnitExists("target") then
-    status = "|cFFFFAA00No target|r"
-    local i = 1
-    while i <= table.getn(COMBAT_ABILITIES) do
-      set(COMBAT_ABILITIES[i].id, false, false, "need target")
-      i = i + 1
-    end
-    return status, nil, rows
-  end
-  if UnitIsDeadOrGhost("target") then
-    status = "|cFFFFAA00Target dead|r"
-    local i = 1
-    while i <= table.getn(COMBAT_ABILITIES) do
-      set(COMBAT_ABILITIES[i].id, false, false, "target dead")
-      i = i + 1
-    end
-    return status, nil, rows
-  end
-  if not UnitCanAttack("player", "target") then
-    status = "|cFFFFAA00Friendly target|r"
-    local i = 1
-    while i <= table.getn(COMBAT_ABILITIES) do
-      set(COMBAT_ABILITIES[i].id, false, false, "not hostile")
-      i = i + 1
-    end
-    return status, nil, rows
-  end
-
-  local tName = UnitName("target") or "?"
-  local manaPct = 0
-  if UnitManaMax("player") > 0 then
-    manaPct = UnitMana("player") / UnitManaMax("player") * 100
-  end
-  local in28 = CheckInteractDistance("target", 4) and true or false
-  local in10 = CheckInteractDistance("target", 3) and true or false
-  local hasWand = GetInventoryItemLink("player", 18) and true or false
-  local corrUp = F.targetHasDebuff(CORRUPTION_TEX)
-  local casting = auto.casting
-  if casting and GetTime() - auto.castingSince > 4 then
-    casting = false
-  end
-
-  status = string.format(
-    "|cFF9482C9%s|r  mana %d%%  %s%s",
-    tName, math.floor(manaPct),
-    move.moving and "moving  " or "still  ",
-    casting and "|cFFFFFF00casting|r" or "")
-
-  -- Corruption
-  if not auto.known["corruption"] then
-    set("corruption", false, false, "not trained")
-  elseif corrUp then
-    set("corruption", true, false, "already up")
-  elseif not in28 then
-    set("corruption", true, false, "out of range")
-  elseif manaPct <= 25 then
-    set("corruption", true, false, "mana low")
-  else
-    set("corruption", true, true, "DoT")
-  end
-
-  -- Shadow Bolt
-  if not auto.known["shadow bolt"] then
-    set("shadowbolt", false, false, "not trained")
-  elseif move.moving then
-    set("shadowbolt", true, false, "stand still")
-  elseif casting then
-    set("shadowbolt", true, false, "casting")
-  elseif not in28 then
-    set("shadowbolt", true, false, "out of range")
-  elseif manaPct <= 35 then
-    set("shadowbolt", true, false, "mana low")
-  else
-    set("shadowbolt", true, true, "nuke")
-  end
-
-  -- Shoot
-  if not auto.known["shoot"] then
-    set("shoot", false, false, "not trained")
-  elseif not hasWand then
-    set("shoot", false, false, "no wand")
-  elseif auto.shooting then
-    set("shoot", true, false, "firing")
-  elseif not in28 then
-    set("shoot", true, false, "out of range")
-  else
-    set("shoot", true, true, "wand")
-  end
-
-  -- Melee
-  if auto.melee then
-    set("melee", true, false, "swinging")
-  elseif not in10 then
-    set("melee", true, false, "not in melee")
-  else
-    set("melee", true, true, "last resort")
-  end
-
-  if not nextId then
-    if casting then
-      status = status .. "  |cFFFFFF00finish cast|r"
-    elseif auto.shooting then
-      status = status .. "  |cFFAAAAAAwanding|r"
-    end
-  end
-  return status, nextId, rows
+function F.cooldownRemaining(start, duration, enable)
+  if not start or not duration or duration <= 0 or enable == 0 then return 0 end
+  local left = start + duration - GetTime()
+  if left < 0 then return 0 end
+  return left
 end
 
--- Fire ability from a button OnClick (hardware event — casts work).
-function F.combatUse(id)
+function F.currentDruidForm()
+  if auto.classToken ~= "DRUID" then return "humanoid" end
   local i = 1
-  while i <= table.getn(COMBAT_ABILITIES) do
-    local a = COMBAT_ABILITIES[i]
-    if a.id == id then
-      if a.kind == "melee" then
-        if UnitExists("target") and UnitCanAttack("player", "target")
-            and not UnitIsDeadOrGhost("target") then
-          AttackTarget()
-        end
-      elseif a.kind == "spell" and a.spell then
-        if a.book and not auto.known[a.book] then
-          return
-        end
-        F.castNow(a.spell)
-      end
-      return
+  while i <= (GetNumShapeshiftForms() or 0) do
+    local texture, name, active = GetShapeshiftFormInfo(i)
+    if active then
+      local lower = string.lower(name or texture or "")
+      if string.find(lower, "cat", 1, true) then return "cat" end
+      if string.find(lower, "bear", 1, true) then return "bear" end
+      if string.find(lower, "moonkin", 1, true) then return "humanoid" end
+      return "other"
     end
     i = i + 1
   end
+  return "humanoid"
 end
 
--- Combat coach UI: clickable ability buttons
+function F.combatActionState(def, snapshot)
+  local state = { known = false, range = "na", cooldown = 0 }
+  if def.kind == "melee" then
+    state.known = true
+    state.active = auto.melee
+    state.activeReason = "swinging"
+    if snapshot.hostile then
+      state.range = CheckInteractDistance("target", 3) and "approx_in" or "approx_far"
+    end
+    return state
+  end
+  local key = string.lower(def.spell or "")
+  local book = auto.spells[key]
+  if not book then return state end
+  state.known, state.texture = true, book.texture
+  state.slot = auto.actionSlots[key]
+  if state.slot then
+    local usable, noResource = IsUsableAction(state.slot)
+    state.usable = usable and true or false
+    state.noResource = noResource and true or false
+    local start, duration, enable = GetActionCooldown(state.slot)
+    state.cooldown = F.cooldownRemaining(start, duration, enable)
+    state.gcd = duration and duration > 0 and duration <= 1.6 and state.cooldown > 0
+    if state.gcd then snapshot.gcd = true end
+    state.active = (IsCurrentAction(state.slot) or IsAutoRepeatAction(state.slot)) and true or false
+    if def.target == "hostile" and ActionHasRange(state.slot) then
+      local inRange = IsActionInRange(state.slot)
+      if inRange == 1 then state.range = "in"
+      elseif inRange == 0 then state.range = "out"
+      else state.range = "unknown" end
+    end
+  else
+    state.usable = true
+    local start, duration, enable = GetSpellCooldown(book.index, "spell")
+    state.cooldown = F.cooldownRemaining(start, duration, enable)
+    state.gcd = duration and duration > 0 and duration <= 1.6 and state.cooldown > 0
+    if state.gcd then snapshot.gcd = true end
+    if def.target == "hostile" and snapshot.hostile then
+      state.range = CheckInteractDistance("target", 4) and "approx_in" or "approx_far"
+    end
+  end
+  if def.id == "shoot" then
+    state.active = auto.shooting
+    state.activeReason = "firing"
+    if not snapshot.hasWand then
+      state.usable = false
+      state.unusableReason = "no wand"
+    end
+  end
+  if state.noResource then state.resourceReason = snapshot.resourceLowReason end
+  if def.debuff and snapshot.hostile then state.debuff = F.targetHasDebuff(book.texture) end
+  if def.buff then state.buff = F.unitHasTexture("player", true, book.texture) end
+  if def.setsForm and snapshot.form == def.setsForm then
+    state.active = true
+    state.activeReason = "active form"
+  end
+  return state
+end
+
+function F.combatDanger()
+  if not UnitExists("target") or not UnitCanAttack("player", "target") then return false, nil end
+  local class = UnitClassification("target")
+  if class == "worldboss" then return true, "BOSS" end
+  if class == "elite" or class == "rareelite" then return true, "ELITE" end
+  local level = UnitLevel("target") or 0
+  if level < 0 then return true, "SKULL" end
+  if level >= UnitLevel("player") + 3 then return true, "+3 LEVEL" end
+  if UnitIsTapped("target") and not UnitIsTappedByPlayer("target") then return true, "TAPPED" end
+  return false, nil
+end
+
+function F.combatSnapshot()
+  local hasTarget = UnitExists("target") and true or false
+  local targetDead = hasTarget and UnitIsDeadOrGhost("target") and true or false
+  local hostile = hasTarget and not targetDead and UnitCanAttack("player", "target") and true or false
+  local hpMax, powerMax = UnitHealthMax("player"), UnitManaMax("player")
+  local powerType = UnitPowerType("player") or 0
+  local resourceNames = { [0] = "mana", [1] = "rage", [3] = "energy" }
+  local resourceName = resourceNames[powerType] or "power"
+  local danger, dangerLabel = F.combatDanger()
+  local snapshot = {
+    classToken = auto.classToken, classLabel = auto.classLabel,
+    form = F.currentDruidForm(),
+    playerDead = UnitIsDeadOrGhost("player") and true or false,
+    hpPct = hpMax > 0 and UnitHealth("player") / hpMax * 100 or 0,
+    powerPct = powerMax > 0 and UnitMana("player") / powerMax * 100 or 0,
+    resourceName = resourceName, resourceLowReason = resourceName .. " low",
+    moving = move.moving, casting = auto.casting,
+    hasTarget = hasTarget, targetDead = targetDead, hostile = hostile,
+    targetName = hasTarget and (UnitName("target") or "?") or nil,
+    targetLevel = hasTarget and UnitLevel("target") or nil,
+    targetHpPct = hasTarget and UnitHealthMax("target") > 0
+      and UnitHealth("target") / UnitHealthMax("target") * 100 or 0,
+    danger = danger, dangerLabel = dangerLabel,
+    combo = GetComboPoints() or 0,
+    hasWand = GetInventoryItemLink("player", 18) and true or false,
+    shooting = auto.shooting, melee = auto.melee,
+    actions = {},
+  }
+  local defs = F.combatDefs()
+  local i = 1
+  while i <= table.getn(defs) do
+    snapshot.actions[defs[i].id] = F.combatActionState(defs[i], snapshot)
+    i = i + 1
+  end
+  return snapshot
+end
+
+function F.combatFailureCodes()
+  local codes = {}
+  local function add(value, code) if value then codes[value] = code end end
+  add(ERR_BADATTACKFACING, "facing")
+  add(ERR_USE_BAD_ANGLE, "facing")
+  add(ERR_WRONG_DIRECTION_FOR_ATTACK, "facing")
+  add(SPELL_FAILED_NOT_INFRONT, "facing")
+  add(SPELL_FAILED_UNIT_NOT_INFRONT, "facing")
+  add(SPELL_FAILED_LINE_OF_SIGHT, "los")
+  add(SPELL_FAILED_OUT_OF_RANGE, "range")
+  add(ERR_BADATTACKPOS, "range")
+  add(SPELL_FAILED_MOVING, "moving")
+  add(ERR_OUT_OF_MANA, "mana")
+  add(ERR_OUT_OF_RAGE, "rage")
+  add(ERR_OUT_OF_ENERGY, "energy")
+  add(SPELL_FAILED_NOT_READY, "cooldown")
+  add(SPELL_FAILED_BAD_TARGETS, "target")
+  add(SPELL_FAILED_TARGETS_DEAD, "target")
+  return codes
+end
+
+function F.combatRecordFailure(message)
+  local failure = CombatModel.classifyFailure(message, F.combatFailureCodes())
+  if failure then
+    failure.at = GetTime()
+    failure.actionId = auto.lastAttempt and auto.lastAttempt.id or nil
+    auto.failure = failure
+    if F.addLog then F.addLog("combat", failure.label) end
+  end
+end
+
+function F.combatFailure()
+  if auto.failure and GetTime() - auto.failure.at <= 2.5 then return auto.failure end
+  auto.failure = nil
+  return nil
+end
+
+-- Shared by the combat buttons and the legacy armor path.
+function F.castNow(spell, onSelf)
+  F.dtrace("cast " .. spell)
+  CastSpellByName(spell, onSelf)
+  auto.gcdUntil = GetTime() + 1.6
+end
+
+function F.combatUse(id)
+  if auto.casting then return end
+  local def = CombatModel.action(auto.classToken, id)
+  if not def then return end
+  auto.lastAttempt = { id = id, at = GetTime(), target = UnitName("target") }
+  if def.kind == "melee" then
+    if UnitExists("target") and UnitCanAttack("player", "target")
+        and not UnitIsDeadOrGhost("target") then AttackTarget() end
+  elseif def.kind == "spell" and def.spell and auto.known[string.lower(def.spell)] then
+    F.castNow(def.spell, def.selfCast and 1 or nil)
+  end
+end
+
+local suggestedKeySeen = false
+
+-- Called from the stock ACTIONBUTTON1 key-release path, which preserves the
+-- real hardware event. Re-evaluate at press time instead of trusting the last
+-- rendered row: target, range, resources, or recommendation may have changed.
+function ShadowArmy.UseSuggested()
+  if auto.casting then return end
+  F.updateMoving()
+  local snapshot = F.combatSnapshot()
+  local result = CombatModel.evaluate(snapshot)
+  if result.nextId then
+    if not suggestedKeySeen then
+      suggestedKeySeen = true
+      F.emit("bindpress", "key=1 suggested=" .. result.nextId)
+    end
+    F.combatUse(result.nextId)
+  end
+end
+
+local stockActionButtonDown = ActionButtonDown
+local stockActionButtonUp = ActionButtonUp
+
+function F.installSuggestedKeyHook()
+  if not stockActionButtonDown or not stockActionButtonUp then
+    F.emit("err", "bind ACTIONBUTTON1 hook unavailable")
+    return false
+  end
+  -- Down remains stock so the first action button visibly depresses. On key
+  -- release, reset that visual without UseAction(slot 1), then use the coach.
+  ActionButtonDown = function(id)
+    stockActionButtonDown(id)
+  end
+  ActionButtonUp = function(id, onSelf)
+    if id ~= 1 then
+      stockActionButtonUp(id, onSelf)
+      return
+    end
+    local button
+    if BonusActionBarFrame and BonusActionBarFrame:IsShown() then
+      button = getglobal("BonusActionButton1")
+    else
+      button = getglobal("ActionButton1")
+    end
+    if button and button:GetButtonState() == "PUSHED" then
+      button:SetButtonState("NORMAL")
+    end
+    ShadowArmy.UseSuggested()
+  end
+  return true
+end
+
+function F.bindSuggestedKey()
+  local command = "ACTIONBUTTON1"
+  if not SetBinding or not SetBinding("1", command) then
+    F.say("could not bind suggested ability to 1")
+    F.emit("err", "bind key=1 failed")
+    return false
+  end
+  if SaveBindings and GetCurrentBindingSet then
+    SaveBindings(GetCurrentBindingSet())
+  end
+  F.say("1 = suggested ability")
+  F.emit("bind", "key=1 action=" .. tostring(GetBindingAction and GetBindingAction("1"))
+    .. " driver=advisor-hook")
+  return true
+end
+
 local combatFrame = CreateFrame("Frame", "ShadowArmyCombatFrame", UIParent)
-combatFrame:SetWidth(260)
-combatFrame:SetHeight(174) -- 4 ability buttons (no pet)
+combatFrame:SetWidth(340)
+combatFrame:SetHeight(180)
 combatFrame:SetPoint("CENTER", UIParent, "CENTER", 120, 20)
 combatFrame:SetBackdrop({
   bgFile = "Interface\\Tooltips\\UI-Tooltip-Background",
@@ -746,108 +1130,139 @@ combatClose:SetPoint("TOPRIGHT", combatFrame, "TOPRIGHT", -2, -2)
 local combatStatus = combatFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
 combatStatus:SetPoint("TOPLEFT", combatFrame, "TOPLEFT", 12, -28)
 combatStatus:SetPoint("TOPRIGHT", combatFrame, "TOPRIGHT", -12, -28)
+combatStatus:SetHeight(32)
 combatStatus:SetJustifyH("LEFT")
+combatStatus:SetJustifyV("TOP")
 combatStatus:SetText("")
 
+local combatAbilityHead = combatFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+combatAbilityHead:SetPoint("TOPLEFT", combatFrame, "TOPLEFT", 18, -64)
+combatAbilityHead:SetText("|cFF777777ABILITY|r")
+local combatRangeHead = combatFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+combatRangeHead:SetPoint("TOPLEFT", combatFrame, "TOPLEFT", 184, -64)
+combatRangeHead:SetText("|cFF777777RANGE|r")
+local combatStateHead = combatFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+combatStateHead:SetPoint("TOPLEFT", combatFrame, "TOPLEFT", 236, -64)
+combatStateHead:SetText("|cFF777777STATE|r")
+
+local COMBAT_MAX_ROWS = 10
 local combatBtns = {}
 local cbi = 1
-while cbi <= table.getn(COMBAT_ABILITIES) do
-  local ab = COMBAT_ABILITIES[cbi]
-  local b = CreateFrame("Button", "ShadowArmyCombatBtn" .. ab.id, combatFrame, "UIPanelButtonTemplate")
-  b:SetWidth(232)
+while cbi <= COMBAT_MAX_ROWS do
+  local b = CreateFrame("Button", "ShadowArmyCombatRow" .. cbi, combatFrame)
+  b:SetWidth(316)
   b:SetHeight(22)
-  b:SetPoint("TOP", combatFrame, "TOP", 0, -44 - (cbi - 1) * 26)
-  b:SetText(ab.label)
-  b.abilityId = ab.id
+  b:SetPoint("TOP", combatFrame, "TOP", 0, -78 - (cbi - 1) * 23)
+  b.bg = b:CreateTexture(nil, "BACKGROUND")
+  b.bg:SetPoint("TOPLEFT", b, "TOPLEFT", 0, 0)
+  b.bg:SetPoint("BOTTOMRIGHT", b, "BOTTOMRIGHT", 0, 0)
+  b.bg:SetTexture(0.10, 0.07, 0.12, 0.82)
+  b.icon = b:CreateTexture(nil, "OVERLAY")
+  b.icon:SetWidth(18)
+  b.icon:SetHeight(18)
+  b.icon:SetPoint("LEFT", b, "LEFT", 4, 0)
+  b.nameText = b:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+  b.nameText:SetPoint("LEFT", b, "LEFT", 27, 0)
+  b.nameText:SetWidth(140)
+  b.nameText:SetJustifyH("LEFT")
+  b.rangeText = b:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+  b.rangeText:SetPoint("LEFT", b, "LEFT", 170, 0)
+  b.rangeText:SetWidth(50)
+  b.rangeText:SetJustifyH("CENTER")
+  b.stateText = b:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+  b.stateText:SetPoint("LEFT", b, "LEFT", 224, 0)
+  b.stateText:SetWidth(88)
+  b.stateText:SetJustifyH("LEFT")
   b:SetScript("OnClick", function()
-    F.combatUse(this.abilityId)
+    if this.clickable and this.abilityId then F.combatUse(this.abilityId) end
   end)
-  combatBtns[ab.id] = b
+  b:SetScript("OnEnter", function()
+    if this.clickable then this.bg:SetTexture(0.20, 0.13, 0.24, 0.95) end
+  end)
+  b:SetScript("OnLeave", function()
+    this.bg:SetTexture(this.bgR or 0.10, this.bgG or 0.07, this.bgB or 0.12, 0.82)
+  end)
+  b:Hide()
+  combatBtns[cbi] = b
   cbi = cbi + 1
 end
 
--- Sort key: 0 = recommended next, 1 = usable (ready or not), 2 = grey/unusable.
--- Within a tier, keep the warlock priority order from COMBAT_ABILITIES.
-function F.combatSortRank(id, nextId, rows)
-  local r = rows and rows[id]
-  if not r then return 9 end
-  if nextId and id == nextId then return 0 end
-  if r.usable then return 1 end
-  return 2
+function F.combatRangeTag(range)
+  if range == "in" then return "|cFF44FF44IN|r" end
+  if range == "out" then return "|cFFFF4444OUT|r" end
+  if range == "approx_in" then return "|cFFFFFF44~IN|r" end
+  if range == "approx_far" then return "|cFFFFAA44~FAR|r" end
+  if range == "unknown" then return "|cFF888888?|r" end
+  return ""
+end
+
+function F.combatStatusText(snapshot, result)
+  local form = snapshot.classToken == "DRUID" and (" " .. snapshot.form) or ""
+  local line1 = string.format("%s%s  hp %d%%  %s %d%%",
+    snapshot.classLabel or "?", form, math.floor(snapshot.hpPct),
+    snapshot.resourceName, math.floor(snapshot.powerPct))
+  local line2
+  if snapshot.hasTarget then
+    local level = snapshot.targetLevel and snapshot.targetLevel >= 0 and tostring(snapshot.targetLevel) or "??"
+    line2 = string.format("%s lvl %s", snapshot.targetName or "?", level)
+    if snapshot.dangerLabel then line2 = line2 .. "  |cFFFF6644" .. snapshot.dangerLabel .. "|r" end
+  else
+    line2 = "|cFF888888No target|r"
+  end
+  if snapshot.moving then line2 = line2 .. "  moving" end
+  if snapshot.casting then line2 = line2 .. "  |cFFFFFF00casting|r" end
+  if snapshot.gcd then line2 = line2 .. "  |cFFAAAAAAGCD|r" end
+  local failure = F.combatFailure()
+  if failure then line2 = "|cFFFF4444" .. failure.label .. "|r" end
+  if result.warning then line2 = line2 .. "  |cFFFFAA00" .. result.warning .. "|r" end
+  return line1 .. "\n" .. line2
 end
 
 local combatAcc = 0
 function F.combatRefresh()
   if not combatFrame:IsShown() then return end
-  local status, nextId, rows = F.combatAdvice()
-  combatStatus:SetText(status or "")
+  local snapshot = F.combatSnapshot()
+  local result = CombatModel.evaluate(snapshot)
+  combatStatus:SetText(F.combatStatusText(snapshot, result))
 
-  -- Build ordered list of ability indices (stable within tier).
-  local order = {}
-  local n = table.getn(COMBAT_ABILITIES)
+  local n = table.getn(result.rows)
   local i = 1
-  while i <= n do
-    order[i] = i
-    i = i + 1
-  end
-  -- Insertion sort (Lua 5.0, tiny n).
-  local a = 2
-  while a <= n do
-    local key = order[a]
-    local keyId = COMBAT_ABILITIES[key].id
-    local keyRank = F.combatSortRank(keyId, nextId, rows)
-    local b = a - 1
-    while b >= 1 do
-      local otherId = COMBAT_ABILITIES[order[b]].id
-      local otherRank = F.combatSortRank(otherId, nextId, rows)
-      -- Lower rank first; same rank keeps original priority (order[b] < key).
-      if otherRank < keyRank or (otherRank == keyRank and order[b] < key) then
-        break
-      end
-      order[b + 1] = order[b]
-      b = b - 1
-    end
-    order[b + 1] = key
-    a = a + 1
-  end
-
-  i = 1
-  while i <= n do
-    local ab = COMBAT_ABILITIES[order[i]]
-    local btn = combatBtns[ab.id]
-    local r = rows and rows[ab.id]
-    if btn and r then
-      local label = ab.label
-      if r.reason and r.reason ~= "" then
-        label = ab.label .. "  |cFF888888" .. r.reason .. "|r"
-      end
-      if nextId == ab.id then
-        btn:SetText("|cFF44FF44→ " .. label .. "|r")
-      elseif r.usable then
-        btn:SetText("|cFFCCCCCC" .. label .. "|r")
+  while i <= COMBAT_MAX_ROWS do
+    local btn = combatBtns[i]
+    local row = i <= n and result.rows[i] or nil
+    if row then
+      btn.abilityId = row.id
+      btn.clickable = row.usable and true or false
+      if row.id == result.nextId then
+        btn.nameText:SetText("|cFF44FF44→ " .. row.label .. "|r")
+        btn.bgR, btn.bgG, btn.bgB = 0.08, 0.20, 0.10
+      elseif row.usable then
+        btn.nameText:SetText("|cFFDDDDDD" .. row.label .. "|r")
+        btn.bgR, btn.bgG, btn.bgB = 0.10, 0.07, 0.12
       else
-        btn:SetText("|cFF666666" .. label .. "|r")
+        btn.nameText:SetText("|cFF888888" .. row.label .. "|r")
+        btn.bgR, btn.bgG, btn.bgB = 0.07, 0.06, 0.08
       end
-      if r.usable then
-        btn:Enable()
-      else
-        btn:Disable()
-      end
-      -- Re-stack top → bottom by importance every refresh.
-      btn:ClearAllPoints()
-      btn:SetPoint("TOP", combatFrame, "TOP", 0, -44 - (i - 1) * 26)
+      btn.bg:SetTexture(btn.bgR, btn.bgG, btn.bgB, 0.82)
+      btn.rangeText:SetText(F.combatRangeTag(row.range))
+      btn.stateText:SetText(row.reason or "")
+      if row.usable then btn.stateText:SetTextColor(0.72, 0.72, 0.72)
+      else btn.stateText:SetTextColor(0.45, 0.45, 0.45) end
+      if row.texture then btn.icon:SetTexture(row.texture); btn.icon:Show() else btn.icon:Hide() end
+      btn:Show()
+    else
+      btn.abilityId = nil
+      btn.clickable = false
+      btn:Hide()
     end
     i = i + 1
   end
+  combatFrame:SetHeight(88 + math.max(1, math.min(n, COMBAT_MAX_ROWS)) * 23)
 end
 
 function F.combatToggle()
-  if combatFrame:IsShown() then
-    combatFrame:Hide()
-  else
-    combatFrame:Show()
-    F.combatRefresh()
-  end
+  if combatFrame:IsShown() then combatFrame:Hide()
+  else combatFrame:Show(); F.combatRefresh() end
 end
 
 combatClose:SetScript("OnClick", function() combatFrame:Hide() end)
@@ -855,12 +1270,9 @@ combatClose:SetScript("OnClick", function() combatFrame:Hide() end)
 local combatBtn = CreateFrame("Button", "ShadowArmyCombatBtn", panel, "UIPanelButtonTemplate")
 combatBtn:SetWidth(118)
 combatBtn:SetHeight(20)
-combatBtn:SetPoint("BOTTOMLEFT", panel, "BOTTOMLEFT", 8, 56) -- top button row
+combatBtn:SetPoint("BOTTOMLEFT", panel, "BOTTOMLEFT", 8, 56)
 combatBtn:SetText("|cFF9482C9Combat|r")
-combatBtn:SetScript("OnClick", function()
-  F.combatToggle()
-end)
-
+combatBtn:SetScript("OnClick", function() F.combatToggle() end)
 -- Remote-reload button: hidden until The System requests a reload. It must
 -- be a click because this build ignores programmatic ReloadUI (see the
 -- driver notes) — a mouse click is the hardware event that makes it legal.
@@ -3854,7 +4266,7 @@ driver:SetScript("OnUpdate", function()
     if not cok then F.emit("err", "crewTick: " .. tostring(cerr)) end
   end
   if loot.active then F.lootTick() end
-  -- r26: combat coach panel refresh (~4 Hz when open). Display only.
+  -- r35: combat coach panel refresh (~4 Hz when open). Display only.
   if combatFrame:IsShown() then
     combatAcc = combatAcc + (arg1 or 0)
     if combatAcc >= 0.25 then
@@ -3932,6 +4344,11 @@ end
 local frame = CreateFrame("Frame", "ShadowArmyFrame", UIParent)
 frame:RegisterEvent("PLAYER_ENTERING_WORLD")
 frame:RegisterEvent("LEARNED_SPELL_IN_TAB")
+frame:RegisterEvent("ACTIONBAR_SLOT_CHANGED")
+frame:RegisterEvent("ACTIONBAR_PAGE_CHANGED")
+frame:RegisterEvent("PLAYER_AURAS_CHANGED")
+frame:RegisterEvent("PLAYER_TARGET_CHANGED")
+frame:RegisterEvent("UI_ERROR_MESSAGE")
 -- cast-time spell window (Shadow Bolt): don't stack cast requests
 frame:RegisterEvent("SPELLCAST_START")
 frame:RegisterEvent("SPELLCAST_STOP")
@@ -3957,6 +4374,8 @@ frame:SetScript("OnEvent", function()
     grind.startTime = GetTime()
     grind.startXP = UnitXP("player")
     F.scanSpellbook()
+    F.installSuggestedKeyHook()
+    F.bindSuggestedKey()
     -- QoL defaults the advisor asserts on every login:
     -- F.instantQuestText() DISABLED (r14): prime remaining suspect for the
     -- reproducible crash+lockup on Complete Quest (it nils the quest
@@ -3971,9 +4390,21 @@ frame:SetScript("OnEvent", function()
     end
   elseif event == "LEARNED_SPELL_IN_TAB" then
     F.scanSpellbook()
+  elseif event == "ACTIONBAR_SLOT_CHANGED" or event == "ACTIONBAR_PAGE_CHANGED" then
+    F.scanCombatActions()
+  elseif event == "PLAYER_AURAS_CHANGED" then
+    -- Druid forms page a different action-bar bank. Re-scan so exact range
+    -- and usability follow the active form instead of the login bar.
+    if auto.classToken == "DRUID" then F.scanCombatActions() end
+  elseif event == "PLAYER_TARGET_CHANGED" then
+    auto.failure = nil
+    auto.lastAttempt = nil
+  elseif event == "UI_ERROR_MESSAGE" then
+    F.combatRecordFailure(arg1 or "")
   elseif event == "SPELLCAST_START" then
     auto.casting = true
     auto.castingSince = GetTime()
+    auto.failure = nil
   elseif event == "SPELLCAST_STOP" then
     auto.casting = false
   elseif event == "SPELLCAST_FAILED" or event == "SPELLCAST_INTERRUPTED" then

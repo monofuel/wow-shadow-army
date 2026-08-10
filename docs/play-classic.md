@@ -54,11 +54,18 @@ cipher, key byte-order gotcha): docs/netlog-pcap-analysis.md.
 ## Addons
 
 Drop addons into `local_classic/client/Interface/AddOns/<Name>/` with a
-`<Name>.toc`. 1.12 has no protected-function lockdown — `ReloadUI()` from
-a slash command or chat event is legal, which is what the advisor's live
-iteration loop (docs/advisor.md) builds on. New addon folders need a full
-client restart once (TOC scan happens at launch); after that, code edits
-only need `/console reloadui`.
+`<Name>.toc` (repo path: `addons/ShadowArmy/` is symlinked on launch).
+
+Full 5875 addon + slash-command reference: **[docs/vanilla-addons/](vanilla-addons/)**.
+Highlights: Lua 5.0 only; stock macros have **no** `/cancelform` /
+`/castsequence` / retail conditionals; some action APIs (including
+`ReloadUI` / `CastSpellByName`) are still **hardware-event gated** on this
+wine seat even without modern SecureTemplates.
+
+New addon folders need a full client restart once (TOC scan at launch).
+Pure `.lua` edits: prefer The System `reload_addon` path
+([docs/the-system-loop.md](the-system-loop.md)); `/console reloadui` is the
+dev escape hatch. Advisor product notes: [docs/advisor.md](advisor.md).
 
 ## Known-unknowns (first human run answers these)
 

@@ -9,6 +9,9 @@ version we target so other docs and code can refer to it consistently.
   **"5875"**.
 - There is evidence in the code for this, and it has been confirmed with the
   team.
+- Vanilla client **addon / slash-command** surface for this pin:
+  [docs/vanilla-addons/](vanilla-addons/) (Lua 5.0, stock `SLASH_*`,
+  anti-hallucination notes — e.g. `/cancelform` does not exist).
 
 ## Server
 

@@ -61,9 +61,13 @@ verbs: `reload`, `ping`, `status`, `say <text>`. Never eval.
    with `luac -p`.
 2. MCP tool `reload_addon` (or dashboard button) → SOAP
    `announce <SYS> reload`.
-3. Addon sees CHAT_MSG_SYSTEM, calls `ReloadUI()` — legal in 1.12, no
-   protected functions.
-4. Fresh addon fires PLAYER_ENTERING_WORLD → `emit("loaded", "rev=rN")`.
+3. Addon sees CHAT_MSG_SYSTEM and tries `ReloadUI()`. There is no retail
+   SecureTemplate lockdown, but **wine 5875 still hardware-gates** many
+   calls: free `ReloadUI` from a system/chat path often **no-ops**. The
+   addon escalates (show **Reload!** / arm next action-bar press) — see
+   AGENTS.md and `docs/vanilla-addons/addon-system.md`.
+4. After a successful reload, fresh addon fires PLAYER_ENTERING_WORLD →
+   `emit("loaded", "rev=rN")`.
 5. Tailer sees the line; `reloadAddon()` returns `{ok: true, loaded: {...}}`
    with the new rev — or `{ok: false, timeout: true}` after 6s (client not
    logged in, or the edit broke the addon before emit could run).
