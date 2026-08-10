@@ -438,6 +438,20 @@ function M.decide(view)
     -- left the liquid. Per-beat keys would drop retention exactly at a
     -- beat handoff. Wet beats carry the human run's z (see navigate_to).
     local reason = (swimming or mid_coast) and "swim_ribbon" or "enter_water"
+    -- Dry with no liquid at our feet in the entry region: ground planning
+    -- can never serve a wet beat and the wade entry needs liquid nearby,
+    -- so walk to the waterline point first (tight stop — its 50 yd beat
+    -- radius would declare arrival on dry sand). Covers both the ordinary
+    -- desert handoff and the walked-back-from-a-fall wedge 50 yd inland.
+    if not swimming and not wading(view, pos) and
+        pos.x < water.x + 150.0 and water_dist > 12.0 then
+      local intent = navigate_to(view, pos, water, "to_waterline",
+        { stop = 8.0, status = { stalled_seconds = stalled } })
+      if intent then
+        wow.set_status(string.format("to_waterline %.0fyd", water_dist))
+        return intent
+      end
+    end
     local fatigued = (view.fatigue_timer and view.fatigue_timer.active)
       or false
     local wet = next_wet_beat(pos.x, pos.y, fatigued)
