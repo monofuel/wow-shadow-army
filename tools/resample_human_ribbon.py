@@ -91,7 +91,25 @@ def resample(track, spacing: float):
     # evidence physics fix makes the human's under-wall dive followable,
     # so the wall span keeps its true (drain-flagged) samples instead of
     # a seaward surface bypass.
-    wet = [p for p in track if X_START <= p[0] <= X_END and
+    bounded = [p for p in track if X_START <= p[0] <= X_END]
+    # Refill representatives: for every entry into a safe bout (the game's
+    # own boundary sensor flipping inactive), take a sample a few steps
+    # INSIDE the bout — a measured interior point of the safe band. These
+    # become tight-capture beats: passing 10 yd seaward of the band edge
+    # skips the instant refill (two gate runs died at hp 1 within ~15 yd
+    # of a recorded clear), so the route must genuinely touch inside.
+    refills = []
+    prev_safe = True
+    for i, p in enumerate(bounded):
+        if p[3] and not prev_safe:
+            j, k = i, 0
+            while j + 1 < len(bounded) and bounded[j + 1][3] and k < 5:
+                j += 1
+                k += 1
+            refills.append(bounded[j])
+        prev_safe = p[3]
+    resample.refills = refills
+    wet = [p for p in bounded if
            (p[3] or WALL_X_MIN <= p[0] <= WALL_X_MAX)]
     out: list[tuple[float, float, float]] = []
     acc = 0.0
@@ -114,26 +132,46 @@ def resample(track, spacing: float):
     for p in out:
         if not mono or p[0] > mono[-1][0] - 5.0:
             mono.append(p)
-    return [(x, y, z) for (x, y, z, _safe) in mono]
+    samples = [[x, y, z, False] for (x, y, z, _safe) in mono]
+    # Merge the refill representatives: tag the nearest sample within
+    # 15 yd (moving it onto the exact interior point), else insert in
+    # route (x) order.
+    for rx, ry, rz, _safe in resample.refills:
+        best, bestd = None, 15.0
+        for smp in samples:
+            d = math.hypot(smp[0] - rx, smp[1] - ry)
+            if d < bestd:
+                best, bestd = smp, d
+        if best is not None:
+            best[0], best[1], best[2], best[3] = rx, ry, rz, True
+        else:
+            idx = 0
+            while idx < len(samples) and samples[idx][0] < rx:
+                idx += 1
+            samples.insert(idx, [rx, ry, rz, True])
+    return [tuple(smp) for smp in samples]
 
 
 def build_beats(samples) -> list[dict]:
     beats = list(LAND_BEATS)
-    for i, (x, y, z) in enumerate(samples, 1):
+    for i, (x, y, z, refill) in enumerate(samples, 1):
         if HOLE_X_MIN <= x <= HOLE_X_MAX:
             y = min(y, HOLE_BYPASS_Y)
-        beats.append({
+        beat = {
             "id": f"ribbon_{i:03d}",
             "x": round(x, 2), "y": round(y, 2), "z": round(z, 2),
             "radius": 35.0, "mode": "liquid_prefer", "require_wet": True,
-        })
+        }
+        if refill:
+            beat["refill"] = True
+        beats.append(beat)
     beats.append(GOAL_BEAT)
     return beats
 
 
 def write_configs(beats: list[dict]) -> None:
     doc = {
-        "version": 12,
+        "version": 13,
         "map_id": 1,
         "goal_id": "duskwallow_coast",
         "cheese": True,
@@ -144,11 +182,11 @@ def write_configs(beats: list[dict]) -> None:
     lines = [
         "-- Petrel route beats: land approach to the Tanaris coast, then the",
         "-- manual-run ribbon to the Dustwallow coast, densely resampled from",
-        "-- the F9 swim log by tools/resample_human_ribbon.py (v12). The JSON",
+        "-- the F9 swim log by tools/resample_human_ribbon.py (v13). The JSON",
         "-- is the source of record (map browser overlay reads it); keep both",
         "-- in sync by regenerating, not editing.",
         "return {",
-        "  version = 12,",
+        "  version = 13,",
         "  map_id = 1,",
         '  goal_id = "duskwallow_coast",',
         "  beats = {",
@@ -158,8 +196,10 @@ def write_configs(beats: list[dict]) -> None:
             f'    {{ id = "{b["id"]}", x = {b["x"]}, y = {b["y"]}, '
             f'z = {b["z"]}, radius = {b["radius"]},'
         )
+        refill = ", refill = true" if b.get("refill") else ""
         lines.append(
-            f'      wet = {"true" if b["require_wet"] else "false"} }},'
+            f'      wet = {"true" if b["require_wet"] else "false"}'
+            f'{refill} }},'
         )
     lines += ["  },", "}", ""]
     LUA_PATH.write_text("\n".join(lines), encoding="utf-8")

@@ -127,7 +127,8 @@ local function next_wet_beat(x, y)
     local passed = x >= (b.x + PASSED_YARDS)
     -- Entering a beat's capture zone retires it permanently: monotonic
     -- selection, no boundary flip-flop.
-    if not skipped[b.id] and planar(x, y, b.x, b.y) <= WET_SELECT_YARDS then
+    local cap = b.refill and 5.0 or WET_SELECT_YARDS
+    if not skipped[b.id] and planar(x, y, b.x, b.y) <= cap then
       skipped[b.id] = true
     end
     if not skipped[b.id] and not passed then
@@ -436,8 +437,10 @@ function M.decide(view)
     local reason = (swimming or mid_coast) and "swim_ribbon" or "enter_water"
     local wet = next_wet_beat(pos.x, pos.y)
     if wet then
+      -- Refill beats demand a genuine touch inside the safe band: tight
+      -- stop, tight capture — the instant refill skips anything skirted.
       local intent = navigate_to(view, pos, wet, reason,
-        { stop = WET_SELECT_YARDS - 4.0,
+        { stop = wet.refill and 4.0 or WET_SELECT_YARDS - 4.0,
           status = { stalled_seconds = stalled } })
       if intent then
         wow.set_status(string.format("%s %s %.0fyd", reason, wet.id,
