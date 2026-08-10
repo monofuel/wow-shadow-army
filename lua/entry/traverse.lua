@@ -117,7 +117,7 @@ end
 --- First wet beat still ahead of us. Stateless: after crossing well into a
 --- beat's X band, lateral drift must not select that beat again, and beats
 --- behind us (Kalimdor +X is north) never regress the run.
-local function next_wet_beat(x, y)
+local function next_wet_beat(x, y, fatigued)
   local wet = {}
   for _, b in ipairs(ROUTE.beats) do
     if b.wet then wet[#wet + 1] = b end
@@ -127,7 +127,10 @@ local function next_wet_beat(x, y)
     local passed = x >= (b.x + PASSED_YARDS)
     -- Entering a beat's capture zone retires it permanently: monotonic
     -- selection, no boundary flip-flop.
-    local cap = b.refill and 5.0 or WET_SELECT_YARDS
+    -- Refill beats demand the tight touch only while the bar is actually
+    -- draining: a full-bar run pays no zigzag tax (a healthy full-course
+    -- run timed out 216 yd short paying it on every beat).
+    local cap = (b.refill and fatigued) and 5.0 or WET_SELECT_YARDS
     if not skipped[b.id] and planar(x, y, b.x, b.y) <= cap then
       skipped[b.id] = true
     end
@@ -435,12 +438,14 @@ function M.decide(view)
     -- left the liquid. Per-beat keys would drop retention exactly at a
     -- beat handoff. Wet beats carry the human run's z (see navigate_to).
     local reason = (swimming or mid_coast) and "swim_ribbon" or "enter_water"
-    local wet = next_wet_beat(pos.x, pos.y)
+    local fatigued = (view.fatigue_timer and view.fatigue_timer.active)
+      or false
+    local wet = next_wet_beat(pos.x, pos.y, fatigued)
     if wet then
       -- Refill beats demand a genuine touch inside the safe band: tight
       -- stop, tight capture — the instant refill skips anything skirted.
       local intent = navigate_to(view, pos, wet, reason,
-        { stop = wet.refill and 4.0 or WET_SELECT_YARDS - 4.0,
+        { stop = (wet.refill and fatigued) and 4.0 or WET_SELECT_YARDS - 4.0,
           status = { stalled_seconds = stalled } })
       if intent then
         wow.set_status(string.format("%s %s %.0fyd", reason, wet.id,
