@@ -641,9 +641,23 @@ SWIM ?=
 # (override with SWIM=0). wet_start lands swimming; water_entry lands DRY
 # on the sand (the shoreline entry is a known-open gap on the lua-bot
 # host — you will see the bot work the waterline, not the ribbon).
+# END_CHECKPOINT=<name> turns either launcher into a bounded segment test. It
+# waits until the start tele is observed, records idle/swim/death metrics, and
+# terminates the launcher successfully at 50 yd from the named endpoint.
 CHECKPOINT ?=
+END_CHECKPOINT ?=
+END_TIMEOUT ?=2700
+TRAVERSE_SEGMENT_RESULT := $(CURDIR)/local_data/traverse-segment-result.json
 TRAVERSE_SWIM_EFFECTIVE = $(or $(SWIM),1)
 define TRAVERSE_CHECKPOINT_PRELUDE
+	if [ -n "$(END_CHECKPOINT)" ] && [ -z "$(CHECKPOINT)" ]; then \
+		echo "error: END_CHECKPOINT requires CHECKPOINT" >&2; exit 2; \
+	fi; \
+	if [ -n "$(END_CHECKPOINT)" ]; then \
+		python3 tools/traverse_checkpoint.py resolve "$(CHECKPOINT)" >/dev/null; \
+		python3 tools/traverse_checkpoint.py resolve "$(END_CHECKPOINT)" >/dev/null; \
+		rm -f "$(TRAVERSE_SEGMENT_RESULT)"; \
+	fi; \
 	if [ -n "$(CHECKPOINT)" ]; then \
 		rm -f local_data/lua-bot-status.json; \
 		prior_cid="$$(docker ps --format '{{.ID}} {{.Names}}' 2>/dev/null | grep 'traverse.*coworld-game' | awk '{print $$1}' | head -1)"; \
@@ -658,16 +672,39 @@ define TRAVERSE_CHECKPOINT_PRELUDE
 			--character Northbound >> local_data/health-logs/traverse-tele.log 2>&1 ) & \
 	fi
 endef
+
+define TRAVERSE_RUN
+	if [ -n "$(END_CHECKPOINT)" ]; then \
+		cd $(FORK_CLIENT); \
+		PETREL_SWIM=$(TRAVERSE_SWIM_EFFECTIVE) setsid $(TRAVERSE_LAUNCH) --presentation=$(1) & \
+		run_pid=$$!; \
+		cleanup() { \
+			kill -TERM -- -$$run_pid 2>/dev/null || true; \
+			wait $$run_pid 2>/dev/null || true; \
+		}; \
+		trap cleanup EXIT INT TERM; \
+		python3 "$(CURDIR)/tools/traverse_checkpoint.py" wait \
+			"$(CHECKPOINT)" "$(END_CHECKPOINT)" \
+			--timeout "$(END_TIMEOUT)" \
+			--result "$(TRAVERSE_SEGMENT_RESULT)"; \
+		segment_rc=$$?; \
+		trap - EXIT INT TERM; \
+		cleanup; \
+		exit $$segment_rc; \
+	else \
+		cd $(FORK_CLIENT) && PETREL_SWIM=$(TRAVERSE_SWIM_EFFECTIVE) $(TRAVERSE_LAUNCH) --presentation=$(1); \
+	fi
+endef
 traverse:
 	@mkdir -p local_data/health-logs
 	@$(TRAVERSE_CHECKPOINT_PRELUDE); \
-	cd $(FORK_CLIENT) && PETREL_SWIM=$(TRAVERSE_SWIM_EFFECTIVE) $(TRAVERSE_LAUNCH) --presentation=headless
+	$(call TRAVERSE_RUN,headless)
 
 # Headed Petrel run for manual verification (opens a window — human use).
 traverse-headed:
 	@mkdir -p local_data/health-logs
 	@$(TRAVERSE_CHECKPOINT_PRELUDE); \
-	cd $(FORK_CLIENT) && PETREL_SWIM=$(TRAVERSE_SWIM_EFFECTIVE) $(TRAVERSE_LAUNCH) --presentation=headed
+	$(call TRAVERSE_RUN,headed)
 
 # Fast regression: proof-of-life (level 60, map 1, movement + inputs).
 traverse-pol:

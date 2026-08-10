@@ -28,6 +28,7 @@ class TestTraverseCheckpoint(unittest.TestCase):
             "duskwallow_coast": (-4627.01, -4869.45, -2.37),
             "merchant_coast": (-1533.7, -4056.5, -12.3),
             "top_barrens": (1071.6, -2303.4, 91.7),
+            "felwood_cave_entrance": (6502.937, -2063.74, 576.017),
             "everlook": (6687.333052, -4647.667, 721.678),
         }
         for name, coordinates in expected.items():
@@ -38,8 +39,6 @@ class TestTraverseCheckpoint(unittest.TestCase):
                 )
                 self.assertEqual(pose["map_id"], 1)
                 self.assertTrue(pose["tele_name"])
-
-        # TODO: add the difficult Everlook cave entrance after capturing its pose.
 
     def test_spawn_has_no_tele(self) -> None:
         pose = tc.resolve_checkpoint("spawn")
@@ -113,6 +112,48 @@ class TestTraverseCheckpoint(unittest.TestCase):
         out = tc.apply_checkpoint("spawn", skip_wait=True)
         self.assertTrue(out["ok"])
         self.assertTrue(out.get("skipped"))
+
+    def test_segment_wait_starts_at_checkpoint_and_reaches_endpoint(self) -> None:
+        statuses = [
+            {"x": 1071.6, "y": -2303.4, "swimming": False},
+            {"x": 6502.937, "y": -2063.74, "swimming": False, "nav_error": ""},
+        ]
+        clock = iter(range(20))
+        with (
+            mock.patch.object(tc, "read_status", side_effect=statuses),
+            mock.patch.object(tc.time, "sleep"),
+            mock.patch.object(tc.time, "monotonic", side_effect=lambda: float(next(clock))),
+        ):
+            out = tc.wait_for_segment_endpoint(
+                "top_barrens", "felwood_cave_entrance", timeout=15
+            )
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["swimming_samples"], 0)
+        self.assertEqual(out["deaths"], 0)
+        self.assertLessEqual(out["endpoint_distance_yards"], 50)
+
+    def test_segment_wait_reports_death(self) -> None:
+        statuses = [
+            {"x": 1071.6, "y": -2303.4, "swimming": False},
+            {
+                "x": 1100.0,
+                "y": -2290.0,
+                "swimming": False,
+                "intent_reason": "run_over",
+                "nav_error": "",
+            },
+        ]
+        clock = iter(range(20))
+        with (
+            mock.patch.object(tc, "read_status", side_effect=statuses),
+            mock.patch.object(tc.time, "sleep"),
+            mock.patch.object(tc.time, "monotonic", side_effect=lambda: float(next(clock))),
+        ):
+            out = tc.wait_for_segment_endpoint(
+                "top_barrens", "felwood_cave_entrance", timeout=15
+            )
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["deaths"], 1)
 
 
 if __name__ == "__main__":

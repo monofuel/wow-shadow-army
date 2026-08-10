@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Local-debug SOAP tele for make traverse CHECKPOINT=<name>.
+"""Local-debug checkpoint and segment support for make traverse.
 
 After the traverse scenario seeds Tanaris and the character is in-world (or
 offline between seed and login), place them at a named pose via MaNGOS SOAP:
@@ -8,6 +8,9 @@ offline between seed and login), place them at a named pose via MaNGOS SOAP:
 
 game_tele rows are ensured in the world DB and reloaded. Fair-play prove does
 not use this path — local CHECKPOINT setup only (monofuel-authorized tele).
+
+The ``wait`` command observes an already-running local checkpoint episode and
+returns success when its named END_CHECKPOINT is reached.
 """
 from __future__ import annotations
 
@@ -477,6 +480,121 @@ def apply_checkpoint(
     }
 
 
+def wait_for_segment_endpoint(
+    start_name: str,
+    end_name: str,
+    *,
+    status_path: Path | None = None,
+    timeout: float = 2700.0,
+    near_yards: float = 50.0,
+    start_near_yards: float = 120.0,
+    poll: float = 0.5,
+) -> dict[str, Any]:
+    """Wait for a fresh checkpoint start, then measure until the endpoint."""
+    start_pose = resolve_checkpoint(start_name)
+    end_pose = resolve_checkpoint(end_name)
+    sp = status_path_resolved(status_path)
+    deadline = time.monotonic() + timeout
+
+    # Ignore the scenario spawn while the asynchronous SOAP tele is pending.
+    started_status: dict[str, Any] | None = None
+    while time.monotonic() < deadline:
+        st = read_status(sp)
+        if st and isinstance(st.get("x"), (int, float)) and isinstance(st.get("y"), (int, float)):
+            if pose_dist_to_checkpoint(st, start_pose) <= start_near_yards:
+                started_status = st
+                break
+            if st.get("intent_reason") == "run_over":
+                return {
+                    "ok": False,
+                    "start_checkpoint": start_name,
+                    "end_checkpoint": end_name,
+                    "reason": "bot died before segment start",
+                    "deaths": 1,
+                }
+        time.sleep(poll)
+    if started_status is None:
+        return {
+            "ok": False,
+            "start_checkpoint": start_name,
+            "end_checkpoint": end_name,
+            "reason": "start checkpoint was not observed",
+            "deaths": 0,
+        }
+
+    segment_started = time.monotonic()
+    last_sample_at = segment_started
+    last_x = float(started_status["x"])
+    last_y = float(started_status["y"])
+    stationary_since = segment_started
+    total_idle = 0.0
+    max_stationary = 0.0
+    swimming_samples = 1 if started_status.get("swimming") else 0
+    samples = 1
+    final_status = started_status
+
+    while time.monotonic() < deadline:
+        time.sleep(poll)
+        now = time.monotonic()
+        st = read_status(sp)
+        if not st or not isinstance(st.get("x"), (int, float)) or not isinstance(st.get("y"), (int, float)):
+            continue
+        x, y = float(st["x"]), float(st["y"])
+        sample_seconds = max(0.0, now - last_sample_at)
+        moved = planar_dist(last_x, last_y, x, y) > 0.2
+        if moved:
+            max_stationary = max(max_stationary, now - stationary_since)
+            stationary_since = now
+        else:
+            total_idle += sample_seconds
+        last_x, last_y = x, y
+        last_sample_at = now
+        final_status = st
+        samples += 1
+        if st.get("swimming"):
+            swimming_samples += 1
+        distance = pose_dist_to_checkpoint(st, end_pose)
+        if distance <= near_yards:
+            elapsed = now - segment_started
+            max_stationary = max(max_stationary, now - stationary_since)
+            return {
+                "ok": True,
+                "start_checkpoint": start_name,
+                "end_checkpoint": end_name,
+                "elapsed_seconds": round(elapsed, 3),
+                "endpoint_distance_yards": round(distance, 3),
+                "max_stationary_seconds": round(max_stationary, 3),
+                "total_idle_seconds": round(total_idle, 3),
+                "idle_fraction": round(total_idle / elapsed, 4) if elapsed > 0 else 0.0,
+                "swimming_samples": swimming_samples,
+                "samples": samples,
+                "deaths": 0,
+                "final_nav_error": st.get("nav_error") or "",
+            }
+        if st.get("intent_reason") == "run_over":
+            return {
+                "ok": False,
+                "start_checkpoint": start_name,
+                "end_checkpoint": end_name,
+                "reason": "bot died during segment",
+                "deaths": 1,
+                "endpoint_distance_yards": round(distance, 3),
+                "final_nav_error": st.get("nav_error") or "",
+            }
+
+    return {
+        "ok": False,
+        "start_checkpoint": start_name,
+        "end_checkpoint": end_name,
+        "reason": "segment endpoint timeout",
+        "deaths": 0,
+        "endpoint_distance_yards": round(
+            pose_dist_to_checkpoint(final_status, end_pose), 3
+        ),
+        "final_nav_error": final_status.get("nav_error") or "",
+    }
+
+
 def cmd_list(_: argparse.Namespace) -> int:
     for name, pose in load_table().items():
         print(
@@ -513,6 +631,25 @@ def cmd_apply(args: argparse.Namespace) -> int:
     return 0 if out.get("ok") else 1
 
 
+def cmd_wait(args: argparse.Namespace) -> int:
+    out = wait_for_segment_endpoint(
+        args.start,
+        args.end,
+        status_path=Path(args.status) if args.status else None,
+        timeout=args.timeout,
+        near_yards=args.near,
+        start_near_yards=args.start_near,
+        poll=args.poll,
+    )
+    body = json.dumps(out, indent=2, default=str)
+    if args.result:
+        result_path = Path(args.result)
+        result_path.parent.mkdir(parents=True, exist_ok=True)
+        result_path.write_text(body + "\n", encoding="utf-8")
+    print(body)
+    return 0 if out.get("ok") else 1
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -530,6 +667,15 @@ def main() -> int:
     pa.add_argument("--timeout", type=float, default=300.0)
     pa.add_argument("--near", type=float, default=120.0)
     pa.add_argument("--no-wait", action="store_true", help="Tele immediately (offline ok)")
+    pw = sub.add_parser("wait", help="Wait for a checkpoint-to-checkpoint segment")
+    pw.add_argument("start")
+    pw.add_argument("end")
+    pw.add_argument("--status", default=str(DEFAULT_STATUS))
+    pw.add_argument("--timeout", type=float, default=2700.0)
+    pw.add_argument("--near", type=float, default=50.0)
+    pw.add_argument("--start-near", type=float, default=120.0)
+    pw.add_argument("--poll", type=float, default=0.5)
+    pw.add_argument("--result")
 
     args = p.parse_args()
     if args.cmd == "list":
@@ -540,8 +686,13 @@ def main() -> int:
         return cmd_tele_cmd(args)
     if args.cmd == "apply":
         return cmd_apply(args)
+    if args.cmd == "wait":
+        return cmd_wait(args)
     return 2
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        raise SystemExit(130) from None
