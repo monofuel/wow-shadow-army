@@ -18,8 +18,9 @@ local M = { name = "petrel" }
 
 local ROUTE = require("config.traverse_beats")
 
--- Wet-chain gate: flip once the land legs are proven on the lua-bot host.
-local SWIM = false
+-- Wet-chain gate: PETREL_SWIM=1 opts a run into the wet chain. Default off
+-- keeps traverse-desert's land-only PASS semantics ("awaiting_swim_pass").
+local SWIM = os.getenv("PETREL_SWIM") == "1"
 
 local TRAVEL_FORM_SPELL = 783
 local TRAVEL_FORM_ID = 3
@@ -52,6 +53,7 @@ local unroutableBeat = nil
 local skipped = {}
 local lastFormCastAt = nil
 local deathLogged = false
+local gateLogged = false
 
 local function planar(ax, ay, bx, by)
   local dx, dy = ax - bx, ay - by
@@ -107,11 +109,13 @@ end
 
 local function bot_status(view, pos, beat, extra)
   local water = beat_by_id("water_entry")
+  local goal = beat_by_id(ROUTE.goal_id)
   local status = {
     beat = beat and beat.id or "?",
     x = pos.x,
     y = pos.y,
     dist_water = water and planar(pos.x, pos.y, water.x, water.y) or -1,
+    dist_goal = goal and planar(pos.x, pos.y, goal.x, goal.y) or -1,
     swimming = view.is_swimming or false,
     -- Deaths must arrive with a cause attached: mobs show up as combat and
     -- sinking health well before the kill, falls do not.
@@ -155,7 +159,14 @@ end
 --- run: the skip turned an inching-but-alive route into a permanent wedge).
 --- A stall on a planned route is never grounds to change the plan either —
 --- that is the underlying bug, and it gets logged, not worked around.
-local function route_dead(beat)
+local function route_dead(view, beat)
+  -- The direct-water route cannot fail while genuinely swimming; an
+  -- "unavailable" there is a transient liquid-observation flicker, never
+  -- grounds to burn a wet beat off the ribbon.
+  if beat.wet and view.is_swimming == true then
+    unroutableBeat, unroutableSince = nil, nil
+    return false
+  end
   local now = wow.time()
   local nav = wow.nav_progress()
   local dead = nav.state == "unavailable" and not nav.walkout_available
@@ -174,7 +185,7 @@ end
 
 local function navigate_to(view, pos, beat, reason, opts)
   opts = opts or {}
-  if route_dead(beat) then return nil end
+  if route_dead(view, beat) then return nil end
   local intent = {
     kind = "navigate",
     x = beat.x,
@@ -202,6 +213,10 @@ local function want_form(view, pos, spell, label)
 end
 
 function M.decide(view)
+  if not gateLogged then
+    gateLogged = true
+    wow.log("petrel: wet chain " .. (SWIM and "ON (PETREL_SWIM=1)" or "off"))
+  end
   -- Death = the speedrun is over. No release, no corpse run, no recovery.
   if view.is_dead or view.is_ghost then
     if not deathLogged then
@@ -290,19 +305,28 @@ function M.decide(view)
       status = bot_status(view, pos, goal) }
   end
 
-  if swimming or wading(view, pos) or mid_coast then
+  -- The wet chain also engages dry inside the entry band: standing on the
+  -- sand at water_entry must press on toward the first wet beat (the ground
+  -- route ends at the shoreline; wading and physics finish the entry).
+  if swimming or wading(view, pos) or mid_coast or
+      water_dist <= water.radius then
+    -- One goal key for the whole ribbon: the engine's shoreline-retention
+    -- clause requires the incoming goal key to match the stored one to
+    -- bridge frames where stock clears the swim flag before the body has
+    -- left the liquid. Per-beat keys would drop retention exactly at a
+    -- beat handoff. Wet beats always omit z (surface ride).
+    local reason = (swimming or mid_coast) and "swim_ribbon" or "enter_water"
     local wet = next_wet_beat(pos.x, pos.y)
     if wet then
-      local reason = swimming and ("swim_" .. wet.id) or "enter_water"
       local intent = navigate_to(view, pos, wet, reason,
-        { surface = swimming, status = { stalled_seconds = stalled } })
+        { surface = true, status = { stalled_seconds = stalled } })
       if intent then
-        wow.set_status(reason)
+        wow.set_status(string.format("%s %s %.0fyd", reason, wet.id,
+          planar(pos.x, pos.y, wet.x, wet.y)))
         return intent
       end
     end
-    local intent = navigate_to(view, pos, goal, "swim_" .. ROUTE.goal_id,
-      { surface = true })
+    local intent = navigate_to(view, pos, goal, reason, { surface = true })
     if intent then return intent end
   end
 

@@ -74,6 +74,8 @@ check(leg.x == -7100.0 and leg.y == -4600.0, "first leg is the land approach")
 check(leg.route_profile == "prefer_ground", "land legs prefer walkable ground")
 check(leg.z ~= nil, "land legs keep their z")
 check(leg.status and leg.status.beat == "land_approach", "status names the beat")
+check(leg.status.dist_goal and leg.status.dist_goal > 0,
+  "status carries planar distance to the goal")
 
 -- Past the approach band, the target is the water entry, never the beach
 -- behind us.
