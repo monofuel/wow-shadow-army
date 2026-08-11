@@ -99,10 +99,25 @@ local snagClusterTries = 0
 local progressBeatId = nil
 local progressBest = nil
 local progressAt = nil
+-- Last beat the seat actually stood on. The land beats north of the pass are
+-- resampled from a run that WALKED them, so a reached beat is proven ground
+-- and the safest place to put a lost seat back down.
+local lastReached = nil
 
 local function planar(ax, ay, bx, by)
   local dx, dy = ax - bx, ay - by
   return math.sqrt(dx * dx + dy * dy)
+end
+
+-- Distance from a point to the segment a->b, used to tell "wandering near the
+-- proven line" from "gone".
+local function seg_distance(px, py, ax, ay, bx, by)
+  local dx, dy = bx - ax, by - ay
+  local len2 = dx * dx + dy * dy
+  if len2 < 0.001 then return planar(px, py, ax, ay) end
+  local t = ((px - ax) * dx + (py - ay) * dy) / len2
+  if t < 0.0 then t = 0.0 elseif t > 1.0 then t = 1.0 end
+  return planar(px, py, ax + t * dx, ay + t * dy)
 end
 
 local function beat_by_id(id)
@@ -169,6 +184,9 @@ local function next_land_beat(x, y)
   for _, b in ipairs(LAND.beats) do
     if not skipped[b.id] and planar(x, y, b.x, b.y) <= b.radius then
       skipped[b.id] = true
+      -- Standing here retires the beat AND proves the ground: remember it as
+      -- the place to put the seat back down if walkout carries it off.
+      lastReached = { x = b.x, y = b.y }
     end
     if not skipped[b.id] and x < b.x + PASSED_YARDS then
       return b
@@ -554,7 +572,27 @@ function M.decide(view)
             -- same corridor is re-planned.
             local reach = 1 + math.min(3, math.floor(snagClusterTries / 6))
             local label
-            if snagClusterCount >= 3 then
+            -- RETURN TO PROVEN GROUND. A sidestep assumes the seat is on the
+            -- line and merely stuck against something; once walkout has
+            -- carried it off the line, ±18 yd of shuffle is noise. Trace-run
+            -- 2 drifted 130 yd north of a walked corridor while every hop
+            -- politely stepped 18 yd sideways, and the "backward" hop made
+            -- it worse — retreating along the bearing to a beat you are no
+            -- longer approaching just pushes you further out. When the seat
+            -- is more than 40 yd off the segment between the last beat it
+            -- actually stood on and the beat it is steering at, put it back
+            -- on that last beat: north of the pass those beats are resampled
+            -- from a run that walked them, so it is the one piece of ground
+            -- known to hold. Still no goal rotation — the beat is untouched
+            -- and resumes the moment the window closes.
+            if drifting and lastReached and
+                seg_distance(pos.x, pos.y, lastReached.x, lastReached.y,
+                  beat.x, beat.y) > 40.0 then
+              local back = planar(pos.x, pos.y, lastReached.x, lastReached.y)
+              snagTarget = { x = lastReached.x, y = lastReached.y }
+              snagUntil = now + 4.0 + back / 8.0
+              label = "back to proven ground"
+            elseif snagClusterCount >= 3 then
               local d = 30.0 * reach
               snagTarget = { x = pos.x - ux * d, y = pos.y - uy * d }
               snagUntil = now + 4.0 + d / 8.0

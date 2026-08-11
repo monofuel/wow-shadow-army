@@ -27,7 +27,7 @@ local petrel = require("traverse")
 check(route.goal_id == "duskwallow_coast", "route keeps the segment goal")
 -- The north land phase is a SPARSE strategy-beat list (fair play): one beat
 -- per road decision point, strictly increasing x, ending at the cave mouth.
-check(landRoute.goal_id == "felwood_cave_entrance" and #landRoute.beats == 25,
+check(landRoute.goal_id == "felwood_cave_entrance" and #landRoute.beats == 44,
   "land route is sparse and ends at the Timbermaw cave mouth")
 for i = 2, #landRoute.beats do
   check(landRoute.beats[i].x > landRoute.beats[i - 1].x,
@@ -277,6 +277,24 @@ for _ = 1, 12 do
   if closing.reason == "snag_hop" then break end
 end
 check(closing.reason ~= "snag_hop", "honest progress toward the beat never hops")
+
+
+-- A seat that walkout has carried far off the line is put back on the last
+-- beat it actually stood on, not nudged 18 yd sideways.
+nav = { state = "walkout", failed_here = true, walkout_available = true }
+clock = clock + 40.0
+-- Stand on felwood_road_bend so it becomes the proven ground...
+petrel.decide(view(3813.0, -1324.0, formed))
+-- ...then get dragged far off the line toward the beats beyond it.
+local recovered = nil
+for i = 1, 40 do
+  clock = clock + 1.0
+  local d = petrel.decide(view(3900.0 + (i % 2) * 2.0, -900.0, formed))
+  if d.reason == "snag_hop" then recovered = d break end
+end
+check(recovered ~= nil, "a seat dragged off the line still hops")
+check(math.abs(recovered.x - 3813.0) < 1.0 and math.abs(recovered.y + 1324.0) < 1.0,
+  "the hop steers back to the last beat actually stood on")
 
 -- The cave mouth is the segment goal: hold there, alive.
 clock = clock + 5.0
