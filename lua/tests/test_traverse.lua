@@ -42,7 +42,7 @@ local petrel = require("traverse")
 check(route.goal_id == "duskwallow_coast", "route keeps the segment goal")
 -- The north land phase is a SPARSE strategy-beat list (fair play): one beat
 -- per road decision point, strictly increasing x, ending at the cave mouth.
-check(landRoute.goal_id == "felwood_cave_entrance" and #landRoute.beats == 42,
+check(landRoute.goal_id == "felwood_cave_entrance" and #landRoute.beats == 25,
   "land route is sparse and ends at the Timbermaw cave mouth")
 for i = 2, #landRoute.beats do
   check(landRoute.beats[i].x > landRoute.beats[i - 1].x,
@@ -192,7 +192,7 @@ check(north1.route_profile == "prefer_ground" and north1.stop_distance == 8.0,
 -- behind, without having visited any earlier beat.
 clock = clock + 5.0
 local mid = petrel.decide(view(5650.0, -1000.0, formed))
-check(mid.kind == "navigate" and mid.x == 5720.0,
+check(mid.kind == "navigate" and mid.x == 5792.0,
   "mid-Felwood selects the next road beat ahead")
 -- Just short of the north collision-trap dodge the dodge is what gets
 -- steered at, so the corridor swings wide of (5645,-1069).

@@ -251,6 +251,89 @@ class TestSourceZSweep(unittest.TestCase):
         recovered_src_z = calls[-1][0]
         self.assertNotAlmostEqual(recovered_src_z, 50.0)
 
+    def test_source_sweep_recovers_from_bare_admissible_message(self) -> None:
+        """Helper wording without 'could not project' still must z-sweep."""
+        src = trl.Point(0.0, 0.0, 50.0)
+        tgt = trl.Point(100.0, 0.0, 50.0)
+        calls: list[tuple[float, float]] = []
+
+        def fake_call(helper, mmaps, source, target, include_flags):
+            calls.append((source.z, target.z))
+            if abs(source.z - 50.0) < 1e-9:
+                return {
+                    "status": "error",
+                    "message": (
+                        "no physically admissible source triangle was found "
+                        "near the client pose"
+                    ),
+                    "waypoints": [],
+                    "continuation_required": False,
+                    "max_segment_slope": 0.0,
+                }
+            return {
+                "status": "ok",
+                "message": "ok",
+                "waypoints": [
+                    {"x": source.x, "y": source.y, "z": source.z},
+                    {"x": target.x, "y": target.y, "z": target.z},
+                ],
+                "continuation_required": False,
+                "max_segment_slope": 0.1,
+            }
+
+        with mock.patch.object(trl, "call_helper_once", side_effect=fake_call):
+            resp = trl.single_hop_with_z_retry(
+                Path("/fake/helper"),
+                Path("/fake/mmaps"),
+                src,
+                tgt,
+                trl.INCLUDE_GROUND,
+            )
+        self.assertEqual(resp.get("status"), "ok")
+        self.assertTrue(any(abs(sz - 50.0) > 1e-9 for sz, _ in calls))
+        self.assertNotAlmostEqual(calls[-1][0], 50.0)
+
+    def test_source_sweep_retries_any_empty_waypoint_failure(self) -> None:
+        """Any no-path/failed probe (empty waypoints) retries with source z."""
+        src = trl.Point(0.0, 0.0, 100.0)
+        tgt = trl.Point(50.0, 0.0, 100.0)
+        calls: list[tuple[float, float]] = []
+
+        def fake_call(helper, mmaps, source, target, include_flags):
+            calls.append((source.z, target.z))
+            # Fail until source z is offset by +30 (first non-zero Z_OFFSETS).
+            if abs(source.z - 130.0) > 1e-9:
+                return {
+                    "status": "ok",
+                    "message": "no path",
+                    "waypoints": [],
+                    "continuation_required": False,
+                    "max_segment_slope": 0.0,
+                }
+            return {
+                "status": "ok",
+                "message": "ok",
+                "waypoints": [
+                    {"x": source.x, "y": source.y, "z": source.z},
+                    {"x": target.x, "y": target.y, "z": target.z},
+                ],
+                "continuation_required": False,
+                "max_segment_slope": 0.05,
+            }
+
+        with mock.patch.object(trl, "call_helper_once", side_effect=fake_call):
+            resp = trl.single_hop_with_z_retry(
+                Path("/fake/helper"),
+                Path("/fake/mmaps"),
+                src,
+                tgt,
+                trl.INCLUDE_GROUND,
+            )
+        self.assertEqual(resp.get("status"), "ok")
+        self.assertTrue(resp.get("waypoints"))
+        self.assertAlmostEqual(calls[-1][0], 130.0)
+        self.assertGreater(len(calls), 1)
+
     def test_all_projection_failures_returns_last(self) -> None:
         def fake_call(helper, mmaps, source, target, include_flags):
             return {

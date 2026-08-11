@@ -184,12 +184,35 @@ def spawn_warnings_for_leg(
 
 
 def _is_projection_failure(message: str) -> bool:
+    """True when the helper message indicates a failed / no-path probe.
+
+    Any no-path or failed probe should trigger source/target z-sweep: recorded
+    beat z is often 10-40 yd off the mesh surface, and the helper's wording
+    varies ("could not project", "no physically admissible …", bare "no path").
+    """
     m = (message or "").lower()
+    if not m:
+        return False
     return (
         "could not project" in m
-        or "no physically admissible source triangle" in m
         or "no physically admissible" in m
+        or "no path" in m
+        or "failed" in m
+        or "error" in m
+        or "unable" in m
     )
+
+
+def _should_retry_with_z_sweep(resp: dict[str, Any]) -> bool:
+    """Retry z-sweep on any failed/incomplete hop, not only projection wording."""
+    status = str(resp.get("status") or "").lower()
+    if status in ("error", "failed", "fail"):
+        return True
+    wps = resp.get("waypoints") or []
+    if not wps:
+        return True
+    msg = str(resp.get("message") or "")
+    return _is_projection_failure(msg)
 
 
 def _parse_point(obj: Any) -> Point | None:
@@ -271,8 +294,7 @@ def single_hop_with_z_retry(
     last: dict[str, Any] = {}
     for s, t in z_sweep_candidates(source, target):
         last = call_helper_once(helper, mmaps, s, t, include_flags)
-        msg = str(last.get("message") or "")
-        if not _is_projection_failure(msg):
+        if not _should_retry_with_z_sweep(last):
             return last
     return last
 
