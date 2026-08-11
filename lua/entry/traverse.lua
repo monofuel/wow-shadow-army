@@ -17,6 +17,7 @@
 local M = { name = "petrel" }
 
 local ROUTE = require("config.traverse_beats")
+local LAND = require("config.traverse_land_beats")
 
 -- Wet-chain gate: PETREL_SWIM=1 opts a run into the wet chain. Default off
 -- keeps traverse-desert's land-only PASS semantics ("awaiting_swim_pass").
@@ -82,10 +83,61 @@ local parkCheckPos = nil
 local parkCheckAt = nil
 local parkCheckFrames = nil
 local surfaceUntil = nil
+local snagCheckPos = nil
+local snagCheckAt = nil
+local snagCheckFrames = nil
+local snagUntil = nil
+local snagTarget = nil
+local snagSide = 1
+local snagClusterPos = nil
+local snagClusterCount = 0
+-- Total hops spent inside the CURRENT snag cluster; unlike snagClusterCount
+-- it never cycles, so the hop reach can grow the longer a wall holds us.
+local snagClusterTries = 0
+-- Closing-on-the-beat watch: a seat can be moving and still be snagged if
+-- the client is walking it out sideways instead of down the corridor.
+local progressBeatId = nil
+local progressBest = nil
+local progressAt = nil
+-- Last beat the seat actually stood on. The land beats north of the pass are
+-- resampled from a run that WALKED them, so a reached beat is proven ground
+-- and the safest place to put a lost seat back down.
+local lastReached = nil
+
+-- Flight recorder: permanent telemetry + edge-triggered anomaly events.
+-- Exists because a human replay watch caught pauses / path-leaving /
+-- water-entry / z-clips that pass-fail telemetry missed. Pure logging —
+-- never changes intents.
+local lastFlightAt = nil
+local lastEvAt = nil
+local prevLandBeat = nil
+local currLandBeatId = nil
+local currLandBeatXY = nil
+local swimEvArmed = true
+local drySwimSince = nil
+local lastFormId = nil
+local lastFrameZ = nil
+local lastFrameSwimming = nil
+local offLineSince = nil
+local offLineFired = false
+-- Off-line only arms after the seat has been on the chord (xt < 20) once —
+-- otherwise test teleports / first-frame wedges would false-positive.
+local offLineArmed = false
 
 local function planar(ax, ay, bx, by)
   local dx, dy = ax - bx, ay - by
   return math.sqrt(dx * dx + dy * dy)
+end
+
+-- Distance from a point to the segment a->b, used to tell "wandering near the
+-- proven line" from "gone".
+local function seg_distance(px, py, ax, ay, bx, by)
+  local dx, dy = bx - ax, by - ay
+  local len2 = dx * dx + dy * dy
+  if len2 < 0.001 then return planar(px, py, ax, ay) end
+  local t = ((px - ax) * dx + (py - ay) * dy) / len2
+  if t < 0.0 then t = 0.0 elseif t > 1.0 then t = 1.0 end
+  return planar(px, py, ax + t * dx, ay + t * dy)
 end
 
 local function beat_by_id(id)
@@ -143,6 +195,43 @@ local function next_wet_beat(x, y, fatigued)
   return wet[#wet]
 end
 
+--- First land beat still ahead of us, same monotonic shape as the wet
+--- selection: capture retires a beat forever, and a beat well behind our X
+--- never regresses the run — except hook beats (westward Timbermaw descent),
+--- which are only retired by capture. Land capture is the full beat radius.
+local function next_land_beat(x, y)
+  for _, b in ipairs(LAND.beats) do
+    if not skipped[b.id] and planar(x, y, b.x, b.y) <= b.radius then
+      skipped[b.id] = true
+      -- Standing here retires the beat AND proves the ground: remember it as
+      -- the place to put the seat back down if walkout carries it off.
+      lastReached = { x = b.x, y = b.y }
+    end
+    if not skipped[b.id] and (b.hook or x < b.x + PASSED_YARDS) then
+      return b
+    end
+  end
+  return LAND.beats[#LAND.beats]
+end
+
+-- Read-only twin of next_land_beat for the flight recorder: same selection
+-- shape without mutating skipped / lastReached (those side effects must stay
+-- on the real navigate path so form-cast early returns do not change policy).
+local function peek_land_beat(x, y)
+  local retired = {}
+  for _, b in ipairs(LAND.beats) do
+    if not skipped[b.id] and not retired[b.id]
+        and planar(x, y, b.x, b.y) <= b.radius then
+      retired[b.id] = true
+    end
+    if not skipped[b.id] and not retired[b.id]
+        and (b.hook or x < b.x + PASSED_YARDS) then
+      return b
+    end
+  end
+  return LAND.beats[#LAND.beats]
+end
+
 local function bot_status(view, pos, beat, extra)
   local water = beat_by_id("water_entry")
   local goal = beat_by_id(ROUTE.goal_id)
@@ -162,6 +251,125 @@ local function bot_status(view, pos, beat, extra)
   }
   for k, v in pairs(extra or {}) do status[k] = v end
   return status
+end
+
+local function mark_ev()
+  lastEvAt = wow.time()
+end
+
+--- Permanent flight recorder + anomaly EVs. Logging only; never returns an
+--- intent. Must run after position is known and before any early form-cast
+--- return so unplanned-swim still fires on the wet frame that casts aquatic.
+local function flight_recorder(view, pos, land_phase)
+  local now = wow.time()
+  local swimming = view.is_swimming == true
+  local formId = view.shapeshift_form_id or 0
+  local beatId = "-"
+  local xt = -1.0
+
+  if land_phase then
+    local beat = peek_land_beat(pos.x, pos.y)
+    beatId = beat and beat.id or "-"
+    if beat then
+      if prevLandBeat == nil then
+        -- Chord starts at land-phase entry pose until the first beat swap.
+        prevLandBeat = { x = pos.x, y = pos.y }
+        currLandBeatId = beat.id
+        currLandBeatXY = { x = beat.x, y = beat.y }
+        offLineSince, offLineFired, offLineArmed = nil, false, false
+      elseif beat.id ~= currLandBeatId then
+        prevLandBeat = currLandBeatXY
+        currLandBeatId = beat.id
+        currLandBeatXY = { x = beat.x, y = beat.y }
+        offLineSince, offLineFired, offLineArmed = nil, false, false
+      end
+      if prevLandBeat then
+        xt = seg_distance(pos.x, pos.y, prevLandBeat.x, prevLandBeat.y,
+          beat.x, beat.y)
+      end
+    end
+  end
+
+  -- EV unplanned_swim: one event per land-phase swim bout; re-arm after
+  -- dry for 5+ sim-seconds.
+  if swimming then
+    drySwimSince = nil
+    if land_phase and swimEvArmed then
+      swimEvArmed = false
+      mark_ev()
+      wow.log(string.format("EV unplanned_swim x=%.1f y=%.1f", pos.x, pos.y))
+    end
+  else
+    if drySwimSince == nil then
+      drySwimSince = now
+    elseif now - drySwimSince >= 5.0 then
+      swimEvArmed = true
+    end
+  end
+
+  -- EV form_lost / form_gained on shapeshift_form_id edges.
+  if lastFormId ~= nil and formId ~= lastFormId then
+    if lastFormId ~= 0 then
+      mark_ev()
+      wow.log(string.format("EV form_lost form=%d x=%.1f y=%.1f",
+        lastFormId, pos.x, pos.y))
+    end
+    if formId ~= 0 then
+      mark_ev()
+      wow.log(string.format("EV form_gained form=%d x=%.1f y=%.1f",
+        formId, pos.x, pos.y))
+    end
+  end
+  lastFormId = formId
+
+  -- EV clip: large z jump between frames while dry on both sides.
+  if lastFrameZ ~= nil and not swimming and lastFrameSwimming == false then
+    local dz = math.abs((pos.z or 0) - lastFrameZ)
+    if dz > 10.0 then
+      mark_ev()
+      wow.log(string.format("EV clip dz=%.1f x=%.1f y=%.1f z=%.1f",
+        dz, pos.x, pos.y, pos.z or 0))
+    end
+  end
+  lastFrameZ = pos.z or 0
+  lastFrameSwimming = swimming
+
+  -- EV off_line: land cross-track > 35 sustained 5s after once being on
+  -- the line (xt < 20). Re-arm when xt drops back below 20.
+  if land_phase and xt >= 0.0 then
+    if xt < 20.0 then
+      offLineArmed = true
+      offLineFired = false
+      offLineSince = nil
+    elseif offLineArmed and xt > 35.0 then
+      if offLineSince == nil then offLineSince = now end
+      if not offLineFired and now - offLineSince >= 5.0 then
+        offLineFired = true
+        mark_ev()
+        wow.log(string.format("EV off_line xt=%.1f x=%.1f y=%.1f",
+          xt, pos.x, pos.y))
+      end
+    else
+      offLineSince = nil
+    end
+  end
+
+  -- FLIGHT cadence: 5s normal, 1s for 10s after any EV.
+  local cadence = 5.0
+  if lastEvAt and now - lastEvAt < 10.0 then cadence = 1.0 end
+  if lastFlightAt == nil or now - lastFlightAt >= cadence then
+    lastFlightAt = now
+    local hp = -1
+    if view.health_known then hp = math.floor(view.health or 0) end
+    wow.log(string.format(
+      'FLIGHT {"t":%.1f,"x":%.1f,"y":%.1f,"z":%.1f,"hp":%d,"form":%d,' ..
+      '"swim":%s,"combat":%s,"nav":"%s","beat":"%s","xt":%.1f}',
+      now, pos.x, pos.y, pos.z or 0, hp, formId,
+      swimming and "true" or "false",
+      (view.in_combat == true) and "true" or "false",
+      tostring(wow.nav_progress().state or "?"),
+      beatId, xt))
+  end
 end
 
 --- Progress watchdog. Returns stall seconds (0 when moving) and logs the
@@ -375,19 +583,195 @@ function M.decide(view)
   local near_water = water_dist <= water.radius + 120.0
   -- North of the entry band: never re-target the beach.
   local mid_coast = pos.x > water.x + 40.0
+  -- At/past the top of the Barrens the run is on roads: the north land
+  -- phase owns it (the mid_coast guard below is about the Tanaris beach and
+  -- must not block Travel Form recasts up here).
+  local land_phase = pos.x >= LAND.start_x
+
+  -- Flight recorder + anomaly EVs (logging only). Before form casts so a
+  -- land-phase swim frame still records unplanned_swim before aquatic cast.
+  flight_recorder(view, pos, land_phase)
 
   -- Forms are speed, and speed is the score. Aquatic whenever wet (even off
   -- plan — drowning slower is still better); Travel on dry open ground.
+  -- Forms are also the ONLY casts this brain ever emits: no heals, no
+  -- defensive cooldowns, no form canceling — casting means standing still,
+  -- and standing still is the only way this bot dies (doctrine,
+  -- docs/traverse/README.md).
   if swimming then
     if not in_aquatic_form(view) then
       local cast = want_form(view, pos, AQUATIC_FORM_SPELL, "aquatic_form")
       if cast then return cast end
     end
-  elseif not near_water and not mid_coast then
+  elseif land_phase or (not near_water and not mid_coast) then
     if not in_travel_form(view) then
       local cast = want_form(view, pos, TRAVEL_FORM_SPELL, "travel_form")
       if cast then return cast end
     end
+  end
+
+  -- North land phase: top of the Barrens through Ashenvale and Felwood to
+  -- the Timbermaw cave mouth. Sparse road beats + mesh navigation, always
+  -- moving; never fight, never heal, never stop.
+  if land_phase then
+    local lgoal = LAND.beats[#LAND.beats]
+    if planar(pos.x, pos.y, lgoal.x, lgoal.y) <= lgoal.radius then
+      -- Holding at the segment goal by choice is not a stall.
+      lastPos, lastProgressAt, stallSince = { x = pos.x, y = pos.y },
+        wow.time(), nil
+      wow.set_status("goal: " .. LAND.goal_id)
+      return { kind = "hold", reason = LAND.goal_id,
+        status = bot_status(view, pos, lgoal, { phase = "north_land" }) }
+    end
+    local beat = next_land_beat(pos.x, pos.y)
+
+    -- Snag hop: the nim client's collision can pin the seat on a road-side
+    -- point object — corridor planned, but every ground input toward it is
+    -- rejected ("no productive ground input", failed_here, no walkout) and
+    -- the seat freezes to the millimeter (run 2 wedge at (3322,-1640),
+    -- 2026-08-10). The goal NEVER rotates: open a short window that steps
+    -- ~18 yd perpendicular to the beat bearing (alternating sides) purely
+    -- to change the physical contact, then resume the same beat. Land twin
+    -- of the wet park detector's surface-ride window.
+    local now = wow.time()
+    if snagUntil and now < snagUntil and snagTarget then
+      return { kind = "navigate", x = snagTarget.x, y = snagTarget.y,
+        z = pos.z, map_id = math.floor(view.location.map_id or ROUTE.map_id),
+        stop_distance = 4.0, route_profile = "prefer_ground",
+        reason = "snag_hop",
+        status = bot_status(view, pos, beat,
+          { phase = "north_land", snag_hop = true }) }
+    end
+    snagUntil, snagTarget = nil, nil
+    -- Trigger on the FROZEN SEAT itself, not on any nav-state combination:
+    -- the run-2 death froze under nav=walkout ("input returned to the same
+    -- pose") while a mob train burned 138 hp/sim-s — the seat was pinned
+    -- but the walkout machinery still claimed progress was possible.
+    -- ...and on a seat that MOVES without ever getting closer. A frozen
+    -- seat is only the loud half of a snag. When the client cannot follow
+    -- the planned corridor it drops to "walkout" and drives the seat off
+    -- on its own — still moving, so the freeze test never trips, while the
+    -- brain waits. That wander is what has actually been killing this
+    -- segment: leaving north_road_2 the seat walks 55 yd SOUTH of a
+    -- corridor that stays clear of the Felpaw camp and straight through
+    -- the camp instead (runs 10, 11 and valley-run 1 each lost 350-1200 hp
+    -- there), and the three walls that ended valley-run 1 at (6034,-1280),
+    -- (6069,-1305) and (6196,-1419) all sit 45-69 yd OFF the planned
+    -- corridor — the seat only reached them by wandering. So treat "no
+    -- closing on the beat for 15 sim-s" as a snag too and hand it to the
+    -- same hop machinery. The beat never changes; only the seat's contact
+    -- with the geometry does.
+    local bdist = planar(pos.x, pos.y, beat.x, beat.y)
+    if progressBeatId ~= beat.id or progressAt == nil then
+      progressBeatId, progressBest, progressAt = beat.id, bdist, now
+    elseif bdist < progressBest - 5.0 then
+      progressBest, progressAt = bdist, now
+    end
+    local drifting = (now - progressAt) > 15.0
+    local pinned = view.movement_allowed and not view.rooted
+    if pinned or drifting then
+      if not drifting and (snagCheckPos == nil or
+          planar(pos.x, pos.y, snagCheckPos.x, snagCheckPos.y) > 1.0) then
+        snagCheckPos, snagCheckAt, snagCheckFrames =
+          { x = pos.x, y = pos.y }, now, 0
+      else
+        snagCheckFrames = (snagCheckFrames or 0) + 1
+        -- 5 sim-s clears a pilot form-cast pause; 8 real frames keeps
+        -- jumpy test clocks from tripping it.
+        if drifting or (snagCheckAt and now - snagCheckAt > 5.0 and
+            snagCheckFrames >= 8) then
+          local dx, dy = beat.x - pos.x, beat.y - pos.y
+          local len = math.sqrt(dx * dx + dy * dy)
+          if len > 0.1 then
+            local ux, uy = dx / len, dy / len
+            -- Escalate within a snag cluster: left, then right, then
+            -- RETREAT along the bearing — the way in is the one exit
+            -- proven walkable (run 6 died oscillating ±10 yd at
+            -- (3724,-1407) with both flanks blocked while a mob train
+            -- burned it down).
+            if snagClusterPos and
+                planar(pos.x, pos.y, snagClusterPos.x, snagClusterPos.y) <= 30.0 then
+              snagClusterCount = snagClusterCount + 1
+              snagClusterTries = snagClusterTries + 1
+            else
+              snagClusterPos = { x = pos.x, y = pos.y }
+              snagClusterCount = 1
+              snagClusterTries = 1
+            end
+            -- ESCALATE THE REACH, not the goal. Some of these pins are not
+            -- point objects at all but long baked walls the mesh does not
+            -- model: run 8 (2026-08-10) burned 131 hops on one pose at
+            -- (2615,-1801) and run 1 burned 67 at (4774,-806), every one of
+            -- them an 18/30 yd shuffle inside the same wall. A fixed reach
+            -- can only ever free a snag narrower than itself, so the reach
+            -- grows with how long this cluster has held us: 18 -> 36 -> 54
+            -- -> 72 yd on the flanks (30 -> 120 backward), which is enough
+            -- to walk around a wall instead of rubbing along it. The beat
+            -- never changes and no new destination is adopted — this is
+            -- still one short window of physical repositioning, then the
+            -- same corridor is re-planned.
+            local reach = 1 + math.min(3, math.floor(snagClusterTries / 6))
+            local label
+            -- RETURN TO PROVEN GROUND. A sidestep assumes the seat is on the
+            -- line and merely stuck against something; once walkout has
+            -- carried it off the line, ±18 yd of shuffle is noise. Trace-run
+            -- 2 drifted 130 yd north of a walked corridor while every hop
+            -- politely stepped 18 yd sideways, and the "backward" hop made
+            -- it worse — retreating along the bearing to a beat you are no
+            -- longer approaching just pushes you further out. When the seat
+            -- is more than 40 yd off the segment between the last beat it
+            -- actually stood on and the beat it is steering at, put it back
+            -- on that last beat: north of the pass those beats are resampled
+            -- from a run that walked them, so it is the one piece of ground
+            -- known to hold. Still no goal rotation — the beat is untouched
+            -- and resumes the moment the window closes.
+            if drifting and lastReached and
+                seg_distance(pos.x, pos.y, lastReached.x, lastReached.y,
+                  beat.x, beat.y) > 40.0 then
+              local back = planar(pos.x, pos.y, lastReached.x, lastReached.y)
+              snagTarget = { x = lastReached.x, y = lastReached.y }
+              snagUntil = now + 4.0 + back / 8.0
+              label = "back to proven ground"
+            elseif snagClusterCount >= 3 then
+              local d = 30.0 * reach
+              snagTarget = { x = pos.x - ux * d, y = pos.y - uy * d }
+              snagUntil = now + 4.0 + d / 8.0
+              label = "backward"
+              if snagClusterCount >= 5 then snagClusterCount = 0 end
+            else
+              local d = 18.0 * reach
+              snagSide = -snagSide
+              snagTarget = { x = pos.x - uy * d * snagSide,
+                y = pos.y + ux * d * snagSide }
+              snagUntil = now + 4.0 + d / 8.0
+              label = snagSide > 0 and "left" or "right"
+            end
+            snagCheckPos, snagCheckAt, snagCheckFrames = nil, nil, nil
+            -- The hop itself is not "progress"; give it a fresh window so
+            -- the drift test judges the corridor, not the sidestep.
+            progressBest, progressAt = bdist, now
+            wow.log(string.format(
+              "SNAG: %s at (%.1f, %.1f) — hopping %s to (%.1f, %.1f) (cluster %d reach %d)",
+              drifting and "drifting" or "pinned",
+              pos.x, pos.y, label, snagTarget.x, snagTarget.y,
+              snagClusterCount, reach))
+          end
+        end
+      end
+    else
+      snagCheckPos, snagCheckAt, snagCheckFrames = nil, nil, nil
+    end
+
+    local intent = navigate_to(view, pos, beat, beat.id,
+      { stop = 8.0,
+        status = { phase = "north_land", stalled_seconds = stalled } })
+    if intent then
+      wow.set_status(string.format("north_land %s %.0fyd", beat.id,
+        planar(pos.x, pos.y, beat.x, beat.y)))
+      return intent
+    end
+    return { kind = "hold", reason = "replanning",
+      status = bot_status(view, pos, beat, { phase = "north_land" }) }
   end
 
   if not SWIM then

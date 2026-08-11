@@ -25,6 +25,23 @@ monofuel's manual run of the course:
    `STALL` line (position + nav state) and holds its goal. It never
    thrashes destinations to escape a stall — a healthy route with a frozen
    seat is a host/client bug to diagnose, not a brain state to farm.
+4. **Never heal, never defensive-cast.** Casting means standing still, and
+   standing still is the only way this bot dies. In-combat heals are
+   strictly worse than running: vanilla spell pushback rewinds the cast bar
+   on every hit while the mob keeps swinging. Travel Form + motion is the
+   entire defense; the only casts the brain may ever emit are the two
+   forms. (Cautionary tale: GPT 5.6 Sol's Felwood heal stack, 2026-08-10 —
+   Nature's Grasp/Barkskin/Rejuv/Healing Touch on four timers turned the
+   run into stop-cast-die. Third AI to try some form of this. The lua test
+   suite now carries a doctrine guard that fails on any heal/defensive
+   spell ID in the brain.)
+5. **`/cancelform` does not exist in 1.12.** At least three AIs have now
+   hallucinated this command; typing it does nothing and the host machinery
+   built around it stands the bot still until a timeout. Forms drop
+   automatically when relevant (Travel Form on entering water) and toggle
+   by recasting — nothing on this run ever needs a form canceled. Any plan
+   containing `/cancelform` or mid-run healing is wrong by construction;
+   the doctrine guard in `lua/tests/test_traverse.lua` fails on the string.
 
 ## Mission facts
 
@@ -81,8 +98,62 @@ Learned from the route engine source; do not rediscover it the hard way:
 | `make traverse-headed` | Headed run (human use — agents stay headless) |
 | `make traverse-checkpoints` | List SOAP tele checkpoints (local debug) |
 
-Readback: `local_data/lua-bot-status.json` (beat, position, dist to water,
-stall seconds); run + CPU logs in `local_data/health-logs/`.
+Readback: `local_data/traverse-status/status.json` (traverse-private —
+the shared `lua-bot-status.json` is written by every lua-bot league and
+gets clobbered under concurrent runs); run + CPU logs in
+`local_data/health-logs/`.
+
+## Observability: progress is not health
+
+A run that reaches its endpoint while swimming off-plan, clipping through
+terrain, or idling 20% of its time is a failing run that got lucky — and
+monofuel's headed replay watches kept catching exactly those failures while
+the pass/fail verdicts looked fine. Three instruments now make them loud in
+headless runs:
+
+- **Flight recorder** (brain): `FLIGHT {json}` telemetry every 5 sim-s
+  (1 sim-s while anomalous) with position, hp, form, swim/combat flags,
+  nav state, active beat, and cross-track distance from the beat chord —
+  plus edge-triggered `EV` lines: `unplanned_swim` (land phase + swim flag:
+  the lake-chord failure), `form_lost`/`form_gained`, `clip` (z jump while
+  dry: terrain glitch-through), `off_line` (>35 yd off the chord for 5 s).
+- **Per-run scorecard** (`tools/traverse_scorecard.py`, auto-run by the
+  segment waiter): stopped seconds BY REASON, cross-track p50/p95/max,
+  swim/clip/form events, hp loss per 100-yd bin (the damage map), snag
+  clusters. `WARN` lines fire on: idle fraction > 0.15, cross-track
+  p95 > 25 yd, any unplanned swim, any clip, any bin losing > 800 hp.
+  Verdicts stay pass/fail; WARNs are the "a human would wince" channel —
+  treat a WARN-heavy PASS as a bug report, not a success.
+- **Route lint** (`make traverse-lint`, in `make test`): offline navmesh
+  check of every land-beat leg — broken corridors, slopes the client
+  cannot climb (>1.5), and water-crossing land legs (probed ground-only vs
+  ground+water: the class that produced the lake and waterfall incidents)
+  FAIL before any live run; hostile spawns within 12 yd of the chord WARN
+  (aggro floor here is ~7–11 yd, mobs 47–53 vs a level-60 seat).
+
+Raw feed: `local_data/traverse-status/run.log` (tee'd from every
+`make traverse` / `traverse-headed` launch).
+
+### Known issues — room for improvement (monofuel's watch, 2026-08-11)
+
+The felwood segment gate is met (2x clean PASS), but the bot is not yet
+competitive:
+
+1. **Move -> wait -> move -> wait.** The bot still spends real time paused
+   between movements. A speedrun bot should NEVER be idle — a competitor's
+   bot does not pause at all and finishes the run faster than ours. The
+   scorecard's idle numbers (3.7-4.1%) understate what the eye sees; the
+   stop-time-by-reason taxonomy is the tool for hunting the remaining
+   pauses (suspects: per-beat corridor replans, form-cast holds, the
+   pilot's settle-before-cast waits).
+2. **Beside the road, not on it.** The route beats sit on the painted
+   road, but between beats the seat runs alongside the road or cuts
+   through the woods whenever the road bends — mesh corridors are
+   straight-ish chords, so every bend gets shortcut. Cross-track p95 is
+   still 60-80 yd on passing runs. Getting ON the road consistently
+   probably means denser bend beats from the road mask (`road_mask.py
+   dump` the bends, beat the apexes) or corridor-vs-paint scoring in the
+   lint — the road-following is "close-ish", not faithful.
 
 Suspected prior blocker, still under investigation: RPB logic pegging a
 core and starving world streaming, so the bot outruns terrain loading and
@@ -93,6 +164,7 @@ it in the act. Evidence first; no guess-fixes.
 
 | Doc | What it is |
 |---|---|
+| [route-engineering.md](route-engineering.md) | The cookbook: offline corridor probing, spawn-field analysis, road detection from painted textures, trace-pinning, autopsy order |
 | [reference-logs.md](reference-logs.md) | Manual F9 recordings: the Great Lift rides (both platforms, up+down) and the 77 MB coast-swim run |
 | [petrel-plan.md](petrel-plan.md) | Plan of record — legs, fatigue, swim-north, weekend contender thesis |
 | [duskwallow-plan.md](duskwallow-plan.md) | Isolated swim segment — water entry → Dustwallow; scoreboard + gates |

@@ -34,7 +34,7 @@ if [[ -z "${TRAVERSE_CAPTURES_DIR:-}" || -z "${TRAVERSE_RUN_DIR:-}" ]]; then
         latest_mtime=$m
         latest_godview=$f
       fi
-    done < <(find "$RUNTIME_ROOT" -type f -path '*/leagues/traverse/captures/godview_*.jsonl' -print0 2>/dev/null)
+    done < <(find "$RUNTIME_ROOT" -type f -path '*/leagues/*/captures/godview_*.jsonl' -print0 2>/dev/null)
   fi
   if [[ -z "$latest_godview" ]]; then
     echo "error: no traverse godview captures under $RUNTIME_ROOT" >&2

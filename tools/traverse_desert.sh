@@ -11,7 +11,7 @@ set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 FORK="$(cd "$ROOT/../monofuel-vanilla-wow" && pwd)"
-STATUS="$ROOT/local_data/lua-bot-status.json"
+STATUS="$ROOT/local_data/traverse-status/status.json"
 LOGDIR="$ROOT/local_data/health-logs"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 RUN_LOG="$LOGDIR/traverse-desert-$STAMP.log"
@@ -27,7 +27,8 @@ echo "traverse-desert: $RUN_SECONDS s headless run -> $RUN_LOG"
   cd "$FORK" &&
   PETREL_SWIM=0 nix develop "$FORK" --command \
     timeout "$RUN_SECONDS" nim r tools/launch_nim_player.nim -- \
-    --league=traverse --bot=lua-bot \
+    --league=race --bot=lua-bot \
+    --lua-status-dir="$ROOT/local_data/traverse-status" \
     --lua-repo="$ROOT" --lua-entry=traverse \
     --presentation=headless
 ) >"$RUN_LOG" 2>&1 &
