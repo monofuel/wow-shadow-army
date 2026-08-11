@@ -36,6 +36,8 @@ end
 
 local route = require("config.traverse_beats")
 local landRoute = require("config.traverse_land_beats")
+local connectorRoute = require("config.traverse_connector_land_beats")
+local finaleRoute = require("config.traverse_finale_beats")
 local petrel = require("traverse")
 
 -- The route data survived the move off host-injected args.
@@ -45,6 +47,10 @@ check(route.goal_id == "duskwallow_coast", "route keeps the segment goal")
 -- ending at the cave mouth.
 check(landRoute.goal_id == "felwood_cave_entrance" and #landRoute.beats == 34,
   "land route is sparse and ends at the Timbermaw cave mouth")
+check(connectorRoute.goal_id == "top_barrens" and #connectorRoute.beats == 9,
+  "connector route reaches the northern land handoff")
+check(finaleRoute.goal_id == "everlook" and #finaleRoute.beats == 13,
+  "finale route follows the canonical road to Everlook")
 for i = 2, #landRoute.beats do
   check(landRoute.beats[i].hook or landRoute.beats[i].x > landRoute.beats[i - 1].x,
     "land beats march north monotonically (hooks exempt)")
@@ -334,11 +340,24 @@ check(hookNav.kind == "navigate" and hookNav.reason ~= "snag_hop"
     and hookNav.x == 6612.0,
   "hook beat timbermaw_road_11 is not x-skipped past its X band")
 
--- The cave mouth is the segment goal: hold there, alive.
+-- The cave mouth is a handoff: the full run continues into Timbermaw.
 clock = clock + 5.0
 local atCave = petrel.decide(view(6500.0, -2060.0, formed))
-check(atCave.kind == "hold" and atCave.reason == "felwood_cave_entrance",
-  "holds at the Timbermaw cave mouth")
+check(atCave.kind == "navigate" and atCave.reason == "timbermaw_hold",
+  "continues through the Timbermaw cave handoff")
+
+-- Once Timbermaw owns the run, a fall/failsafe relocation back into Felwood
+-- must stay a finale failure instead of silently resuming the old land route.
+clock = clock + 5.0
+local afterFinaleFall = petrel.decide(view(5935.5, -1217.8, formed))
+check(afterFinaleFall.kind == "navigate" and
+    afterFinaleFall.reason == "timbermaw_hold",
+  "finale ownership survives a Timbermaw failsafe relocation")
+
+clock = clock + 5.0
+local atEverlook = petrel.decide(view(6687.3, -4647.7, formed))
+check(atEverlook.kind == "hold" and atEverlook.reason == "everlook",
+  "holds only at the final Everlook goal")
 
 -- Flight recorder: land navigation emits FLIGHT telemetry with beat + xt.
 local flightLine = any_log("FLIGHT ")

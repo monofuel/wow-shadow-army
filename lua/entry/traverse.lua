@@ -19,6 +19,9 @@ local M = { name = "petrel" }
 local ROUTE = require("config.traverse_beats")
 local LAND = require("config.traverse_land_beats")
 local COAST = require("config.traverse_coast_beats")
+local CONNECT_WET = require("config.traverse_connector_wet_beats")
+local CONNECT_LAND = require("config.traverse_connector_land_beats")
+local FINALE = require("config.traverse_finale_beats")
 
 -- Wet-chain gate: PETREL_SWIM=1 opts a run into the wet chain. Default off
 -- keeps traverse-desert's land-only PASS semantics ("awaiting_swim_pass").
@@ -104,6 +107,9 @@ local progressAt = nil
 -- resampled from a run that WALKED them, so a reached beat is proven ground
 -- and the safest place to put a lost seat back down.
 local lastReached = nil
+local connectorStarted = false
+local connectorComplete = false
+local finaleStarted = false
 
 -- Flight recorder: permanent telemetry + edge-triggered anomaly events.
 -- Exists because a human replay watch caught pauses / path-leaving /
@@ -148,6 +154,11 @@ local function beat_by_id(id)
   for _, b in ipairs(COAST.beats) do
     if b.id == id then return b end
   end
+  for _, route in ipairs({ LAND, CONNECT_WET, CONNECT_LAND, FINALE }) do
+    for _, b in ipairs(route.beats) do
+      if b.id == id then return b end
+    end
+  end
   return nil
 end
 
@@ -183,8 +194,12 @@ local function next_wet_beat(x, y, fatigued)
   for _, b in ipairs(COAST.beats) do
     wet[#wet + 1] = b
   end
+  for _, b in ipairs(CONNECT_WET.beats) do
+    wet[#wet + 1] = b
+  end
   if #wet == 0 then return nil end
-  for _, b in ipairs(wet) do
+  local captured = 0
+  for i, b in ipairs(wet) do
     -- Entering a beat's capture zone retires it permanently: monotonic
     -- selection, no boundary flip-flop.
     -- Refill beats demand the tight touch only while the bar is actually
@@ -192,8 +207,11 @@ local function next_wet_beat(x, y, fatigued)
     -- run timed out 216 yd short paying it on every beat).
     local cap = (b.refill and fatigued) and 5.0 or WET_SELECT_YARDS
     if not skipped[b.id] and planar(x, y, b.x, b.y) <= cap then
-      skipped[b.id] = true
+      captured = i
     end
+  end
+  for i = 1, captured do skipped[wet[i].id] = true end
+  for _, b in ipairs(wet) do
     -- hook or still south of the X-pass band (land selector shape).
     if not skipped[b.id] and (b.hook or x < b.x + PASSED_YARDS) then
       if b.x + b.radius >= x - 40.0 then
@@ -202,6 +220,37 @@ local function next_wet_beat(x, y, fatigued)
     end
   end
   return wet[#wet]
+end
+
+local function next_sparse_beat(route, x, y)
+  local captured = 0
+  for i, b in ipairs(route.beats) do
+    if not skipped[b.id] and planar(x, y, b.x, b.y) <= b.radius then
+      captured = i
+    end
+  end
+  for i = 1, captured do skipped[route.beats[i].id] = true end
+  for _, b in ipairs(route.beats) do
+    if not skipped[b.id] and (b.hook or x < b.x + PASSED_YARDS) then
+      return b
+    end
+  end
+  return route.beats[#route.beats]
+end
+
+local function peek_sparse_beat(route, x, y)
+  local retired = {}
+  for _, b in ipairs(route.beats) do
+    if not skipped[b.id] and not retired[b.id] and
+        planar(x, y, b.x, b.y) <= b.radius then
+      retired[b.id] = true
+    end
+    if not skipped[b.id] and not retired[b.id] and
+        (b.hook or x < b.x + PASSED_YARDS) then
+      return b
+    end
+  end
+  return route.beats[#route.beats]
 end
 
 --- First land beat still ahead of us, same monotonic shape as the wet
@@ -271,15 +320,16 @@ end
 --- Permanent flight recorder + anomaly EVs. Logging only; never returns an
 --- intent. Must run after position is known and before any early form-cast
 --- return so unplanned-swim still fires on the wet frame that casts aquatic.
-local function flight_recorder(view, pos, land_phase)
+local function flight_recorder(view, pos, land_route)
   local now = wow.time()
   local swimming = view.is_swimming == true
   local formId = view.shapeshift_form_id or 0
   local beatId = "-"
   local xt = -1.0
 
-  if land_phase then
-    local beat = peek_land_beat(pos.x, pos.y)
+  if land_route then
+    local beat = land_route == LAND and peek_land_beat(pos.x, pos.y) or
+      peek_sparse_beat(land_route, pos.x, pos.y)
     beatId = beat and beat.id or "-"
     if beat then
       if prevLandBeat == nil then
@@ -305,7 +355,7 @@ local function flight_recorder(view, pos, land_phase)
   -- dry for 5+ sim-seconds.
   if swimming then
     drySwimSince = nil
-    if land_phase and swimEvArmed then
+    if land_route and swimEvArmed then
       swimEvArmed = false
       mark_ev()
       wow.log(string.format("EV unplanned_swim x=%.1f y=%.1f", pos.x, pos.y))
@@ -347,7 +397,7 @@ local function flight_recorder(view, pos, land_phase)
 
   -- EV off_line: land cross-track > 35 sustained 5s after once being on
   -- the line (xt < 20). Re-arm when xt drops back below 20.
-  if land_phase and xt >= 0.0 then
+  if land_route and xt >= 0.0 then
     if xt < 20.0 then
       offLineArmed = true
       offLineFired = false
@@ -469,7 +519,8 @@ local function navigate_to(view, pos, beat, reason, opts)
     -- host's ascent toward a near-surface target is what launched the bot
     -- clear of the water (Aquatic auto-cancel, breath panic) — monofuel
     -- watched it happen repeatedly. Dive depths pass through untouched.
-    intent.z = beat.wet and math.min(beat.z, -2.5) or beat.z
+    intent.z = beat.wet and
+      (beat.shore and beat.z or math.min(beat.z, -2.5)) or beat.z
   end
   -- Wet beats are declared water goals: the host commits to the water
   -- (wade steering at the bearing until the swim flag flips) instead of
@@ -477,6 +528,23 @@ local function navigate_to(view, pos, beat, reason, opts)
   -- speedrun — walk INTO the water, no inching on walkout crumbs.
   if beat.wet then intent.water = true end
   return intent
+end
+
+local function navigate_sparse_land(view, pos, route, phase, stalled)
+  local goal = route.beats[#route.beats]
+  if planar(pos.x, pos.y, goal.x, goal.y) <= goal.radius then
+    return nil
+  end
+  local beat = next_sparse_beat(route, pos.x, pos.y)
+  local intent = navigate_to(view, pos, beat, beat.id,
+    { stop = 8.0, status = { phase = phase, stalled_seconds = stalled } })
+  if intent then
+    wow.set_status(string.format("%s %s %.0fyd", phase, beat.id,
+      planar(pos.x, pos.y, beat.x, beat.y)))
+    return intent
+  end
+  return { kind = "hold", reason = "replanning",
+    status = bot_status(view, pos, beat, { phase = phase }) }
 end
 
 local function want_form(view, pos, spell, label)
@@ -612,21 +680,51 @@ function M.decide(view)
 
   local land = beat_by_id("land_approach")
   local water = beat_by_id("water_entry")
-  local goal = beat_by_id(COAST.goal_id)
+  local goal = beat_by_id(CONNECT_WET.goal_id)
+  local connectorGoal = beat_by_id(CONNECT_LAND.goal_id)
+  local cave = beat_by_id(LAND.goal_id)
   local water_dist = planar(pos.x, pos.y, water.x, water.y)
   local land_dist = planar(pos.x, pos.y, land.x, land.y)
   local swimming = view.is_swimming == true
   local near_water = water_dist <= water.radius + 120.0
   -- North of the entry band: never re-target the beach.
   local mid_coast = pos.x > water.x + 40.0
-  -- At/past the top of the Barrens the run is on roads: the north land
-  -- phase owns it (the mid_coast guard below is about the Tanaris beach and
-  -- must not block Travel Form recasts up here).
-  local land_phase = pos.x >= LAND.start_x
+  if connectorStarted and pos.x < -1000.0 then
+    connectorStarted, connectorComplete = false, false
+  end
+  -- Finale ownership is monotonic for the lifetime of the run. A collision
+  -- fall inside Timbermaw can trigger the server's ordinary failsafe and put
+  -- the seat back in Felwood; reverting to the northern-land route there
+  -- hides the actual finale failure and sends the bot south. Checkpoint runs
+  -- start a fresh process, so no in-run reset is needed.
+  if SWIM and not connectorStarted and
+      ((pos.x >= -920.0 and pos.x < LAND.start_x) or
+       planar(pos.x, pos.y, goal.x, goal.y) <= goal.radius + 20.0) then
+    connectorStarted = true
+  end
+  if connectorStarted and not connectorComplete and
+      planar(pos.x, pos.y, connectorGoal.x, connectorGoal.y) <=
+        connectorGoal.radius then
+    connectorComplete = true
+  end
+  if not finaleStarted and pos.x > 6300.0 and
+      (pos.y < cave.y - 20.0 or
+       planar(pos.x, pos.y, cave.x, cave.y) <= cave.radius + 50.0) then
+    finaleStarted = true
+  end
+  local finale_phase = finaleStarted
+  local connector_land_phase = connectorStarted and not connectorComplete and
+    not swimming
+  -- At/past the top of the Barrens the painted northern road owns the run,
+  -- until the cave handoff starts the Winterspring finale.
+  local land_phase = pos.x >= LAND.start_x and not finale_phase and
+    not connector_land_phase
+  local active_land_route = finale_phase and FINALE or
+    (connector_land_phase and CONNECT_LAND or (land_phase and LAND or nil))
 
   -- Flight recorder + anomaly EVs (logging only). Before form casts so a
   -- land-phase swim frame still records unplanned_swim before aquatic cast.
-  flight_recorder(view, pos, land_phase)
+  flight_recorder(view, pos, active_land_route)
 
   -- Forms are speed, and speed is the score. Aquatic whenever wet (even off
   -- plan — drowning slower is still better); Travel on dry open ground.
@@ -639,11 +737,28 @@ function M.decide(view)
       local cast = want_form(view, pos, AQUATIC_FORM_SPELL, "aquatic_form")
       if cast then return cast end
     end
-  elseif land_phase or (not near_water and not mid_coast) then
+  elseif active_land_route or (not near_water and not mid_coast) then
     if not in_travel_form(view) then
       local cast = want_form(view, pos, TRAVEL_FORM_SPELL, "travel_form")
       if cast then return cast end
     end
+  end
+
+  if finale_phase then
+    local fgoal = FINALE.beats[#FINALE.beats]
+    if planar(pos.x, pos.y, fgoal.x, fgoal.y) <= fgoal.radius then
+      lastPos, lastProgressAt, stallSince = { x = pos.x, y = pos.y },
+        wow.time(), nil
+      wow.set_status("goal: " .. FINALE.goal_id)
+      return { kind = "hold", reason = FINALE.goal_id,
+        status = bot_status(view, pos, fgoal, { phase = "finale" }) }
+    end
+    return navigate_sparse_land(view, pos, FINALE, "finale", stalled)
+  end
+
+  if connector_land_phase then
+    return navigate_sparse_land(view, pos, CONNECT_LAND,
+      "barrens_connector", stalled)
   end
 
   -- North land phase: top of the Barrens through Ashenvale and Felwood to
@@ -839,13 +954,8 @@ function M.decide(view)
       status = bot_status(view, pos, beat) }
   end
 
-  -- Wet chain (SWIM=true): cheese ribbon through duskwallow, then the
-  -- fatigue-free coast to merchant_coast. One sparse beat at a time.
-  if swimming and planar(pos.x, pos.y, goal.x, goal.y) <= goal.radius then
-    wow.set_status("goal: " .. COAST.goal_id)
-    return { kind = "hold", reason = COAST.goal_id,
-      status = bot_status(view, pos, goal) }
-  end
+  -- Wet chain (SWIM=true): cheese ribbon through Duskwallow and Merchant
+  -- Bay, then the final coastal approach to the Barrens shore.
 
   -- The wet chain also engages dry inside the entry band: standing on the
   -- sand at water_entry must press on toward the first wet beat (the ground

@@ -142,13 +142,28 @@ check(
     or (math.abs(coastPick.x - (-4125.7)) < 0.1 and math.abs(coastPick.y - (-4841.2)) < 0.1),
   "at (-4300,-4900) targets coast_01 or coast_02")
 
--- Inside merchant_coast radius, swimming: hold the wet goal.
+-- Merchant Coast is now a handoff into the final coastal connector.
 clock = clock + 5.0
 local goal = petrel.decide(view(-1533.7, -4057.0,
   { shapeshift_form_id = 4, is_swimming = true }))
-check(goal.kind == "hold" and goal.reason == "merchant_coast",
-  "holds at the merchant_coast goal")
+check(goal.kind == "navigate" and goal.reason == "swim_ribbon" and
+    goal.x == -1400.0,
+  "merchant coast continues into the Barrens connector")
 check(goal.status and goal.status.dist_goal < 25.0,
-  "the goal hold reports the closing distance")
+  "the connector handoff retains merchant closing distance")
+
+-- Once the shore beat has cleared swimming, Travel Form and the land road
+-- take over automatically.
+clock = clock + 20.0
+local shoreForm = petrel.decide(view(-900.0, -3750.0,
+  { shapeshift_form_id = 0, is_swimming = false }))
+check(shoreForm.kind == "cast_spell" and shoreForm.spell == 783,
+  "dry Barrens shore casts Travel Form")
+clock = clock + 20.0
+local shoreRoad = petrel.decide(view(-900.0, -3750.0,
+  { shapeshift_form_id = 3, is_swimming = false }))
+check(shoreRoad.kind == "navigate" and shoreRoad.x == -950.0 and
+    shoreRoad.reason == "barrens_lower_road",
+  "dry Barrens shore joins the land connector")
 
 print("test_traverse_wet: " .. passed .. " ok")
