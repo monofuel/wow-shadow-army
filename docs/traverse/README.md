@@ -134,6 +134,27 @@ headless runs:
 Raw feed: `local_data/traverse-status/run.log` (tee'd from every
 `make traverse` / `traverse-headed` launch).
 
+### Known issues — room for improvement (monofuel's watch, 2026-08-11)
+
+The felwood segment gate is met (2x clean PASS), but the bot is not yet
+competitive:
+
+1. **Move -> wait -> move -> wait.** The bot still spends real time paused
+   between movements. A speedrun bot should NEVER be idle — a competitor's
+   bot does not pause at all and finishes the run faster than ours. The
+   scorecard's idle numbers (3.7-4.1%) understate what the eye sees; the
+   stop-time-by-reason taxonomy is the tool for hunting the remaining
+   pauses (suspects: per-beat corridor replans, form-cast holds, the
+   pilot's settle-before-cast waits).
+2. **Beside the road, not on it.** The route beats sit on the painted
+   road, but between beats the seat runs alongside the road or cuts
+   through the woods whenever the road bends — mesh corridors are
+   straight-ish chords, so every bend gets shortcut. Cross-track p95 is
+   still 60-80 yd on passing runs. Getting ON the road consistently
+   probably means denser bend beats from the road mask (`road_mask.py
+   dump` the bends, beat the apexes) or corridor-vs-paint scoring in the
+   lint — the road-following is "close-ish", not faithful.
+
 Suspected prior blocker, still under investigation: RPB logic pegging a
 core and starving world streaming, so the bot outruns terrain loading and
 sticks. `traverse-desert` samples client CPU alongside bot status to catch
