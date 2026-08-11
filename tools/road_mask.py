@@ -50,15 +50,34 @@ How this was pinned down (2026-08-11):
 
 Format notes worth remembering:
   * FourCCs are byte-reversed on disk; the file opens with "REVM" (MVER).
-  * MCNK header sub-offsets (ofsLayer/ofsAlpha/ofsHeight) are relative to the
-    start of the MCNK *chunk header* (the FourCC), and point AT the sub-chunk's
-    own FourCC -- add 8 to reach its payload.
+  * MCNK header sub-offsets (ofsLayer/ofsAlpha/ofsHeight/ofsLiquid) are relative
+    to the start of the MCNK *chunk header* (the FourCC), and point AT the
+    sub-chunk's own FourCC -- add 8 to reach its payload.
   * Never scan MCNK sub-chunks sequentially: MCNR carries 13 undocumented
     padding bytes that desynchronise a scan. Use the header offsets only.
   * Vanilla alpha maps are uncompressed 2048 bytes (64x64, 4 bits per cell,
     low nibble first). sizeAlpha counts the 8-byte MCAL header too, so a
     4-layer chunk reports 3*2048 + 8 = 6152.
   * Layer 0 is the base layer: full coverage, no alpha map.
+
+Liquid (MCLQ) -- confirmed on Kalimdor hex 2026-08-11:
+  * MCNK +0x60 ofsLiquid, +0x64 sizeLiquid. sizeLiquid > 8 means MCLQ present
+    (size counts the 8-byte FourCC header; the on-disk MCLQ size field is 0).
+  * MCNK flags liquid bits: river 0x4, ocean 0x8, magma 0x10. Ocean chunks often
+    set 0x8|0x1 with a full 812-byte MCLQ (sea level height 0.0).
+  * Payload after the FourCC header (sizeLiquid-8 bytes):
+        float minHeight; float maxHeight;          // 8 bytes
+        WaterVert verts[9*9];                      // 648 bytes
+        uint8 tiles[8*8];                          // 64 bytes
+        // then ~84 bytes trailing (often zero) -- ignored
+    WaterVert = 4 bytes (depth/flow/light) + float height (world Z absolute).
+    Magma uses a different 8-byte vertex; only water/ocean/river matter here.
+  * tiles[i]: low nibble 0x0F = no liquid in that 8x8 cell; 0x41 is common
+    ocean/coast paint (0x40 = fatigue bit on some data). Index is x-major then
+    y, same axis directions as the 64x64 alpha map (count down x, then y from
+    the chunk max corner). The 9x9 vertex grid shares that orientation.
+  * MCVT heights are relative to MCNK position.z; MCLQ vertex heights are
+    absolute world Z. depth = liquid_height - (position.z + mcvt_rel).
 """
 from __future__ import annotations
 
@@ -77,9 +96,23 @@ ALPHA_DIM = 64
 ALPHA_BYTES_4BIT = ALPHA_DIM * ALPHA_DIM // 2  # 2048
 ALPHA_BYTES_8BIT = ALPHA_DIM * ALPHA_DIM  # 4096
 MCNK_HEADER_SIZE = 128
+LIQUID_DIM = 8  # 8x8 tile-flag grid per MCNK
+LIQUID_VERT_DIM = 9  # 9x9 height vertices
+MCVT_COUNT = 145  # 9*9 outer + 8*8 holes
+# MCLQ payload layout (after FourCC+size)
+MCLQ_HEADER_FLOATS = 8  # minHeight + maxHeight
+MCLQ_VERT_BYTES = LIQUID_VERT_DIM * LIQUID_VERT_DIM * 8  # 648
+MCLQ_TILE_BYTES = LIQUID_DIM * LIQUID_DIM  # 64
+MCLQ_LAYER_BYTES = MCLQ_HEADER_FLOATS + MCLQ_VERT_BYTES + MCLQ_TILE_BYTES  # 720
 # MCLY flags
 LAYER_USE_ALPHA = 0x100
 LAYER_ALPHA_COMPRESSED = 0x200
+# MCNK header flags -- liquid type bits
+MCNK_FLAG_RIVER = 0x4
+MCNK_FLAG_OCEAN = 0x8
+MCNK_FLAG_MAGMA = 0x10
+# MCLQ tile flag: low nibble 0x0F means no liquid in that cell
+MCLQ_TILE_NO_LIQUID = 0x0F
 
 # A road layer counts as "on road" above this alpha (0-255).
 ROAD_ALPHA_THRESHOLD = 64
@@ -99,6 +132,14 @@ class RoadSample(NamedTuple):
     is_road: bool
     texture: str | None
     alpha: int
+
+
+class WaterSample(NamedTuple):
+    """(water?, liquid surface height, depth = height - ground). Unpacks as 3-tuple."""
+
+    is_water: bool
+    height: float
+    depth: float
 
 
 @dataclass
@@ -194,8 +235,41 @@ def alpha_index(cx: int, cy: int) -> int:
     return cx * ALPHA_DIM + cy
 
 
+def liquid_cell_indices(x: float, y: float) -> tuple[int, int]:
+    """(lx, ly) inside the 8x8 MCLQ tile-flag grid; same axes as alpha cells."""
+    a, b = tile_indices(x, y)
+    ix, iy = chunk_indices(x, y)
+    origin_x, origin_y = chunk_origin(a, b, ix, iy)
+    lx = int((origin_x - x) / CHUNK_YD * LIQUID_DIM)
+    ly = int((origin_y - y) / CHUNK_YD * LIQUID_DIM)
+    return (min(LIQUID_DIM - 1, max(0, lx)), min(LIQUID_DIM - 1, max(0, ly)))
+
+
+def liquid_tile_index(lx: int, ly: int) -> int:
+    """Flat index into an 8x8 MCLQ tile-flag grid: x-major, then y."""
+    return lx * LIQUID_DIM + ly
+
+
+def liquid_vert_coords(x: float, y: float) -> tuple[float, float]:
+    """Fractional 9x9 vertex coords (0..8) from the chunk max corner."""
+    a, b = tile_indices(x, y)
+    ix, iy = chunk_indices(x, y)
+    origin_x, origin_y = chunk_origin(a, b, ix, iy)
+    vx = (origin_x - x) / CHUNK_YD * (LIQUID_VERT_DIM - 1)
+    vy = (origin_y - y) / CHUNK_YD * (LIQUID_VERT_DIM - 1)
+    return (
+        min(float(LIQUID_VERT_DIM - 1), max(0.0, vx)),
+        min(float(LIQUID_VERT_DIM - 1), max(0.0, vy)),
+    )
+
+
 def is_road_texture(name: str) -> bool:
     return "road" in name.lower()
+
+
+def mclq_tile_has_liquid(flag: int) -> bool:
+    """True when the MCLQ 8x8 tile flag marks liquid (low nibble != 0x0F)."""
+    return (flag & 0x0F) != MCLQ_TILE_NO_LIQUID
 
 
 # --------------------------------------------------------------------------
@@ -266,6 +340,29 @@ class Chunk:
     mcal_start: int
     mcal_size: int
     position: tuple[float, float, float]
+    flags: int = 0
+    mcvt_start: int = 0  # payload start (past MCVT FourCC), 0 if missing
+    mclq_start: int = 0  # payload start (past MCLQ FourCC), 0 if missing
+    mclq_size: int = 0  # payload bytes (sizeLiquid - 8)
+    size_liquid: int = 0  # raw MCNK sizeLiquid field
+
+
+@dataclass
+class WaterProbe:
+    x: float
+    y: float
+    tile: tuple[int, int]
+    chunk: tuple[int, int]
+    chunk_index: int
+    liquid_cell: tuple[int, int]
+    mcnk_flags: int
+    size_liquid: int
+    min_height: float | None
+    max_height: float | None
+    tile_flag: int | None
+    liquid_height: float | None
+    ground_z: float | None
+    sample: WaterSample
 
 
 class Tile:
@@ -277,6 +374,8 @@ class Tile:
         self.textures: list[str] = []
         self.chunks: list[Chunk] = []
         self._alpha_cache: dict[tuple[int, int], tuple[bytes, str]] = {}
+        self._mcvt_cache: dict[int, tuple[float, ...]] = {}
+        self._mclq_cache: dict[int, tuple[float, float, tuple[float, ...], bytes] | None] = {}
         self._parse()
         self.road_texture_ids = frozenset(
             i for i, name in enumerate(self.textures) if is_road_texture(name)
@@ -299,11 +398,15 @@ class Tile:
 
     def _parse_chunk(self, off: int) -> Chunk:
         buf = self._buf
+        flags = struct.unpack_from("<I", buf, off)[0]
         header = struct.unpack_from("<16I", buf, off)
         n_layers = header[3]
+        ofs_height = header[5]
         ofs_layer = header[7]
         ofs_alpha = header[9]
         size_alpha = header[10]
+        ofs_liquid = struct.unpack_from("<I", buf, off + 0x60)[0]
+        size_liquid = struct.unpack_from("<I", buf, off + 0x64)[0]
         pos = struct.unpack_from("<3f", buf, off + 0x68)
         # Sub-chunk offsets are relative to the MCNK chunk header (the FourCC),
         # not to the 128-byte MCNK header that follows it.
@@ -312,10 +415,10 @@ class Tile:
         if n_layers and buf[base + ofs_layer : base + ofs_layer + 4][::-1] == b"MCLY":
             entry = base + ofs_layer + 8
             for index in range(n_layers):
-                tid, flags, alpha_off, _effect = struct.unpack_from(
+                tid, layer_flags, alpha_off, _effect = struct.unpack_from(
                     "<4I", buf, entry + index * 16
                 )
-                layers.append(Layer(index, tid, flags, alpha_off))
+                layers.append(Layer(index, tid, layer_flags, alpha_off))
         mcal_start = 0
         mcal_size = 0
         if size_alpha > 8 and buf[base + ofs_alpha : base + ofs_alpha + 4][::-1] == (
@@ -323,7 +426,29 @@ class Tile:
         ):
             mcal_start = base + ofs_alpha + 8
             mcal_size = size_alpha - 8
-        return Chunk(off, n_layers, layers, mcal_start, mcal_size, pos)
+        mcvt_start = 0
+        if ofs_height and buf[base + ofs_height : base + ofs_height + 4][::-1] == b"MCVT":
+            mcvt_start = base + ofs_height + 8
+        mclq_start = 0
+        mclq_size = 0
+        if size_liquid > 8 and buf[base + ofs_liquid : base + ofs_liquid + 4][::-1] == (
+            b"MCLQ"
+        ):
+            mclq_start = base + ofs_liquid + 8
+            mclq_size = size_liquid - 8
+        return Chunk(
+            off,
+            n_layers,
+            layers,
+            mcal_start,
+            mcal_size,
+            pos,
+            flags=flags,
+            mcvt_start=mcvt_start,
+            mclq_start=mclq_start,
+            mclq_size=mclq_size,
+            size_liquid=size_liquid,
+        )
 
     def alpha_map(self, chunk_index: int, layer_index: int) -> tuple[bytes, str]:
         key = (chunk_index, layer_index)
@@ -343,9 +468,114 @@ class Tile:
         self._alpha_cache[key] = result
         return result
 
+    def mcvt_heights(self, chunk_index: int) -> tuple[float, ...] | None:
+        """145 MCVT relative heights, or None if the chunk has no MCVT."""
+        cached = self._mcvt_cache.get(chunk_index)
+        if cached is not None:
+            return cached
+        chunk = self.chunks[chunk_index]
+        if not chunk.mcvt_start:
+            return None
+        end = chunk.mcvt_start + MCVT_COUNT * 4
+        if end > len(self._buf):
+            return None
+        heights = struct.unpack_from(f"<{MCVT_COUNT}f", self._buf, chunk.mcvt_start)
+        self._mcvt_cache[chunk_index] = heights
+        return heights
+
+    def ground_height(self, chunk_index: int, x: float, y: float) -> float | None:
+        """World Z of the MCVT surface at (x, y); None if unreadable."""
+        heights = self.mcvt_heights(chunk_index)
+        if heights is None:
+            return None
+        chunk = self.chunks[chunk_index]
+        a, b = tile_indices(x, y)
+        ix, iy = chunk_indices(x, y)
+        origin_x, origin_y = chunk_origin(a, b, ix, iy)
+        fx = (origin_x - x) / CHUNK_YD
+        fy = (origin_y - y) / CHUNK_YD
+        # Outer 9x9 grid: vertex (i=y, j=x) lives at heights[i * 17 + j].
+        gx = min(8.0, max(0.0, fx * 8.0))
+        gy = min(8.0, max(0.0, fy * 8.0))
+        j0 = min(7, int(math.floor(gx)))
+        i0 = min(7, int(math.floor(gy)))
+        tx = gx - j0
+        ty = gy - i0
+
+        def outer(i: int, j: int) -> float:
+            return heights[i * 17 + j]
+
+        h00 = outer(i0, j0)
+        h10 = outer(i0, j0 + 1)
+        h01 = outer(i0 + 1, j0)
+        h11 = outer(i0 + 1, j0 + 1)
+        rel = (
+            h00 * (1.0 - tx) * (1.0 - ty)
+            + h10 * tx * (1.0 - ty)
+            + h01 * (1.0 - tx) * ty
+            + h11 * tx * ty
+        )
+        return chunk.position[2] + rel
+
+    def mclq_layer(
+        self, chunk_index: int
+    ) -> tuple[float, float, tuple[float, ...], bytes] | None:
+        """(min_h, max_h, 81 vertex heights, 64 tile flags) or None."""
+        if chunk_index in self._mclq_cache:
+            return self._mclq_cache[chunk_index]
+        chunk = self.chunks[chunk_index]
+        if chunk.mclq_size < MCLQ_LAYER_BYTES:
+            self._mclq_cache[chunk_index] = None
+            return None
+        start = chunk.mclq_start
+        buf = self._buf
+        min_h, max_h = struct.unpack_from("<2f", buf, start)
+        verts: list[float] = []
+        vbase = start + MCLQ_HEADER_FLOATS
+        for i in range(LIQUID_VERT_DIM * LIQUID_VERT_DIM):
+            # WaterVert: 4 bytes depth/flow + float height (absolute world Z).
+            h = struct.unpack_from("<f", buf, vbase + i * 8 + 4)[0]
+            verts.append(h)
+        tbase = vbase + MCLQ_VERT_BYTES
+        tiles = bytes(buf[tbase : tbase + MCLQ_TILE_BYTES])
+        result = (min_h, max_h, tuple(verts), tiles)
+        self._mclq_cache[chunk_index] = result
+        return result
+
+    def liquid_height(self, chunk_index: int, x: float, y: float) -> float | None:
+        """Bilinear MCLQ surface height (world Z), or None if no layer."""
+        layer = self.mclq_layer(chunk_index)
+        if layer is None:
+            return None
+        _min_h, _max_h, verts, _tiles = layer
+        vx, vy = liquid_vert_coords(x, y)
+        j0 = min(7, int(math.floor(vx)))
+        i0 = min(7, int(math.floor(vy)))
+        tx = vx - j0
+        ty = vy - i0
+
+        def vert(i: int, j: int) -> float:
+            return verts[i * LIQUID_VERT_DIM + j]
+
+        h00, h10 = vert(i0, j0), vert(i0, j0 + 1)
+        h01, h11 = vert(i0 + 1, j0), vert(i0 + 1, j0 + 1)
+        # FLT_MAX marks missing magma/slime verts -- fall back to nearest finite.
+        candidates = (h00, h10, h01, h11)
+        if not all(math.isfinite(h) and abs(h) < 1.0e30 for h in candidates):
+            finite = [h for h in candidates if math.isfinite(h) and abs(h) < 1.0e30]
+            if not finite:
+                return None
+            return finite[0]
+        return (
+            h00 * (1.0 - tx) * (1.0 - ty)
+            + h10 * tx * (1.0 - ty)
+            + h01 * (1.0 - tx) * ty
+            + h11 * tx * ty
+        )
+
 
 class RoadMask:
-    """is_road() over a directory of Kalimdor ADTs, with tile caching."""
+    """is_road() / is_water() over a directory of Kalimdor ADTs, with tile caching."""
 
     def __init__(self, adt_dir: Path | str = DEFAULT_ADT_DIR) -> None:
         self.adt_dir = Path(adt_dir)
@@ -410,6 +640,79 @@ class RoadMask:
     def is_road(self, x: float, y: float) -> RoadSample:
         return self.probe(x, y).sample
 
+    def water_probe(self, x: float, y: float) -> WaterProbe:
+        a, b = tile_indices(x, y)
+        ix, iy = chunk_indices(x, y)
+        index = chunk_array_index(ix, iy)
+        lx, ly = liquid_cell_indices(x, y)
+        empty = WaterProbe(
+            x=x,
+            y=y,
+            tile=(a, b),
+            chunk=(ix, iy),
+            chunk_index=index,
+            liquid_cell=(lx, ly),
+            mcnk_flags=0,
+            size_liquid=0,
+            min_height=None,
+            max_height=None,
+            tile_flag=None,
+            liquid_height=None,
+            ground_z=None,
+            sample=WaterSample(False, 0.0, 0.0),
+        )
+        tile = self.tile(a, b)
+        if tile is None or index >= len(tile.chunks):
+            return empty
+        chunk = tile.chunks[index]
+        ground_z = tile.ground_height(index, x, y)
+        layer = tile.mclq_layer(index)
+        if layer is None:
+            return WaterProbe(
+                x=x,
+                y=y,
+                tile=(a, b),
+                chunk=(ix, iy),
+                chunk_index=index,
+                liquid_cell=(lx, ly),
+                mcnk_flags=chunk.flags,
+                size_liquid=chunk.size_liquid,
+                min_height=None,
+                max_height=None,
+                tile_flag=None,
+                liquid_height=None,
+                ground_z=ground_z,
+                sample=WaterSample(False, 0.0, 0.0),
+            )
+        min_h, max_h, _verts, tiles = layer
+        flag = tiles[liquid_tile_index(lx, ly)]
+        height = tile.liquid_height(index, x, y)
+        wet = mclq_tile_has_liquid(flag) and height is not None
+        if wet and height is not None:
+            depth = height - ground_z if ground_z is not None else 0.0
+            sample = WaterSample(True, height, depth)
+        else:
+            sample = WaterSample(False, height if height is not None else 0.0, 0.0)
+        return WaterProbe(
+            x=x,
+            y=y,
+            tile=(a, b),
+            chunk=(ix, iy),
+            chunk_index=index,
+            liquid_cell=(lx, ly),
+            mcnk_flags=chunk.flags,
+            size_liquid=chunk.size_liquid,
+            min_height=min_h,
+            max_height=max_h,
+            tile_flag=flag,
+            liquid_height=height,
+            ground_z=ground_z,
+            sample=sample,
+        )
+
+    def is_water(self, x: float, y: float) -> WaterSample:
+        return self.water_probe(x, y).sample
+
     def nearest_road(
         self, x: float, y: float, radius: float = 60.0, step: float = 1.0
     ) -> tuple[float, float, float, str] | None:
@@ -437,6 +740,14 @@ def is_road(x: float, y: float) -> RoadSample:
     if _DEFAULT_MASK is None:
         _DEFAULT_MASK = RoadMask()
     return _DEFAULT_MASK.is_road(x, y)
+
+
+def is_water(x: float, y: float) -> WaterSample:
+    """(bool, height, depth) for a Kalimdor world point."""
+    global _DEFAULT_MASK
+    if _DEFAULT_MASK is None:
+        _DEFAULT_MASK = RoadMask()
+    return _DEFAULT_MASK.is_water(x, y)
 
 
 # --------------------------------------------------------------------------
@@ -603,6 +914,59 @@ def cmd_dump(mask: RoadMask, args: argparse.Namespace) -> int:
     return 0
 
 
+def _liquid_type_name(flags: int) -> str:
+    parts: list[str] = []
+    if flags & MCNK_FLAG_RIVER:
+        parts.append("river")
+    if flags & MCNK_FLAG_OCEAN:
+        parts.append("ocean")
+    if flags & MCNK_FLAG_MAGMA:
+        parts.append("magma")
+    return "+".join(parts) if parts else "none"
+
+
+def cmd_water_probe(mask: RoadMask, args: argparse.Namespace) -> int:
+    probe = mask.water_probe(args.x, args.y)
+    sample = probe.sample
+    a, b = probe.tile
+    ix, iy = probe.chunk
+    lx, ly = probe.liquid_cell
+    verdict = "WATER" if sample.is_water else "dry"
+    print(f"({args.x:.2f}, {args.y:.2f}) -> {verdict}")
+    print(
+        f"  height={sample.height:.4f} depth={sample.depth:.4f} "
+        f"ground_z={probe.ground_z if probe.ground_z is not None else 'n/a'}"
+    )
+    print(
+        f"  tile=kalimdor_{a}_{b}.adt chunk=(ix={ix}, iy={iy}) "
+        f"index={probe.chunk_index} liquid_cell=(lx={lx}, ly={ly})"
+    )
+    print(
+        f"  mcnk_flags=0x{probe.mcnk_flags:x} ({_liquid_type_name(probe.mcnk_flags)}) "
+        f"sizeLiquid={probe.size_liquid}"
+    )
+    if probe.min_height is not None:
+        print(
+            f"  MCLQ min={probe.min_height:.4f} max={probe.max_height:.4f} "
+            f"tile_flag=0x{probe.tile_flag:02x} liquid_height={probe.liquid_height}"
+        )
+    else:
+        print("  (no MCLQ layer)")
+    return 0
+
+
+def cmd_water_dump(mask: RoadMask, args: argparse.Namespace) -> int:
+    hits = 0
+    for px, py in grid_points(args.x0, args.y0, args.x1, args.y1, args.step):
+        sample = mask.is_water(px, py)
+        if sample.is_water:
+            hits += 1
+            print(f"{px:.2f} {py:.2f} {sample.height:.4f} {sample.depth:.4f}")
+    if hits == 0:
+        print("# no water-positive samples in range", file=sys.stderr)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--adt-dir", type=Path, default=DEFAULT_ADT_DIR)
@@ -632,6 +996,19 @@ def build_parser() -> argparse.ArgumentParser:
         p_dump.add_argument(name, type=float)
     p_dump.add_argument("--step", type=float, default=5.0)
     p_dump.set_defaults(func=cmd_dump)
+
+    p_wprobe = sub.add_parser(
+        "water-probe", help="Water verdict plus chunk/MCLQ/ground debug"
+    )
+    p_wprobe.add_argument("x", type=float)
+    p_wprobe.add_argument("y", type=float)
+    p_wprobe.set_defaults(func=cmd_water_probe)
+
+    p_wdump = sub.add_parser("water-dump", help="Print water-positive grid samples")
+    for name in ("x0", "y0", "x1", "y1"):
+        p_wdump.add_argument(name, type=float)
+    p_wdump.add_argument("--step", type=float, default=5.0)
+    p_wdump.set_defaults(func=cmd_water_dump)
     return parser
 
 

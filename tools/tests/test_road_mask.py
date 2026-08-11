@@ -128,6 +128,41 @@ class TestTransformMath(unittest.TestCase):
         self.assertFalse(rmask.is_road_texture("Tileset\\Generic\\Black.blp"))
 
 
+class TestMclqTileFlags(unittest.TestCase):
+    """Pure unit tests of MCLQ 8x8 tile-flag decoding -- no ADT files."""
+
+    def test_low_nibble_0f_is_dry(self) -> None:
+        self.assertFalse(rmask.mclq_tile_has_liquid(0x0F))
+        self.assertFalse(rmask.mclq_tile_has_liquid(0x4F))  # fatigue bit + no-liquid
+
+    def test_ocean_paint_0x41_is_wet(self) -> None:
+        self.assertTrue(rmask.mclq_tile_has_liquid(0x41))
+        self.assertTrue(rmask.mclq_tile_has_liquid(0x01))
+        self.assertTrue(rmask.mclq_tile_has_liquid(0x40))  # low nibble 0, not 0xF
+
+    def test_synthetic_grid_x_major_index(self) -> None:
+        # 8x8 grid: dry everywhere except (lx=3, ly=5) = 0x41.
+        tiles = bytearray([0x0F] * 64)
+        tiles[rmask.liquid_tile_index(3, 5)] = 0x41
+        self.assertEqual(rmask.liquid_tile_index(0, 0), 0)
+        self.assertEqual(rmask.liquid_tile_index(1, 0), 8)
+        self.assertEqual(rmask.liquid_tile_index(3, 5), 3 * 8 + 5)
+        self.assertTrue(rmask.mclq_tile_has_liquid(tiles[3 * 8 + 5]))
+        self.assertFalse(rmask.mclq_tile_has_liquid(tiles[0]))
+        self.assertFalse(rmask.mclq_tile_has_liquid(tiles[5 * 8 + 3]))  # swapped axes dry
+
+    def test_liquid_cell_helpers_match_alpha_axes(self) -> None:
+        # Chunk max corner -> cell (0,0); step down x/y raises indices.
+        base_x, base_y = 1190.0, -2260.0
+        lx0, ly0 = rmask.liquid_cell_indices(base_x, base_y)
+        lx1, _ = rmask.liquid_cell_indices(base_x - 5.0, base_y)
+        _, ly1 = rmask.liquid_cell_indices(base_x, base_y - 5.0)
+        self.assertGreater(lx1, lx0)
+        self.assertGreater(ly1, ly0)
+        for lx, ly in [(0, 0), (7, 7), (3, 5)]:
+            self.assertTrue(0 <= rmask.liquid_tile_index(lx, ly) < 64)
+
+
 class TestAlphaDecode(unittest.TestCase):
     def test_uncompressed_4bit_low_nibble_first(self) -> None:
         raw = bytes([0x21]) + bytes(rmask.ALPHA_BYTES_4BIT - 1)
@@ -417,6 +452,54 @@ class TestLegSampling(unittest.TestCase):
         spans = report.off_road_spans()
         self.assertEqual(len(spans), 1)
         self.assertGreater(spans[0][2], 300.0)
+
+
+@skip_no_adt
+class TestWaterAnchors(unittest.TestCase):
+    """Five calibration anchors for MCLQ liquid presence (do not fudge)."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.mask = rmask.RoadMask(ADT_DIR)
+
+    def test_ocean_tele_is_water(self) -> None:
+        # Bot tele lands swimming here; ocean flag + full 0x41 tile paint.
+        sample = self.mask.is_water(-6711.4, -4868.5)
+        self.assertTrue(sample.is_water, msg=f"sample={sample}")
+        self.assertGreater(sample.depth, 0.0)
+        probe = self.mask.water_probe(-6711.4, -4868.5)
+        self.assertTrue(probe.mcnk_flags & rmask.MCNK_FLAG_OCEAN)
+        self.assertGreater(probe.size_liquid, 8)
+        self.assertIsNotNone(probe.tile_flag)
+        self.assertTrue(rmask.mclq_tile_has_liquid(probe.tile_flag))
+
+    def test_shallow_coast_is_water(self) -> None:
+        sample = self.mask.is_water(-4627.0, -4869.5)
+        self.assertTrue(sample.is_water, msg=f"sample={sample}")
+        self.assertGreater(sample.depth, 0.0)
+        probe = self.mask.water_probe(-4627.0, -4869.5)
+        self.assertTrue(probe.mcnk_flags & rmask.MCNK_FLAG_OCEAN)
+
+    def test_beach_sand_is_dry(self) -> None:
+        # Same ocean-flagged chunk family, but this cell's tile flag is 0x0F.
+        sample = self.mask.is_water(-6784.5, -4833.9)
+        self.assertFalse(sample.is_water, msg=f"sample={sample}")
+        probe = self.mask.water_probe(-6784.5, -4833.9)
+        self.assertGreater(probe.size_liquid, 8)  # MCLQ present but cell dry
+        self.assertIsNotNone(probe.tile_flag)
+        self.assertFalse(rmask.mclq_tile_has_liquid(probe.tile_flag))
+
+    def test_inland_barrens_is_dry(self) -> None:
+        sample = self.mask.is_water(1071.6, -2303.4)
+        self.assertFalse(sample.is_water, msg=f"sample={sample}")
+        probe = self.mask.water_probe(1071.6, -2303.4)
+        self.assertLessEqual(probe.size_liquid, 8)
+
+    def test_felwood_road_is_dry(self) -> None:
+        sample = self.mask.is_water(6502.9, -2063.7)
+        self.assertFalse(sample.is_water, msg=f"sample={sample}")
+        probe = self.mask.water_probe(6502.9, -2063.7)
+        self.assertLessEqual(probe.size_liquid, 8)
 
 
 if __name__ == "__main__":
