@@ -12,7 +12,7 @@ got. See [route-engineering.md](route-engineering.md) for the tooling.
 |---|---|---|---|---|
 | A | Tanaris desert | `spawn → water_entry` | **PASS** | `traverse-desert`: coast reached, no stalls |
 | B | Fatigue swim | `water_entry → duskwallow_coast` | **FAIL — regression** | Bot never left the beach: parked at (-6775,-4829) in `nav=planning`, 67% idle, zero deaths. See B analysis below |
-| C | Coastal swim (new) | `duskwallow_coast → merchant_coast` | **FAIL** | ~800 yd of clean swimming, then frozen mid-column at (-3814,-4752, z -9) in 32-yd-deep water with `swim=false`. See C analysis |
+| C | Coastal swim (new) | `duskwallow_coast → merchant_coast` | **PASS** (after sandbar nudges) | 54 s, 31.4 yd, zero idle. First attempt froze after grounding on a 1.4-yd sandbar leg; `coast_04`/`coast_09` nudged to ≥3.9 yd min leg depth via the water mask and the segment passes — with the wade machinery observed recovering swim-flag desyncs live (`nav=wading`) |
 | D | Barrens land hop | `merchant_coast → top_barrens` | expected fail (UNBUILT) | Zero progress — the brain has no beats here; seat sits at the merchant wet goal. 3,140 yd unbuilt |
 | E | Northern land run | `top_barrens → felwood_cave_entrance` | **PASS** | 110.6 s, 23.7 yd, idle 4.5% — the painted-road route |
 | F | Winterspring finale | `felwood_cave_entrance → everlook` | expected fail (UNBUILT) | Zero progress — land goal hold at the cave. 2,590 yd unbuilt, includes the Timbermaw tunnel (indoor-location risk monofuel flagged) |
@@ -31,14 +31,18 @@ client is not reporting observable liquid at the shoreline anymore. The
 brain is exonerated: replaying B's exact frozen state through `decide()`
 offline yields the correct `navigate enter_water water=true` intent.
 
-Timeline fits the fork: segment B last passed BEFORE the two upstream
-merges (`91cd8a33b` hosted-session protocol, `e641af0fa` follow-up); the
-land segments we gated since then never exercise water. Suspect: upstream
-Observation/liquid projection changes. **Fork-side issue — coordinate
-with the agent doing the upstream realign; do not hack the lua-bot layer**
-(prefer-upstream tenet). A `WETSTATEDBG` instrument now logs the client's
-liquid fields whenever the wet chain wants water but the seat isn't
-swimming; rerun evidence pending.
+CONFIRMED by WETSTATEDBG (2026-08-11 rerun): at the shoreline the client
+reports `liquid_known=true, coverage_known=true` but
+**`liquid_surface_z = -500.0`** — a sentinel where the real surface
+(~0.4) used to be. The wade gate computes depth ≈ -500 and never opens.
+Segment B last passed BEFORE the two upstream merges (`91cd8a33b`,
+`e641af0fa`); the land gates since never exercise water. **Fork-side
+issue — coordinate with the agent doing the upstream realign; do not hack
+the lua-bot layer** (prefer-upstream tenet; ledgered in
+upstream-health.md with the evidence line). Entry is stochastic, not
+absolute: the rerun got 1,300 yd into the swim before a formless
+swim-flag desync mid-ocean turned it around — so the sentinel bites at
+SOME shoreline poses, always at the water_entry tele pose.
 
 ## Why C fails: swim-flag desync with no recovery path
 
