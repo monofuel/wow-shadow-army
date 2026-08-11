@@ -89,6 +89,11 @@ local snagCheckFrames = nil
 local snagUntil = nil
 local snagTarget = nil
 local snagSide = 1
+local snagClusterPos = nil
+local snagClusterCount = 0
+-- Total hops spent inside the CURRENT snag cluster; unlike snagClusterCount
+-- it never cycles, so the hop reach can grow the longer a wall holds us.
+local snagClusterTries = 0
 
 local function planar(ax, ay, bx, by)
   local dx, dy = ax - bx, ay - by
@@ -494,15 +499,53 @@ function M.decide(view)
           local len = math.sqrt(dx * dx + dy * dy)
           if len > 0.1 then
             local ux, uy = dx / len, dy / len
-            snagSide = -snagSide
-            snagTarget = { x = pos.x - uy * 18.0 * snagSide,
-              y = pos.y + ux * 18.0 * snagSide }
-            snagUntil = now + 6.0
+            -- Escalate within a snag cluster: left, then right, then
+            -- RETREAT along the bearing — the way in is the one exit
+            -- proven walkable (run 6 died oscillating ±10 yd at
+            -- (3724,-1407) with both flanks blocked while a mob train
+            -- burned it down).
+            if snagClusterPos and
+                planar(pos.x, pos.y, snagClusterPos.x, snagClusterPos.y) <= 30.0 then
+              snagClusterCount = snagClusterCount + 1
+              snagClusterTries = snagClusterTries + 1
+            else
+              snagClusterPos = { x = pos.x, y = pos.y }
+              snagClusterCount = 1
+              snagClusterTries = 1
+            end
+            -- ESCALATE THE REACH, not the goal. Some of these pins are not
+            -- point objects at all but long baked walls the mesh does not
+            -- model: run 8 (2026-08-10) burned 131 hops on one pose at
+            -- (2615,-1801) and run 1 burned 67 at (4774,-806), every one of
+            -- them an 18/30 yd shuffle inside the same wall. A fixed reach
+            -- can only ever free a snag narrower than itself, so the reach
+            -- grows with how long this cluster has held us: 18 -> 36 -> 54
+            -- -> 72 yd on the flanks (30 -> 120 backward), which is enough
+            -- to walk around a wall instead of rubbing along it. The beat
+            -- never changes and no new destination is adopted — this is
+            -- still one short window of physical repositioning, then the
+            -- same corridor is re-planned.
+            local reach = 1 + math.min(3, math.floor(snagClusterTries / 6))
+            local label
+            if snagClusterCount >= 3 then
+              local d = 30.0 * reach
+              snagTarget = { x = pos.x - ux * d, y = pos.y - uy * d }
+              snagUntil = now + 4.0 + d / 8.0
+              label = "backward"
+              if snagClusterCount >= 5 then snagClusterCount = 0 end
+            else
+              local d = 18.0 * reach
+              snagSide = -snagSide
+              snagTarget = { x = pos.x - uy * d * snagSide,
+                y = pos.y + ux * d * snagSide }
+              snagUntil = now + 4.0 + d / 8.0
+              label = snagSide > 0 and "left" or "right"
+            end
             snagCheckPos, snagCheckAt, snagCheckFrames = nil, nil, nil
             wow.log(string.format(
-              "SNAG: pinned at (%.1f, %.1f) — hopping %s to (%.1f, %.1f)",
-              pos.x, pos.y, snagSide > 0 and "left" or "right",
-              snagTarget.x, snagTarget.y))
+              "SNAG: pinned at (%.1f, %.1f) — hopping %s to (%.1f, %.1f) (cluster %d reach %d)",
+              pos.x, pos.y, label, snagTarget.x, snagTarget.y,
+              snagClusterCount, reach))
           end
         end
       end

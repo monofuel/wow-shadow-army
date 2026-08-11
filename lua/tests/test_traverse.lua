@@ -27,7 +27,7 @@ local petrel = require("traverse")
 check(route.goal_id == "duskwallow_coast", "route keeps the segment goal")
 -- The north land phase is a SPARSE strategy-beat list (fair play): one beat
 -- per road decision point, strictly increasing x, ending at the cave mouth.
-check(landRoute.goal_id == "felwood_cave_entrance" and #landRoute.beats == 14,
+check(landRoute.goal_id == "felwood_cave_entrance" and #landRoute.beats == 23,
   "land route is sparse and ends at the Timbermaw cave mouth")
 for i = 2, #landRoute.beats do
   check(landRoute.beats[i].x > landRoute.beats[i - 1].x,
@@ -176,9 +176,15 @@ check(north1.route_profile == "prefer_ground" and north1.stop_distance == 8.0,
 -- Selection is monotonic: mid-Felwood picks the next beat ahead, never one
 -- behind, without having visited any earlier beat.
 clock = clock + 5.0
-local mid = petrel.decide(view(5600.0, -1000.0, formed))
-check(mid.kind == "navigate" and mid.x == 5792.0,
+local mid = petrel.decide(view(5650.0, -1000.0, formed))
+check(mid.kind == "navigate" and mid.x == 5720.0,
   "mid-Felwood selects the next road beat ahead")
+-- Just short of the north collision-trap dodge the dodge is what gets
+-- steered at, so the corridor swings wide of (5645,-1069).
+clock = clock + 5.0
+local preDodge = petrel.decide(view(5545.0, -1000.0, formed))
+check(preDodge.kind == "navigate" and preDodge.x == 5585.0,
+  "north trap dodge is selected before north_road_2")
 
 -- SPEEDRUN DOCTRINE: hurt and in combat on the Felwood road, the answer is
 -- still only to keep running — no heal, no defensive cast, no stopping.
@@ -207,6 +213,31 @@ check(hop.kind == "navigate" and hop.reason == "snag_hop",
 local hopDx, hopDy = hop.x - 3322.0, hop.y - (-1640.0)
 check(math.sqrt(hopDx * hopDx + hopDy * hopDy) > 10.0,
   "the hop target is a genuine sidestep")
+-- A WALL, not a point object: when the same cluster keeps holding the seat,
+-- the hop REACH grows (18 -> 36 -> 54 -> 72 yd) so a long baked wall can be
+-- walked around instead of rubbed along. The goal still never rotates.
+local function hopFrom(x, y)
+  for _ = 1, 20 do
+    clock = clock + 1.0
+    local d = petrel.decide(view(x, y, formed))
+    if d.reason == "snag_hop" then
+      return math.sqrt((d.x - x) ^ 2 + (d.y - y) ^ 2)
+    end
+  end
+  return nil
+end
+local firstReach = math.sqrt(hopDx * hopDx + hopDy * hopDy)
+local grownReach = nil
+for _ = 1, 12 do
+  clock = clock + 30.0
+  local r = hopFrom(3322.0, -1640.0)
+  if r then grownReach = r end
+end
+check(grownReach ~= nil and grownReach > firstReach * 1.5,
+  "a cluster that keeps holding the seat gets a longer hop reach")
+
+-- Let the last (long) hop window close before checking the resume.
+clock = clock + 40.0
 nav = { state = "following", failed_here = false, walkout_available = false }
 clock = clock + 7.0
 local resumed = petrel.decide(view(3330.0, -1655.0, formed))
