@@ -27,7 +27,7 @@ local petrel = require("traverse")
 check(route.goal_id == "duskwallow_coast", "route keeps the segment goal")
 -- The north land phase is a SPARSE strategy-beat list (fair play): one beat
 -- per road decision point, strictly increasing x, ending at the cave mouth.
-check(landRoute.goal_id == "felwood_cave_entrance" and #landRoute.beats == 23,
+check(landRoute.goal_id == "felwood_cave_entrance" and #landRoute.beats == 25,
   "land route is sparse and ends at the Timbermaw cave mouth")
 for i = 2, #landRoute.beats do
   check(landRoute.beats[i].x > landRoute.beats[i - 1].x,
@@ -243,6 +243,40 @@ clock = clock + 7.0
 local resumed = petrel.decide(view(3330.0, -1655.0, formed))
 check(resumed.kind == "navigate" and resumed.reason ~= "snag_hop",
   "after the hop window the same beat resumes")
+
+-- Drift: a seat can be MOVING and still be snagged. When the client drops
+-- to walkout it drives the seat sideways off the corridor forever, which the
+-- frozen-seat test can never see. No closing on the beat for 15 sim-s is a
+-- snag too, and it goes to the same hop machinery (same beat, always).
+nav = { state = "walkout", failed_here = true, walkout_available = true }
+clock = clock + 1.0
+petrel.decide(view(3400.0, -1600.0, formed))
+local drift = nil
+for i = 1, 40 do
+  clock = clock + 1.0
+  local d = petrel.decide(view(3400.0 + (i % 2) * 2.0, -1600.0, formed))
+  if d.reason == "snag_hop" then drift = d break end
+end
+check(drift ~= nil, "a moving seat that never closes on the beat hops too")
+
+-- ...and a seat that IS closing on the beat is left alone. Walk it in on
+-- the NEXT beat, so the drift watch starts clean the way it does in flight.
+nav = { state = "following", failed_here = false, walkout_available = false }
+clock = clock + 40.0
+local closing = nil
+local cx, cy = 3600.0, -1500.0
+local bx, by = 3700.0, -1360.0
+closing = petrel.decide(view(cx, cy, formed))
+check(closing.reason ~= "snag_hop", "a fresh beat starts the drift watch clean")
+for _ = 1, 12 do
+  clock = clock + 1.0
+  local dx, dy = bx - cx, by - cy
+  local len = math.sqrt(dx * dx + dy * dy)
+  cx, cy = cx + dx / len * 10.0, cy + dy / len * 10.0
+  closing = petrel.decide(view(cx, cy, formed))
+  if closing.reason == "snag_hop" then break end
+end
+check(closing.reason ~= "snag_hop", "honest progress toward the beat never hops")
 
 -- The cave mouth is the segment goal: hold there, alive.
 clock = clock + 5.0

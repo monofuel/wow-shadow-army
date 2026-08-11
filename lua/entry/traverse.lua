@@ -94,6 +94,11 @@ local snagClusterCount = 0
 -- Total hops spent inside the CURRENT snag cluster; unlike snagClusterCount
 -- it never cycles, so the hop reach can grow the longer a wall holds us.
 local snagClusterTries = 0
+-- Closing-on-the-beat watch: a seat can be moving and still be snagged if
+-- the client is walking it out sideways instead of down the corridor.
+local progressBeatId = nil
+local progressBest = nil
+local progressAt = nil
 
 local function planar(ax, ay, bx, by)
   local dx, dy = ax - bx, ay - by
@@ -484,17 +489,39 @@ function M.decide(view)
     -- the run-2 death froze under nav=walkout ("input returned to the same
     -- pose") while a mob train burned 138 hp/sim-s — the seat was pinned
     -- but the walkout machinery still claimed progress was possible.
+    -- ...and on a seat that MOVES without ever getting closer. A frozen
+    -- seat is only the loud half of a snag. When the client cannot follow
+    -- the planned corridor it drops to "walkout" and drives the seat off
+    -- on its own — still moving, so the freeze test never trips, while the
+    -- brain waits. That wander is what has actually been killing this
+    -- segment: leaving north_road_2 the seat walks 55 yd SOUTH of a
+    -- corridor that stays clear of the Felpaw camp and straight through
+    -- the camp instead (runs 10, 11 and valley-run 1 each lost 350-1200 hp
+    -- there), and the three walls that ended valley-run 1 at (6034,-1280),
+    -- (6069,-1305) and (6196,-1419) all sit 45-69 yd OFF the planned
+    -- corridor — the seat only reached them by wandering. So treat "no
+    -- closing on the beat for 15 sim-s" as a snag too and hand it to the
+    -- same hop machinery. The beat never changes; only the seat's contact
+    -- with the geometry does.
+    local bdist = planar(pos.x, pos.y, beat.x, beat.y)
+    if progressBeatId ~= beat.id or progressAt == nil then
+      progressBeatId, progressBest, progressAt = beat.id, bdist, now
+    elseif bdist < progressBest - 5.0 then
+      progressBest, progressAt = bdist, now
+    end
+    local drifting = (now - progressAt) > 15.0
     local pinned = view.movement_allowed and not view.rooted
-    if pinned then
-      if snagCheckPos == nil or
-          planar(pos.x, pos.y, snagCheckPos.x, snagCheckPos.y) > 1.0 then
+    if pinned or drifting then
+      if not drifting and (snagCheckPos == nil or
+          planar(pos.x, pos.y, snagCheckPos.x, snagCheckPos.y) > 1.0) then
         snagCheckPos, snagCheckAt, snagCheckFrames =
           { x = pos.x, y = pos.y }, now, 0
       else
         snagCheckFrames = (snagCheckFrames or 0) + 1
         -- 5 sim-s clears a pilot form-cast pause; 8 real frames keeps
         -- jumpy test clocks from tripping it.
-        if now - snagCheckAt > 5.0 and snagCheckFrames >= 8 then
+        if drifting or (snagCheckAt and now - snagCheckAt > 5.0 and
+            snagCheckFrames >= 8) then
           local dx, dy = beat.x - pos.x, beat.y - pos.y
           local len = math.sqrt(dx * dx + dy * dy)
           if len > 0.1 then
@@ -542,8 +569,12 @@ function M.decide(view)
               label = snagSide > 0 and "left" or "right"
             end
             snagCheckPos, snagCheckAt, snagCheckFrames = nil, nil, nil
+            -- The hop itself is not "progress"; give it a fresh window so
+            -- the drift test judges the corridor, not the sidestep.
+            progressBest, progressAt = bdist, now
             wow.log(string.format(
-              "SNAG: pinned at (%.1f, %.1f) — hopping %s to (%.1f, %.1f) (cluster %d reach %d)",
+              "SNAG: %s at (%.1f, %.1f) — hopping %s to (%.1f, %.1f) (cluster %d reach %d)",
+              drifting and "drifting" or "pinned",
               pos.x, pos.y, label, snagTarget.x, snagTarget.y,
               snagClusterCount, reach))
           end
