@@ -65,21 +65,29 @@ COMPOSE_FILE := infra/compose.vmangos.yml
 ACCOUNT_USER := monofuel
 ACCOUNT_PASS := password
 
-.PHONY: test test-lua test-nim system pin-check start-server stop-server server-logging logs account soap-account play play-classic play-classic-netlog play-xr traverse traverse-field traverse-replay traverse-pack-replay traverse-headed traverse-pol traverse-desert traverse-wet traverse-checkpoints lift-tele quest-data warlock-account warlock-bot botwarrior-bot tusk-account tusk-bot beru-account beru-bot party-army navmesh-helper navmesh-status map-browser map-browser-once map-browser-debug map-browser-probe
+.PHONY: test test-lua test-nim system pin-check start-server stop-server server-logging logs account soap-account play play-classic play-classic-netlog play-xr traverse traverse-field traverse-replay traverse-pack-replay traverse-headed traverse-pol traverse-desert traverse-wet traverse-checkpoints traverse-lint traverse-lint-soft lift-tele quest-data warlock-account warlock-bot botwarrior-bot tusk-account tusk-bot beru-account beru-bot party-army navmesh-helper navmesh-status map-browser map-browser-once map-browser-debug map-browser-probe
 
 # Unit tier: Lua tools + Nim host/system tests only (v2 DoD: no Python required
 # for bot correctness). If nim is missing, test-nim-soft skips rather than
 # failing bare CI hosts. Smoke tier parse/compile-checks code no unit test
 # executes (addon Lua, army_host) — doctrine: a cheap compile-check is a
 # legitimate leg for a binary with no unit tests yet.
-test: test-lua test-nim-soft test-smoke test-traverse-soap test-traverse-checkpoint
+test: test-lua test-nim-soft test-smoke test-traverse-soap test-traverse-checkpoint traverse-lint-soft
 
-.PHONY: test-traverse-soap test-traverse-checkpoint
+.PHONY: test-traverse-soap test-traverse-checkpoint traverse-lint traverse-lint-soft
 test-traverse-soap:
 	@python3 tools/tests/test_traverse_soap.py
 test-traverse-checkpoint:
 	@python3 tools/tests/test_traverse_checkpoint.py
 	@python3 tools/tests/test_traverse_scorecard.py
+	@python3 tools/tests/test_traverse_route_lint.py
+# Offline land-beat corridor lint (Detour helper + spawn TSV). Exits 0 on SKIP
+# when helper/mmaps are missing so bare CI hosts stay green. make test uses
+# --warn-only so corridor FAILs do not red the unit suite; traverse-lint is strict.
+traverse-lint-soft:
+	@python3 tools/traverse_route_lint.py --warn-only
+traverse-lint:
+	@python3 tools/traverse_route_lint.py
 
 # Every Nim entrypoint/module must at least compile (`nim check`), even where
 # no unit suite imports it yet (army_host, msgpack_json).

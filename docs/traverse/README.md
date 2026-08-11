@@ -98,8 +98,41 @@ Learned from the route engine source; do not rediscover it the hard way:
 | `make traverse-headed` | Headed run (human use — agents stay headless) |
 | `make traverse-checkpoints` | List SOAP tele checkpoints (local debug) |
 
-Readback: `local_data/lua-bot-status.json` (beat, position, dist to water,
-stall seconds); run + CPU logs in `local_data/health-logs/`.
+Readback: `local_data/traverse-status/status.json` (traverse-private —
+the shared `lua-bot-status.json` is written by every lua-bot league and
+gets clobbered under concurrent runs); run + CPU logs in
+`local_data/health-logs/`.
+
+## Observability: progress is not health
+
+A run that reaches its endpoint while swimming off-plan, clipping through
+terrain, or idling 20% of its time is a failing run that got lucky — and
+monofuel's headed replay watches kept catching exactly those failures while
+the pass/fail verdicts looked fine. Three instruments now make them loud in
+headless runs:
+
+- **Flight recorder** (brain): `FLIGHT {json}` telemetry every 5 sim-s
+  (1 sim-s while anomalous) with position, hp, form, swim/combat flags,
+  nav state, active beat, and cross-track distance from the beat chord —
+  plus edge-triggered `EV` lines: `unplanned_swim` (land phase + swim flag:
+  the lake-chord failure), `form_lost`/`form_gained`, `clip` (z jump while
+  dry: terrain glitch-through), `off_line` (>35 yd off the chord for 5 s).
+- **Per-run scorecard** (`tools/traverse_scorecard.py`, auto-run by the
+  segment waiter): stopped seconds BY REASON, cross-track p50/p95/max,
+  swim/clip/form events, hp loss per 100-yd bin (the damage map), snag
+  clusters. `WARN` lines fire on: idle fraction > 0.15, cross-track
+  p95 > 25 yd, any unplanned swim, any clip, any bin losing > 800 hp.
+  Verdicts stay pass/fail; WARNs are the "a human would wince" channel —
+  treat a WARN-heavy PASS as a bug report, not a success.
+- **Route lint** (`make traverse-lint`, in `make test`): offline navmesh
+  check of every land-beat leg — broken corridors, slopes the client
+  cannot climb (>1.5), and water-crossing land legs (probed ground-only vs
+  ground+water: the class that produced the lake and waterfall incidents)
+  FAIL before any live run; hostile spawns within 12 yd of the chord WARN
+  (aggro floor here is ~7–11 yd, mobs 47–53 vs a level-60 seat).
+
+Raw feed: `local_data/traverse-status/run.log` (tee'd from every
+`make traverse` / `traverse-headed` launch).
 
 Suspected prior blocker, still under investigation: RPB logic pegging a
 core and starving world streaming, so the bot outruns terrain loading and
