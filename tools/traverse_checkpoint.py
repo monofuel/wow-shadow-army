@@ -535,6 +535,7 @@ def wait_for_segment_endpoint(
     swimming_samples = 1 if started_status.get("swimming") else 0
     samples = 1
     final_status = started_status
+    best_endpoint_distance = pose_dist_to_checkpoint(started_status, end_pose)
 
     while time.monotonic() < deadline:
         time.sleep(poll)
@@ -557,6 +558,8 @@ def wait_for_segment_endpoint(
         if st.get("swimming"):
             swimming_samples += 1
         distance = pose_dist_to_checkpoint(st, end_pose)
+        if distance < best_endpoint_distance:
+            best_endpoint_distance = distance
         if distance <= near_yards:
             elapsed = now - segment_started
             max_stationary = max(max_stationary, now - stationary_since)
@@ -566,6 +569,7 @@ def wait_for_segment_endpoint(
                 "end_checkpoint": end_name,
                 "elapsed_seconds": round(elapsed, 3),
                 "endpoint_distance_yards": round(distance, 3),
+                "best_endpoint_distance_yards": round(best_endpoint_distance, 3),
                 "max_stationary_seconds": round(max_stationary, 3),
                 "total_idle_seconds": round(total_idle, 3),
                 "idle_fraction": round(total_idle / elapsed, 4) if elapsed > 0 else 0.0,
@@ -582,6 +586,7 @@ def wait_for_segment_endpoint(
                 "reason": "bot died during segment",
                 "deaths": 1,
                 "endpoint_distance_yards": round(distance, 3),
+                "best_endpoint_distance_yards": round(best_endpoint_distance, 3),
                 "final_nav_error": st.get("nav_error") or "",
             }
 
@@ -594,6 +599,7 @@ def wait_for_segment_endpoint(
         "endpoint_distance_yards": round(
             pose_dist_to_checkpoint(final_status, end_pose), 3
         ),
+        "best_endpoint_distance_yards": round(best_endpoint_distance, 3),
         "final_nav_error": final_status.get("nav_error") or "",
     }
 

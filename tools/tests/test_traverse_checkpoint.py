@@ -131,6 +131,10 @@ class TestTraverseCheckpoint(unittest.TestCase):
         self.assertEqual(out["swimming_samples"], 0)
         self.assertEqual(out["deaths"], 0)
         self.assertLessEqual(out["endpoint_distance_yards"], 50)
+        self.assertIn("best_endpoint_distance_yards", out)
+        self.assertLessEqual(
+            out["best_endpoint_distance_yards"], out["endpoint_distance_yards"]
+        )
 
     def test_segment_wait_reports_death(self) -> None:
         statuses = [
@@ -154,6 +158,46 @@ class TestTraverseCheckpoint(unittest.TestCase):
             )
         self.assertFalse(out["ok"])
         self.assertEqual(out["deaths"], 1)
+        self.assertIn("best_endpoint_distance_yards", out)
+        self.assertGreater(out["best_endpoint_distance_yards"], 0)
+
+    def test_segment_wait_tracks_best_endpoint_distance(self) -> None:
+        """Closest approach is kept even when the final sample backs off."""
+        end = tc.resolve_checkpoint("felwood_cave_entrance")
+        near = {"x": end["x"] + 30.0, "y": end["y"], "swimming": False}
+        far = {"x": end["x"] + 200.0, "y": end["y"], "swimming": False, "nav_error": ""}
+        seq = iter(
+            [
+                {"x": 1071.6, "y": -2303.4, "swimming": False},
+                near,
+            ]
+        )
+
+        def statuses() -> dict:
+            try:
+                return next(seq)
+            except StopIteration:
+                return far
+
+        t = [0.0]
+
+        def mono() -> float:
+            cur = t[0]
+            t[0] += 0.1
+            return cur
+
+        with (
+            mock.patch.object(tc, "read_status", side_effect=lambda *_a, **_k: statuses()),
+            mock.patch.object(tc.time, "sleep"),
+            mock.patch.object(tc.time, "monotonic", side_effect=mono),
+        ):
+            out = tc.wait_for_segment_endpoint(
+                "top_barrens", "felwood_cave_entrance", timeout=2.0, near_yards=20.0
+            )
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["reason"], "segment endpoint timeout")
+        self.assertAlmostEqual(out["best_endpoint_distance_yards"], 30.0, places=1)
+        self.assertGreater(out["endpoint_distance_yards"], out["best_endpoint_distance_yards"])
 
     def test_cmd_wait_embeds_scorecard_when_run_log_exists(self) -> None:
         import argparse

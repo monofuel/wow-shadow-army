@@ -121,12 +121,33 @@ check(held.kind == "navigate" and held.x == -6413.2,
   "wet beats are never skipped while swimming")
 nav = { state = "following", failed_here = false, walkout_available = false }
 
--- Inside the goal radius, swimming: hold the segment goal.
+-- duskwallow_coast is retired like any ordinary wet beat: swimming there
+-- continues the coast chain toward merchant_coast, not a hold.
 clock = clock + 5.0
-local goal = petrel.decide(view(-4630.0, -4869.0,
+local pastDusk = petrel.decide(view(-4627.0, -4869.5,
   { shapeshift_form_id = 4, is_swimming = true }))
-check(goal.kind == "hold" and goal.reason == "duskwallow_coast",
-  "holds at the duskwallow goal")
+check(pastDusk.kind == "navigate" and pastDusk.water == true,
+  "at duskwallow_coast navigates the coast chain, no hold")
+check(pastDusk.reason == "swim_ribbon",
+  "coast continuation keeps the ribbon goal key")
+
+-- Coast beat selection just north of dusk targets coast_01 or coast_02.
+clock = clock + 5.0
+local coastPick = petrel.decide(view(-4300.0, -4900.0,
+  { shapeshift_form_id = 4, is_swimming = true }))
+check(coastPick.kind == "navigate" and coastPick.water == true,
+  "mid-coast selects a coast beat")
+check(
+  (math.abs(coastPick.x - (-4363.6)) < 0.1 and math.abs(coastPick.y - (-4903.7)) < 0.1)
+    or (math.abs(coastPick.x - (-4125.7)) < 0.1 and math.abs(coastPick.y - (-4841.2)) < 0.1),
+  "at (-4300,-4900) targets coast_01 or coast_02")
+
+-- Inside merchant_coast radius, swimming: hold the wet goal.
+clock = clock + 5.0
+local goal = petrel.decide(view(-1533.7, -4057.0,
+  { shapeshift_form_id = 4, is_swimming = true }))
+check(goal.kind == "hold" and goal.reason == "merchant_coast",
+  "holds at the merchant_coast goal")
 check(goal.status and goal.status.dist_goal < 25.0,
   "the goal hold reports the closing distance")
 

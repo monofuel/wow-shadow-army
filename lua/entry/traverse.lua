@@ -18,6 +18,7 @@ local M = { name = "petrel" }
 
 local ROUTE = require("config.traverse_beats")
 local LAND = require("config.traverse_land_beats")
+local COAST = require("config.traverse_coast_beats")
 
 -- Wet-chain gate: PETREL_SWIM=1 opts a run into the wet chain. Default off
 -- keeps traverse-desert's land-only PASS semantics ("awaiting_swim_pass").
@@ -144,6 +145,9 @@ local function beat_by_id(id)
   for _, b in ipairs(ROUTE.beats) do
     if b.id == id then return b end
   end
+  for _, b in ipairs(COAST.beats) do
+    if b.id == id then return b end
+  end
   return nil
 end
 
@@ -168,15 +172,19 @@ end
 
 --- First wet beat still ahead of us. Stateless: after crossing well into a
 --- beat's X band, lateral drift must not select that beat again, and beats
---- behind us (Kalimdor +X is north) never regress the run.
+--- behind us (Kalimdor +X is north) never regress the run — except hook
+--- beats (westward Merchant Bay mouth), same rule as the land selector.
+--- ROUTE wet ribbon first, then COAST beats through merchant_coast.
 local function next_wet_beat(x, y, fatigued)
   local wet = {}
   for _, b in ipairs(ROUTE.beats) do
     if b.wet then wet[#wet + 1] = b end
   end
+  for _, b in ipairs(COAST.beats) do
+    wet[#wet + 1] = b
+  end
   if #wet == 0 then return nil end
   for _, b in ipairs(wet) do
-    local passed = x >= (b.x + PASSED_YARDS)
     -- Entering a beat's capture zone retires it permanently: monotonic
     -- selection, no boundary flip-flop.
     -- Refill beats demand the tight touch only while the bar is actually
@@ -186,7 +194,8 @@ local function next_wet_beat(x, y, fatigued)
     if not skipped[b.id] and planar(x, y, b.x, b.y) <= cap then
       skipped[b.id] = true
     end
-    if not skipped[b.id] and not passed then
+    -- hook or still south of the X-pass band (land selector shape).
+    if not skipped[b.id] and (b.hook or x < b.x + PASSED_YARDS) then
       if b.x + b.radius >= x - 40.0 then
         return b
       end
@@ -234,7 +243,9 @@ end
 
 local function bot_status(view, pos, beat, extra)
   local water = beat_by_id("water_entry")
-  local goal = beat_by_id(ROUTE.goal_id)
+  -- Wet chain reports distance to merchant_coast; land-only still uses
+  -- the ROUTE segment goal (duskwallow_coast).
+  local goal = beat_by_id(SWIM and COAST.goal_id or ROUTE.goal_id)
   local status = {
     beat = beat and beat.id or "?",
     x = pos.x,
@@ -576,7 +587,7 @@ function M.decide(view)
 
   local land = beat_by_id("land_approach")
   local water = beat_by_id("water_entry")
-  local goal = beat_by_id(ROUTE.goal_id)
+  local goal = beat_by_id(COAST.goal_id)
   local water_dist = planar(pos.x, pos.y, water.x, water.y)
   local land_dist = planar(pos.x, pos.y, land.x, land.y)
   local swimming = view.is_swimming == true
@@ -803,11 +814,11 @@ function M.decide(view)
       status = bot_status(view, pos, beat) }
   end
 
-  -- Wet chain (SWIM=true): the manual-run ribbon, one sparse beat at a time,
-  -- never a single ocean chord.
+  -- Wet chain (SWIM=true): cheese ribbon through duskwallow, then the
+  -- fatigue-free coast to merchant_coast. One sparse beat at a time.
   if swimming and planar(pos.x, pos.y, goal.x, goal.y) <= goal.radius then
-    wow.set_status("goal: " .. ROUTE.goal_id)
-    return { kind = "hold", reason = ROUTE.goal_id,
+    wow.set_status("goal: " .. COAST.goal_id)
+    return { kind = "hold", reason = COAST.goal_id,
       status = bot_status(view, pos, goal) }
   end
 
