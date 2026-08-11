@@ -33,7 +33,10 @@ ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_TABLE = ROOT / "tools" / "traverse_checkpoints.json"
 # The live status file is written by the lua-bot host every frame; the old
 # traverse-cv-status.json died with the ClientView bridge (1454caa).
-DEFAULT_STATUS = ROOT / "local_data" / "lua-bot-status.json"
+# Traverse-private status file: the shared local_data/lua-bot-status.json
+# is written by EVERY lua-bot league (the accelerated bot clobbered it
+# mid-battery, 2026-08-10); the traverse launch passes --lua-status-dir.
+DEFAULT_STATUS = ROOT / "local_data" / "traverse-status" / "status.json"
 DEFAULT_CHAR = os.environ.get("TRAVERSE_CHARACTER", "Northbound")
 DEFAULT_SOAP_USER = os.environ.get("TRAVERSE_SOAP_USER", "COWCAM")
 DEFAULT_SOAP_PASS = os.environ.get("TRAVERSE_SOAP_PASS", "COWCAM")

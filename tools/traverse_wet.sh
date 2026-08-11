@@ -14,7 +14,7 @@ set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 FORK="$(cd "$ROOT/../monofuel-vanilla-wow" && pwd)"
-STATUS="$ROOT/local_data/lua-bot-status.json"
+STATUS="$ROOT/local_data/traverse-status/status.json"
 LOGDIR="$ROOT/local_data/health-logs"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 RUN_LOG="$LOGDIR/traverse-wet-$STAMP.log"
@@ -36,7 +36,8 @@ echo "traverse-wet: $RUN_SECONDS s headless run -> $RUN_LOG"
   cd "$FORK" &&
   PETREL_SWIM=1 nix develop "$FORK" --command \
     timeout "$RUN_SECONDS" nim r tools/launch_nim_player.nim -- \
-    --league=traverse --bot=lua-bot \
+    --league=race --bot=lua-bot \
+    --lua-status-dir="$ROOT/local_data/traverse-status" \
     --lua-repo="$ROOT" --lua-entry=traverse \
     --presentation=headless
 ) >"$RUN_LOG" 2>&1 &
@@ -48,7 +49,7 @@ run_pid=$!
 (
   for _ in $(seq 1 150); do
     if docker ps --format '{{.Names}}' 2>/dev/null |
-        grep -q 'traverse.*coworld-game'; then
+        grep -qE '(traverse|race).*coworld-game'; then
       break
     fi
     kill -0 "$run_pid" 2>/dev/null || exit 0

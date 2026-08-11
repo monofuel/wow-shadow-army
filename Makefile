@@ -29,9 +29,12 @@ LUA_BOT_LAUNCH = nix develop $(FORK_CLIENT) --command \
 	nim r tools/launch_nim_player.nim -- --league=accelerated \
 	--bot=lua-bot --lua-repo=$(CURDIR) --lua-entry=$(ENTRY)
 # Same host, traverse league: Petrel runs as lua/entry/traverse.lua.
+# Upstream renamed the leagues in the hosted-session protocol update
+# (2026-08-10): traverse -> race (same kalimdor_traversal scenario).
 TRAVERSE_LAUNCH = nix develop $(FORK_CLIENT) --command \
-	nim r tools/launch_nim_player.nim -- --league=traverse \
-	--bot=lua-bot --lua-repo=$(CURDIR) --lua-entry=traverse
+	nim r tools/launch_nim_player.nim -- --league=race \
+	--bot=lua-bot --lua-repo=$(CURDIR) --lua-entry=traverse \
+	--lua-status-dir=$(CURDIR)/local_data/traverse-status
 
 # Local realm operator inputs (paths relative to UPSTREAM).
 export VANILLA_WOW_EXTRACTED_DATA_DIR := $(UPSTREAM)/local_data/vmangos-5875-data
@@ -659,12 +662,13 @@ define TRAVERSE_CHECKPOINT_PRELUDE
 		rm -f "$(TRAVERSE_SEGMENT_RESULT)"; \
 	fi; \
 	if [ -n "$(CHECKPOINT)" ]; then \
-		rm -f local_data/lua-bot-status.json; \
-		prior_cid="$$(docker ps --format '{{.ID}} {{.Names}}' 2>/dev/null | grep 'traverse.*coworld-game' | awk '{print $$1}' | head -1)"; \
+		mkdir -p local_data/traverse-status; \
+		rm -f local_data/lua-bot-status.json local_data/traverse-status/status.json; \
+		prior_cid="$$(docker ps --format '{{.ID}} {{.Names}}' 2>/dev/null | grep -E '(traverse|race).*coworld-game' | awk '{print $$1}' | head -1)"; \
 		VMANGOS_MANGOSD_CONFIG_OVERRIDES="$$(python3 tools/traverse_soap.py env)"; \
 		export VMANGOS_MANGOSD_CONFIG_OVERRIDES; \
 		( for _ in $$(seq 1 200); do \
-			cid="$$(docker ps --format '{{.ID}} {{.Names}}' 2>/dev/null | grep 'traverse.*coworld-game' | awk '{print $$1}' | head -1)"; \
+			cid="$$(docker ps --format '{{.ID}} {{.Names}}' 2>/dev/null | grep -E '(traverse|race).*coworld-game' | awk '{print $$1}' | head -1)"; \
 			if [ -n "$$cid" ] && [ "$$cid" != "$$prior_cid" ]; then break; fi; \
 			sleep 2; \
 		  done; \
