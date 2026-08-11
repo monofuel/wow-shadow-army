@@ -11,13 +11,28 @@ end
 
 local clock = 100.0
 local nav = { state = "following", failed_here = false, walkout_available = false }
+local loggedLines = {}
 _G.wow = {
-  log = function() end,
+  log = function(msg) loggedLines[#loggedLines + 1] = msg end,
   set_status = function() end,
   time = function() return clock end,
   nav_progress = function() return nav end,
   position = function() return nil end,
 }
+
+local function any_log(prefix)
+  for _, line in ipairs(loggedLines) do
+    if line:sub(1, #prefix) == prefix then return line end
+  end
+  return nil
+end
+
+local function any_log_find(needle)
+  for _, line in ipairs(loggedLines) do
+    if line:find(needle, 1, true) then return line end
+  end
+  return nil
+end
 
 local route = require("config.traverse_beats")
 local landRoute = require("config.traverse_land_beats")
@@ -196,6 +211,12 @@ local hurt = petrel.decide(view(5600.0, -1000.0, {
 check(hurt.kind == "navigate",
   "low health in combat still just runs — never heals, never stops")
 
+-- Flight recorder false-positive guard: ordinary on-corridor land nav
+-- (before snag tests that deliberately freeze far off a test teleport)
+-- must not emit EV off_line.
+check(any_log("EV off_line") == nil,
+  "ordinary land navigation never logs EV off_line")
+
 -- Collision snag: pinned pose (unavailable + failed_here + no walkout) with
 -- a frozen seat opens a short perpendicular hop window — the goal itself
 -- never rotates, and the hop resumes the same beat after the window.
@@ -301,6 +322,46 @@ clock = clock + 5.0
 local atCave = petrel.decide(view(6500.0, -2060.0, formed))
 check(atCave.kind == "hold" and atCave.reason == "felwood_cave_entrance",
   "holds at the Timbermaw cave mouth")
+
+-- Flight recorder: land navigation emits FLIGHT telemetry with beat + xt.
+local flightLine = any_log("FLIGHT ")
+check(flightLine ~= nil, "land navigation logs a FLIGHT line")
+check(flightLine:find('"beat":', 1, true) ~= nil, "FLIGHT carries beat")
+check(flightLine:find('"xt":', 1, true) ~= nil, "FLIGHT carries xt")
+
+-- EV unplanned_swim on land-phase swim (before aquatic form cast return).
+loggedLines = {}
+clock = clock + 20.0
+local landSwim = petrel.decide(view(1200.0, -2300.0, {
+  shapeshift_form_id = 3, is_swimming = true,
+}))
+check(any_log("EV unplanned_swim") ~= nil,
+  "land-phase swim logs EV unplanned_swim")
+check(landSwim.kind == "cast_spell" and landSwim.spell == 1066,
+  "land-phase swim still casts aquatic form")
+
+-- EV clip: dry |z| jump > 10 between consecutive frames.
+loggedLines = {}
+clock = clock + 1.0
+petrel.decide(view(1200.0, -2300.0, {
+  shapeshift_form_id = 3,
+  location = { map_id = 1, position = { x = 1200.0, y = -2300.0, z = 14.0, o = 0.0 } },
+}))
+clock = clock + 0.1
+petrel.decide(view(1200.0, -2300.0, {
+  shapeshift_form_id = 3,
+  location = { map_id = 1, position = { x = 1200.0, y = -2300.0, z = 64.0, o = 0.0 } },
+}))
+check(any_log("EV clip") ~= nil, "large dry z jump logs EV clip")
+
+-- EV form_lost when shapeshift_form_id drops 3 -> 0.
+loggedLines = {}
+clock = clock + 1.0
+petrel.decide(view(1200.0, -2300.0, { shapeshift_form_id = 3 }))
+clock = clock + 0.1
+petrel.decide(view(1200.0, -2300.0, { shapeshift_form_id = 0 }))
+check(any_log_find("EV form_lost form=3") ~= nil,
+  "form 3 -> 0 logs EV form_lost")
 
 -- DOCTRINE GUARD: the brain must never contain form-cancel chat commands or
 -- heal/defensive spells. Multiple AIs have now tried both; both are fatal
