@@ -44,7 +44,7 @@ absolute: the rerun got 1,300 yd into the swim before a formless
 swim-flag desync mid-ocean turned it around — so the sentinel bites at
 SOME shoreline poses, always at the water_entry tele pose.
 
-## Why C fails: swim-flag desync with no recovery path
+## Why C failed (now GATE MET): grounding + wreck doodad, both fixed
 
 The seat swam ~800 yd in Aquatic Form (WETDBG: speed 7.08, submerged,
 surface 0.0), threw a form_lost/form_gained flicker, and then hung
