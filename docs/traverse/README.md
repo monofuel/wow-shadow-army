@@ -164,6 +164,7 @@ it in the act. Evidence first; no guess-fixes.
 
 | Doc | What it is |
 |---|---|
+| [segment-status.md](segment-status.md) | LIVING: per-segment verdicts, failure diagnoses, next actions (Petrel battery) |
 | [route-engineering.md](route-engineering.md) | The cookbook: offline corridor probing, spawn-field analysis, road detection from painted textures, trace-pinning, autopsy order |
 | [reference-logs.md](reference-logs.md) | Manual F9 recordings: the Great Lift rides (both platforms, up+down) and the 77 MB coast-swim run |
 | [petrel-plan.md](petrel-plan.md) | Plan of record — legs, fatigue, swim-north, weekend contender thesis |
