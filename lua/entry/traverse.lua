@@ -197,9 +197,8 @@ end
 
 --- First land beat still ahead of us, same monotonic shape as the wet
 --- selection: capture retires a beat forever, and a beat well behind our X
---- never regresses the run. Land capture is the full beat radius — roads
---- have no fatigue mechanic, so a 25 yd pass-by counts and the seat never
---- dwells at a beat center.
+--- never regresses the run — except hook beats (westward Timbermaw descent),
+--- which are only retired by capture. Land capture is the full beat radius.
 local function next_land_beat(x, y)
   for _, b in ipairs(LAND.beats) do
     if not skipped[b.id] and planar(x, y, b.x, b.y) <= b.radius then
@@ -208,7 +207,7 @@ local function next_land_beat(x, y)
       -- the place to put the seat back down if walkout carries it off.
       lastReached = { x = b.x, y = b.y }
     end
-    if not skipped[b.id] and x < b.x + PASSED_YARDS then
+    if not skipped[b.id] and (b.hook or x < b.x + PASSED_YARDS) then
       return b
     end
   end
@@ -226,7 +225,7 @@ local function peek_land_beat(x, y)
       retired[b.id] = true
     end
     if not skipped[b.id] and not retired[b.id]
-        and x < b.x + PASSED_YARDS then
+        and (b.hook or x < b.x + PASSED_YARDS) then
       return b
     end
   end

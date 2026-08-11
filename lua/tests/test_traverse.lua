@@ -41,12 +41,13 @@ local petrel = require("traverse")
 -- The route data survived the move off host-injected args.
 check(route.goal_id == "duskwallow_coast", "route keeps the segment goal")
 -- The north land phase is a SPARSE strategy-beat list (fair play): one beat
--- per road decision point, strictly increasing x, ending at the cave mouth.
-check(landRoute.goal_id == "felwood_cave_entrance" and #landRoute.beats == 25,
+-- per road decision point, strictly increasing x (hook beats may decrease),
+-- ending at the cave mouth.
+check(landRoute.goal_id == "felwood_cave_entrance" and #landRoute.beats == 31,
   "land route is sparse and ends at the Timbermaw cave mouth")
 for i = 2, #landRoute.beats do
-  check(landRoute.beats[i].x > landRoute.beats[i - 1].x,
-    "land beats march north monotonically")
+  check(landRoute.beats[i].hook or landRoute.beats[i].x > landRoute.beats[i - 1].x,
+    "land beats march north monotonically (hooks exempt)")
 end
 check(#route.beats == 50, "route keeps every beat")
 local wetCount = 0
@@ -188,18 +189,17 @@ check(north1.status and north1.status.phase == "north_land",
 check(north1.route_profile == "prefer_ground" and north1.stop_distance == 8.0,
   "land legs ground-route with a decisive stop")
 
--- Selection is monotonic: mid-Felwood picks the next beat ahead, never one
--- behind, without having visited any earlier beat.
+-- Selection is monotonic: mid-course on the painted Timbermaw road picks
+-- the next beat ahead, never one behind, without having visited any earlier.
 clock = clock + 5.0
-local mid = petrel.decide(view(5650.0, -1000.0, formed))
-check(mid.kind == "navigate" and mid.x == 5792.0,
-  "mid-Felwood selects the next road beat ahead")
--- Just short of the north collision-trap dodge the dodge is what gets
--- steered at, so the corridor swings wide of (5645,-1069).
+local mid = petrel.decide(view(5500.0, -650.0, formed))
+check(mid.kind == "navigate" and mid.x == 5600.0,
+  "mid-Felwood selects timbermaw_road_02 ahead")
+-- Past road_02's X band, the next painted beat is selected.
 clock = clock + 5.0
-local preDodge = petrel.decide(view(5545.0, -1000.0, formed))
-check(preDodge.kind == "navigate" and preDodge.x == 5585.0,
-  "north trap dodge is selected before north_road_2")
+local mid2 = petrel.decide(view(5650.0, -600.0, formed))
+check(mid2.kind == "navigate" and mid2.x == 5850.0,
+  "past road_02 selects timbermaw_road_03")
 
 -- SPEEDRUN DOCTRINE: hurt and in combat on the Felwood road, the answer is
 -- still only to keep running — no heal, no defensive cast, no stopping.
@@ -316,6 +316,23 @@ end
 check(recovered ~= nil, "a seat dragged off the line still hops")
 check(math.abs(recovered.x - 3813.0) < 1.0 and math.abs(recovered.y + 1324.0) < 1.0,
   "the hop steers back to the last beat actually stood on")
+
+-- Hook beats: past road_10 in X (x > road_11.x + PASSED_YARDS) must still
+-- NAVIGATE to timbermaw_road_11 — hook exempts westward descent from the
+-- monotonic-x skip. Clear any snag window left by the walkout tests, retire
+-- road_09 by capture first (its X band still covers 6640: 6625+20), then
+-- the test pose captures road_10 (20 yd away) and must select road_11.
+-- Far enough from road_11 that it is not captured. Before the cave hold.
+-- Proven-ground snag windows can last 4 + dist/8 sim-s (~50+ after the
+-- walkout recovery hop); clear that before asserting pure navigate.
+nav = { state = "following", failed_here = false, walkout_available = false }
+clock = clock + 100.0
+petrel.decide(view(6625.0, -1400.0, formed))  -- capture timbermaw_road_09
+clock = clock + 1.0
+local hookNav = petrel.decide(view(6640.0, -1520.0, formed))
+check(hookNav.kind == "navigate" and hookNav.reason ~= "snag_hop"
+    and hookNav.x == 6612.0,
+  "hook beat timbermaw_road_11 is not x-skipped past its X band")
 
 -- The cave mouth is the segment goal: hold there, alive.
 clock = clock + 5.0
