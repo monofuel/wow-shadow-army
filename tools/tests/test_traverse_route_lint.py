@@ -625,15 +625,15 @@ class TestProbeLegCli(unittest.TestCase):
 
     def test_probe_leg_lints_only_named_pair(self) -> None:
         rc, out = self._run(
-            ["--probe-leg", "ashenvale_climb_dodge", "ashenvale_climb"]
+            ["--probe-leg", "ashenvale_pass_1", "ashenvale_pass_2"]
         )
         self.assertEqual(rc, 0)
         self.assertEqual(out.strip().splitlines()[0].split()[0], "OK")
-        self.assertIn("ashenvale_climb_dodge->ashenvale_climb", out)
+        self.assertIn("ashenvale_pass_1->ashenvale_pass_2", out)
         self.assertEqual(len(out.strip().splitlines()), 1)
 
     def test_probe_leg_unknown_id_fails(self) -> None:
-        rc, _ = self._run(["--probe-leg", "nope_a", "ashenvale_climb"])
+        rc, _ = self._run(["--probe-leg", "nope_a", "ashenvale_pass_2"])
         self.assertEqual(rc, 1)
 
 
