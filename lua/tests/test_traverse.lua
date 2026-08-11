@@ -27,7 +27,7 @@ local petrel = require("traverse")
 check(route.goal_id == "duskwallow_coast", "route keeps the segment goal")
 -- The north land phase is a SPARSE strategy-beat list (fair play): one beat
 -- per road decision point, strictly increasing x, ending at the cave mouth.
-check(landRoute.goal_id == "felwood_cave_entrance" and #landRoute.beats == 44,
+check(landRoute.goal_id == "felwood_cave_entrance" and #landRoute.beats == 42,
   "land route is sparse and ends at the Timbermaw cave mouth")
 for i = 2, #landRoute.beats do
   check(landRoute.beats[i].x > landRoute.beats[i - 1].x,
