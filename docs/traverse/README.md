@@ -143,6 +143,7 @@ it in the act. Evidence first; no guess-fixes.
 
 | Doc | What it is |
 |---|---|
+| [route-engineering.md](route-engineering.md) | The cookbook: offline corridor probing, spawn-field analysis, road detection from painted textures, trace-pinning, autopsy order |
 | [reference-logs.md](reference-logs.md) | Manual F9 recordings: the Great Lift rides (both platforms, up+down) and the 77 MB coast-swim run |
 | [petrel-plan.md](petrel-plan.md) | Plan of record — legs, fatigue, swim-north, weekend contender thesis |
 | [duskwallow-plan.md](duskwallow-plan.md) | Isolated swim segment — water entry → Dustwallow; scoreboard + gates |
