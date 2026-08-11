@@ -155,6 +155,58 @@ class TestTraverseCheckpoint(unittest.TestCase):
         self.assertFalse(out["ok"])
         self.assertEqual(out["deaths"], 1)
 
+    def test_cmd_wait_embeds_scorecard_when_run_log_exists(self) -> None:
+        import argparse
+        import io
+        import tempfile
+
+        statuses = [
+            {"x": 1071.6, "y": -2303.4, "swimming": False},
+            {"x": 6502.937, "y": -2063.74, "swimming": False, "nav_error": ""},
+        ]
+        clock = iter(range(20))
+        flight = (
+            'lua-bot[traverse]: FLIGHT {"t":0.0,"x":0.0,"y":0.0,"z":0,'
+            '"hp":1000,"form":0,"swim":false,"combat":false,'
+            '"nav":"following","beat":"desert","xt":1.0}\n'
+            'lua-bot[traverse]: FLIGHT {"t":5.0,"x":40.0,"y":0.0,"z":0,'
+            '"hp":1000,"form":0,"swim":false,"combat":false,'
+            '"nav":"following","beat":"desert","xt":2.0}\n'
+        )
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            run_dir = tmp / "local_data" / "traverse-status"
+            run_dir.mkdir(parents=True)
+            (run_dir / "run.log").write_text(flight, encoding="utf-8")
+            result_path = tmp / "segment.json"
+            args = argparse.Namespace(
+                start="top_barrens",
+                end="felwood_cave_entrance",
+                status=None,
+                timeout=15.0,
+                near=50.0,
+                start_near=120.0,
+                poll=0.5,
+                result=str(result_path),
+            )
+            buf = io.StringIO()
+            with (
+                mock.patch.object(tc, "ROOT", tmp),
+                mock.patch.object(tc, "read_status", side_effect=statuses),
+                mock.patch.object(tc.time, "sleep"),
+                mock.patch.object(
+                    tc.time, "monotonic", side_effect=lambda: float(next(clock))
+                ),
+                mock.patch("sys.stdout", buf),
+            ):
+                rc = tc.cmd_wait(args)
+            self.assertEqual(rc, 0)
+            data = json.loads(result_path.read_text(encoding="utf-8"))
+            self.assertIn("scorecard", data)
+            self.assertIn("duration_s", data["scorecard"])
+            self.assertAlmostEqual(data["scorecard"]["duration_s"], 5.0, places=2)
+            self.assertIn("traverse scorecard", buf.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

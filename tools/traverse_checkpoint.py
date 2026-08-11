@@ -634,6 +634,22 @@ def cmd_apply(args: argparse.Namespace) -> int:
     return 0 if out.get("ok") else 1
 
 
+def _attach_scorecard(out: dict[str, Any]) -> dict[str, Any] | None:
+    """Best-effort scorecard from run.log. Never raises; never mutates verdict keys."""
+    run_log = ROOT / "local_data" / "traverse-status" / "run.log"
+    if not run_log.is_file():
+        return None
+    try:
+        from traverse_scorecard import format_table, parse_run_log
+
+        sc = parse_run_log(run_log)
+        out["scorecard"] = sc
+        return sc
+    except Exception as e:  # noqa: BLE001 — scorecard must not affect wait
+        print(f"[traverse-checkpoint] scorecard skipped: {e}", file=sys.stderr)
+        return None
+
+
 def cmd_wait(args: argparse.Namespace) -> int:
     out = wait_for_segment_endpoint(
         args.start,
@@ -644,12 +660,20 @@ def cmd_wait(args: argparse.Namespace) -> int:
         start_near_yards=args.start_near,
         poll=args.poll,
     )
+    sc = _attach_scorecard(out)
     body = json.dumps(out, indent=2, default=str)
     if args.result:
         result_path = Path(args.result)
         result_path.parent.mkdir(parents=True, exist_ok=True)
         result_path.write_text(body + "\n", encoding="utf-8")
     print(body)
+    if sc is not None:
+        try:
+            from traverse_scorecard import format_table
+
+            print(format_table(sc), flush=True)
+        except Exception:  # noqa: BLE001
+            pass
     return 0 if out.get("ok") else 1
 
 

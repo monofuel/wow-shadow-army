@@ -79,6 +79,7 @@ test-traverse-soap:
 	@python3 tools/tests/test_traverse_soap.py
 test-traverse-checkpoint:
 	@python3 tools/tests/test_traverse_checkpoint.py
+	@python3 tools/tests/test_traverse_scorecard.py
 
 # Every Nim entrypoint/module must at least compile (`nim check`), even where
 # no unit suite imports it yet (army_host, msgpack_json).
@@ -678,9 +679,10 @@ define TRAVERSE_CHECKPOINT_PRELUDE
 endef
 
 define TRAVERSE_RUN
+	mkdir -p "$(CURDIR)/local_data/traverse-status"; \
 	if [ -n "$(END_CHECKPOINT)" ]; then \
 		cd $(FORK_CLIENT); \
-		PETREL_SWIM=$(TRAVERSE_SWIM_EFFECTIVE) setsid $(TRAVERSE_LAUNCH) --presentation=$(1) & \
+		PETREL_SWIM=$(TRAVERSE_SWIM_EFFECTIVE) setsid sh -c '$(TRAVERSE_LAUNCH) --presentation=$(1) 2>&1 | tee "$(CURDIR)/local_data/traverse-status/run.log"' & \
 		run_pid=$$!; \
 		cleanup() { \
 			kill -TERM -- -$$run_pid 2>/dev/null || true; \
@@ -696,7 +698,9 @@ define TRAVERSE_RUN
 		cleanup; \
 		exit $$segment_rc; \
 	else \
-		cd $(FORK_CLIENT) && PETREL_SWIM=$(TRAVERSE_SWIM_EFFECTIVE) $(TRAVERSE_LAUNCH) --presentation=$(1); \
+		cd $(FORK_CLIENT) && set -o pipefail && \
+		PETREL_SWIM=$(TRAVERSE_SWIM_EFFECTIVE) $(TRAVERSE_LAUNCH) --presentation=$(1) 2>&1 | \
+			tee "$(CURDIR)/local_data/traverse-status/run.log"; \
 	fi
 endef
 traverse:
