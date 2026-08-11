@@ -551,6 +551,31 @@ function M.decide(view)
     parkCheckPos, parkCheckAt, parkCheckFrames = nil, nil, nil
   end
 
+  -- TEMP WETSTATEDBG: post-upstream-merge wet regressions (2026-08-11).
+  -- Segment B: dry seat at the beach never wades in (nav=planning forever).
+  -- Segment C: seat suspended mid-column, swim flag false, unrecovered.
+  -- Log the client's liquid observation whenever the wet chain would want
+  -- water but the seat is NOT swimming. Remove after the fork report.
+  if SWIM and not view.is_swimming then
+    local near_beach = planar(pos.x, pos.y, -6784.5, -4833.9) < 250.0
+    local submerged_odd = view.liquid_submerged or
+      (view.liquid_known and type(view.liquid_surface_z) == "number" and
+       pos.z < view.liquid_surface_z - 3.0)
+    if near_beach or submerged_odd then
+      local now = wow.time()
+      if lastWetDbgAt == nil or now - lastWetDbgAt > 5.0 then
+        lastWetDbgAt = now
+        wow.log(string.format(
+          "WETSTATEDBG pos=(%.1f,%.1f,%.1f) swim=%s lk=%s lck=%s sub=%s surf=%s form=%s nav=%s",
+          pos.x, pos.y, pos.z or -99,
+          tostring(view.is_swimming), tostring(view.liquid_known),
+          tostring(view.liquid_coverage_known),
+          tostring(view.liquid_submerged), tostring(view.liquid_surface_z),
+          tostring(view.shapeshift_form_id), wow.nav_progress().state))
+      end
+    end
+  end
+
   -- TEMP WETDBG: frozen-swimmer investigation (2026-08-10). Remove after.
   if SWIM and view.is_swimming then
     local now = wow.time()
