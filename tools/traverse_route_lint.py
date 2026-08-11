@@ -48,7 +48,27 @@ FRIENDLY_NAMES = frozenset(
         "Timbermaw Warder",
     }
 )
+# Target-side z offsets. The helper only enforces a 6 yd *horizontal* limit on
+# the target projection (kRouteProjectionHorizontalLimit) plus an 80 yd vertical
+# findNearestPoly extent, so a coarse sweep is plenty on that side.
 Z_OFFSETS = (0.0, 30.0, -30.0, 60.0, -60.0)
+# Source-side z sweep. vmangos_navmesh_helper.cpp rejects every source
+# projection farther than kRouteSourceProjectionVerticalLimit = 2.0 yd
+# vertically (and kGraphProjectionHorizontalLimit = 3.0 yd horizontally) from
+# the requested pose -> "no physically admissible source triangle was found
+# near the client pose". The admissible band is therefore only 4 yd tall, and a
+# 30 yd sweep step steps straight over it. SOURCE_Z_STEP = 3.0 puts every z in
+# range within 1.5 yd of a probe, so any reachable band is always hit.
+SOURCE_Z_STEP = 3.0
+SOURCE_Z_MAX = 90.0
+# Helper wordings that mean "the *source* pose did not project", i.e. the ones
+# worth spending more source-z candidates on.
+SOURCE_PROJECTION_MARKERS = (
+    "source triangle",
+    "local source projection",
+    "source did not project",
+    "source polygon",
+)
 
 
 @dataclass(frozen=True)
@@ -94,6 +114,8 @@ class ProbeResult:
 
 
 ProbeFn = Callable[[Point, Point, int], ProbeResult]
+# observer(source, target, include_flags, response) -- raw attempt trace.
+ObserverFn = Callable[[Point, Point, int, dict[str, Any]], None]
 
 
 def planar_distance(ax: float, ay: float, bx: float, by: float) -> float:
@@ -273,15 +295,60 @@ def call_helper_once(
         }
 
 
-def z_sweep_candidates(source: Point, target: Point) -> list[tuple[Point, Point]]:
-    """Source and target z offsets (0, +-30, +-60) for projection recovery."""
-    out: list[tuple[Point, Point]] = []
-    for src_dz in Z_OFFSETS:
-        s = Point(source.x, source.y, source.z + src_dz)
-        for tgt_dz in Z_OFFSETS:
-            t = Point(target.x, target.y, target.z + tgt_dz)
-            out.append((s, t))
+def source_z_offsets(
+    step: float = SOURCE_Z_STEP, limit: float = SOURCE_Z_MAX
+) -> list[float]:
+    """Fine source-z offsets ordered by |dz| (0, -step, +step, -2*step, ...).
+
+    Step must stay below 2 * kRouteSourceProjectionVerticalLimit (4.0 yd) or the
+    sweep can straddle the only admissible band above a beat's mesh floor.
+    """
+    if step <= 0.0:
+        return [0.0]
+    out = [0.0]
+    k = 1
+    while k * step <= limit + 1e-9:
+        out.append(-k * step)
+        out.append(k * step)
+        k += 1
     return out
+
+
+def target_z_offsets() -> tuple[float, ...]:
+    """Coarse target-z offsets; the helper is lenient about target height."""
+    return Z_OFFSETS
+
+
+def z_sweep_candidates(source: Point, target: Point) -> list[tuple[Point, Point]]:
+    """Ordered (source, target) candidates: fine source sweep, then target sweep.
+
+    The source is swept first and finely because the helper's source projection
+    is the tight one; only afterwards is the (lenient) target height varied.
+    """
+    out: list[tuple[Point, Point]] = []
+    for src_dz in source_z_offsets():
+        out.append(
+            (
+                Point(source.x, source.y, source.z + src_dz),
+                Point(target.x, target.y, target.z),
+            )
+        )
+    for tgt_dz in target_z_offsets():
+        if tgt_dz == 0.0:
+            continue
+        out.append((source, Point(target.x, target.y, target.z + tgt_dz)))
+    return out
+
+
+def _is_source_projection_failure(resp: dict[str, Any]) -> bool:
+    """True when the helper rejected the *source* pose specifically."""
+    msg = str(resp.get("message") or "").lower()
+    if any(marker in msg for marker in SOURCE_PROJECTION_MARKERS):
+        return True
+    if "could not project source or target" in msg:
+        # The helper echoes source_poly_ref only when the source did project.
+        return not resp.get("source_poly_ref")
+    return False
 
 
 def single_hop_with_z_retry(
@@ -290,10 +357,43 @@ def single_hop_with_z_retry(
     source: Point,
     target: Point,
     include_flags: int,
+    observer: ObserverFn | None = None,
+    target_dz: float = 0.0,
 ) -> dict[str, Any]:
+    """One hop, recovering from off-mesh beat z by sweeping source then target.
+
+    ``target_dz`` seeds the target height with an offset already known to work
+    on this leg (carried across continuation hops) so later hops do not redo the
+    whole sweep. The applied offsets are echoed back under ``z_sweep``.
+    """
+
+    def attempt(s: Point, t: Point, s_dz: float, t_dz: float) -> dict[str, Any]:
+        resp = call_helper_once(helper, mmaps, s, t, include_flags)
+        resp["z_sweep"] = {"source_dz": s_dz, "target_dz": t_dz}
+        if observer is not None:
+            observer(s, t, include_flags, resp)
+        return resp
+
+    seed_target = Point(target.x, target.y, target.z + target_dz)
     last: dict[str, Any] = {}
-    for s, t in z_sweep_candidates(source, target):
-        last = call_helper_once(helper, mmaps, s, t, include_flags)
+    # Phase 1: fine source sweep at the known-good target height.
+    source_ok: Point | None = None
+    for src_dz in source_z_offsets():
+        s = Point(source.x, source.y, source.z + src_dz)
+        last = attempt(s, seed_target, src_dz, target_dz)
+        if not _should_retry_with_z_sweep(last):
+            return last
+        if source_ok is None and not _is_source_projection_failure(last):
+            # This source height projects fine; remember it for the target sweep.
+            source_ok = s
+    # Phase 2: coarse target sweep from the best-known source height.
+    s = source_ok if source_ok is not None else source
+    src_dz = s.z - source.z
+    for tgt_dz in target_z_offsets():
+        if tgt_dz == target_dz:
+            continue
+        t = Point(target.x, target.y, target.z + tgt_dz)
+        last = attempt(s, t, src_dz, tgt_dz)
         if not _should_retry_with_z_sweep(last):
             return last
     return last
@@ -317,16 +417,28 @@ def chain_route(
     source: Point,
     target: Point,
     include_flags: int,
+    observer: ObserverFn | None = None,
 ) -> ProbeResult:
     """Query helper, chain partials (max hops), return completeness + worst slope."""
     all_wps: list[Point] = []
     worst_slope = 0.0
     cursor = source
     last_msg = ""
+    target_dz = 0.0
     for _hop in range(MAX_CONTINUATION_HOPS):
         resp = single_hop_with_z_retry(
-            helper, mmaps, cursor, target, include_flags
+            helper,
+            mmaps,
+            cursor,
+            target,
+            include_flags,
+            observer=observer,
+            target_dz=target_dz,
         )
+        # Carry the target height that worked into the next continuation hop.
+        sweep = resp.get("z_sweep")
+        if isinstance(sweep, dict) and not _should_retry_with_z_sweep(resp):
+            target_dz = float(sweep.get("target_dz") or 0.0)
         last_msg = str(resp.get("message") or "")
         slope = float(resp.get("max_segment_slope") or 0.0)
         if slope > worst_slope:
@@ -375,11 +487,42 @@ def chain_route(
     )
 
 
-def make_helper_probe(helper: Path, mmaps: Path) -> ProbeFn:
+def make_helper_probe(
+    helper: Path, mmaps: Path, observer: ObserverFn | None = None
+) -> ProbeFn:
     def probe(source: Point, target: Point, include_flags: int) -> ProbeResult:
-        return chain_route(helper, mmaps, source, target, include_flags)
+        return chain_route(
+            helper, mmaps, source, target, include_flags, observer=observer
+        )
 
     return probe
+
+
+def format_attempt(
+    source: Point, target: Point, include_flags: int, resp: dict[str, Any]
+) -> str:
+    """One-line trace of a raw helper attempt (for --verbose)."""
+    sweep = resp.get("z_sweep") if isinstance(resp.get("z_sweep"), dict) else {}
+    src_dz = float(sweep.get("source_dz") or 0.0)
+    tgt_dz = float(sweep.get("target_dz") or 0.0)
+    wps = resp.get("waypoints") or []
+    return (
+        f"  attempt flags={include_flags} "
+        f"src=({source.x:.1f},{source.y:.1f},{source.z:.2f}) dz={src_dz:+.1f} "
+        f"tgt=({target.x:.1f},{target.y:.1f},{target.z:.2f}) dz={tgt_dz:+.1f} "
+        f"-> status={resp.get('status')} wps={len(wps)} "
+        f"cont={bool(resp.get('continuation_required'))} "
+        f"msg={str(resp.get('message') or '')!r}"
+    )
+
+
+def make_verbose_observer(stream: Any = sys.stderr) -> ObserverFn:
+    def observer(
+        source: Point, target: Point, include_flags: int, resp: dict[str, Any]
+    ) -> None:
+        print(format_attempt(source, target, include_flags, resp), file=stream)
+
+    return observer
 
 
 def directional_slopes(waypoints: Sequence[Point]) -> tuple[float, float]:
@@ -480,6 +623,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         action="store_true",
         help="Print FAILs as LINT-FAIL but exit 0 (test suite mode)",
     )
+    parser.add_argument(
+        "--probe-leg",
+        nargs=2,
+        metavar=("ID_A", "ID_B"),
+        help="Lint a single leg by beat id instead of the whole route",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Print every raw helper attempt (source/target z sweep trace)",
+    )
     args = parser.parse_args(list(argv) if argv is not None else None)
 
     if not resources_ready(args.helper, args.mmaps):
@@ -501,7 +655,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
 
     hostiles = filter_hostile_spawns(load_spawns(args.spawns))
-    probe = make_helper_probe(args.helper, args.mmaps)
+    observer = make_verbose_observer() if args.verbose else None
+    probe = make_helper_probe(args.helper, args.mmaps, observer=observer)
+
+    if args.probe_leg:
+        by_id = {b.id: b for b in beats}
+        missing = [bid for bid in args.probe_leg if bid not in by_id]
+        if missing:
+            print(f"FAIL unknown beat id(s): {', '.join(missing)}", file=sys.stderr)
+            return 1
+        a, b = by_id[args.probe_leg[0]], by_id[args.probe_leg[1]]
+        sev, details = lint_leg(a, b, probe, hostiles)
+        label = f"{a.id}->{b.id}"
+        print_sev = "LINT-FAIL" if (args.warn_only and sev == "FAIL") else sev
+        print(format_line(print_sev, label, details))
+        if args.warn_only:
+            return 0
+        return 1 if sev == "FAIL" else 0
+
     rows = lint_route(beats, probe, hostiles)
     for sev, label, details in rows:
         print_sev = "LINT-FAIL" if (args.warn_only and sev == "FAIL") else sev

@@ -81,6 +81,7 @@ test-traverse-checkpoint:
 	@python3 tools/tests/test_traverse_checkpoint.py
 	@python3 tools/tests/test_traverse_scorecard.py
 	@python3 tools/tests/test_traverse_route_lint.py
+	@python3 tools/tests/test_road_mask.py
 # Offline land-beat corridor lint (Detour helper + spawn TSV). Exits 0 on SKIP
 # when helper/mmaps are missing so bare CI hosts stay green. make test uses
 # --warn-only so corridor FAILs do not red the unit suite; traverse-lint is strict.
