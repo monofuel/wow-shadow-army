@@ -30,6 +30,18 @@ NEIGH8 = tuple(
     for dj in (-1, 0, 1)
     if not (di == 0 and dj == 0)
 )
+# Frozen clockwise Zhang-Suen ring P2..P9. Orientation-agnostic; do not
+# "fix" for world-axis direction.
+_ZS_RING = (
+    (0, 1),
+    (1, 1),
+    (1, 0),
+    (1, -1),
+    (0, -1),
+    (-1, -1),
+    (-1, 0),
+    (-1, 1),
+)
 
 
 def decimate(chain: Sequence[Point], spacing: float) -> list[Point]:
@@ -132,13 +144,59 @@ def erase_near_path(
     return remaining
 
 
+def _zs_deletable(p: Cell, working: set[Cell], phase: int) -> bool:
+    i, j = p
+    neigh = tuple(1 if (i + di, j + dj) in working else 0 for di, dj in _ZS_RING)
+    b = sum(neigh)
+    if b < 2 or b > 6:
+        return False
+    circled = neigh + (neigh[0],)
+    a = sum(1 for k in range(8) if circled[k] == 0 and circled[k + 1] == 1)
+    if a != 1:
+        return False
+    p2, _p3, p4, _p5, p6, _p7, p8, _p9 = neigh
+    if phase == 1:
+        return p2 * p4 * p6 == 0 and p4 * p6 * p8 == 0
+    return p2 * p4 * p8 == 0 and p2 * p6 * p8 == 0
+
+
+def thin_cells(comp: set[Cell]) -> set[Cell]:
+    """Zhang-Suen morphological thinning.
+
+    Snapshot semantics: each sub-iteration computes ``to_delete`` against the
+    unmodified working set, then subtracts. Never delete mid-scan.
+
+    Clockwise ring P2..P9 is frozen and orientation-agnostic (do not "fix"
+    for world-axis direction): P2=(i,j+1), P3=(i+1,j+1), P4=(i+1,j),
+    P5=(i+1,j-1), P6=(i,j-1), P7=(i-1,j-1), P8=(i-1,j), P9=(i-1,j+1).
+    """
+    working = set(comp)
+    while True:
+        deleted = 0
+        for phase in (1, 2):
+            to_delete = {p for p in working if _zs_deletable(p, working, phase)}
+            working -= to_delete
+            deleted += len(to_delete)
+        if deleted == 0:
+            break
+    return working
+
+
 def extract_centerlines(
     cell_set: set[Cell],
     step: float,
     min_cells: int,
     erase_radius: float = ERASE_YD,
 ) -> tuple[list[list[Cell]], list[set[Cell]]]:
-    pending = [c for c in connected_components(cell_set) if len(c) >= min_cells]
+    # Zhang-Suen can annihilate small symmetric blobs entirely (a 2x2 block
+    # thins to nothing) -- drop empty skeletons or pending.sort(key=min) dies.
+    pending = [
+        skeleton
+        for c in connected_components(cell_set)
+        if len(c) >= min_cells
+        for skeleton in (thin_cells(c),)
+        if skeleton
+    ]
     paths: list[list[Cell]] = []
     discarded: list[set[Cell]] = []
     while pending:
@@ -186,20 +244,45 @@ def canonicalize_segments(polylines: Iterable[Sequence[Point]]) -> list[dict]:
     return segs
 
 
+def _planar_arclength(chain: Sequence[Point]) -> float:
+    total = 0.0
+    for prev, cur in zip(chain, chain[1:]):
+        total += math.hypot(cur[0] - prev[0], cur[1] - prev[1])
+    return total
+
+
+def _paths_to_segments(
+    paths: Sequence[Sequence[Cell]],
+    cells: dict[Cell, float],
+    step: float,
+    decimate_yd: float,
+    min_length: float,
+) -> list[list[Point]]:
+    # Filter on full-resolution planar arclength. Measuring after decimation
+    # would couple segment survival to the smoothing knob.
+    polylines: list[list[Point]] = []
+    for path in paths:
+        world = cells_to_world(path, cells, step)
+        if min_length > 0 and _planar_arclength(world) < min_length:
+            continue
+        pts = decimate(world, decimate_yd)
+        if len(pts) >= 2:
+            polylines.append(pts)
+    return polylines
+
+
 def bake_from_cells(
     cells: dict[Cell, float],
     *,
     step: float = 4.0,
     decimate_yd: float = 10.0,
     min_cells: int = 6,
+    min_length: float = 30.0,
 ) -> list[dict]:
     paths, _discarded = extract_centerlines(set(cells), step, min_cells)
-    polylines: list[list[Point]] = []
-    for path in paths:
-        pts = decimate(cells_to_world(path, cells, step), decimate_yd)
-        if len(pts) >= 2:
-            polylines.append(pts)
-    return canonicalize_segments(polylines)
+    return canonicalize_segments(
+        _paths_to_segments(paths, cells, step, decimate_yd, min_length)
+    )
 
 
 def make_meta(
@@ -207,6 +290,8 @@ def make_meta(
     step: float,
     decimate_yd: float,
     min_cells: int,
+    min_length: float = 30.0,
+    max_water_depth: float = 0.5,
 ) -> dict:
     return {
         "meta": 1,
@@ -217,6 +302,9 @@ def make_meta(
         "step": step,
         "decimate_yd": decimate_yd,
         "min_cells": min_cells,
+        "min_length_yd": min_length,
+        "max_water_depth": max_water_depth,
+        "markers": list(rmask.ROAD_TEXTURE_MARKERS),
     }
 
 
@@ -284,9 +372,11 @@ def sample_road_cells(
     mask: rmask.RoadMask,
     step: float,
     bbox: tuple[float, float, float, float] | None = None,
+    max_water_depth: float = 0.5,
 ) -> tuple[dict[Cell, float], dict[str, int]]:
     cells: dict[Cell, float] = {}
     fallbacks = 0
+    water_skipped = 0
     tiles_scanned = 0
     tiles_with_roads = 0
     t0 = time.monotonic()
@@ -319,6 +409,9 @@ def sample_road_cells(
                     continue
                 if not mask.is_road(x, y).is_road:
                     continue
+                if max_water_depth > 0 and mask.is_water(x, y).depth > max_water_depth:
+                    water_skipped += 1
+                    continue
                 z = mask.ground_z(x, y)
                 if z is None:
                     z = 0.0
@@ -328,7 +421,8 @@ def sample_road_cells(
             print(
                 f"  sampled {tiles_with_roads} road tiles "
                 f"({tiles_scanned} opened / {n} listed) "
-                f"cells={len(cells)} elapsed={time.monotonic() - t0:.1f}s",
+                f"cells={len(cells)} water_skipped={water_skipped} "
+                f"elapsed={time.monotonic() - t0:.1f}s",
                 file=sys.stderr,
                 flush=True,
             )
@@ -338,6 +432,7 @@ def sample_road_cells(
         "tiles_with_roads": tiles_with_roads,
         "cells": len(cells),
         "fallback_z": fallbacks,
+        "water_skipped": water_skipped,
     }
     return cells, stats
 
@@ -350,20 +445,26 @@ def bake_map(
     min_cells: int,
     out_path: Path,
     bbox: tuple[float, float, float, float] | None = None,
+    min_length: float = 30.0,
+    max_water_depth: float = 0.5,
 ) -> dict:
     t0 = time.monotonic()
     print(
         f"bake {map_name} adt={adt_dir} step={step} decimate={decimate_yd} "
-        f"min_cells={min_cells} out={out_path}",
+        f"min_cells={min_cells} min_length={min_length} "
+        f"max_water_depth={max_water_depth} out={out_path}",
         file=sys.stderr,
         flush=True,
     )
     mask = rmask.RoadMask(adt_dir, map_name=map_name)
-    cells, stats = sample_road_cells(mask, step, bbox)
+    cells, stats = sample_road_cells(
+        mask, step, bbox, max_water_depth=max_water_depth
+    )
     print(
         f"sample done tiles_scanned={stats['tiles_scanned']} "
         f"road_tiles={stats['tiles_with_roads']} cells={stats['cells']} "
-        f"fallback_z={stats['fallback_z']} elapsed={time.monotonic() - t0:.1f}s",
+        f"fallback_z={stats['fallback_z']} water_skipped={stats['water_skipped']} "
+        f"elapsed={time.monotonic() - t0:.1f}s",
         file=sys.stderr,
         flush=True,
     )
@@ -375,13 +476,17 @@ def bake_map(
         file=sys.stderr,
         flush=True,
     )
-    polylines: list[list[Point]] = []
-    for path in paths:
-        pts = decimate(cells_to_world(path, cells, step), decimate_yd)
-        if len(pts) >= 2:
-            polylines.append(pts)
-    baked = canonicalize_segments(polylines)
-    meta = make_meta(map_name, step, decimate_yd, min_cells)
+    baked = canonicalize_segments(
+        _paths_to_segments(paths, cells, step, decimate_yd, min_length)
+    )
+    meta = make_meta(
+        map_name,
+        step,
+        decimate_yd,
+        min_cells,
+        min_length=min_length,
+        max_water_depth=max_water_depth,
+    )
     existing = out_path.read_text(encoding="utf-8") if out_path.is_file() else ""
     hand = read_hand_lines(existing)
     text = render_artifact(meta, hand, baked)
@@ -420,6 +525,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--step", type=float, default=4.0)
     parser.add_argument("--decimate", type=float, default=10.0)
     parser.add_argument("--min-cells", type=int, default=6)
+    parser.add_argument(
+        "--min-length",
+        type=float,
+        default=30.0,
+        help="Drop segments shorter than this planar yards; <=0 disables",
+    )
+    parser.add_argument(
+        "--max-water-depth",
+        type=float,
+        default=0.5,
+        help="Skip road cells with MCLQ depth above this; <=0 disables",
+    )
     parser.add_argument("--out", type=Path, default=None)
     parser.add_argument(
         "--bbox",
@@ -448,6 +565,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.min_cells,
         out_path,
         bbox=bbox,
+        min_length=args.min_length,
+        max_water_depth=args.max_water_depth,
     )
     return 0
 

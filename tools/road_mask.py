@@ -116,7 +116,14 @@ MCLQ_TILE_NO_LIQUID = 0x0F
 
 # A road layer counts as "on road" above this alpha (0-255).
 ROAD_ALPHA_THRESHOLD = 64
-ROAD_TEXTURE_MARKERS = ("road", "elwynncobblestone")
+# NOTE: thousandneedlesdirt was tried and dropped 2026-08-12 — the whole
+# canyon floor is that dirt, so the zone baked into one solid blob.
+ROAD_TEXTURE_MARKERS = (
+    "road",
+    "elwynncobblestone",
+    "duskwoodcobblestone",
+    "tanarisdirtfootprint",
+)
 
 DEFAULT_ADT_DIR = Path(
     os.environ.get(

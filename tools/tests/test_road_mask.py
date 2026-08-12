@@ -137,8 +137,24 @@ class TestTransformMath(unittest.TestCase):
         self.assertTrue(
             rmask.is_road_texture("Tileset\\Elwynn\\ElwynnCobbleStoneBase.blp")
         )
+        self.assertTrue(
+            rmask.is_road_texture("Tileset\\Duskwood\\DuskwoodCobblestone.blp")
+        )
+        self.assertTrue(
+            rmask.is_road_texture("Tileset\\Tanaris\\TanarisDirtFootprint.blp")
+        )
+        # thousandneedlesdirt marker was tried and dropped (whole canyon floor
+        # is that dirt -> zone baked to a blob); pin that it stays off.
+        self.assertFalse(
+            rmask.is_road_texture(
+                "Tileset\\ThousandNeedles\\ThousandNeedlesDirt.blp"
+            )
+        )
         self.assertFalse(rmask.is_road_texture("Tileset\\Felwood\\FelwoodDirt.blp"))
         self.assertFalse(rmask.is_road_texture("Tileset\\Generic\\Black.blp"))
+        self.assertFalse(
+            rmask.is_road_texture("Tileset\\Duskwood\\DuskwoodGrassBase.blp")
+        )
 
     def test_tile_path_infers_map_name_from_dir(self) -> None:
         mask = rmask.RoadMask(Path("/nonexistent/azeroth"), map_name=None)
@@ -572,7 +588,7 @@ class TestBakeRoadWaypoints(unittest.TestCase):
             cells[(i, 0)] = 1.0
         for i in range(8):
             cells[(i + 40, 50)] = 2.0
-        segs = bake.bake_from_cells(cells, step=4.0, min_cells=6)
+        segs = bake.bake_from_cells(cells, step=4.0, min_cells=6, min_length=0.0)
         self.assertEqual(len(segs), 2)
 
     def test_plus_shape_splits_spur_after_erasure(self) -> None:
@@ -598,15 +614,15 @@ class TestBakeRoadWaypoints(unittest.TestCase):
         cells = self._l_cells()
         for i in range(8):
             cells[(i + 30, 20)] = 3.0
-        a = bake.bake_from_cells(cells)
-        b = bake.bake_from_cells(cells)
+        a = bake.bake_from_cells(cells, min_length=0.0)
+        b = bake.bake_from_cells(cells, min_length=0.0)
         meta = bake.make_meta("kalimdor", 4.0, 10.0, 6)
         bytes_a = bake.render_artifact(meta, [], a).encode("utf-8")
         bytes_b = bake.render_artifact(meta, [], b).encode("utf-8")
         self.assertEqual(bytes_a, bytes_b)
         items = list(cells.items())
         random.Random(0).shuffle(items)
-        c = bake.bake_from_cells(dict(items))
+        c = bake.bake_from_cells(dict(items), min_length=0.0)
         self.assertEqual(bake.render_artifact(meta, [], c).encode("utf-8"), bytes_a)
 
     def test_merge_preserves_hand_line_bytes_drops_stale_baked(self) -> None:
@@ -648,6 +664,9 @@ class TestBakeRoadWaypoints(unittest.TestCase):
         self.assertEqual(obj["step"], 4.0)
         self.assertEqual(obj["decimate_yd"], 10.0)
         self.assertEqual(obj["min_cells"], 6)
+        self.assertEqual(obj["min_length_yd"], 30.0)
+        self.assertEqual(obj["max_water_depth"], 0.5)
+        self.assertEqual(obj["markers"], list(rmask.ROAD_TEXTURE_MARKERS))
         azeroth = json.loads(json.dumps(bake.make_meta("azeroth", 4.0, 15.0, 8)))
         self.assertEqual(azeroth["map_id"], 0)
         self.assertEqual(azeroth["decimate_yd"], 15.0)
@@ -663,6 +682,213 @@ class TestBakeRoadWaypoints(unittest.TestCase):
             self.assertGreaterEqual(
                 math.hypot(cur[0] - prev[0], cur[1] - prev[1]), 10.0
             )
+
+
+class TestThinning(unittest.TestCase):
+    """Zhang-Suen thinning — synthetic cells, no ADT files."""
+
+    def _bar(self, length: int, width: int) -> set[tuple[int, int]]:
+        return {(i, j) for i in range(length) for j in range(width)}
+
+    def test_thick_bar_skeleton_is_one_wide(self) -> None:
+        skel = bake.thin_cells(self._bar(15, 5))
+        for i, j in skel:
+            n = sum(
+                1 for di, dj in bake.NEIGH8 if (i + di, j + dj) in skel
+            )
+            self.assertLessEqual(n, 2, msg=f"cell {(i, j)} neighbors={n}")
+
+    def test_skeleton_subset_and_one_component(self) -> None:
+        bar = self._bar(15, 5)
+        skel = bake.thin_cells(bar)
+        self.assertTrue(skel.issubset(bar))
+        self.assertEqual(len(bake.connected_components(skel)), 1)
+
+    def test_annihilated_blob_does_not_crash_extraction(self) -> None:
+        # A 2x2 block thins to the empty set; extract_centerlines must skip
+        # it instead of crashing on sort(key=min) over an empty set.
+        self.assertEqual(bake.thin_cells(self._bar(2, 2)), set())
+        blob = self._bar(2, 2)
+        bar = {(i + 10, 0) for i in range(12)}
+        paths, _ = bake.extract_centerlines(blob | bar, step=4.0, min_cells=4)
+        self.assertEqual(len(paths), 1)
+
+    def test_one_wide_l_and_plus_are_fixed_points(self) -> None:
+        ell: set[tuple[int, int]] = set()
+        for i in range(8):
+            ell.add((i, 0))
+        for j in range(1, 8):
+            ell.add((0, j))
+        self.assertEqual(bake.thin_cells(ell), ell)
+        plus: set[tuple[int, int]] = set()
+        for i in range(-4, 5):
+            plus.add((i, 0))
+        for j in range(-4, 5):
+            plus.add((0, j))
+        self.assertEqual(bake.thin_cells(plus), plus)
+
+    def test_determinism_under_insertion_order(self) -> None:
+        bar = self._bar(15, 5)
+        expected = bake.thin_cells(set(bar))
+        items = list(bar)
+        for seed in range(8):
+            random.Random(seed).shuffle(items)
+            built: set[tuple[int, int]] = set()
+            for cell in items:
+                built.add(cell)
+            self.assertEqual(bake.thin_cells(built), expected)
+
+    def test_thick_bar_bakes_to_one_segment(self) -> None:
+        cells = {(i, j): 10.0 for i in range(16) for j in range(5)}
+        segs = bake.bake_from_cells(cells, min_length=0.0)
+        self.assertEqual(len(segs), 1)
+
+    def test_thick_l_is_single_segment_tip_to_tip(self) -> None:
+        arm = 20
+        width = 5
+        cells: dict[tuple[int, int], float] = {}
+        for i in range(arm):
+            for j in range(width):
+                cells[(i, j)] = 10.0
+        for j in range(width, arm):
+            for i in range(width):
+                cells[(i, j)] = 10.0
+        segs = bake.bake_from_cells(cells, min_length=0.0)
+        self.assertEqual(len(segs), 1)
+        pts = segs[0]["pts"]
+        step = 4.0
+        tips = (
+            ((arm - 1) * step, (width // 2) * step),
+            ((width // 2) * step, (arm - 1) * step),
+        )
+        ends = ((pts[0][0], pts[0][1]), (pts[-1][0], pts[-1][1]))
+
+        def _near(end: tuple[float, float]) -> float:
+            return min(math.hypot(end[0] - t[0], end[1] - t[1]) for t in tips)
+
+        self.assertLessEqual(_near(ends[0]), 12.0)
+        self.assertLessEqual(_near(ends[1]), 12.0)
+        self.assertNotEqual(
+            min(range(2), key=lambda k: math.hypot(ends[0][0] - tips[k][0], ends[0][1] - tips[k][1])),
+            min(range(2), key=lambda k: math.hypot(ends[1][0] - tips[k][0], ends[1][1] - tips[k][1])),
+        )
+
+
+class _FakeMask:
+    """Duck-typed RoadMask for sample_road_cells water tests."""
+
+    def __init__(
+        self,
+        road_rect: tuple[float, float, float, float],
+        water: dict[tuple[float, float], rmask.WaterSample] | None = None,
+    ) -> None:
+        self._road_rect = road_rect
+        self._water = water or {}
+        layer = type("Layer", (), {"texture_id": 0})()
+        chunk = type("Chunk", (), {"layers": [layer]})()
+        self._tile = type(
+            "Tile",
+            (),
+            {"road_texture_ids": {0}, "chunks": [chunk] * 256},
+        )()
+
+    def tile_coords(self) -> list[tuple[int, int]]:
+        return [(0, 0)]
+
+    def tile(self, a: int, b: int) -> object:
+        return self._tile
+
+    def is_road(self, x: float, y: float) -> rmask.RoadSample:
+        x0, y0, x1, y1 = self._road_rect
+        inside = x0 <= x <= x1 and y0 <= y <= y1
+        return rmask.RoadSample(inside, "road" if inside else None, 255 if inside else 0)
+
+    def is_water(self, x: float, y: float) -> rmask.WaterSample:
+        return self._water.get((x, y), rmask.WaterSample(False, 0.0, 0.0))
+
+    def ground_z(self, x: float, y: float) -> float:
+        return 10.0
+
+
+def _tile00_lattice(count: int, step: float = 4.0) -> list[tuple[float, float]]:
+    max_x, max_y = rmask.tile_origin(0, 0)
+    min_x = max_x - rmask.TILE_YD
+    min_y = max_y - rmask.TILE_YD
+    i0 = math.ceil(min_x / step - 1e-9)
+    j0 = math.ceil(min_y / step - 1e-9)
+    return [((i0 + k) * step, j0 * step) for k in range(count)]
+
+
+class TestWaterExclusion(unittest.TestCase):
+    """sample_road_cells water skip — fake mask, no ADT files."""
+
+    def _setup(
+        self, n: int = 8
+    ) -> tuple[_FakeMask, list[tuple[float, float]], tuple[float, float, float, float]]:
+        pts = _tile00_lattice(n)
+        xs = [p[0] for p in pts]
+        ys = [p[1] for p in pts]
+        rect = (min(xs), min(ys), max(xs), max(ys))
+        water = {
+            pts[0]: rmask.WaterSample(True, 12.0, 2.0),
+            pts[1]: rmask.WaterSample(True, 12.0, 2.0),
+            pts[2]: rmask.WaterSample(True, 12.0, 2.0),
+            pts[3]: rmask.WaterSample(True, 10.3, 0.3),
+        }
+        bbox = (min(xs) - 1.0, min(ys) - 1.0, max(xs) + 1.0, max(ys) + 1.0)
+        return _FakeMask(rect, water), pts, bbox
+
+    def test_deep_water_skipped_shallow_kept(self) -> None:
+        mask, pts, bbox = self._setup()
+        cells, stats = bake.sample_road_cells(mask, 4.0, bbox=bbox)
+        self.assertEqual(stats["water_skipped"], 3)
+        self.assertEqual(len(cells), 5)
+        step = 4.0
+        deep_keys = {(int(round(p[0] / step)), int(round(p[1] / step))) for p in pts[:3]}
+        shallow_key = (int(round(pts[3][0] / step)), int(round(pts[3][1] / step)))
+        self.assertTrue(deep_keys.isdisjoint(cells))
+        self.assertIn(shallow_key, cells)
+
+    def test_max_water_depth_zero_disables(self) -> None:
+        mask, _pts, bbox = self._setup()
+        cells, stats = bake.sample_road_cells(
+            mask, 4.0, bbox=bbox, max_water_depth=0.0
+        )
+        self.assertEqual(stats["water_skipped"], 0)
+        self.assertEqual(len(cells), 8)
+
+    def test_water_skipped_in_stats(self) -> None:
+        mask, _pts, bbox = self._setup()
+        _cells, stats = bake.sample_road_cells(mask, 4.0, bbox=bbox)
+        self.assertIn("water_skipped", stats)
+        self.assertEqual(stats["water_skipped"], 3)
+
+
+class TestMinLength(unittest.TestCase):
+    """min_length filter — synthetic cells, no ADT files."""
+
+    def test_short_segment_dropped_at_default(self) -> None:
+        cells = {(i, 0): 1.0 for i in range(8)}
+        segs = bake.bake_from_cells(cells)
+        self.assertEqual(len(segs), 0)
+
+    def test_min_length_zero_keeps_short(self) -> None:
+        cells = {(i, 0): 1.0 for i in range(8)}
+        segs = bake.bake_from_cells(cells, min_length=0.0)
+        self.assertEqual(len(segs), 1)
+
+    def test_zigzag_measured_before_decimate(self) -> None:
+        cells: dict[tuple[int, int], float] = {}
+        for i in range(7):
+            cells[(i, 0)] = 1.0
+        cells[(6, 1)] = 1.0
+        for i in range(7):
+            cells[(i, 2)] = 1.0
+        segs = bake.bake_from_cells(cells, decimate_yd=100.0, min_length=30.0)
+        self.assertEqual(len(segs), 1)
+        pts = segs[0]["pts"]
+        chord = math.hypot(pts[-1][0] - pts[0][0], pts[-1][1] - pts[0][1])
+        self.assertLess(chord, 30.0)
 
 
 if __name__ == "__main__":
