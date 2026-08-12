@@ -77,6 +77,7 @@ type
 var
   terrainGpu*: TerrainGpu
   birdCam*: BirdCamera
+  continentLoadError*: string
   rightDragActive: bool
 
 proc compileShader(kind: GLenum; source: string): GLuint =
@@ -202,14 +203,17 @@ proc ensureContinent*(mapId: uint32): bool =
   ## Load + upload a continent mesh if not already cached.
   if mapId in terrainGpu.meshes and terrainGpu.meshes[mapId].ready:
     terrainGpu.currentMapId = mapId
+    continentLoadError = ""
     return true
   try:
     let mesh = loadContinentMesh(mapId)
     result = uploadContinentMesh(mapId, mesh)
     if result:
       terrainGpu.currentMapId = mapId
+      continentLoadError = ""
   except CatchableError as err:
     echo "map_browser: loadContinentMesh(", mapId, ") failed: ", err.msg
+    continentLoadError = "map " & $mapId & " load failed: " & err.msg
     result = false
 
 proc currentGpu*(): GpuMesh =

@@ -5,7 +5,8 @@
 ##   make map-browser-probe
 ##
 ## Env: VANILLA_WOW_EXTRACTED_DATA_DIR, VANILLA_WOW_CLIENT_DATA_DIR,
-##      MAP_BROWSER_ONCE=1, MAP_BROWSER_STATS, MAP_BROWSER_AUTO
+##      MAP_BROWSER_ONCE=1, MAP_BROWSER_STATS, MAP_BROWSER_AUTO,
+##      MAP_BROWSER_MAP=0|1 (window startup continent; 0 Azeroth, 1 Kalimdor)
 
 import
   std/[math, monotimes, os, strutils, tables, times],
@@ -162,6 +163,8 @@ proc headerStatusLine(): string =
     parts &= "  |  runs " & $oc.runsLoaded
   if browser.xray:
     parts &= "  |  xray"
+  if continentLoadError.len > 0:
+    parts &= "  |  ERR " & continentLoadError
   parts
 
 proc pollRuns() =
@@ -329,6 +332,8 @@ proc runHeadlessOnce() =
     " points=", azerothPts
   doAssert kalimdorSegs > 50,
     "kalimdor (mapId 1) road segments expected > 50, got " & $kalimdorSegs
+  doAssert azerothSegs > 50,
+    "azeroth (mapId 0) road segments expected > 50, got " & $azerothSegs
 
   let mesh = loadContinentMesh(1'u32)
   echo "map_browser: WDL Kalimdor tiles=", mesh.tileCount,
@@ -358,6 +363,35 @@ proc runHeadlessOnce() =
     " (", formatFloat(pct, ffDecimal, 1), "%)"
   doAssert mapNodes > 0
   doAssert aligned * 100 >= mapNodes * 70
+
+  let azerothMesh = loadContinentMesh(0'u32)
+  echo "map_browser: WDL Azeroth tiles=", azerothMesh.tileCount,
+    " vertices=", azerothMesh.vertices.len,
+    " minZ=", azerothMesh.minZ, " maxZ=", azerothMesh.maxZ
+  doAssert azerothMesh.tileCount > 500
+  doAssert azerothMesh.vertices.len > 100_000
+  doAssert azerothMesh.minZ < 0
+  doAssert azerothMesh.maxZ > 500
+
+  var
+    azerothMapNodes = 0
+    azerothAligned = 0
+  for node in graph.nodes:
+    if node.point.mapId != 0'u32:
+      continue
+    inc azerothMapNodes
+    let sample = sampleHeight(azerothMesh, node.point.x, node.point.y)
+    if sample == sample and abs(sample - node.point.z) < 250.0'f32:
+      inc azerothAligned
+  let azerothPct =
+    if azerothMapNodes > 0:
+      100.0 * float(azerothAligned) / float(azerothMapNodes)
+    else:
+      0.0
+  echo "map_browser: WDL alignment Azeroth ", azerothAligned, "/",
+    azerothMapNodes, " (", formatFloat(azerothPct, ffDecimal, 1), "%)"
+  doAssert azerothMapNodes > 0
+  doAssert azerothAligned * 100 >= azerothMapNodes * 70
 
 proc runWindow() =
   ## Real window: WDL terrain + overlays + bird's-eye camera + silky UI.
@@ -399,8 +433,16 @@ proc runWindow() =
   initTerrainGpu()
   initOverlayGpu()
 
-  if not ensureContinent(1'u32):
-    echo "map_browser: failed to load Kalimdor mesh"
+  var startMap =
+    try:
+      uint32(parseInt(getEnv("MAP_BROWSER_MAP", "1")))
+    except ValueError:
+      1'u32
+  if startMap != 0'u32 and startMap != 1'u32:
+    echo "map_browser: MAP_BROWSER_MAP=", startMap, " invalid, falling back to 1"
+    startMap = 1'u32
+  if not ensureContinent(startMap):
+    echo "map_browser: failed to load continent mesh mapId=" & $startMap
     mbAutoMarkDone(false)
     mbStatsWrite(final = true)
     quit 1
