@@ -62,6 +62,9 @@ Header line mirrors the same hints (ASCII `|` separators).
 
 Supported continent map ids: `0` Azeroth, `1` Kalimdor. Startup loads Kalimdor.
 
+See [../navigation.md](../navigation.md) for every navigation data system
+(ours vs upstream) and which ones this viewer draws.
+
 ## Known limits
 
 - WDL is coarse (~33 yd cells) — fine for whole-continent nav debug, not close-up terrain.
