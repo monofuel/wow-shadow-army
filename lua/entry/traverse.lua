@@ -1055,8 +1055,19 @@ function M.decide(view)
     if wet then
       -- Refill beats demand a genuine touch inside the safe band: tight
       -- stop, tight capture — the instant refill skips anything skirted.
+      -- Liquid-blind shoreline (post-merge fork bug: the sample is
+      -- REJECTED, not corrected, so liquid_known=false at the beach): the
+      -- wade gate cannot open, and a commanded z of -2.5 sits below the
+      -- swim polys' projection band so ground planning cannot serve the
+      -- wet target either — the seat parks on the sand jiggling (stitched
+      -- run, 2026-08-11). With no z the planner projects the target onto
+      -- the surface poly and simply walks in; the wade/swim machinery
+      -- takes over the moment liquid becomes observable.
+      local liquid_blind = not swimming and
+        not (view.liquid_coverage_known and view.liquid_known)
       local intent = navigate_to(view, pos, wet, reason,
         { stop = (wet.refill and fatigued) and 4.0 or WET_SELECT_YARDS - 4.0,
+          surface = liquid_blind,
           status = { stalled_seconds = stalled } })
       if intent then
         wow.set_status(string.format("%s %s %.0fyd", reason, wet.id,
