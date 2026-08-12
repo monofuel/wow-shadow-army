@@ -8,7 +8,7 @@
 
 import
   std/[algorithm, json, monotimes, os, strutils, times],
-  map_browser/gl_view
+  map_browser/[gl_view, overlay_gl]
 
 type
   MbAutoCfg* = object
@@ -77,10 +77,12 @@ proc mbAuto*(): MbAutoCfg =
   autoCfg
 
 proc mbStatsJson*(): JsonNode =
-  ## Snapshot of viewer stats for agents (overlay counts stay 0 until T4).
+  ## Snapshot of viewer stats for agents (terrain + overlay counts).
   var sorted = frameMs
   sorted.sort()
-  let g = currentGpu()
+  let
+    g = currentGpu()
+    oc = overlayCounts()
   result = %*{
     "ts": epochTime(),
     "uptime_s": float64(nowNs() - startNs) / 1e9,
@@ -99,10 +101,11 @@ proc mbStatsJson*(): JsonNode =
     "tile_count": g.tileCount,
     "vertex_count": g.vertexCount,
     "overlays": {
-      "waypoints": 0,
-      "taxi": 0,
-      "runs": 0,
-      "labels": 0
+      "wp_nodes": oc.wpNodes,
+      "wp_edges": oc.wpEdges,
+      "taxi_paths": oc.taxiPaths,
+      "runs_loaded": oc.runsLoaded,
+      "labels": oc.labels
     }
   }
 
