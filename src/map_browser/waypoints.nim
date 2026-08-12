@@ -7,9 +7,9 @@
 
 import
   std/[sets, tables],
-  environment/contract/client_types,
+  environment/contract/spatial_types,
   environment/client/common,
-  environment/client/world_catalogs/model,
+  environment/client/world_catalogs/world_catalog_types,
   bots/real_playerbot/policy/world_catalog
 
 type
