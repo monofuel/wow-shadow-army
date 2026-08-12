@@ -75,7 +75,7 @@ ACCOUNT_PASS := password
 # legitimate leg for a binary with no unit tests yet.
 test: test-lua test-nim-soft test-smoke test-traverse-soap test-traverse-checkpoint traverse-lint-soft
 
-.PHONY: test-traverse-soap test-traverse-checkpoint traverse-lint traverse-lint-soft
+.PHONY: test-traverse-soap test-traverse-checkpoint test-road-artifacts traverse-lint traverse-lint-soft
 test-traverse-soap:
 	@python3 tools/tests/test_traverse_soap.py
 test-traverse-checkpoint:
@@ -83,6 +83,10 @@ test-traverse-checkpoint:
 	@python3 tools/tests/test_traverse_scorecard.py
 	@python3 tools/tests/test_traverse_route_lint.py
 	@python3 tools/tests/test_road_mask.py
+	@python3 tools/tests/test_minimap_mask.py
+# TODO(round-5): fold into test-traverse-checkpoint once the 1kN re-bake ships
+test-road-artifacts:
+	@python3 tools/tests/test_road_artifacts.py
 # Offline land-beat corridor lint (Detour helper + spawn TSV). Exits 0 on SKIP
 # when helper/mmaps are missing so bare CI hosts stay green. make test uses
 # --warn-only so corridor FAILs do not red the unit suite; traverse-lint is strict.
