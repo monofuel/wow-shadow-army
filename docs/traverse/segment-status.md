@@ -102,8 +102,11 @@ passage (6517 → 6579) including the jump lip, and the exit tunnel.
 1. Fork agent: B's flag-stability + shoreline-liquid fixes; F's
    local_steer + allow_jump. Everything else integrates the moment they
    land.
-2. Stitched A–E gate (spawn → felwood_cave_entrance): in progress — note
-   it crosses B's fatigue ribbon, so it rides the same desync dice until
-   the fork fix lands; attempts double as desync statistics.
+2. Stitched A–E gate (spawn → felwood_cave_entrance): attempted 2026-08-11
+   and HARD-BLOCKED at the A→B seam — the seat parks at the water's edge
+   (-6776,-4841) with `lk=false`, so the wade gate never opens and the run
+   cannot even reach the fatigue ribbon. Same course passed 3× pre-merge.
+   The shoreline-liquid fix is therefore the highest-priority fork ask:
+   it unblocks segment B's dry entry AND the whole stitched course.
 3. monofuel (optional, ~2 min total): encore F9 walks of the cave mouth
    passage and the exit tunnel.
