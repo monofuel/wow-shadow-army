@@ -116,16 +116,18 @@ MCLQ_TILE_NO_LIQUID = 0x0F
 
 # A road layer counts as "on road" above this alpha (0-255).
 ROAD_ALPHA_THRESHOLD = 64
-# thousandneedlesdirt is overlay-only: zone-floor dirt as a base layer is
-# ground; dirt brushed as an overlay is the trail.
+# thousandneedlesdirt was tried and removed: its base layer is the entire
+# canyon floor and its overlay is cliff faces (median grade 1.02). The
+# actual light-brown Thousand Needles road paint is RockHighlight02.
+# Overlay-only because mesa tops carry it as a base layer.
 ROAD_TEXTURE_MARKERS = (
     "road",
     "elwynncobblestone",
     "duskwoodcobblestone",
     "tanarisdirtfootprint",
-    "thousandneedlesdirt",
+    "thousandneedlesrockhighlight02",
 )
-OVERLAY_ONLY_MARKERS = ("thousandneedlesdirt", "tanarisdirtfootprint")
+OVERLAY_ONLY_MARKERS = ("thousandneedlesrockhighlight02", "tanarisdirtfootprint")
 
 DEFAULT_ADT_DIR = Path(
     os.environ.get(

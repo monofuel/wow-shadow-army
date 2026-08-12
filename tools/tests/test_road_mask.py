@@ -146,6 +146,29 @@ class TestTransformMath(unittest.TestCase):
         # overlay-only: still a road marker; Probe.sample ignores it as base.
         self.assertTrue(
             rmask.is_road_texture(
+                "Tileset\\ThousandNeedles\\ThousandNeedlesRockHighlight02.blp"
+            )
+        )
+        self.assertTrue(
+            rmask.is_overlay_only_texture(
+                "Tileset\\ThousandNeedles\\ThousandNeedlesRockHighlight02.blp"
+            )
+        )
+        # substring specificity: Highlight (no 02) must not match Highlight02.
+        self.assertFalse(
+            rmask.is_road_texture(
+                "Tileset\\ThousandNeedles\\ThousandNeedlesRockHighlight.blp"
+            )
+        )
+        # thousandneedlesdirt was tried (base=canyon floor, overlay=cliffs)
+        # and removed. Do not flip this back.
+        self.assertFalse(
+            rmask.is_road_texture(
+                "Tileset\\ThousandNeedles\\ThousandNeedlesDirt.blp"
+            )
+        )
+        self.assertFalse(
+            rmask.is_overlay_only_texture(
                 "Tileset\\ThousandNeedles\\ThousandNeedlesDirt.blp"
             )
         )
@@ -153,11 +176,6 @@ class TestTransformMath(unittest.TestCase):
         self.assertFalse(rmask.is_road_texture("Tileset\\Generic\\Black.blp"))
         self.assertFalse(
             rmask.is_road_texture("Tileset\\Duskwood\\DuskwoodGrassBase.blp")
-        )
-        self.assertTrue(
-            rmask.is_overlay_only_texture(
-                "Tileset\\ThousandNeedles\\ThousandNeedlesDirt.blp"
-            )
         )
         self.assertTrue(
             rmask.is_overlay_only_texture(
@@ -315,27 +333,27 @@ class TestRoadSampleSelection(unittest.TestCase):
         probe = self._probe([self._layer(0, False, 255), self._layer(1, False, 200)])
         self.assertEqual(probe.sample, (False, None, 0))
 
-    def test_base_layer_overlay_only_dirt_is_not_road(self) -> None:
-        dirt = r"Tileset\ThousandNeedles\ThousandNeedlesDirt.blp"
-        probe = self._probe([self._layer(0, True, 255, dirt)])
+    def test_base_layer_overlay_only_hl02_is_not_road(self) -> None:
+        hl02 = r"Tileset\ThousandNeedles\ThousandNeedlesRockHighlight02.blp"
+        probe = self._probe([self._layer(0, True, 255, hl02)])
         self.assertEqual(probe.sample, (False, None, 0))
 
-    def test_overlay_dirt_on_base_dirt_is_road(self) -> None:
-        dirt = r"Tileset\ThousandNeedles\ThousandNeedlesDirt.blp"
+    def test_overlay_hl02_on_base_hl02_is_road(self) -> None:
+        hl02 = r"Tileset\ThousandNeedles\ThousandNeedlesRockHighlight02.blp"
         probe = self._probe(
-            [self._layer(0, True, 255, dirt), self._layer(1, True, 200, dirt)]
+            [self._layer(0, True, 255, hl02), self._layer(1, True, 200, hl02)]
         )
-        self.assertEqual(probe.sample, (True, dirt, 200))
+        self.assertEqual(probe.sample, (True, hl02, 200))
 
-    def test_overlay_dirt_at_threshold_is_not_road(self) -> None:
-        dirt = r"Tileset\ThousandNeedles\ThousandNeedlesDirt.blp"
+    def test_overlay_hl02_at_threshold_is_not_road(self) -> None:
+        hl02 = r"Tileset\ThousandNeedles\ThousandNeedlesRockHighlight02.blp"
         probe = self._probe(
-            [self._layer(0, False, 255), self._layer(1, True, 64, dirt)]
+            [self._layer(0, False, 255), self._layer(1, True, 64, hl02)]
         )
         sample = probe.sample
         self.assertFalse(sample.is_road)
         self.assertEqual(sample.alpha, 64)
-        self.assertEqual(sample.texture, dirt)
+        self.assertEqual(sample.texture, hl02)
 
     def test_base_kalidar_road_still_full_coverage(self) -> None:
         probe = self._probe([self._layer(0, True, 255, "KalidarRoad.blp")])
@@ -618,7 +636,9 @@ class TestBakeRoadWaypoints(unittest.TestCase):
     def test_l_shape_is_one_segment_tip_to_tip(self) -> None:
         step = 4.0
         arm = 12
-        segs = bake.bake_from_cells(self._l_cells(arm), step=step, min_cells=6)
+        segs = bake.bake_from_cells(
+            self._l_cells(arm), step=step, min_cells=6, min_component_length=0.0
+        )
         self.assertEqual(len(segs), 1)
         pts = segs[0]["pts"]
         tips = {
@@ -634,7 +654,9 @@ class TestBakeRoadWaypoints(unittest.TestCase):
             cells[(i, 0)] = 1.0
         for i in range(8):
             cells[(i + 40, 50)] = 2.0
-        segs = bake.bake_from_cells(cells, step=4.0, min_cells=6, min_length=0.0)
+        segs = bake.bake_from_cells(
+            cells, step=4.0, min_cells=6, min_length=0.0, min_component_length=0.0
+        )
         self.assertEqual(len(segs), 2)
 
     def test_plus_shape_splits_spur_after_erasure(self) -> None:
@@ -644,7 +666,7 @@ class TestBakeRoadWaypoints(unittest.TestCase):
             cells[(i, 0)] = 5.0
         for j in range(-12, 13):
             cells[(0, j)] = 5.0
-        paths, discarded, _dropped = bake.extract_centerlines(
+        paths, discarded, _dropped, _short = bake.extract_centerlines(
             set(cells), step, min_cells=6
         )
         self.assertGreaterEqual(len(paths), 2)
@@ -662,15 +684,17 @@ class TestBakeRoadWaypoints(unittest.TestCase):
         cells = self._l_cells()
         for i in range(8):
             cells[(i + 30, 20)] = 3.0
-        a = bake.bake_from_cells(cells, min_length=0.0)
-        b = bake.bake_from_cells(cells, min_length=0.0)
+        a = bake.bake_from_cells(cells, min_length=0.0, min_component_length=0.0)
+        b = bake.bake_from_cells(cells, min_length=0.0, min_component_length=0.0)
         meta = bake.make_meta("kalimdor", 4.0, 10.0, 6)
         bytes_a = bake.render_artifact(meta, [], a).encode("utf-8")
         bytes_b = bake.render_artifact(meta, [], b).encode("utf-8")
         self.assertEqual(bytes_a, bytes_b)
         items = list(cells.items())
         random.Random(0).shuffle(items)
-        c = bake.bake_from_cells(dict(items), min_length=0.0)
+        c = bake.bake_from_cells(
+            dict(items), min_length=0.0, min_component_length=0.0
+        )
         self.assertEqual(bake.render_artifact(meta, [], c).encode("utf-8"), bytes_a)
 
     def test_merge_preserves_hand_line_bytes_drops_stale_baked(self) -> None:
@@ -715,8 +739,11 @@ class TestBakeRoadWaypoints(unittest.TestCase):
         self.assertEqual(obj["min_length_yd"], 30.0)
         self.assertEqual(obj["max_water_depth"], 0.5)
         self.assertEqual(obj["max_width_yd"], 28.0)
+        self.assertEqual(obj["max_grade"], 0.55)
+        self.assertEqual(obj["min_component_length_yd"], 150.0)
         self.assertEqual(obj["markers"], list(rmask.ROAD_TEXTURE_MARKERS))
-        self.assertIn("thousandneedlesdirt", obj["markers"])
+        self.assertIn("thousandneedlesrockhighlight02", obj["markers"])
+        self.assertNotIn("thousandneedlesdirt", obj["markers"])
         self.assertEqual(
             obj["overlay_only_markers"], list(rmask.OVERLAY_ONLY_MARKERS)
         )
@@ -763,7 +790,7 @@ class TestThinning(unittest.TestCase):
         self.assertEqual(bake.thin_cells(self._bar(2, 2)), set())
         blob = self._bar(2, 2)
         bar = {(i + 10, 0) for i in range(12)}
-        paths, _, _ = bake.extract_centerlines(blob | bar, step=4.0, min_cells=4)
+        paths, _, _, _ = bake.extract_centerlines(blob | bar, step=4.0, min_cells=4)
         self.assertEqual(len(paths), 1)
 
     def test_one_wide_l_and_plus_are_fixed_points(self) -> None:
@@ -793,7 +820,9 @@ class TestThinning(unittest.TestCase):
 
     def test_thick_bar_bakes_to_one_segment(self) -> None:
         cells = {(i, j): 10.0 for i in range(16) for j in range(5)}
-        segs = bake.bake_from_cells(cells, min_length=0.0, max_width=0.0)
+        segs = bake.bake_from_cells(
+            cells, min_length=0.0, max_width=0.0, min_component_length=0.0
+        )
         self.assertEqual(len(segs), 1)
 
     def test_thick_l_is_single_segment_tip_to_tip(self) -> None:
@@ -806,7 +835,7 @@ class TestThinning(unittest.TestCase):
         for j in range(width, arm):
             for i in range(width):
                 cells[(i, j)] = 10.0
-        segs = bake.bake_from_cells(cells, min_length=0.0)
+        segs = bake.bake_from_cells(cells, min_length=0.0, min_component_length=0.0)
         self.assertEqual(len(segs), 1)
         pts = segs[0]["pts"]
         step = 4.0
@@ -828,15 +857,17 @@ class TestThinning(unittest.TestCase):
 
 
 class _FakeMask:
-    """Duck-typed RoadMask for sample_road_cells water tests."""
+    """Duck-typed RoadMask for sample_road_cells water/grade tests."""
 
     def __init__(
         self,
         road_rect: tuple[float, float, float, float],
         water: dict[tuple[float, float], rmask.WaterSample] | None = None,
+        ground_fn=None,
     ) -> None:
         self._road_rect = road_rect
         self._water = water or {}
+        self._ground_fn = ground_fn
         layer = type("Layer", (), {"texture_id": 0})()
         chunk = type("Chunk", (), {"layers": [layer]})()
         self._tile = type(
@@ -859,7 +890,9 @@ class _FakeMask:
     def is_water(self, x: float, y: float) -> rmask.WaterSample:
         return self._water.get((x, y), rmask.WaterSample(False, 0.0, 0.0))
 
-    def ground_z(self, x: float, y: float) -> float:
+    def ground_z(self, x: float, y: float) -> float | None:
+        if self._ground_fn is not None:
+            return self._ground_fn(x, y)
         return 10.0
 
 
@@ -926,26 +959,32 @@ class TestMaxWidth(unittest.TestCase):
         return {(i, j): 1.0 for i in range(20) for j in range(8)}
 
     def test_solid_block_dropped_at_default(self) -> None:
-        segs = bake.bake_from_cells(self._block(), min_length=0.0)
+        segs = bake.bake_from_cells(
+            self._block(), min_length=0.0, min_component_length=0.0
+        )
         self.assertEqual(len(segs), 0)
 
     def test_max_width_zero_keeps_block(self) -> None:
-        segs = bake.bake_from_cells(self._block(), min_length=0.0, max_width=0.0)
+        segs = bake.bake_from_cells(
+            self._block(), min_length=0.0, max_width=0.0, min_component_length=0.0
+        )
         self.assertGreaterEqual(len(segs), 1)
 
     def test_thin_bar_kept_at_default(self) -> None:
         cells = {(i, j): 1.0 for i in range(50) for j in range(3)}
-        segs = bake.bake_from_cells(cells, min_length=0.0)
+        segs = bake.bake_from_cells(
+            cells, min_length=0.0, min_component_length=0.0
+        )
         self.assertEqual(len(segs), 1)
 
     def test_extract_dropped_wide_counts(self) -> None:
         block = set(self._block())
         bar = {(i, j) for i in range(50) for j in range(3)}
-        _, _, dropped_block = bake.extract_centerlines(
+        _, _, dropped_block, _ = bake.extract_centerlines(
             block, step=4.0, min_cells=6, max_width=28.0
         )
         self.assertEqual(dropped_block, 1)
-        _, _, dropped_bar = bake.extract_centerlines(
+        _, _, dropped_bar, _ = bake.extract_centerlines(
             bar, step=4.0, min_cells=6, max_width=28.0
         )
         self.assertEqual(dropped_bar, 0)
@@ -955,7 +994,9 @@ class TestMaxWidth(unittest.TestCase):
         for i in range(50):
             for j in range(3):
                 cells[(i + 40, j)] = 1.0
-        segs = bake.bake_from_cells(cells, min_length=0.0)
+        segs = bake.bake_from_cells(
+            cells, min_length=0.0, min_component_length=0.0
+        )
         self.assertEqual(len(segs), 1)
         pts = segs[0]["pts"]
         length = math.hypot(pts[-1][0] - pts[0][0], pts[-1][1] - pts[0][1])
@@ -967,12 +1008,12 @@ class TestMinLength(unittest.TestCase):
 
     def test_short_segment_dropped_at_default(self) -> None:
         cells = {(i, 0): 1.0 for i in range(8)}
-        segs = bake.bake_from_cells(cells)
+        segs = bake.bake_from_cells(cells, min_component_length=0.0)
         self.assertEqual(len(segs), 0)
 
     def test_min_length_zero_keeps_short(self) -> None:
         cells = {(i, 0): 1.0 for i in range(8)}
-        segs = bake.bake_from_cells(cells, min_length=0.0)
+        segs = bake.bake_from_cells(cells, min_length=0.0, min_component_length=0.0)
         self.assertEqual(len(segs), 1)
 
     def test_zigzag_measured_before_decimate(self) -> None:
@@ -982,11 +1023,124 @@ class TestMinLength(unittest.TestCase):
         cells[(6, 1)] = 1.0
         for i in range(7):
             cells[(i, 2)] = 1.0
-        segs = bake.bake_from_cells(cells, decimate_yd=100.0, min_length=30.0)
+        segs = bake.bake_from_cells(
+            cells, decimate_yd=100.0, min_length=30.0, min_component_length=0.0
+        )
         self.assertEqual(len(segs), 1)
         pts = segs[0]["pts"]
         chord = math.hypot(pts[-1][0] - pts[0][0], pts[-1][1] - pts[0][1])
         self.assertLess(chord, 30.0)
+
+
+class TestGradeFilter(unittest.TestCase):
+    """sample_road_cells max_grade skip — fake mask, no ADT files."""
+
+    def _split_pts(self, n: int = 8) -> tuple[list[tuple[float, float]], float]:
+        pts = _tile00_lattice(n)
+        mid = (pts[0][0] + pts[-1][0]) / 2.0
+        return pts, mid
+
+    def _mask(
+        self, pts: list[tuple[float, float]], ground_fn
+    ) -> tuple[_FakeMask, tuple[float, float, float, float]]:
+        xs = [p[0] for p in pts]
+        ys = [p[1] for p in pts]
+        rect = (min(xs), min(ys), max(xs), max(ys))
+        bbox = (min(xs) - 1.0, min(ys) - 1.0, max(xs) + 1.0, max(ys) + 1.0)
+        return _FakeMask(rect, ground_fn=ground_fn), bbox
+
+    def test_steep_cells_skipped_flat_kept(self) -> None:
+        pts, mid = self._split_pts()
+
+        def ground_fn(x: float, _y: float) -> float:
+            return 0.0 if x < mid else x * 2.0
+
+        mask, bbox = self._mask(pts, ground_fn)
+        cells, stats = bake.sample_road_cells(mask, 4.0, bbox=bbox)
+        step = 4.0
+        # Cells within one stencil step of the split see a steep neighbor.
+        flat_keys = {
+            (int(round(p[0] / step)), int(round(p[1] / step)))
+            for p in pts
+            if p[0] < mid - 4.0
+        }
+        steep_keys = {
+            (int(round(p[0] / step)), int(round(p[1] / step)))
+            for p in pts
+            if p[0] >= mid
+        }
+        self.assertTrue(flat_keys)
+        self.assertTrue(flat_keys.issubset(cells))
+        self.assertTrue(steep_keys.isdisjoint(cells))
+        self.assertGreaterEqual(stats["grade_skipped"], len(steep_keys))
+        self.assertGreater(stats["grade_skipped"], 0)
+
+    def test_max_grade_zero_disables(self) -> None:
+        pts, mid = self._split_pts()
+
+        def ground_fn(x: float, _y: float) -> float:
+            return 0.0 if x < mid else x * 2.0
+
+        mask, bbox = self._mask(pts, ground_fn)
+        cells, stats = bake.sample_road_cells(
+            mask, 4.0, bbox=bbox, max_grade=0.0
+        )
+        self.assertEqual(stats["grade_skipped"], 0)
+        self.assertEqual(len(cells), 8)
+
+    def test_missing_neighbor_z_keeps_edge_cells(self) -> None:
+        pts = _tile00_lattice(8)
+        xs = [p[0] for p in pts]
+        lo, hi = min(xs), max(xs)
+
+        def ground_fn(x: float, _y: float) -> float | None:
+            if x < lo or x > hi:
+                return None
+            return x * 2.0
+
+        mask, bbox = self._mask(pts, ground_fn)
+        cells, stats = bake.sample_road_cells(mask, 4.0, bbox=bbox)
+        step = 4.0
+        edge_keys = {
+            (int(round(p[0] / step)), int(round(p[1] / step)))
+            for p in pts
+            if p[0] == lo or p[0] == hi
+        }
+        self.assertTrue(edge_keys.issubset(cells))
+        self.assertEqual(stats["grade_skipped"], 6)
+        self.assertEqual(len(cells), 2)
+
+
+class TestMinComponentLength(unittest.TestCase):
+    """min_component_length gate — synthetic cells, no ADT files."""
+
+    def test_long_thin_bar_kept(self) -> None:
+        # 50 cells at step 4: ~196 yd centerline, above the 150 yd gate.
+        cells = {(i, 0): 1.0 for i in range(50)}
+        segs = bake.bake_from_cells(cells, min_length=0.0)
+        self.assertEqual(len(segs), 1)
+
+    def test_short_bar_dropped_via_extract(self) -> None:
+        # 26 cells at step 4: 100 yd, passes width, fails the 150 yd gate.
+        bar = {(i, 0) for i in range(26)}
+        paths, _, dropped_wide, dropped_short = bake.extract_centerlines(
+            bar, step=4.0, min_cells=6, min_component_length=150.0
+        )
+        self.assertEqual(len(paths), 0)
+        self.assertEqual(dropped_wide, 0)
+        self.assertEqual(dropped_short, 1)
+
+    def test_min_component_length_zero_disables(self) -> None:
+        bar = {(i, 0) for i in range(26)}
+        paths, _, _, dropped_short = bake.extract_centerlines(
+            bar, step=4.0, min_cells=6, min_component_length=0.0
+        )
+        self.assertEqual(len(paths), 1)
+        self.assertEqual(dropped_short, 0)
+        segs = bake.bake_from_cells(
+            {c: 1.0 for c in bar}, min_length=0.0, min_component_length=0.0
+        )
+        self.assertEqual(len(segs), 1)
 
 
 if __name__ == "__main__":

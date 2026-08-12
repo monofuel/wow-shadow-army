@@ -194,12 +194,14 @@ def extract_centerlines(
     min_cells: int,
     erase_radius: float = ERASE_YD,
     max_width: float = 0.0,
-) -> tuple[list[list[Cell]], list[set[Cell]], int]:
+    min_component_length: float = 0.0,
+) -> tuple[list[list[Cell]], list[set[Cell]], int, int]:
     # Width gate only kills isolated pockets. A pocket 8-connected to a real
     # road dilutes into the network mean and survives.
     paths: list[list[Cell]] = []
     discarded: list[set[Cell]] = []
     dropped_wide = 0
+    dropped_short = 0
     for comp in sorted(connected_components(cell_set), key=min):
         if len(comp) < min_cells:
             continue  # silent raw-size skip, as today
@@ -230,9 +232,12 @@ def extract_centerlines(
         ):
             dropped_wide += 1
             continue  # whole component is a blob, not a road
+        if min_component_length > 0 and comp_paths and total_len < min_component_length:
+            dropped_short += 1
+            continue
         paths.extend(comp_paths)
         discarded.extend(comp_discarded)
-    return paths, discarded, dropped_wide
+    return paths, discarded, dropped_wide, dropped_short
 
 
 def cells_to_world(
@@ -298,9 +303,14 @@ def bake_from_cells(
     min_cells: int = 6,
     min_length: float = 30.0,
     max_width: float = 28.0,
+    min_component_length: float = 150.0,
 ) -> list[dict]:
-    paths, _discarded, _dropped_wide = extract_centerlines(
-        set(cells), step, min_cells, max_width=max_width
+    paths, _discarded, _dropped_wide, _dropped_short = extract_centerlines(
+        set(cells),
+        step,
+        min_cells,
+        max_width=max_width,
+        min_component_length=min_component_length,
     )
     return canonicalize_segments(
         _paths_to_segments(paths, cells, step, decimate_yd, min_length)
@@ -315,6 +325,8 @@ def make_meta(
     min_length: float = 30.0,
     max_water_depth: float = 0.5,
     max_width: float = 28.0,
+    max_grade: float = 0.55,
+    min_component_length: float = 150.0,
 ) -> dict:
     return {
         "meta": 1,
@@ -328,6 +340,8 @@ def make_meta(
         "min_length_yd": min_length,
         "max_water_depth": max_water_depth,
         "max_width_yd": max_width,
+        "max_grade": max_grade,
+        "min_component_length_yd": min_component_length,
         "markers": list(rmask.ROAD_TEXTURE_MARKERS),
         "overlay_only_markers": list(rmask.OVERLAY_ONLY_MARKERS),
     }
@@ -398,10 +412,12 @@ def sample_road_cells(
     step: float,
     bbox: tuple[float, float, float, float] | None = None,
     max_water_depth: float = 0.5,
+    max_grade: float = 0.55,
 ) -> tuple[dict[Cell, float], dict[str, int]]:
     cells: dict[Cell, float] = {}
     fallbacks = 0
     water_skipped = 0
+    grade_skipped = 0
     tiles_scanned = 0
     tiles_with_roads = 0
     t0 = time.monotonic()
@@ -437,7 +453,20 @@ def sample_road_cells(
                 if max_water_depth > 0 and mask.is_water(x, y).depth > max_water_depth:
                     water_skipped += 1
                     continue
-                z = mask.ground_z(x, y)
+                zc = None
+                if max_grade > 0:
+                    zc = mask.ground_z(x, y)
+                    zxp = mask.ground_z(x + 4.0, y)
+                    zxm = mask.ground_z(x - 4.0, y)
+                    zyp = mask.ground_z(x, y + 4.0)
+                    zym = mask.ground_z(x, y - 4.0)
+                    if zc is not None and None not in (zxp, zxm, zyp, zym):
+                        grade = max(abs(zxp - zxm), abs(zyp - zym)) / 8.0
+                        if grade > max_grade:
+                            grade_skipped += 1
+                            continue
+                    # any missing neighbor z -> keep the cell (don't punish tile edges)
+                z = zc if zc is not None else mask.ground_z(x, y)
                 if z is None:
                     z = 0.0
                     fallbacks += 1
@@ -458,6 +487,7 @@ def sample_road_cells(
         "cells": len(cells),
         "fallback_z": fallbacks,
         "water_skipped": water_skipped,
+        "grade_skipped": grade_skipped,
     }
     return cells, stats
 
@@ -473,6 +503,8 @@ def bake_map(
     min_length: float = 30.0,
     max_water_depth: float = 0.5,
     max_width: float = 28.0,
+    max_grade: float = 0.55,
+    min_component_length: float = 150.0,
 ) -> dict:
     t0 = time.monotonic()
     print(
@@ -484,23 +516,29 @@ def bake_map(
     )
     mask = rmask.RoadMask(adt_dir, map_name=map_name)
     cells, stats = sample_road_cells(
-        mask, step, bbox, max_water_depth=max_water_depth
+        mask, step, bbox, max_water_depth=max_water_depth, max_grade=max_grade
     )
     print(
         f"sample done tiles_scanned={stats['tiles_scanned']} "
         f"road_tiles={stats['tiles_with_roads']} cells={stats['cells']} "
         f"fallback_z={stats['fallback_z']} water_skipped={stats['water_skipped']} "
+        f"grade_skipped={stats['grade_skipped']} "
         f"elapsed={time.monotonic() - t0:.1f}s",
         file=sys.stderr,
         flush=True,
     )
-    paths, discarded, dropped_wide = extract_centerlines(
-        set(cells), step, min_cells, max_width=max_width
+    paths, discarded, dropped_wide, dropped_short = extract_centerlines(
+        set(cells),
+        step,
+        min_cells,
+        max_width=max_width,
+        min_component_length=min_component_length,
     )
     n_components = len(connected_components(set(cells))) if cells else 0
     print(
         f"components={n_components} centerlines={len(paths)} "
         f"discarded_remnants={len(discarded)} dropped_wide={dropped_wide} "
+        f"dropped_short={dropped_short} "
         f"elapsed={time.monotonic() - t0:.1f}s",
         file=sys.stderr,
         flush=True,
@@ -516,6 +554,8 @@ def bake_map(
         min_length=min_length,
         max_water_depth=max_water_depth,
         max_width=max_width,
+        max_grade=max_grade,
+        min_component_length=min_component_length,
     )
     existing = out_path.read_text(encoding="utf-8") if out_path.is_file() else ""
     hand = read_hand_lines(existing)
@@ -535,6 +575,7 @@ def bake_map(
             "segments": len(baked),
             "hand": len(hand),
             "dropped_wide": dropped_wide,
+            "dropped_short": dropped_short,
             "elapsed_s": elapsed,
         }
     )
@@ -574,6 +615,18 @@ def build_parser() -> argparse.ArgumentParser:
         default=28.0,
         help="Drop components whose mean paint width exceeds this (yd); <=0 disables",
     )
+    parser.add_argument(
+        "--max-grade",
+        type=float,
+        default=0.55,
+        help="Skip cells whose local terrain grade exceeds this (dz/yd); <=0 disables",
+    )
+    parser.add_argument(
+        "--min-component-length",
+        type=float,
+        default=150.0,
+        help="Drop components whose total centerline length is shorter than this (yd); <=0 disables",
+    )
     parser.add_argument("--out", type=Path, default=None)
     parser.add_argument(
         "--bbox",
@@ -605,6 +658,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         min_length=args.min_length,
         max_water_depth=args.max_water_depth,
         max_width=args.max_width,
+        max_grade=args.max_grade,
+        min_component_length=args.min_component_length,
     )
     return 0
 
