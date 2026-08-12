@@ -234,7 +234,11 @@ local function next_wet_beat(x, y, fatigued)
   for _, b in ipairs(wet) do
     -- hook or still south of the X-pass band (land selector shape).
     if not skipped[b.id] and (b.hook or x < b.x + PASSED_YARDS) then
-      if b.x + b.radius >= x - 40.0 then
+      -- Hook beats are retired ONLY by capture, so they also skip the
+      -- south-lag band: the Merchant Bay beach detour (2026-08-12) runs
+      -- 250 yd south-west of the coast line, far outside the 40-yd guard
+      -- that protects ordinary beats from lateral-drift regression.
+      if b.hook or b.x + b.radius >= x - 40.0 then
         return b
       end
     end
