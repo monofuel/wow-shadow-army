@@ -21,6 +21,12 @@ local LAND = require("config.traverse_land_beats")
 local COAST = require("config.traverse_coast_beats")
 local CONNECT_WET = require("config.traverse_connector_wet_beats")
 local CONNECT_LAND = require("config.traverse_connector_land_beats")
+-- Timbermaw interior: walked-ground beats resampled from monofuel's manual
+-- F9 cave logs (tools/resample_trace_beats.py; docs/traverse/
+-- reference-logs.md). Live navigation through the WMO needs the fork's
+-- local_steer + allow_jump features (ledgered); until they land, these
+-- beats route like any others and the finale stays blocked at the cave.
+local INTERIOR = require("config.traverse_finale_interior_beats")
 local FINALE = require("config.traverse_finale_beats")
 
 -- Wet-chain gate: PETREL_SWIM=1 opts a run into the wet chain. Default off
@@ -110,6 +116,10 @@ local lastReached = nil
 local connectorStarted = false
 local connectorComplete = false
 local finaleStarted = false
+-- The interior chain owns the run from the cave mouth until its last
+-- walked beat retires; monotonic like finaleStarted — a failsafe fall must
+-- stay visible as a finale failure, never re-run the cave.
+local interiorComplete = false
 
 -- Flight recorder: permanent telemetry + edge-triggered anomaly events.
 -- Exists because a human replay watch caught pauses / path-leaving /
@@ -154,7 +164,7 @@ local function beat_by_id(id)
   for _, b in ipairs(COAST.beats) do
     if b.id == id then return b end
   end
-  for _, route in ipairs({ LAND, CONNECT_WET, CONNECT_LAND, FINALE }) do
+  for _, route in ipairs({ LAND, CONNECT_WET, CONNECT_LAND, INTERIOR, FINALE }) do
     for _, b in ipairs(route.beats) do
       if b.id == id then return b end
     end
@@ -530,6 +540,13 @@ local function navigate_to(view, pos, beat, reason, opts)
   -- asking ground planning for a corridor it will never grant. This is a
   -- speedrun — walk INTO the water, no inching on walkout crumbs.
   if beat.wet then intent.water = true end
+  -- Fork features (forward-safe: the committed intent parser ignores
+  -- unknown keys). local_steer drives collision-observed steps through WMO
+  -- interiors where Detour serves the exterior surface; allow_jump lets an
+  -- advertised jump step clear the Timbermaw cave lip (monofuel's walk
+  -- proved plain forward walking is rejected there).
+  if beat.navigation_mode then intent.navigation_mode = beat.navigation_mode end
+  if beat.allow_jump then intent.allow_jump = true end
   return intent
 end
 
@@ -716,13 +733,20 @@ function M.decide(view)
     finaleStarted = true
   end
   local finale_phase = finaleStarted
+  local interiorGoal = INTERIOR.beats[#INTERIOR.beats]
+  if finale_phase and not interiorComplete and
+      planar(pos.x, pos.y, interiorGoal.x, interiorGoal.y) <=
+        interiorGoal.radius then
+    interiorComplete = true
+  end
   local connector_land_phase = connectorStarted and not connectorComplete and
     not swimming
   -- At/past the top of the Barrens the painted northern road owns the run,
   -- until the cave handoff starts the Winterspring finale.
   local land_phase = pos.x >= LAND.start_x and not finale_phase and
     not connector_land_phase
-  local active_land_route = finale_phase and FINALE or
+  local active_land_route = finale_phase and
+    (interiorComplete and FINALE or INTERIOR) or
     (connector_land_phase and CONNECT_LAND or (land_phase and LAND or nil))
 
   -- Flight recorder + anomaly EVs (logging only). Before form casts so a
@@ -748,6 +772,11 @@ function M.decide(view)
   end
 
   if finale_phase then
+    -- The walked interior chain owns the cave until its last beat retires;
+    -- only then does the Winterspring finale line take over.
+    if not interiorComplete then
+      return navigate_sparse_land(view, pos, INTERIOR, "timbermaw", stalled)
+    end
     local fgoal = FINALE.beats[#FINALE.beats]
     if planar(pos.x, pos.y, fgoal.x, fgoal.y) <= fgoal.radius then
       lastPos, lastProgressAt, stallSince = { x = pos.x, y = pos.y },
