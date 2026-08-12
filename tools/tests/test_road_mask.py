@@ -6,12 +6,16 @@ Kalimdor ADT dump is not present.
 """
 from __future__ import annotations
 
+import json
+import math
+import random
 import sys
 import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "tools"))
+import bake_road_waypoints as bake  # noqa: E402
 import road_mask as rmask  # noqa: E402
 
 ADT_DIR = rmask.DEFAULT_ADT_DIR
@@ -536,6 +540,129 @@ class TestAzerothAdt(unittest.TestCase):
         self.assertTrue(coords)
         self.assertIn((28, 28), coords)
         self.assertEqual(coords, sorted(coords))
+
+
+class TestBakeRoadWaypoints(unittest.TestCase):
+    """Pure-math bake pipeline — synthetic cells, no ADT files."""
+
+    def _l_cells(self, arm: int = 12, z: float = 10.0) -> dict[tuple[int, int], float]:
+        cells: dict[tuple[int, int], float] = {}
+        for i in range(arm):
+            cells[(i, 0)] = z
+        for j in range(1, arm):
+            cells[(0, j)] = z
+        return cells
+
+    def test_l_shape_is_one_segment_tip_to_tip(self) -> None:
+        step = 4.0
+        arm = 12
+        segs = bake.bake_from_cells(self._l_cells(arm), step=step, min_cells=6)
+        self.assertEqual(len(segs), 1)
+        pts = segs[0]["pts"]
+        tips = {
+            (0.0, (arm - 1) * step),
+            ((arm - 1) * step, 0.0),
+        }
+        ends = {(pts[0][0], pts[0][1]), (pts[-1][0], pts[-1][1])}
+        self.assertEqual(ends, tips)
+
+    def test_two_disjoint_blobs_are_two_segments(self) -> None:
+        cells: dict[tuple[int, int], float] = {}
+        for i in range(8):
+            cells[(i, 0)] = 1.0
+        for i in range(8):
+            cells[(i + 40, 50)] = 2.0
+        segs = bake.bake_from_cells(cells, step=4.0, min_cells=6)
+        self.assertEqual(len(segs), 2)
+
+    def test_plus_shape_splits_spur_after_erasure(self) -> None:
+        step = 4.0
+        cells: dict[tuple[int, int], float] = {}
+        for i in range(-12, 13):
+            cells[(i, 0)] = 5.0
+        for j in range(-12, 13):
+            cells[(0, j)] = 5.0
+        paths, discarded = bake.extract_centerlines(set(cells), step, min_cells=6)
+        self.assertGreaterEqual(len(paths), 2)
+        path_xy = [(i * step, j * step) for path in paths for i, j in path]
+        small = set()
+        for rem in discarded:
+            small.update(rem)
+        for i, j in cells:
+            x, y = i * step, j * step
+            dmin = min(math.hypot(x - px, y - py) for px, py in path_xy)
+            if dmin > bake.ERASE_YD:
+                self.assertIn((i, j), small)
+
+    def test_determinism_bytes_and_insertion_order(self) -> None:
+        cells = self._l_cells()
+        for i in range(8):
+            cells[(i + 30, 20)] = 3.0
+        a = bake.bake_from_cells(cells)
+        b = bake.bake_from_cells(cells)
+        meta = bake.make_meta("kalimdor", 4.0, 10.0, 6)
+        bytes_a = bake.render_artifact(meta, [], a).encode("utf-8")
+        bytes_b = bake.render_artifact(meta, [], b).encode("utf-8")
+        self.assertEqual(bytes_a, bytes_b)
+        items = list(cells.items())
+        random.Random(0).shuffle(items)
+        c = bake.bake_from_cells(dict(items))
+        self.assertEqual(bake.render_artifact(meta, [], c).encode("utf-8"), bytes_a)
+
+    def test_merge_preserves_hand_line_bytes_drops_stale_baked(self) -> None:
+        hand_raw = (
+            '{"id": "h_bridge",  "source":"hand","note": "odd keys", '
+            '"pts": [[1, 2, 3], [4,5,6]]}'
+        )
+        existing = "\n".join(
+            [
+                '{"meta": 1, "map": "kalimdor", "map_id": 1}',
+                hand_raw,
+                '{"id": "b0099", "source": "baked", "pts": [[0, 0, 0], [9, 9, 9]]}',
+            ]
+        ) + "\n"
+        meta = bake.make_meta("kalimdor", 4.0, 10.0, 6)
+        baked = [
+            {
+                "id": "b0001",
+                "source": "baked",
+                "pts": [[0.0, 0.0, 1.0], [10.0, 0.0, 1.0]],
+            }
+        ]
+        out = bake.render_artifact(meta, bake.read_hand_lines(existing), baked)
+        lines = out.splitlines()
+        self.assertEqual(json.loads(lines[0])["meta"], 1)
+        self.assertEqual(lines[1], hand_raw)
+        self.assertNotIn("b0099", out)
+        self.assertEqual(json.loads(lines[2])["id"], "b0001")
+        self.assertTrue(out.endswith("\n"))
+
+    def test_meta_line_fields_match_args(self) -> None:
+        meta = bake.make_meta("kalimdor", 4.0, 10.0, 6)
+        obj = json.loads(json.dumps(meta))
+        self.assertEqual(obj["meta"], 1)
+        self.assertEqual(obj["map"], "kalimdor")
+        self.assertEqual(obj["map_id"], 1)
+        self.assertEqual(obj["generator"], "tools/bake_road_waypoints.py")
+        self.assertEqual(obj["alpha_threshold"], 64)
+        self.assertEqual(obj["step"], 4.0)
+        self.assertEqual(obj["decimate_yd"], 10.0)
+        self.assertEqual(obj["min_cells"], 6)
+        azeroth = json.loads(json.dumps(bake.make_meta("azeroth", 4.0, 15.0, 8)))
+        self.assertEqual(azeroth["map_id"], 0)
+        self.assertEqual(azeroth["decimate_yd"], 15.0)
+        self.assertEqual(azeroth["min_cells"], 8)
+
+    def test_decimate_keeps_ends_and_interior_spacing(self) -> None:
+        chain = [(float(i), 0.0, 0.0) for i in range(56)]
+        kept = bake.decimate(chain, 10.0)
+        self.assertEqual(kept[0], chain[0])
+        self.assertEqual(kept[-1], chain[-1])
+        self.assertGreaterEqual(len(kept), 2)
+        for prev, cur in zip(kept[:-2], kept[1:-1]):
+            self.assertGreaterEqual(
+                math.hypot(cur[0] - prev[0], cur[1] - prev[1]), 10.0
+            )
 
 
 if __name__ == "__main__":
