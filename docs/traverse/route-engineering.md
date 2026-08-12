@@ -66,17 +66,35 @@ documented in its README; never write to the realm DB).
 ## Technique: road detection from painted textures (`tools/road_mask.py`)
 
 Roads in 1.12 are literally painted onto the terrain: each ADT tile's MTEX
-chunk names its textures (`*road*` tilesets), and each MCNK sub-chunk's
-MCLY/MCAL layers say where each texture is painted, at ~yard resolution.
-`road_mask.py` parses the ADTs under
-`local_data/player/assets-flat/world/maps/kalimdor/` into `is_road(x,y)`,
-per-leg on-road fractions, and bbox dumps of road-positive samples — the
-ground truth for placing beats on actual roads and hairpins without anyone
-manually walking them. The coordinate transform is calibrated against
-known road/non-road anchors (see its tests). Use `dump` over a climb's
-bbox to extract a hairpin polyline; use `leg` to score whether a beat
-chord stays on pavement. This exists because a replay watch proved "the
-bot leaves the path" was the root cause the mesh could never see.
+chunk names its textures (`*road*` tilesets, plus Elwynn cobblestone —
+see below), and each MCNK sub-chunk's MCLY/MCAL layers say where each
+texture is painted, at ~yard resolution. `road_mask.py` parses the ADTs
+under `local_data/player/assets-flat/world/maps/<kalimdor|azeroth>/` into
+`is_road(x,y)`, per-leg on-road fractions, and bbox dumps of
+road-positive samples — the ground truth for placing beats on actual
+roads and hairpins without anyone manually walking them. The coordinate
+transform is calibrated against known road/non-road anchors (see its
+tests). Use `dump` over a climb's bbox to extract a hairpin polyline;
+use `leg` to score whether a beat chord stays on pavement. This exists
+because a replay watch proved "the bot leaves the path" was the root
+cause the mesh could never see.
+
+The dump→eyeball workflow still works. There is also a productized path:
+`tools/bake_road_waypoints.py` regenerates the checked-in artifacts
+`tools/data/road_waypoints_{kalimdor,azeroth}.jsonl`. Two tiers:
+
+- **baked** — regenerable centerlines from the current paint. Replaced
+  wholesale on every bake.
+- **hand** — curated stitches. The merge rule keeps every non-`baked`
+  line **byte-identical** and in original relative order.
+
+Curation rules (bridges have no paint; plaza blobs come back on re-bake;
+never key other tooling on baked ids) live in `tools/data/README.md`.
+
+Eastern Kingdoms: `--map azeroth`. Elwynn's paved textures do not contain
+`road` (e.g. `ElwynnCobbleStoneBase.blp`), so `ROAD_TEXTURE_MARKERS` also
+matches the `elwynncobblestone` substring; without that extra marker the
+Elwynn roads would not bake.
 
 ## Technique: trace-pinning (walked ground is evidence)
 

@@ -16,7 +16,7 @@ the same map — the differences are ownership and purpose, not geometry.
 | 4 | Traverse checkpoints | **Ours** | `tools/traverse_checkpoints.json` | Run scoring / progress gates | Same partial path as beats |
 | 5 | Godview run trails | **Ours** (captured) | `~/.coworld/player/launcher_units/runtime/*/leagues/traverse/captures/godview_*.jsonl` | What a bot actually walked (2 Hz) | **Yes** — per-run, click rows in the `L` panel |
 | 6 | Navmesh corridors | Generated | Not stored — fork navigate intents live, or offline via `monofuel-vanilla-wow/tmp/vmangos-navmesh-helper` (mmaps) | Fills the gaps *between* beats | **No** |
-| 7 | Road mask | **Ours** | `tools/road_mask.py` (+ tests) | `is_road(x,y)` from painted ADT textures (MTEX/MCLY/MCAL) — ground truth for placing beats on pavement | **No** |
+| 7 | Road mask | **Ours** | `tools/road_mask.py` + `tools/bake_road_waypoints.py` + `tools/data/road_waypoints_<map>.jsonl` | `is_road(x,y)` from painted ADT textures (MTEX/MCLY/MCAL) — ground truth for placing beats on pavement | **Yes** — red lines + dots, key `3` (both continents) |
 | 8 | Server terrain truth | vmangos extract | `coworld-vanilla-wow/local_data/vmangos-5875-data/{maps,mmaps,vmaps}` | What the server/mesh believes | **No** (viewer terrain is client WDL instead) |
 
 The viewer's terrain itself is the client **WDL** heightmesh (see
@@ -38,6 +38,9 @@ navigation source.
 - **Roads are paint, not data.** 1.12 has no road records; `road_mask.py`
   recovers them from texture alpha layers. Its coordinate transform is
   calibrated — do not re-derive it.
+- **Roads are now also a persisted artifact.** Baked centerlines in
+  `tools/data/road_waypoints_<map>.jsonl`, hand-curated over time
+  (bridges have no paint; see `tools/data/README.md`).
 - **Trails are evidence.** Godview captures are client-verified walkable
   lines; beats get resampled *from* them (`tools/resample_human_ribbon.py`,
   `tools/resample_trace_beats.py`).
@@ -52,8 +55,9 @@ order:
   layer (distinct color per file, beat radius rings), not gated behind the
   runs panel.
 - [ ] Checkpoints as their own toggle, independent of the runs panel.
-- [ ] Road-mask layer (raster or sampled dots from `road_mask.py dump`)
+- [x] Road-mask layer (raster or sampled dots from `road_mask.py dump`)
   under the beat ribbons — makes "beat off pavement" visible at a glance.
+  (shipped as the checked-in road-waypoints artifact, key 3)
 - [ ] Navmesh corridor preview: click two points → chained
   navmesh-helper corridor drawn (the offline probing loop from
   route-engineering, on the map).

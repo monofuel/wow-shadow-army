@@ -17,7 +17,7 @@ OpenGL + windy window (`src/map_browser/gl_view.nim`,
 | Target | What it does |
 |---|---|
 | `make map-browser` | Interactive GL window |
-| `make map-browser-once` | Headless smoke (`MAP_BROWSER_ONCE=1`): catalog + waypoint graph + Kalimdor WDL mesh asserts; no window |
+| `make map-browser-once` | Headless smoke (`MAP_BROWSER_ONCE=1`): catalog + waypoint graph + both continents' WDL meshes and road artifact counts; no window |
 | `make map-browser-probe` | Autopilot window: N seconds, screenshot + stats JSON, exit nonzero if mesh/overlays never ready |
 
 ## Env vars
@@ -29,15 +29,17 @@ OpenGL + windy window (`src/map_browser/gl_view.nim`,
 | `MAP_BROWSER_ONCE=1` | Headless smoke path (see above). |
 | `MAP_BROWSER_STATS=path.json` | Rewrite stats every ~2s and on exit (fps, frame p50/p95, camera, tile/vertex counts, overlay counts). |
 | `MAP_BROWSER_AUTO="seconds=N,screenshot=path.png"` | Autopilot; default probe uses `seconds=8` and `local_data/map_browser_probe.png`. |
+| `MAP_BROWSER_MAP` | Startup continent: `0` Azeroth / `1` Kalimdor (default `1`). |
 
 ## Controls
 
-From `gl_view.nim` / `map_browser.nim` (defaults: waypoints on, taxi on, xray on):
+From `gl_view.nim` / `map_browser.nim` (defaults: waypoints on, taxi on, roads on, xray on):
 
 | Input | Action |
 |---|---|
 | `1` | Toggle waypoint graph (city routes) |
 | `2` | Toggle taxi flight network |
+| `3` | Toggle road waypoints |
 | `L` | Toggle traverse-runs panel (click a row to load/plot) |
 | `X` | Toggle xray (overlays ignore depth) |
 | `WASD` | Pan target (speed scales with camera height) |
@@ -59,8 +61,10 @@ Header line mirrors the same hints (ASCII `|` separators).
 | Taxi polylines | Catalog `taxiPaths` / `taxiPathNodes`, decimated (every 4th node, ends kept). |
 | Traverse runs | Godview JSONL at `~/.coworld/player/launcher_units/runtime/*/leagues/traverse/captures/godview_*.jsonl` (2 Hz captures; parse on a background thread; decimated ≤2000 points). |
 | Beats / checkpoints | Repo `lua/config/traverse_beats.json` and `tools/traverse_checkpoints.json` (loaded when the runs panel opens). |
+| Road waypoints | `tools/data/road_waypoints_*.jsonl`. Meta line stamps `map_id`. `z` is pre-baked from ADT MCVT so the viewer does not sample terrain. |
 
-Supported continent map ids: `0` Azeroth, `1` Kalimdor. Startup loads Kalimdor.
+Supported continent map ids: `0` Azeroth, `1` Kalimdor. Startup loads
+Kalimdor unless `MAP_BROWSER_MAP=0`.
 
 See [../navigation.md](../navigation.md) for every navigation data system
 (ours vs upstream) and which ones this viewer draws.
@@ -73,6 +77,7 @@ See [../navigation.md](../navigation.md) for every navigation data system
 - Continents are separate meshes; no ocean pan between them — `Tab` switches.
 - Waypoint edges are reconstructed by `worldRoutePath` probing, not exported from the fork.
 - Run list is load/plot only — no timeline scrubbing.
+- Road `z` is MCVT-accurate but terrain is coarse WDL — dots can sink in rough spots; xray (default on) covers it.
 
 ## Follow-ups
 
