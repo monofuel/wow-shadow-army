@@ -69,13 +69,22 @@ Bake knobs (see `tools/bake_road_waypoints.py`):
   `max_water_depth`. Sample stats include `water_skipped`. Roads that
   cross `>0.5` yd of water therefore split at the banks — hand-stitch
   those gaps the same way as bridges.
-- Meta also records `markers`, a copy of `ROAD_TEXTURE_MARKERS`.
+- `--max-width` (default `28.0`; `<=0` disables) drops whole components
+  whose mean paint width (cell area / total centerline arclength)
+  exceeds the threshold. Meta field: `max_width_yd`. Bake stats include
+  `dropped_wide`. Isolated wide blobs die; a blob 8-connected to a real
+  road dilutes into the network mean and survives.
+- Meta also records `markers` (copy of `ROAD_TEXTURE_MARKERS`) and
+  `overlay_only_markers` (copy of `OVERLAY_ONLY_MARKERS`).
 
 `ROAD_TEXTURE_MARKERS` (substring match, lowercased): `road`,
-`elwynncobblestone`, `duskwoodcobblestone`, `tanarisdirtfootprint`.
-`thousandneedlesdirt` was tried and dropped — the whole canyon floor is
-that dirt, so the zone baked into one solid blob. A unit test pins the
-marker off.
+`elwynncobblestone`, `duskwoodcobblestone`, `tanarisdirtfootprint`,
+`thousandneedlesdirt`. `OVERLAY_ONLY_MARKERS` is `thousandneedlesdirt`
+and `tanarisdirtfootprint`: those count as road only when painted as an
+overlay layer (alpha > 64), never as a chunk's base layer — zone-floor
+dirt is ground, brushed dirt is the trail. `thousandneedlesdirt` was
+dropped as a base-layer blob (the whole canyon floor is that dirt) and
+re-enabled overlay-only, so Thousand Needles now bakes trail segments.
 
 Dev subset (does not replace the checked-in artifact):
 
@@ -102,8 +111,13 @@ with a newline.
   baked ends. Stitch with a `"source": "hand"` line (same as bridges).
 - **Tanaris paint is thin.** The extra marker is `tanarisdirtfootprint`
   (a footprint tileset, not a `*road*` tileset); coverage is sparse.
-- **Thousand Needles has no baked roads.** `thousandneedlesdirt` stays
-  off by decision (canyon-floor blob). Hand lines are the path there.
+  Overlay-only, same as Thousand Needles dirt.
+- **Thousand Needles trails are overlay dirt.** `thousandneedlesdirt`
+  is a marker again, overlay-only: canyon-floor base paint is ground,
+  brushed overlay is the trail.
+- **Isolated wide blobs are auto-dropped** by `--max-width`. A blob
+  fused (8-connected) to a real road dilutes into the network mean and
+  survives — trim those by hand.
 - **Town plazas blob.** Deleting or trimming a baked line only lasts
   until the next re-bake — the paint is still there, so the baker
   regenerates it. A trimmed replacement you want to keep must be a

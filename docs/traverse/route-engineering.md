@@ -93,17 +93,22 @@ never key other tooling on baked ids) live in `tools/data/README.md`.
 
 Eastern Kingdoms: `--map azeroth`. `ROAD_TEXTURE_MARKERS` is the `*road*`
 substring plus `elwynncobblestone` (Elwynn's paved textures do not
-contain `road`), `duskwoodcobblestone` (same for Duskwood), and
+contain `road`), `duskwoodcobblestone` (same for Duskwood),
 `tanarisdirtfootprint` (Tanaris coverage is thin — sparse footprint
-paint). `thousandneedlesdirt` was tried and dropped: the whole canyon
-floor is that dirt, so the zone baked into one solid blob. A test pins
-it off; Thousand Needles has no baked roads. Hand lines are the path
-there.
+paint), and `thousandneedlesdirt`. The last two are overlay-only
+(`OVERLAY_ONLY_MARKERS`): they count as road only when painted as an
+overlay layer (alpha > 64), never as a chunk's base layer — zone-floor
+dirt is ground, brushed dirt is the trail. `thousandneedlesdirt` was
+dropped as a base-layer blob (the whole canyon floor is that dirt) and
+re-enabled overlay-only, so Thousand Needles now bakes trail segments.
 
 Bake always Zhang-Suen-thins the paint mask first, so a wide road still
 yields a single centerline. Road cells whose MCLQ water depth exceeds
 `--max-water-depth` (default 0.5 yd) are skipped, so painted lakebeds
-like the Pool of Tears no longer bake.
+like the Pool of Tears no longer bake. `--max-width` (default 28.0 yd;
+`<=0` disables) drops whole components whose mean paint width (cell
+area / total centerline arclength) exceeds the threshold — isolated
+blobs die; a blob 8-connected to a real road survives.
 
 ## Technique: trace-pinning (walked ground is evidence)
 
