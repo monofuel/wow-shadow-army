@@ -66,12 +66,12 @@ for i = 2, #landRoute.beats do
   check(landRoute.beats[i].hook or landRoute.beats[i].x > landRoute.beats[i - 1].x,
     "land beats march north monotonically (hooks exempt)")
 end
-check(#route.beats == 52, "route keeps every beat (incl. the two clearance guards)")
+check(#route.beats == 53, "route keeps every beat (incl. the two clearance guards)")
 local wetCount = 0
 for _, b in ipairs(route.beats) do
   if b.wet then wetCount = wetCount + 1 end
 end
-check(wetCount == 50, "route keeps the wet ribbon")
+check(wetCount == 51, "route keeps the wet ribbon")
 check(route.beats[1].id == "land_approach" and route.beats[2].id == "water_entry",
   "land legs lead the route")
 
@@ -482,6 +482,36 @@ local caveResume = cavePetrel.decide(view(6866.6, -2126.2, formed))
 check(caveResume.kind == "navigate" and caveResume.reason == holdNextId,
   "after the interior hop window the same beat resumes")
 nav = { state = "following", failed_here = false, walkout_available = false }
+
+-- INDOORS FORM GATE: Travel Form is outdoor-only in 1.12. Inside a WMO
+-- the brain must keep navigating formless (one edge-triggered EV) instead
+-- of standing still to chat-cast a spell that can never succeed — the
+-- Timbermaw crawl of 2026-08-12. Fresh brain: interior ownership and the
+-- form-retry pacing are monotonic per run.
+package.loaded["traverse"] = nil
+local indoorPetrel = require("traverse")
+clock = clock + 100.0
+nav = { state = "following", failed_here = false, walkout_available = false }
+local indoorMove = indoorPetrel.decide(view(6600.0, -2085.0,
+  { shapeshift_form_id = 0, indoors_known = true, indoors = true }))
+check(indoorMove.kind == "navigate",
+  "an indoors formless seat navigates instead of casting")
+check(any_log_find("EV form_denied_indoors") ~= nil,
+  "the indoor denial logs one EV")
+check(indoorMove.stop_distance == 4.0,
+  "sparse stops stay strictly inside the capture radius")
+clock = clock + 6.0
+local indoorAgain = indoorPetrel.decide(view(6610.0, -2085.0,
+  { shapeshift_form_id = 0, indoors_known = true, indoors = true }))
+check(indoorAgain.kind == "navigate",
+  "still navigating formless while indoors")
+clock = clock + 20.0
+local outdoorCast = indoorPetrel.decide(view(6620.0, -2085.0,
+  { shapeshift_form_id = 0, indoors_known = true, indoors = false }))
+check(outdoorCast.kind == "cast_spell" and outdoorCast.spell == 783,
+  "stepping outside re-arms the Travel Form cast")
+check(any_log_find('"indoors":true') ~= nil,
+  "the flight recorder carries the indoors flag")
 
 -- DOCTRINE GUARD: the brain must never contain form-cancel chat commands or
 -- heal/defensive spells. Multiple AIs have now tried both; both are fatal

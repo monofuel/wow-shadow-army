@@ -117,6 +117,12 @@ local lastReached = nil
 -- those chains are resampled from walked runs too, but each owns its own
 -- captures and must never hand another route's beat back to a lost seat.
 local sparseReached = {}
+-- Edge-trigger for the indoors form denial: one EV per indoor entry, so
+-- replays show the transition without a log line every frame.
+local formDeniedLogged = false
+-- One-way latch: the seat has stood at the waterline once; entry now
+-- belongs to the wade machinery for the rest of the run.
+local waterlineReached = false
 local connectorStarted = false
 local connectorComplete = false
 local finaleStarted = false
@@ -329,6 +335,8 @@ local function bot_status(view, pos, beat, extra)
     -- sinking health well before the kill, falls do not.
     health = view.health_known and view.health or -1,
     in_combat = view.in_combat or false,
+    -- Outdoor-only forms need this visible everywhere a human debugs.
+    indoors = (view.indoors_known == true) and (view.indoors == true) or false,
   }
   for k, v in pairs(extra or {}) do status[k] = v end
   return status
@@ -445,10 +453,11 @@ local function flight_recorder(view, pos, land_route)
     if view.health_known then hp = math.floor(view.health or 0) end
     wow.log(string.format(
       'FLIGHT {"t":%.1f,"x":%.1f,"y":%.1f,"z":%.1f,"hp":%d,"form":%d,' ..
-      '"swim":%s,"combat":%s,"nav":"%s","beat":"%s","xt":%.1f}',
+      '"swim":%s,"combat":%s,"indoors":%s,"nav":"%s","beat":"%s","xt":%.1f}',
       now, pos.x, pos.y, pos.z or 0, hp, formId,
       swimming and "true" or "false",
       (view.in_combat == true) and "true" or "false",
+      (view.indoors_known == true and view.indoors == true) and "true" or "false",
       tostring(wow.nav_progress().state or "?"),
       beatId, xt))
   end
@@ -721,8 +730,16 @@ local function navigate_sparse_land(view, pos, route, phase, stalled)
   -- win over re-issuing the corridor the client has already refused.
   local hop = snag_recovery(view, pos, beat, phase, sparseReached[route])
   if hop then return hop end
+  -- Rotation while moving needs CAPTURE before engine arrival: the land
+  -- road's 25 yd radius / 8 yd stop geometry never lets the engine stop
+  -- at a beat, but the interior chain's 8 yd beats with the same 8 yd
+  -- stop fully ARRIVED at every one — 104 dead stops through the cave
+  -- (monofuel's replay, 2026-08-12). Keep the stop strictly inside the
+  -- capture radius so greedy capture rotates the target first; the goal
+  -- hold above still keys on the final beat's full radius.
+  local stop = math.min(8.0, math.max(3.0, beat.radius - 4.0))
   local intent = navigate_to(view, pos, beat, beat.id,
-    { stop = 8.0, status = { phase = phase, stalled_seconds = stalled } })
+    { stop = stop, status = { phase = phase, stalled_seconds = stalled } })
   if intent then
     wow.set_status(string.format("%s %s %.0fyd", phase, beat.id,
       planar(pos.x, pos.y, beat.x, beat.y)))
@@ -930,9 +947,24 @@ function M.decide(view)
       if cast then return cast end
     end
   elseif active_land_route or (not near_water and not mid_coast) then
-    if not in_travel_form(view) then
-      local cast = want_form(view, pos, TRAVEL_FORM_SPELL, "travel_form")
-      if cast then return cast end
+    -- Travel Form is OUTDOOR-ONLY in 1.12: inside a WMO the cast can
+    -- never succeed, and every retry used to stand the seat still — the
+    -- Timbermaw crawl monofuel watched (2026-08-12) was largely this.
+    -- With the fork's indoors bridge the brain just keeps running
+    -- formless and re-arms the moment it steps back outside.
+    if view.indoors_known == true and view.indoors == true then
+      if not formDeniedLogged then
+        formDeniedLogged = true
+        mark_ev()
+        wow.log(string.format(
+          "EV form_denied_indoors x=%.1f y=%.1f", pos.x, pos.y))
+      end
+    else
+      formDeniedLogged = false
+      if not in_travel_form(view) then
+        local cast = want_form(view, pos, TRAVEL_FORM_SPELL, "travel_form")
+        if cast then return cast end
+      end
     end
   end
 
@@ -1039,7 +1071,14 @@ function M.decide(view)
     -- becomes observable the wade machinery owns entry — a distance-based
     -- release deadlocked here (ground nav stalls ~14 yd out in the surf,
     -- battery four).
-    if not swimming and not wading(view, pos) and
+    -- ONE-WAY: once the seat has stood at the waterline, this branch never
+    -- fires again. The waterline point is the BEACH beat, ~11 yd shy of
+    -- the actual sea, and honest ADT liquid keeps lk=false on the sand —
+    -- so wading east out of the 12 yd ring used to re-trigger this branch
+    -- and drag the seat back west forever (dry-entry oscillation,
+    -- 2026-08-12: 513 wading frames, zero net progress).
+    if water_dist <= 12.0 then waterlineReached = true end
+    if not swimming and not wading(view, pos) and not waterlineReached and
         not (view.liquid_coverage_known and view.liquid_known) and
         pos.x < water.x + 150.0 and water_dist > 12.0 then
       local intent = navigate_to(view, pos, water, "to_waterline",
