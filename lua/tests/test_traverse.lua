@@ -435,8 +435,10 @@ package.loaded["traverse"] = nil
 local cavePetrel = require("traverse")
 clock = clock + 100.0
 nav = { state = "following", failed_here = false, walkout_available = false }
--- Walk the gallery so the frozen pose steers at timbermaw_17 like the live
--- run did (interior beats are all hooks: they retire by capture only).
+-- Walk the gallery so the frozen pose steers at the next hold-chamber beat
+-- like the live run did (interior beats are all hooks: they retire by
+-- capture only). Chain resampled at 12 yd after the live wedge: the pose
+-- that froze on the old 20-yd chord now targets timbermaw_25.
 cavePetrel.decide(view(6854.6, -2114.7, formed))
 clock = clock + 1.0
 cavePetrel.decide(view(6876.1, -2115.8, formed))
@@ -444,8 +446,8 @@ clock = clock + 1.0
 nav = { state = "unavailable", failed_here = true, walkout_available = false,
   waypoint_count = 0 }
 local caveBeat = cavePetrel.decide(view(6866.6, -2126.2, formed))
-check(caveBeat.kind == "navigate" and caveBeat.reason == "timbermaw_17",
-  "the frozen interior pose steers at timbermaw_17")
+check(caveBeat.kind == "navigate" and caveBeat.reason == "timbermaw_25",
+  "the frozen interior pose steers at the next hold-chamber beat")
 local caveHop = nil
 for _ = 1, 20 do
   clock = clock + 1.0
@@ -469,7 +471,7 @@ check(math.sqrt(caveDx * caveDx + caveDy * caveDy) > 10.0,
 -- beat is steered at again. Sparse routes never rotate a goal either.
 clock = clock + 60.0
 local caveResume = cavePetrel.decide(view(6866.6, -2126.2, formed))
-check(caveResume.kind == "navigate" and caveResume.reason == "timbermaw_17",
+check(caveResume.kind == "navigate" and caveResume.reason == "timbermaw_25",
   "after the interior hop window the same beat resumes")
 nav = { state = "following", failed_here = false, walkout_available = false }
 
