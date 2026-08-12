@@ -11,7 +11,7 @@ got. See [route-engineering.md](route-engineering.md) for the tooling.
 | # | Segment | Checkpoints | Verdict | Detail |
 |---|---|---|---|---|
 | A | Tanaris desert | `spawn → water_entry` | **PASS** | Stable; reconfirmed inside the stitched run |
-| B | Fatigue swim | `wet_start → duskwallow_coast` | **HARDENED + FORK-GATED** (3 PASSes: 39.0/37.5/33.5 s) | Route rebuilt on corrected terrain data (see B analysis); remaining failures are post-merge client flag desyncs whose sites move run to run. Gate pending the fork stability fix |
+| B | Fatigue swim | `water_entry → duskwallow_coast` | **DRY ENTRY WORKS** (PASS 36.0 s from a dry start, 2026-08-12) | Shoreline liquid corrected fork-side (09cc7b7fd + dry-shore wade arm), waterline latch brain-side. Residual: mid-swim flag desyncs (fork ticket 0002) |
 | C | Coastal swim | `duskwallow_coast → merchant_coast` | **GATE MET** | Reconfirmed post-fix: PASS 53.0 s / 39.0 yd |
 | D | Barrens connector | `merchant_coast → top_barrens` | **GATE MET (3× consecutive)** | 84.5 / 50.0 / 53.0 s, zero deaths, zero snags — after killing GPT 5.6 Sol's wet-z "shore" bypass (see D analysis) |
 | E | Northern land run | `top_barrens → felwood_cave_entrance` | **PASS** | Painted-road route, stable |
@@ -117,11 +117,12 @@ passage (6517 → 6579) including the jump lip, and the exit tunnel.
 1. Fork agent: B's flag-stability + shoreline-liquid fixes; F's
    local_steer + allow_jump. Everything else integrates the moment they
    land.
-2. Stitched A–E gate (spawn → felwood_cave_entrance): attempted 2026-08-11
-   and HARD-BLOCKED at the A→B seam — the seat parks at the water's edge
-   (-6776,-4841) with `lk=false`, so the wade gate never opens and the run
-   cannot even reach the fatigue ribbon. Same course passed 3× pre-merge.
-   The shoreline-liquid fix is therefore the highest-priority fork ask:
-   it unblocks segment B's dry entry AND the whole stitched course.
+2. Stitched A–E gate: UNBLOCKED 2026-08-12 — the course now chains
+   A→B→C→D reliably (runs of 19k and 20.5k yd), dying on the E road at a
+   different pose-local planning death each attempt ((1650,-2085) lake
+   margin; (2960,-1804) pass exit): seat frozen at full HP,
+   nav=unavailable/planning, hop intents useless (they route through the
+   same dead planner). This client pose-death class is now the top fork
+   ask (tickets 0004/0011 notes); with it fixed, A–E gates.
 3. monofuel (optional, ~2 min total): encore F9 walks of the cave mouth
    passage and the exit tunnel.
