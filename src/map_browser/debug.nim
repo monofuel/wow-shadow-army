@@ -104,6 +104,8 @@ proc mbStatsJson*(): JsonNode =
       "wp_nodes": oc.wpNodes,
       "wp_edges": oc.wpEdges,
       "taxi_paths": oc.taxiPaths,
+      "road_segments": oc.roadSegments,
+      "road_points": oc.roadPoints,
       "runs_loaded": oc.runsLoaded,
       "labels": oc.labels
     }

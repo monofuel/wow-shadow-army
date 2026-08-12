@@ -1,12 +1,12 @@
 ## Constant-color GL overlays for the bird's-eye map browser.
-## Waypoints, taxi paths, activity rings, and traverse-run trails.
+## Waypoints, taxi paths, roads, activity rings, and traverse-run trails.
 ## Built once per continent/toggle change; drawn after terrain.
 
 import
   std/[math, tables],
   opengl, vmath,
   bots/real_playerbot/policy/world_catalog,
-  map_browser/[runs, waypoints]
+  map_browser/[roads, runs, waypoints]
 
 const
   VertSrc = """
@@ -35,12 +35,14 @@ void main() {
   LiftColor = (0.72'f32, 0.32'f32, 0.95'f32)
   SpellColor = (0.30'f32, 0.55'f32, 0.95'f32)
   TaxiColor = (0.30'f32, 0.82'f32, 0.90'f32)
+  RoadColor = (0.90'f32, 0.15'f32, 0.15'f32)
   RegionColor = (0.35'f32, 0.85'f32, 0.45'f32)
   BeatColor = (0.95'f32, 0.80'f32, 0.30'f32)
   StartColor = (0.20'f32, 1.00'f32, 0.35'f32)
   EndColor = (1.00'f32, 0.25'f32, 0.20'f32)
   CheckpointColor = (0.95'f32, 0.95'f32, 0.95'f32)
   NodePointSize = 9.0'f32
+  RoadPointSize = 5.0'f32
   MarkerPointSize = 12.0'f32
   CheckpointPointSize = 10.0'f32
   CircleSegments = 32
@@ -59,6 +61,8 @@ type
     wpNodes*: int
     wpEdges*: int
     taxiPaths*: int
+    roadSegments*: int
+    roadPoints*: int
     runsLoaded*: int
     labels*: int
 
@@ -82,6 +86,7 @@ type
     nodePoints: PointBatch
     markerPoints: PointBatch
     checkpointPoints: PointBatch
+    roadPoints: PointBatch
     builtMapId: uint32
     counts: OverlayCounts
     labels: seq[EdgeLabel]
@@ -247,7 +252,9 @@ proc rebuildOverlays*(
   loadedRuns: Table[string, TraverseRun];
   selectedRuns: seq[string];
   beats: seq[TraverseBeat];
-  checkpoints: seq[TraverseCheckpoint]
+  checkpoints: seq[TraverseCheckpoint];
+  showRoads: bool;
+  roads: seq[RoadSegment]
 ) =
   ## Filter to mapId and rebuild dynamic VBOs for lines + points.
   initOverlayGpu()
@@ -256,6 +263,7 @@ proc rebuildOverlays*(
     nodeVerts: seq[float32]
     markerVerts: seq[float32]
     checkpointVerts: seq[float32]
+    roadVerts: seq[float32]
     counts = OverlayCounts()
     labels: seq[EdgeLabel]
 
@@ -319,6 +327,29 @@ proc rebuildOverlays*(
           a.x, a.y, a.z + ZLift,
           b.x, b.y, b.z + ZLift,
           TaxiColor[0], TaxiColor[1], TaxiColor[2]
+        )
+
+  if showRoads:
+    for segment in roads:
+      if segment.mapId != mapId:
+        continue
+      inc counts.roadSegments
+      for i in 0 ..< segment.points.len - 1:
+        let
+          a = segment.points[i]
+          b = segment.points[i + 1]
+        pushLine(
+          lineVerts,
+          a.x, a.y, a.z + ZLift,
+          b.x, b.y, b.z + ZLift,
+          RoadColor[0], RoadColor[1], RoadColor[2]
+        )
+      for point in segment.points:
+        inc counts.roadPoints
+        pushVert(
+          roadVerts,
+          point.x, point.y, point.z + ZLift + 2.0'f32,
+          RoadColor[0], RoadColor[1], RoadColor[2]
         )
 
   for index, path in selectedRuns:
@@ -387,6 +418,10 @@ proc rebuildOverlays*(
     checkpointVerts
   )
   overlayGpu.checkpointPoints.pointSize = CheckpointPointSize
+  overlayGpu.roadPoints.count = uploadBatch(
+    overlayGpu.roadPoints.vao, overlayGpu.roadPoints.vbo, roadVerts
+  )
+  overlayGpu.roadPoints.pointSize = RoadPointSize
   overlayGpu.counts = counts
   overlayGpu.labels = labels
   overlayGpu.builtMapId = mapId
@@ -413,7 +448,8 @@ proc drawOverlays*(viewProj: Mat4; xray: bool) =
   if overlayGpu.lines.count == 0 and
       overlayGpu.nodePoints.count == 0 and
       overlayGpu.markerPoints.count == 0 and
-      overlayGpu.checkpointPoints.count == 0:
+      overlayGpu.checkpointPoints.count == 0 and
+      overlayGpu.roadPoints.count == 0:
     return
 
   glUseProgram(overlayGpu.program)
@@ -443,6 +479,9 @@ proc drawOverlays*(viewProj: Mat4; xray: bool) =
   )
   drawPointBatch(
     overlayGpu.checkpointPoints, overlayGpu.mvpLoc, overlayGpu.pointSizeLoc, mvp
+  )
+  drawPointBatch(
+    overlayGpu.roadPoints, overlayGpu.mvpLoc, overlayGpu.pointSizeLoc, mvp
   )
 
   glDisable(GL_PROGRAM_POINT_SIZE)

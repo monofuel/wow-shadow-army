@@ -12,7 +12,7 @@ import
   chroma, opengl, pixie, silky, vmath, windy,
   environment/client/localpaths,
   environment/client/world_catalogs,
-  map_browser/[debug, gl_view, overlay_gl, runs, waypoints, wdl_terrain]
+  map_browser/[debug, gl_view, overlay_gl, roads, runs, waypoints, wdl_terrain]
 
 const
   AppTitle = "map browser"
@@ -20,7 +20,7 @@ const
   ClearG = 0.14'f32
   ClearB = 0.18'f32
   AtlasOut = "local_data" / "map_browser_atlas.png"
-  HeaderHints = "1 wp | 2 taxi | L runs | X xray | WASD/drag pan | wheel zoom | RMB orbit | Tab continent | Home reset"
+  HeaderHints = "1 wp | 2 taxi | 3 roads | L runs | X xray | WASD/drag pan | wheel zoom | RMB orbit | Tab continent | Home reset"
   HeaderBg = rgbx(24, 28, 36, 230)
   HeaderText = rgbx(230, 220, 190, 255)
   HeaderMuted = rgbx(160, 150, 130, 255)
@@ -31,8 +31,10 @@ type
     catalog: WorldCatalog
     waypointGraph: WaypointGraph
     taxiLines: seq[TaxiPolyline]
+    roads*: seq[RoadSegment]
     showWaypoints: bool
     showTaxi: bool
+    showRoads*: bool
     xray: bool
     showRunsPanel: bool
     runListingsLoaded: bool
@@ -154,6 +156,8 @@ proc headerStatusLine(): string =
     parts &= "  |  wp " & $oc.wpNodes & "/" & $oc.wpEdges & "e"
   if browser.showTaxi:
     parts &= "  |  taxi " & $oc.taxiPaths
+  if browser.showRoads:
+    parts &= "  |  roads " & $oc.roadSegments
   if browser.selectedRuns.len > 0:
     parts &= "  |  runs " & $oc.runsLoaded
   if browser.xray:
@@ -194,7 +198,9 @@ proc ensureOverlayGeometry() =
     browser.loadedRuns,
     browser.selectedRuns,
     browser.beats,
-    browser.checkpoints
+    browser.checkpoints,
+    browser.showRoads,
+    browser.roads
   )
 
 proc handleOverlayKeys(window: Window) =
@@ -204,6 +210,9 @@ proc handleOverlayKeys(window: Window) =
     markOverlaysDirty()
   if window.buttonPressed[Key2]:
     browser.showTaxi = not browser.showTaxi
+    markOverlaysDirty()
+  if window.buttonPressed[Key3]:
+    browser.showRoads = not browser.showRoads
     markOverlaysDirty()
   if window.buttonPressed[KeyX]:
     browser.xray = not browser.xray
@@ -298,6 +307,29 @@ proc runHeadlessOnce() =
   echo "map_browser: taxi paths=", taxi.len
   doAssert taxi.len > 10
 
+  let roads = loadRoadWaypoints(repoRoot())
+  var
+    kalimdorSegs = 0
+    kalimdorPts = 0
+    azerothSegs = 0
+    azerothPts = 0
+  for segment in roads:
+    case segment.mapId
+    of 1'u32:
+      inc kalimdorSegs
+      kalimdorPts += segment.points.len
+    of 0'u32:
+      inc azerothSegs
+      azerothPts += segment.points.len
+    else:
+      discard
+  echo "map_browser: roads kalimdor segments=", kalimdorSegs,
+    " points=", kalimdorPts
+  echo "map_browser: roads azeroth segments=", azerothSegs,
+    " points=", azerothPts
+  doAssert kalimdorSegs > 50,
+    "kalimdor (mapId 1) road segments expected > 50, got " & $kalimdorSegs
+
   let mesh = loadContinentMesh(1'u32)
   echo "map_browser: WDL Kalimdor tiles=", mesh.tileCount,
     " vertices=", mesh.vertices.len,
@@ -345,8 +377,10 @@ proc runWindow() =
     catalog: catalog,
     waypointGraph: buildWaypointGraph(),
     taxiLines: taxiPolylines(catalog),
+    roads: loadRoadWaypoints(repoRoot()),
     showWaypoints: true,
     showTaxi: true,
+    showRoads: true,
     xray: true,
     loadedRuns: initTable[string, TraverseRun]()
   )
