@@ -6,76 +6,107 @@ updated per battery. Battery fixture:
 scorecard per run; `best_endpoint_distance_yards` = how far a failing run
 got. See [route-engineering.md](route-engineering.md) for the tooling.
 
-## Battery of 2026-08-11 (post coast-ribbon build, post upstream merges)
+## Battery of 2026-08-11 (post GPT-mess cleanup — all rows OUR verified runs)
 
 | # | Segment | Checkpoints | Verdict | Detail |
 |---|---|---|---|---|
-| A | Tanaris desert | `spawn → water_entry` | **PASS** | `traverse-desert`: coast reached, no stalls |
-| B | Fatigue swim | `water_entry → duskwallow_coast` | **FAIL — regression** | Bot never left the beach: parked at (-6775,-4829) in `nav=planning`, 67% idle, zero deaths. See B analysis below |
-| C | Coastal swim (new) | `duskwallow_coast → merchant_coast` | **GATE MET** (2× consecutive) | 55/57 s, 36.4/32.8 yd, zero idle both. Three hazards found and fixed: two shallow sandbar legs (beats nudged via the water mask) and a sunken-ship doodad at (-3830,-4745) that dragged the seat 12 yd down and cleared the swim flag — deterministic across two runs, dodged 57 yd seaward (`coast_03b`). Wade machinery observed self-recovering surface-level flag desyncs (`nav=wading`) |
-| D | Barrens land hop | `merchant_coast → top_barrens` | expected fail (UNBUILT) | Zero progress — the brain has no beats here; seat sits at the merchant wet goal. 3,140 yd unbuilt |
-| E | Northern land run | `top_barrens → felwood_cave_entrance` | **PASS** | 110.6 s, 23.7 yd, idle 4.5% — the painted-road route |
-| F | Winterspring finale | `felwood_cave_entrance → everlook` | expected fail (UNBUILT) | Zero progress — land goal hold at the cave. 2,590 yd unbuilt, includes the Timbermaw tunnel (indoor-location risk monofuel flagged) |
+| A | Tanaris desert | `spawn → water_entry` | **PASS** | Stable; reconfirmed inside the stitched run |
+| B | Fatigue swim | `wet_start → duskwallow_coast` | **FORK-BLOCKED** | Two client-side blockers, both ledgered with evidence (see B analysis). Brain exonerated: it commanded the correct dive profile at the failure point |
+| C | Coastal swim | `duskwallow_coast → merchant_coast` | **GATE MET** | Reconfirmed post-fix: PASS 53.0 s / 39.0 yd |
+| D | Barrens connector | `merchant_coast → top_barrens` | **GATE MET (3× consecutive)** | 84.5 / 50.0 / 53.0 s, zero deaths, zero snags — after killing GPT 5.6 Sol's wet-z "shore" bypass (see D analysis) |
+| E | Northern land run | `top_barrens → felwood_cave_entrance` | **PASS** | Painted-road route, stable |
+| F | Winterspring finale | `felwood_cave_entrance → everlook` | **FORK-BLOCKED (route ready)** | The cave is now a 37-beat walked-ground interior chain resampled from monofuel's manual F9 logs; the exterior over-mountain node is deleted. Live navigation waits on two fork features (see F analysis) |
 
-**Isolation run:** `wet_start → duskwallow_coast` (lands ALREADY swimming,
-skipping beach entry) **PASSes perfectly** — 35 s, 20 yd, zero idle, 0.5 s
-max stationary. The swim machinery itself is fully healthy.
+## Why D failed before (now GATE MET): the wet-z "shore" bypass
 
-## Why B fails: dry beach entry lost its liquid observation
+GPT 5.6 Sol's `barrens_shore` beat carried `shore = true` + z = +9.5,
+bypassing the -2.5 yd draft clamp. A swimming seat commanded above the
+surface holds swim-ascent JUMP and launches clear of the water (Aquatic
+auto-cancel, breath panic) — the exact documented failure the clamp was
+built against; monofuel watched it drown repeatedly. Fixes, live-proven:
 
-The wade-in machinery (fork `pilot.nim`: water goal + dry seat +
-`liquidCoverageKnown/liquidKnown/liquidDepth` within the wade band →
-`appendWadeSteering`) is intact post-merge — verified line by line. But
-the seat stands 10 yd from the surf in `planning` forever, meaning the
-client is not reporting observable liquid at the shoreline anymore. The
-brain is exonerated: replaying B's exact frozen state through `decide()`
-offline yields the correct `navigate enter_water water=true` intent.
+1. Draft clamp unconditional again; the `shore` flag is gone from the
+   schema (schema-level test forbids it).
+2. The exit beat's PLANAR target sits up the beach so the engine's 8 yd
+   stop ring lands on dry sand. Live-run evidence forced this: a waterline
+   target was "reached" at depth 1.4 with the swim flag still up — parked
+   wet forever. The swimmer must ground (stock client clears swimming on
+   the rising floor) before it can stop; the land connector owns the run
+   from there.
+3. `connector_swim_02` swung seaward off a sandbar 1.9 yd proud of the
+   surface that the old chord crossed (water-mask audit; C's sandbar
+   lesson, applied offline this time).
 
-CONFIRMED by WETSTATEDBG (2026-08-11 rerun): at the shoreline the client
-reports `liquid_known=true, coverage_known=true` but
-**`liquid_surface_z = -500.0`** — a sentinel where the real surface
-(~0.4) used to be. The wade gate computes depth ≈ -500 and never opens.
-Segment B last passed BEFORE the two upstream merges (`91cd8a33b`,
-`e641af0fa`); the land gates since never exercise water. **Fork-side
-issue — coordinate with the agent doing the upstream realign; do not hack
-the lua-bot layer** (prefer-upstream tenet; ledgered in
-upstream-health.md with the evidence line). Entry is stochastic, not
-absolute: the rerun got 1,300 yd into the swim before a formless
-swim-flag desync mid-ocean turned it around — so the sentinel bites at
-SOME shoreline poses, always at the water_entry tele pose.
+Residual (non-blocking, upstream class): 1–6 transient mid-water Aquatic
+flickers per run, all self-recovered at the surface. Depth is what makes
+them lethal — see B.
 
-## Why C failed (now GATE MET): grounding + wreck doodad, both fixed
+## Why B is fork-blocked: flag desync at depth + unknown shoreline liquid
 
-The seat swam ~800 yd in Aquatic Form (WETDBG: speed 7.08, submerged,
-surface 0.0), threw a form_lost/form_gained flicker, and then hung
-suspended at z -9 — in water 32 yd deep per the MCLQ water mask, so NOT
-grounded — with `is_swimming=false`, `nav planning→unavailable`
-("source projection unavailable": a non-swimming seat can't ground-plan
-from mid-ocean). Nothing recovers this state: the park detector requires
-the swim flag UP; the wade band is surface-relative; the snag hop is
-land-phase only. This is the known swim-flag flicker class (ledgered
-upstream) in a new, stickier form. Candidate brain-side recovery: a
-"sunk seat" detector (wet chain + submerged + not swimming + frozen) —
-but what input actually moves that seat is a fork-physics question;
-evidence first via WETSTATEDBG.
+Instrumented repro (2026-08-11): four Aquatic/swim-flag drops in one run
+(x -6692, -6263, -5961, -5653). Three self-recovered at the surface. The
+fourth hit the -5675 wall under-gap dive — the one deep point on the
+ribbon — and a deep seat with no swim flag has no water physics: it fell
+through the column (EV clip chain z -235 → -602) until the server
+failsafe relocated it 1,500 yd back. `FLIGHT` shows `nav=following` with
+the correct commanded dive profile — nothing brain-side to fix, and the
+seaward bypass around the wall costs a full fatigue bar (unaffordable).
 
-Ribbon depth audit (water mask): two beats sat near shallow sandbars
-(1.4 yd / 2.4 yd legs) — `coast_04`/`coast_09` nudged to ≥3.9 yd minimum
-leg depth. Unrelated to the z -9 freeze (that water is 32 yd deep) but
-removes future grounding risk.
+Second blocker: after the failsafe the seat parked at the beach
+(-6776,-4828) with `WETSTATEDBG lk=false` — the fork's `22c612006`
+REJECTS the below-terrain liquid sample instead of correcting it, so
+`liquid_known=false` at the shoreline and the wade entry gate can never
+open. Dry entry (`water_entry` fixture) stays blocked; this replaces the
+old -500 sentinel as the entry blocker. Both ledgered with asks in
+`~/src/wow-coworld/upstream-health.md`.
 
-## Segment history (gates met before this battery)
+History: B gated 2× on 2026-08-10 pre-merge — the desync frequency is a
+post-merge regression, not a route problem.
 
-- B (fatigue swim): gate met 2026-08-10 pre-merge (2× consecutive PASS,
-  24.6/23.7 yd) — the regression is environmental, not route.
-- E (painted road): gate met 2026-08-11 (2× consecutive PASS, zero deaths,
-  zero unplanned swims) — reconfirmed by this battery.
+## Why F waits on the fork: no steering, no jumping inside the WMO
+
+Committed-contract research (2026-08-11): the lua-bot contract's only
+movement kind is Detour `navigate`; the sole bearing-steer is hard-gated
+on liquid; and NO call site can emit a jump. VMaNGOS Detour serves an
+exterior z692 over-the-mountain corridor inside Timbermaw that the client
+wedges on and falls through — and monofuel's manual walk proved the
+Felwood cave lip REJECTS plain forward walking (a jump is required; the
+1 Hz F9 log sampled between jump frames, see
+[reference-logs.md](reference-logs.md)).
+
+Ready and waiting traverse-side:
+- 37-beat walked-ground interior chain
+  (`lua/config/traverse_finale_interior_beats.*`) resampled from the
+  manual logs by `tools/resample_trace_beats.py`; all `hook = true`
+  (galleries double back in x), all declaring
+  `navigation_mode = local_steer` + `allow_jump` (forward-safe: the
+  committed parser ignores unknown intent keys).
+- Brain wiring: INTERIOR owns the run from the cave mouth until its last
+  beat retires, then the Winterspring finale line (exterior hold node
+  deleted; `timbermaw_north_tunnel → winterspring_west_entry` bridges the
+  unwalked exit tunnel — mesh probes REACH both targets at interior floor
+  z ≤ 588, worst slope 1.03, so the bridge is plausible pending the
+  encore walk).
+
+Fork asks (ledgered; monofuel assigned ownership to the fork agent):
+land `local_steer` (GPT draft on branch `gpt-sol-local-steer-wip`, needs
+trim + review) and intent-requestable `allow_jump`
+(`navigation_steering.nim:603` already supports advertised jumps behind a
+flag every lua-bot call site leaves false).
+
+Known walked-coverage gaps (encore F9 targets, ~60 s each): the mouth
+passage (6517 → 6579) including the jump lip, and the exit tunnel.
 
 ## Next actions
 
-1. Read WETSTATEDBG evidence from the B/C reruns; file the fork
-   observation report (or brain-side recovery if the data allows one).
-2. Build D (Merchant Bay → top of Barrens): open-Barrens road terrain;
-   road mask + spawn DB apply directly.
-3. Build F (cave → Everlook): Timbermaw tunnel first — expect indoor
-   navigation questions; scout with a headed run before route work.
+1. Fork agent: B's flag-stability + shoreline-liquid fixes; F's
+   local_steer + allow_jump. Everything else integrates the moment they
+   land.
+2. Stitched A–E gate (spawn → felwood_cave_entrance): attempted 2026-08-11
+   and HARD-BLOCKED at the A→B seam — the seat parks at the water's edge
+   (-6776,-4841) with `lk=false`, so the wade gate never opens and the run
+   cannot even reach the fatigue ribbon. Same course passed 3× pre-merge.
+   The shoreline-liquid fix is therefore the highest-priority fork ask:
+   it unblocks segment B's dry entry AND the whole stitched course.
+3. monofuel (optional, ~2 min total): encore F9 walks of the cave mouth
+   passage and the exit tunnel.

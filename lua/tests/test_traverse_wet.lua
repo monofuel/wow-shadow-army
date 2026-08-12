@@ -142,13 +142,51 @@ check(
     or (math.abs(coastPick.x - (-4125.7)) < 0.1 and math.abs(coastPick.y - (-4841.2)) < 0.1),
   "at (-4300,-4900) targets coast_01 or coast_02")
 
--- Inside merchant_coast radius, swimming: hold the wet goal.
+-- Merchant Coast is now a handoff into the final coastal connector.
 clock = clock + 5.0
 local goal = petrel.decide(view(-1533.7, -4057.0,
   { shapeshift_form_id = 4, is_swimming = true }))
-check(goal.kind == "hold" and goal.reason == "merchant_coast",
-  "holds at the merchant_coast goal")
+check(goal.kind == "navigate" and goal.reason == "swim_ribbon" and
+    goal.x == -1400.0,
+  "merchant coast continues into the Barrens connector")
 check(goal.status and goal.status.dist_goal < 25.0,
-  "the goal hold reports the closing distance")
+  "the connector handoff retains merchant closing distance")
+
+-- The final shelf beat steers the swimmer onto the waterline at clamped
+-- depth — never above the surface. (A z=+9.5 "shore" bypass here once
+-- launched the bot clear of the water, Aquatic auto-cancel and all;
+-- monofuel watched it drown repeatedly. Gone for good.)
+clock = clock + 5.0
+local shelf = petrel.decide(view(-928.0, -3805.0,
+  { shapeshift_form_id = 4, is_swimming = true }))
+check(shelf.kind == "navigate" and shelf.x == -910.0,
+  "the shore approach targets the beach-lip beat")
+check(shelf.z == -2.5, "the shelf beat is clamped to the draft floor")
+check(shelf.water == true, "the shelf beat stays a declared water goal")
+
+-- Schema: the shore bypass flag no longer exists on any wet route.
+for _, cfg in ipairs({
+  require("config.traverse_beats"),
+  require("config.traverse_coast_beats"),
+  require("config.traverse_connector_wet_beats"),
+}) do
+  for _, b in ipairs(cfg.beats) do
+    check(b.shore == nil, "no beat carries the removed shore flag: " .. b.id)
+  end
+end
+
+-- Once the shore beat has cleared swimming, Travel Form and the land road
+-- take over automatically.
+clock = clock + 20.0
+local shoreForm = petrel.decide(view(-900.0, -3750.0,
+  { shapeshift_form_id = 0, is_swimming = false }))
+check(shoreForm.kind == "cast_spell" and shoreForm.spell == 783,
+  "dry Barrens shore casts Travel Form")
+clock = clock + 20.0
+local shoreRoad = petrel.decide(view(-900.0, -3750.0,
+  { shapeshift_form_id = 3, is_swimming = false }))
+check(shoreRoad.kind == "navigate" and shoreRoad.x == -950.0 and
+    shoreRoad.reason == "barrens_lower_road",
+  "dry Barrens shore joins the land connector")
 
 print("test_traverse_wet: " .. passed .. " ok")

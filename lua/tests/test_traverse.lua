@@ -36,6 +36,8 @@ end
 
 local route = require("config.traverse_beats")
 local landRoute = require("config.traverse_land_beats")
+local connectorRoute = require("config.traverse_connector_land_beats")
+local finaleRoute = require("config.traverse_finale_beats")
 local petrel = require("traverse")
 
 -- The route data survived the move off host-injected args.
@@ -45,6 +47,21 @@ check(route.goal_id == "duskwallow_coast", "route keeps the segment goal")
 -- ending at the cave mouth.
 check(landRoute.goal_id == "felwood_cave_entrance" and #landRoute.beats == 34,
   "land route is sparse and ends at the Timbermaw cave mouth")
+check(connectorRoute.goal_id == "top_barrens" and #connectorRoute.beats == 9,
+  "connector route reaches the northern land handoff")
+check(finaleRoute.goal_id == "everlook" and #finaleRoute.beats == 11,
+  "finale route runs north tunnel to Everlook (no exterior hold node)")
+local interiorRoute = require("config.traverse_finale_interior_beats")
+check(#interiorRoute.beats >= 30,
+  "interior route carries the walked Timbermaw chain")
+for _, b in ipairs(interiorRoute.beats) do
+  check(b.hook == true,
+    "interior beats are all hooks (galleries double back in x): " .. b.id)
+  check(b.navigation_mode == "local_steer",
+    "interior beats declare local_steer for the WMO: " .. b.id)
+end
+check(finaleRoute.beats[1].id == "timbermaw_north_tunnel",
+  "finale starts at the north tunnel after the interior chain")
 for i = 2, #landRoute.beats do
   check(landRoute.beats[i].hook or landRoute.beats[i].x > landRoute.beats[i - 1].x,
     "land beats march north monotonically (hooks exempt)")
@@ -334,11 +351,38 @@ check(hookNav.kind == "navigate" and hookNav.reason ~= "snag_hop"
     and hookNav.x == 6612.0,
   "hook beat timbermaw_road_11 is not x-skipped past its X band")
 
--- The cave mouth is the segment goal: hold there, alive.
+-- The cave mouth is a handoff: the walked interior chain owns Timbermaw.
+-- timbermaw_01 (the mouth itself) captures immediately; the next intent
+-- targets the first gallery beat and carries the fork steering features.
 clock = clock + 5.0
 local atCave = petrel.decide(view(6500.0, -2060.0, formed))
-check(atCave.kind == "hold" and atCave.reason == "felwood_cave_entrance",
-  "holds at the Timbermaw cave mouth")
+check(atCave.kind == "navigate" and atCave.reason == "timbermaw_02",
+  "the cave mouth hands off to the walked interior chain")
+check(atCave.navigation_mode == "local_steer",
+  "interior intents declare local_steer for the WMO")
+check(atCave.allow_jump == true,
+  "interior intents allow the advertised jump at the cave lip")
+
+-- Once Timbermaw owns the run, a fall/failsafe relocation back into Felwood
+-- must stay a finale failure instead of silently resuming the old land route.
+clock = clock + 5.0
+local afterFinaleFall = petrel.decide(view(5935.5, -1217.8, formed))
+check(afterFinaleFall.kind == "navigate" and
+    afterFinaleFall.reason == "timbermaw_02",
+  "finale ownership survives a Timbermaw failsafe relocation")
+
+-- Reaching the last walked interior beat retires the cave chain and hands
+-- the run to the Winterspring finale line.
+clock = clock + 5.0
+local interiorDone = petrel.decide(view(6875.1, -2306.2, formed))
+check(interiorDone.kind == "navigate" and
+    interiorDone.reason == "timbermaw_north_tunnel",
+  "the interior goal hands off to the north tunnel bridge")
+
+clock = clock + 5.0
+local atEverlook = petrel.decide(view(6687.3, -4647.7, formed))
+check(atEverlook.kind == "hold" and atEverlook.reason == "everlook",
+  "holds only at the final Everlook goal")
 
 -- Flight recorder: land navigation emits FLIGHT telemetry with beat + xt.
 local flightLine = any_log("FLIGHT ")

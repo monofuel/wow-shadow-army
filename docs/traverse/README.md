@@ -64,12 +64,17 @@ monofuel's manual run of the course:
 | Segment | Beats | Status |
 |---|---|---|
 | Land approach: spawn → desert ocean coast | `land_approach`, `water_entry` | **Proven** — `make traverse-desert` (2 consecutive PASSes 2026-08-09) |
-| Swim: water entry → Dustwallow coast (~2,160 yd) | `ribbon_001..N` (v12, F9-resampled), `duskwallow_coast` | **Active** — `make traverse-wet` (PETREL_SWIM=1); best 295.8 yd from goal, endgame falls under investigation ([duskwallow-plan.md](duskwallow-plan.md) §7) |
-| Land run: Dustwallow → Everlook | none yet | Later; upstream RPB's road route (`bots/real_playerbot/policy/world_catalog.nim:295-345`) is transcribable |
+| Fatigue swim: wet start → Dustwallow coast | `ribbon_001..N`, `duskwallow_coast` | **Active** — packaged-liquid regression fixed; latest run died 257.2 yd short after late park/flag churn |
+| Coastal swim: Dustwallow → Merchant Bay | `coast_01..N`, `merchant_coast` | **Proven** — 2 consecutive passes |
+| Barrens connector: Merchant Bay → top Barrens | connector wet + land beats | **Proven** — 2 consecutive passes; terrain-fall quality warning remains |
+| Northern roads: top Barrens → Timbermaw cave | `traverse_land_beats` | **Proven** — painted-road route through Ashenvale and Felwood |
+| Finale: Timbermaw cave → Everlook | `traverse_finale_beats` | **Partial** — north tunnel exit and Winterspring-to-Everlook pass; southern Timbermaw WMO/MMAP transition blocked |
 
-Beats live in `lua/config/traverse_beats.lua` (the brain's copy) and
-`lua/config/traverse_beats.json` (source of record; the map-browser overlay
-reads it). Keep them in sync when editing the route.
+Each route lives as a synchronized Lua/JSON pair under `lua/config/`:
+`traverse_beats`, `traverse_coast_beats`, `traverse_connector_wet_beats`,
+`traverse_connector_land_beats`, `traverse_land_beats`, and
+`traverse_finale_beats`. JSON is the map-browser/lint source; Lua is the
+brain's copy. Keep each pair in sync when editing the route.
 
 ## Nav/water truth for the swim pass
 

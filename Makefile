@@ -88,8 +88,16 @@ test-traverse-checkpoint:
 # --warn-only so corridor FAILs do not red the unit suite; traverse-lint is strict.
 traverse-lint-soft:
 	@python3 tools/traverse_route_lint.py --warn-only
+	@python3 tools/traverse_route_lint.py --warn-only \
+		--beats lua/config/traverse_connector_land_beats.json
+	@python3 tools/traverse_route_lint.py --warn-only \
+		--beats lua/config/traverse_finale_beats.json
 traverse-lint:
 	@python3 tools/traverse_route_lint.py
+	@python3 tools/traverse_route_lint.py \
+		--beats lua/config/traverse_connector_land_beats.json
+	@python3 tools/traverse_route_lint.py \
+		--beats lua/config/traverse_finale_beats.json
 
 # Every Nim entrypoint/module must at least compile (`nim check`), even where
 # no unit suite imports it yet (army_host, msgpack_json).
@@ -683,8 +691,18 @@ CHECKPOINT ?=
 END_CHECKPOINT ?=
 END_TIMEOUT ?=2700
 TRAVERSE_SEGMENT_RESULT := $(CURDIR)/local_data/traverse-segment-result.json
+TRAVERSE_LIVE_LOCK := $(CURDIR)/local_data/traverse-live.lock
 TRAVERSE_SWIM_EFFECTIVE = $(or $(SWIM),1)
+define TRAVERSE_ACQUIRE_LOCK
+	mkdir -p "$(CURDIR)/local_data"; \
+	exec 8>"$(TRAVERSE_LIVE_LOCK)"; \
+	if ! flock -n 8; then \
+		echo "error: another live Traverse run owns $(TRAVERSE_LIVE_LOCK)" >&2; \
+		exit 2; \
+	fi
+endef
 define TRAVERSE_CHECKPOINT_PRELUDE
+	$(TRAVERSE_ACQUIRE_LOCK); \
 	if [ -n "$(END_CHECKPOINT)" ] && [ -z "$(CHECKPOINT)" ]; then \
 		echo "error: END_CHECKPOINT requires CHECKPOINT" >&2; exit 2; \
 	fi; \
@@ -747,17 +765,20 @@ traverse-headed:
 
 # Fast regression: proof-of-life (level 60, map 1, movement + inputs).
 traverse-pol:
-	@cd $(FORK_CLIENT) && PETREL_SWIM=0 $(TRAVERSE_LAUNCH) --proof-of-life
+	@$(TRAVERSE_ACQUIRE_LOCK); \
+	cd $(FORK_CLIENT) && PETREL_SWIM=0 $(TRAVERSE_LAUNCH) --proof-of-life
 
 # Land-leg proof: spawn → desert ocean coast (water_entry), with client CPU
 # sampling for the streaming-starvation investigation. Readback at exit.
 traverse-desert:
-	@tools/traverse_desert.sh
+	@$(TRAVERSE_ACQUIRE_LOCK); \
+	tools/traverse_desert.sh
 
 # Wet lab: SOAP-tele to water_entry, swim the cheese ribbon to Dustwallow.
 # Local debug only; reports best_planar_to_duskwallow_wet at exit.
 traverse-wet:
-	@tools/traverse_wet.sh
+	@$(TRAVERSE_ACQUIRE_LOCK); \
+	tools/traverse_wet.sh
 
 # List SOAP tele checkpoints (does not launch).
 traverse-checkpoints:
