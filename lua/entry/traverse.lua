@@ -120,6 +120,9 @@ local sparseReached = {}
 -- Edge-trigger for the indoors form denial: one EV per indoor entry, so
 -- replays show the transition without a log line every frame.
 local formDeniedLogged = false
+-- One-way latch: the seat has stood at the waterline once; entry now
+-- belongs to the wade machinery for the rest of the run.
+local waterlineReached = false
 local connectorStarted = false
 local connectorComplete = false
 local finaleStarted = false
@@ -1068,7 +1071,14 @@ function M.decide(view)
     -- becomes observable the wade machinery owns entry — a distance-based
     -- release deadlocked here (ground nav stalls ~14 yd out in the surf,
     -- battery four).
-    if not swimming and not wading(view, pos) and
+    -- ONE-WAY: once the seat has stood at the waterline, this branch never
+    -- fires again. The waterline point is the BEACH beat, ~11 yd shy of
+    -- the actual sea, and honest ADT liquid keeps lk=false on the sand —
+    -- so wading east out of the 12 yd ring used to re-trigger this branch
+    -- and drag the seat back west forever (dry-entry oscillation,
+    -- 2026-08-12: 513 wading frames, zero net progress).
+    if water_dist <= 12.0 then waterlineReached = true end
+    if not swimming and not wading(view, pos) and not waterlineReached and
         not (view.liquid_coverage_known and view.liquid_known) and
         pos.x < water.x + 150.0 and water_dist > 12.0 then
       local intent = navigate_to(view, pos, water, "to_waterline",
