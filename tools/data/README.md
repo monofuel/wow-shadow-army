@@ -56,6 +56,27 @@ python3 tools/bake_road_waypoints.py --map azeroth
 Defaults write `tools/data/road_waypoints_<map>.jsonl`. A second run of
 the same command must leave `git diff --stat tools/data/` empty.
 
+Bake knobs (see `tools/bake_road_waypoints.py`):
+
+- **Zhang-Suen thinning** (`thin_cells`) always runs before centerline
+  extraction — one skeleton regardless of paint width. Not a flag.
+- `--min-length` (default `30.0`; `<=0` disables) drops segments whose
+  **pre-decimation** planar arclength is below the threshold. Meta
+  field: `min_length_yd`. Measuring after decimation would couple
+  survival to `--decimate`.
+- `--max-water-depth` (default `0.5`; `<=0` disables) skips road cells
+  whose MCLQ water depth exceeds the threshold. Meta field:
+  `max_water_depth`. Sample stats include `water_skipped`. Roads that
+  cross `>0.5` yd of water therefore split at the banks — hand-stitch
+  those gaps the same way as bridges.
+- Meta also records `markers`, a copy of `ROAD_TEXTURE_MARKERS`.
+
+`ROAD_TEXTURE_MARKERS` (substring match, lowercased): `road`,
+`elwynncobblestone`, `duskwoodcobblestone`, `tanarisdirtfootprint`.
+`thousandneedlesdirt` was tried and dropped — the whole canyon floor is
+that dirt, so the zone baked into one solid blob. A unit test pins the
+marker off.
+
 Dev subset (does not replace the checked-in artifact):
 
 ```sh
@@ -76,6 +97,13 @@ with a newline.
 
 - **Bridges have no paint.** Add a `"source": "hand"` line whose `pts`
   stitch the two road ends across the gap.
+- **Water crossings split at the banks.** Paint under `>0.5` yd of MCLQ
+  water is skipped, so a road that fords a river or lake becomes two
+  baked ends. Stitch with a `"source": "hand"` line (same as bridges).
+- **Tanaris paint is thin.** The extra marker is `tanarisdirtfootprint`
+  (a footprint tileset, not a `*road*` tileset); coverage is sparse.
+- **Thousand Needles has no baked roads.** `thousandneedlesdirt` stays
+  off by decision (canyon-floor blob). Hand lines are the path there.
 - **Town plazas blob.** Deleting or trimming a baked line only lasts
   until the next re-bake — the paint is still there, so the baker
   regenerates it. A trimmed replacement you want to keep must be a

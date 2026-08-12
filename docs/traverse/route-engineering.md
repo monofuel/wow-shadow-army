@@ -66,7 +66,7 @@ documented in its README; never write to the realm DB).
 ## Technique: road detection from painted textures (`tools/road_mask.py`)
 
 Roads in 1.12 are literally painted onto the terrain: each ADT tile's MTEX
-chunk names its textures (`*road*` tilesets, plus Elwynn cobblestone —
+chunk names its textures (`*road*` tilesets, plus a few named extras —
 see below), and each MCNK sub-chunk's MCLY/MCAL layers say where each
 texture is painted, at ~yard resolution. `road_mask.py` parses the ADTs
 under `local_data/player/assets-flat/world/maps/<kalimdor|azeroth>/` into
@@ -91,10 +91,19 @@ The dump→eyeball workflow still works. There is also a productized path:
 Curation rules (bridges have no paint; plaza blobs come back on re-bake;
 never key other tooling on baked ids) live in `tools/data/README.md`.
 
-Eastern Kingdoms: `--map azeroth`. Elwynn's paved textures do not contain
-`road` (e.g. `ElwynnCobbleStoneBase.blp`), so `ROAD_TEXTURE_MARKERS` also
-matches the `elwynncobblestone` substring; without that extra marker the
-Elwynn roads would not bake.
+Eastern Kingdoms: `--map azeroth`. `ROAD_TEXTURE_MARKERS` is the `*road*`
+substring plus `elwynncobblestone` (Elwynn's paved textures do not
+contain `road`), `duskwoodcobblestone` (same for Duskwood), and
+`tanarisdirtfootprint` (Tanaris coverage is thin — sparse footprint
+paint). `thousandneedlesdirt` was tried and dropped: the whole canyon
+floor is that dirt, so the zone baked into one solid blob. A test pins
+it off; Thousand Needles has no baked roads. Hand lines are the path
+there.
+
+Bake always Zhang-Suen-thins the paint mask first, so a wide road still
+yields a single centerline. Road cells whose MCLQ water depth exceeds
+`--max-water-depth` (default 0.5 yd) are skipped, so painted lakebeds
+like the Pool of Tears no longer bake.
 
 ## Technique: trace-pinning (walked ground is evidence)
 
