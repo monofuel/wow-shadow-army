@@ -731,7 +731,12 @@ local function navigate_sparse_land(view, pos, route, phase, stalled)
   -- stride away; the skipped ones retire by capture as the seat passes,
   -- and the corridor to a beat ~20 yd down the walked line still follows
   -- the walked line. The goal beat is never skipped past.
+  -- ...but NOT indoors: a 15+ yd target inside a bent WMO corridor asks
+  -- the seam's broken projection for exactly the corridor it cannot
+  -- serve (live roll: wedged at the pocket for a full timeout at 100%
+  -- hp). The 7 yd density exists to keep interior planning local.
   local look = beat
+  if view.indoors_known == true and view.indoors == true then look = nil end
   while look and planar(pos.x, pos.y, look.x, look.y) < 15.0 do
     local nxt = nil
     local seen = false
