@@ -385,14 +385,15 @@ proc rebuildOverlays*(
     )
 
   if selectedRuns.len > 0:
-    if mapId == 1'u32:
-      for beat in beats:
-        pushCircle(
-          lineVerts,
-          beat.x, beat.y, beat.z + ZLift,
-          beat.radius,
-          BeatColor[0], BeatColor[1], BeatColor[2]
-        )
+    for beat in beats:
+      if beat.mapId != mapId:
+        continue
+      pushCircle(
+        lineVerts,
+        beat.x, beat.y, beat.z + ZLift,
+        beat.radius,
+        BeatColor[0], BeatColor[1], BeatColor[2]
+      )
     for checkpoint in checkpoints:
       if checkpoint.mapId != mapId:
         continue
