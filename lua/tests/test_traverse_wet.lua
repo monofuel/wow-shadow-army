@@ -145,15 +145,36 @@ check(
     or (math.abs(coastPick.x - (-4125.7)) < 0.1 and math.abs(coastPick.y - (-4841.2)) < 0.1),
   "at (-4300,-4900) targets coast_01 or coast_02")
 
--- Merchant Coast is now a handoff into the final coastal connector.
+-- The bay interior (2026-08-12): capturing bay_center hooks the swimmer
+-- WEST toward the sandbar saddle — the beach goal detour, far outside the
+-- old 40-yd south-lag band.
 clock = clock + 5.0
-local goal = petrel.decide(view(-1533.7, -4057.0,
+local bay = petrel.decide(view(-1533.0, -4088.0,
   { shapeshift_form_id = 4, is_swimming = true }))
+check(bay.kind == "navigate" and bay.reason == "swim_ribbon" and
+    bay.x == -1652.0,
+  "bay_center hooks west toward the sandbar saddle")
+
+-- The merchant BEACH goal (monofuel's scouted point) captures dry on the
+-- sand — honest ADT reports no liquid there — and hands off into the
+-- departure cove on the offset line.
+clock = clock + 5.0
+local goal = petrel.decide(view(-1744.7, -3799.4,
+  { shapeshift_form_id = 0, is_swimming = false }))
 check(goal.kind == "navigate" and goal.reason == "swim_ribbon" and
-    goal.x == -1400.0,
-  "merchant coast continues into the Barrens connector")
+    goal.x == -1802.0,
+  "merchant beach hands off into the departure cove")
 check(goal.status and goal.status.dist_goal < 25.0,
-  "the connector handoff retains merchant closing distance")
+  "the beach handoff retains merchant closing distance")
+
+-- One decide at the last departure beat retires the whole outbound bay
+-- line (capture retires up to the farthest captured index), restoring the
+-- Barrens approach for the shelf checks below.
+clock = clock + 5.0
+local depart = petrel.decide(view(-950.0, -3850.0,
+  { shapeshift_form_id = 4, is_swimming = true }))
+check(depart.kind == "navigate" and depart.x == -910.0,
+  "capturing the last departure beat targets the beach lip")
 
 -- The final shelf beat steers the swimmer onto the waterline at clamped
 -- depth — never above the surface. (A z=+9.5 "shore" bypass here once
