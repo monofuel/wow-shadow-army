@@ -113,6 +113,10 @@ local progressAt = nil
 -- resampled from a run that WALKED them, so a reached beat is proven ground
 -- and the safest place to put a lost seat back down.
 local lastReached = nil
+-- Same proven ground, kept per sparse route (interior / finale / connector):
+-- those chains are resampled from walked runs too, but each owns its own
+-- captures and must never hand another route's beat back to a lost seat.
+local sparseReached = {}
 local connectorStarted = false
 local connectorComplete = false
 local finaleStarted = false
@@ -240,6 +244,13 @@ local function next_sparse_beat(route, x, y)
     end
   end
   for i = 1, captured do skipped[route.beats[i].id] = true end
+  -- Standing on a sparse beat retires it AND proves the ground, the same way
+  -- next_land_beat records lastReached: snag recovery needs somewhere known
+  -- walkable to put a seat that the client has carried off the line.
+  if captured > 0 then
+    local reached = route.beats[captured]
+    sparseReached[route] = { x = reached.x, y = reached.y }
+  end
   for _, b in ipairs(route.beats) do
     if not skipped[b.id] and (b.hook or x < b.x + PASSED_YARDS) then
       return b
@@ -550,12 +561,166 @@ local function navigate_to(view, pos, beat, reason, opts)
   return intent
 end
 
+-- Snag hop: the nim client's collision can pin the seat on a road-side
+-- point object — corridor planned, but every ground input toward it is
+-- rejected ("no productive ground input", failed_here, no walkout) and
+-- the seat freezes to the millimeter (run 2 wedge at (3322,-1640),
+-- 2026-08-10). The goal NEVER rotates: open a short window that steps
+-- ~18 yd perpendicular to the beat bearing (alternating sides) purely
+-- to change the physical contact, then resume the same beat. Land twin
+-- of the wet park detector's surface-ride window.
+--
+-- Shared by every walking phase. The machinery only ever needed a beat and
+-- the proven ground behind it, and the sparse routes went without it until
+-- the interior chain froze 380 yd inside Timbermaw at (6866.6, -2126.2)
+-- with nav=unavailable on timbermaw_17 and never attempted a thing
+-- (2026-08-11). `proven` is the last beat this phase actually stood on.
+--
+-- Returns a hop intent only while a window is OPEN; arming one is silent so
+-- the caller still issues the corridor for the beat on the arming frame.
+local function snag_recovery(view, pos, beat, phase, proven)
+  local now = wow.time()
+  if snagUntil and now < snagUntil and snagTarget then
+    return { kind = "navigate", x = snagTarget.x, y = snagTarget.y,
+      z = pos.z, map_id = math.floor(view.location.map_id or ROUTE.map_id),
+      stop_distance = 4.0, route_profile = "prefer_ground",
+      reason = "snag_hop",
+      status = bot_status(view, pos, beat,
+        { phase = phase, snag_hop = true }) }
+  end
+  snagUntil, snagTarget = nil, nil
+  -- Trigger on the FROZEN SEAT itself, not on any nav-state combination:
+  -- the run-2 death froze under nav=walkout ("input returned to the same
+  -- pose") while a mob train burned 138 hp/sim-s — the seat was pinned
+  -- but the walkout machinery still claimed progress was possible.
+  -- ...and on a seat that MOVES without ever getting closer. A frozen
+  -- seat is only the loud half of a snag. When the client cannot follow
+  -- the planned corridor it drops to "walkout" and drives the seat off
+  -- on its own — still moving, so the freeze test never trips, while the
+  -- brain waits. That wander is what has actually been killing this
+  -- segment: leaving north_road_2 the seat walks 55 yd SOUTH of a
+  -- corridor that stays clear of the Felpaw camp and straight through
+  -- the camp instead (runs 10, 11 and valley-run 1 each lost 350-1200 hp
+  -- there), and the three walls that ended valley-run 1 at (6034,-1280),
+  -- (6069,-1305) and (6196,-1419) all sit 45-69 yd OFF the planned
+  -- corridor — the seat only reached them by wandering. So treat "no
+  -- closing on the beat for 15 sim-s" as a snag too and hand it to the
+  -- same hop machinery. The beat never changes; only the seat's contact
+  -- with the geometry does.
+  local bdist = planar(pos.x, pos.y, beat.x, beat.y)
+  if progressBeatId ~= beat.id or progressAt == nil then
+    progressBeatId, progressBest, progressAt = beat.id, bdist, now
+  elseif bdist < progressBest - 5.0 then
+    progressBest, progressAt = bdist, now
+  end
+  local drifting = (now - progressAt) > 15.0
+  local pinned = view.movement_allowed and not view.rooted
+  if pinned or drifting then
+    if not drifting and (snagCheckPos == nil or
+        planar(pos.x, pos.y, snagCheckPos.x, snagCheckPos.y) > 1.0) then
+      snagCheckPos, snagCheckAt, snagCheckFrames =
+        { x = pos.x, y = pos.y }, now, 0
+    else
+      snagCheckFrames = (snagCheckFrames or 0) + 1
+      -- 5 sim-s clears a pilot form-cast pause; 8 real frames keeps
+      -- jumpy test clocks from tripping it.
+      if drifting or (snagCheckAt and now - snagCheckAt > 5.0 and
+          snagCheckFrames >= 8) then
+        local dx, dy = beat.x - pos.x, beat.y - pos.y
+        local len = math.sqrt(dx * dx + dy * dy)
+        if len > 0.1 then
+          local ux, uy = dx / len, dy / len
+          -- Escalate within a snag cluster: left, then right, then
+          -- RETREAT along the bearing — the way in is the one exit
+          -- proven walkable (run 6 died oscillating ±10 yd at
+          -- (3724,-1407) with both flanks blocked while a mob train
+          -- burned it down).
+          if snagClusterPos and
+              planar(pos.x, pos.y, snagClusterPos.x, snagClusterPos.y) <= 30.0 then
+            snagClusterCount = snagClusterCount + 1
+            snagClusterTries = snagClusterTries + 1
+          else
+            snagClusterPos = { x = pos.x, y = pos.y }
+            snagClusterCount = 1
+            snagClusterTries = 1
+          end
+          -- ESCALATE THE REACH, not the goal. Some of these pins are not
+          -- point objects at all but long baked walls the mesh does not
+          -- model: run 8 (2026-08-10) burned 131 hops on one pose at
+          -- (2615,-1801) and run 1 burned 67 at (4774,-806), every one of
+          -- them an 18/30 yd shuffle inside the same wall. A fixed reach
+          -- can only ever free a snag narrower than itself, so the reach
+          -- grows with how long this cluster has held us: 18 -> 36 -> 54
+          -- -> 72 yd on the flanks (30 -> 120 backward), which is enough
+          -- to walk around a wall instead of rubbing along it. The beat
+          -- never changes and no new destination is adopted — this is
+          -- still one short window of physical repositioning, then the
+          -- same corridor is re-planned.
+          local reach = 1 + math.min(3, math.floor(snagClusterTries / 6))
+          local label
+          -- RETURN TO PROVEN GROUND. A sidestep assumes the seat is on the
+          -- line and merely stuck against something; once walkout has
+          -- carried it off the line, ±18 yd of shuffle is noise. Trace-run
+          -- 2 drifted 130 yd north of a walked corridor while every hop
+          -- politely stepped 18 yd sideways, and the "backward" hop made
+          -- it worse — retreating along the bearing to a beat you are no
+          -- longer approaching just pushes you further out. When the seat
+          -- is more than 40 yd off the segment between the last beat it
+          -- actually stood on and the beat it is steering at, put it back
+          -- on that last beat: north of the pass those beats are resampled
+          -- from a run that walked them, so it is the one piece of ground
+          -- known to hold. Still no goal rotation — the beat is untouched
+          -- and resumes the moment the window closes.
+          if drifting and proven and
+              seg_distance(pos.x, pos.y, proven.x, proven.y,
+                beat.x, beat.y) > 40.0 then
+            local back = planar(pos.x, pos.y, proven.x, proven.y)
+            snagTarget = { x = proven.x, y = proven.y }
+            snagUntil = now + 4.0 + back / 8.0
+            label = "back to proven ground"
+          elseif snagClusterCount >= 3 then
+            local d = 30.0 * reach
+            snagTarget = { x = pos.x - ux * d, y = pos.y - uy * d }
+            snagUntil = now + 4.0 + d / 8.0
+            label = "backward"
+            if snagClusterCount >= 5 then snagClusterCount = 0 end
+          else
+            local d = 18.0 * reach
+            snagSide = -snagSide
+            snagTarget = { x = pos.x - uy * d * snagSide,
+              y = pos.y + ux * d * snagSide }
+            snagUntil = now + 4.0 + d / 8.0
+            label = snagSide > 0 and "left" or "right"
+          end
+          snagCheckPos, snagCheckAt, snagCheckFrames = nil, nil, nil
+          -- The hop itself is not "progress"; give it a fresh window so
+          -- the drift test judges the corridor, not the sidestep.
+          progressBest, progressAt = bdist, now
+          wow.log(string.format(
+            "SNAG: %s at (%.1f, %.1f) — hopping %s to (%.1f, %.1f) (cluster %d reach %d)",
+            drifting and "drifting" or "pinned",
+            pos.x, pos.y, label, snagTarget.x, snagTarget.y,
+            snagClusterCount, reach))
+        end
+      end
+    end
+  else
+    snagCheckPos, snagCheckAt, snagCheckFrames = nil, nil, nil
+  end
+  return nil
+end
+
 local function navigate_sparse_land(view, pos, route, phase, stalled)
   local goal = route.beats[#route.beats]
   if planar(pos.x, pos.y, goal.x, goal.y) <= goal.radius then
     return nil
   end
   local beat = next_sparse_beat(route, pos.x, pos.y)
+  -- Same recovery the painted road gets: a sparse corridor pins a seat just
+  -- as hard (Timbermaw interior, 2026-08-11), and an open hop window must
+  -- win over re-issuing the corridor the client has already refused.
+  local hop = snag_recovery(view, pos, beat, phase, sparseReached[route])
+  if hop then return hop end
   local intent = navigate_to(view, pos, beat, beat.id,
     { stop = 8.0, status = { phase = phase, stalled_seconds = stalled } })
   if intent then
@@ -807,143 +972,10 @@ function M.decide(view)
         status = bot_status(view, pos, lgoal, { phase = "north_land" }) }
     end
     local beat = next_land_beat(pos.x, pos.y)
-
-    -- Snag hop: the nim client's collision can pin the seat on a road-side
-    -- point object — corridor planned, but every ground input toward it is
-    -- rejected ("no productive ground input", failed_here, no walkout) and
-    -- the seat freezes to the millimeter (run 2 wedge at (3322,-1640),
-    -- 2026-08-10). The goal NEVER rotates: open a short window that steps
-    -- ~18 yd perpendicular to the beat bearing (alternating sides) purely
-    -- to change the physical contact, then resume the same beat. Land twin
-    -- of the wet park detector's surface-ride window.
-    local now = wow.time()
-    if snagUntil and now < snagUntil and snagTarget then
-      return { kind = "navigate", x = snagTarget.x, y = snagTarget.y,
-        z = pos.z, map_id = math.floor(view.location.map_id or ROUTE.map_id),
-        stop_distance = 4.0, route_profile = "prefer_ground",
-        reason = "snag_hop",
-        status = bot_status(view, pos, beat,
-          { phase = "north_land", snag_hop = true }) }
-    end
-    snagUntil, snagTarget = nil, nil
-    -- Trigger on the FROZEN SEAT itself, not on any nav-state combination:
-    -- the run-2 death froze under nav=walkout ("input returned to the same
-    -- pose") while a mob train burned 138 hp/sim-s — the seat was pinned
-    -- but the walkout machinery still claimed progress was possible.
-    -- ...and on a seat that MOVES without ever getting closer. A frozen
-    -- seat is only the loud half of a snag. When the client cannot follow
-    -- the planned corridor it drops to "walkout" and drives the seat off
-    -- on its own — still moving, so the freeze test never trips, while the
-    -- brain waits. That wander is what has actually been killing this
-    -- segment: leaving north_road_2 the seat walks 55 yd SOUTH of a
-    -- corridor that stays clear of the Felpaw camp and straight through
-    -- the camp instead (runs 10, 11 and valley-run 1 each lost 350-1200 hp
-    -- there), and the three walls that ended valley-run 1 at (6034,-1280),
-    -- (6069,-1305) and (6196,-1419) all sit 45-69 yd OFF the planned
-    -- corridor — the seat only reached them by wandering. So treat "no
-    -- closing on the beat for 15 sim-s" as a snag too and hand it to the
-    -- same hop machinery. The beat never changes; only the seat's contact
-    -- with the geometry does.
-    local bdist = planar(pos.x, pos.y, beat.x, beat.y)
-    if progressBeatId ~= beat.id or progressAt == nil then
-      progressBeatId, progressBest, progressAt = beat.id, bdist, now
-    elseif bdist < progressBest - 5.0 then
-      progressBest, progressAt = bdist, now
-    end
-    local drifting = (now - progressAt) > 15.0
-    local pinned = view.movement_allowed and not view.rooted
-    if pinned or drifting then
-      if not drifting and (snagCheckPos == nil or
-          planar(pos.x, pos.y, snagCheckPos.x, snagCheckPos.y) > 1.0) then
-        snagCheckPos, snagCheckAt, snagCheckFrames =
-          { x = pos.x, y = pos.y }, now, 0
-      else
-        snagCheckFrames = (snagCheckFrames or 0) + 1
-        -- 5 sim-s clears a pilot form-cast pause; 8 real frames keeps
-        -- jumpy test clocks from tripping it.
-        if drifting or (snagCheckAt and now - snagCheckAt > 5.0 and
-            snagCheckFrames >= 8) then
-          local dx, dy = beat.x - pos.x, beat.y - pos.y
-          local len = math.sqrt(dx * dx + dy * dy)
-          if len > 0.1 then
-            local ux, uy = dx / len, dy / len
-            -- Escalate within a snag cluster: left, then right, then
-            -- RETREAT along the bearing — the way in is the one exit
-            -- proven walkable (run 6 died oscillating ±10 yd at
-            -- (3724,-1407) with both flanks blocked while a mob train
-            -- burned it down).
-            if snagClusterPos and
-                planar(pos.x, pos.y, snagClusterPos.x, snagClusterPos.y) <= 30.0 then
-              snagClusterCount = snagClusterCount + 1
-              snagClusterTries = snagClusterTries + 1
-            else
-              snagClusterPos = { x = pos.x, y = pos.y }
-              snagClusterCount = 1
-              snagClusterTries = 1
-            end
-            -- ESCALATE THE REACH, not the goal. Some of these pins are not
-            -- point objects at all but long baked walls the mesh does not
-            -- model: run 8 (2026-08-10) burned 131 hops on one pose at
-            -- (2615,-1801) and run 1 burned 67 at (4774,-806), every one of
-            -- them an 18/30 yd shuffle inside the same wall. A fixed reach
-            -- can only ever free a snag narrower than itself, so the reach
-            -- grows with how long this cluster has held us: 18 -> 36 -> 54
-            -- -> 72 yd on the flanks (30 -> 120 backward), which is enough
-            -- to walk around a wall instead of rubbing along it. The beat
-            -- never changes and no new destination is adopted — this is
-            -- still one short window of physical repositioning, then the
-            -- same corridor is re-planned.
-            local reach = 1 + math.min(3, math.floor(snagClusterTries / 6))
-            local label
-            -- RETURN TO PROVEN GROUND. A sidestep assumes the seat is on the
-            -- line and merely stuck against something; once walkout has
-            -- carried it off the line, ±18 yd of shuffle is noise. Trace-run
-            -- 2 drifted 130 yd north of a walked corridor while every hop
-            -- politely stepped 18 yd sideways, and the "backward" hop made
-            -- it worse — retreating along the bearing to a beat you are no
-            -- longer approaching just pushes you further out. When the seat
-            -- is more than 40 yd off the segment between the last beat it
-            -- actually stood on and the beat it is steering at, put it back
-            -- on that last beat: north of the pass those beats are resampled
-            -- from a run that walked them, so it is the one piece of ground
-            -- known to hold. Still no goal rotation — the beat is untouched
-            -- and resumes the moment the window closes.
-            if drifting and lastReached and
-                seg_distance(pos.x, pos.y, lastReached.x, lastReached.y,
-                  beat.x, beat.y) > 40.0 then
-              local back = planar(pos.x, pos.y, lastReached.x, lastReached.y)
-              snagTarget = { x = lastReached.x, y = lastReached.y }
-              snagUntil = now + 4.0 + back / 8.0
-              label = "back to proven ground"
-            elseif snagClusterCount >= 3 then
-              local d = 30.0 * reach
-              snagTarget = { x = pos.x - ux * d, y = pos.y - uy * d }
-              snagUntil = now + 4.0 + d / 8.0
-              label = "backward"
-              if snagClusterCount >= 5 then snagClusterCount = 0 end
-            else
-              local d = 18.0 * reach
-              snagSide = -snagSide
-              snagTarget = { x = pos.x - uy * d * snagSide,
-                y = pos.y + ux * d * snagSide }
-              snagUntil = now + 4.0 + d / 8.0
-              label = snagSide > 0 and "left" or "right"
-            end
-            snagCheckPos, snagCheckAt, snagCheckFrames = nil, nil, nil
-            -- The hop itself is not "progress"; give it a fresh window so
-            -- the drift test judges the corridor, not the sidestep.
-            progressBest, progressAt = bdist, now
-            wow.log(string.format(
-              "SNAG: %s at (%.1f, %.1f) — hopping %s to (%.1f, %.1f) (cluster %d reach %d)",
-              drifting and "drifting" or "pinned",
-              pos.x, pos.y, label, snagTarget.x, snagTarget.y,
-              snagClusterCount, reach))
-          end
-        end
-      end
-    else
-      snagCheckPos, snagCheckAt, snagCheckFrames = nil, nil, nil
-    end
+    -- lastReached is the proven ground here: the northern beats are
+    -- resampled from a run that walked them.
+    local hop = snag_recovery(view, pos, beat, "north_land", lastReached)
+    if hop then return hop end
 
     local intent = navigate_to(view, pos, beat, beat.id,
       { stop = 8.0,
