@@ -159,8 +159,8 @@ check(goal.status and goal.status.dist_goal < 25.0,
 clock = clock + 5.0
 local shelf = petrel.decide(view(-928.0, -3805.0,
   { shapeshift_form_id = 4, is_swimming = true }))
-check(shelf.kind == "navigate" and shelf.x == -921.0,
-  "the shore approach targets the shelf beat at the waterline")
+check(shelf.kind == "navigate" and shelf.x == -910.0,
+  "the shore approach targets the beach-lip beat")
 check(shelf.z == -2.5, "the shelf beat is clamped to the draft floor")
 check(shelf.water == true, "the shelf beat stays a declared water goal")
 
