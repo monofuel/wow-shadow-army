@@ -113,6 +113,74 @@ class TestTraverseCheckpoint(unittest.TestCase):
         self.assertTrue(out["ok"])
         self.assertTrue(out.get("skipped"))
 
+    def test_apply_no_wait_is_one_shot(self) -> None:
+        """--no-wait fires exactly one accepted tele and never reads status.
+
+        The status file belongs to the bot seat; the old shared verify loop
+        read it after a manual tele and re-fired every cycle, repeatedly
+        yanking a logged-in human back to the checkpoint (2026-08-10).
+        """
+        calls = {"soap": 0}
+
+        def fake_soap(cmd, **_kw):
+            calls["soap"] += 1
+            return "You are teleporting Cowcam to petrel_merchant_coast."
+
+        with (
+            mock.patch.object(tc, "wait_for_soap", return_value="up"),
+            mock.patch.object(tc, "ensure_gm_account"),
+            mock.patch.object(
+                tc, "ensure_game_tele", return_value="petrel_merchant_coast"
+            ),
+            mock.patch.object(tc, "soap_execute", side_effect=fake_soap),
+            mock.patch.object(
+                tc,
+                "read_status",
+                side_effect=AssertionError(
+                    "--no-wait must never read the bot status file"
+                ),
+            ),
+            mock.patch.object(tc.time, "sleep"),
+        ):
+            out = tc.apply_checkpoint(
+                "merchant_coast", character="Cowcam", skip_wait=True
+            )
+        self.assertTrue(out["ok"])
+        self.assertTrue(out.get("one_shot"))
+        self.assertEqual(out["attempts"], 1)
+        self.assertEqual(calls["soap"], 1)
+
+    def test_apply_no_wait_retries_unloaded_tele_location(self) -> None:
+        """A 'location not found' reply re-ensures game_tele, then re-fires."""
+        replies = iter(
+            [
+                "Teleport location not found!",
+                "You are teleporting Cowcam to petrel_merchant_coast.",
+            ]
+        )
+        ensured = {"count": 0}
+
+        def fake_ensure(_pose):
+            ensured["count"] += 1
+            return "petrel_merchant_coast"
+
+        with (
+            mock.patch.object(tc, "wait_for_soap", return_value="up"),
+            mock.patch.object(tc, "ensure_gm_account"),
+            mock.patch.object(tc, "ensure_game_tele", side_effect=fake_ensure),
+            mock.patch.object(
+                tc, "soap_execute", side_effect=lambda *_a, **_k: next(replies)
+            ),
+            mock.patch.object(tc, "read_status"),
+            mock.patch.object(tc.time, "sleep"),
+        ):
+            out = tc.apply_checkpoint(
+                "merchant_coast", character="Cowcam", skip_wait=True
+            )
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["attempts"], 2)
+        self.assertGreaterEqual(ensured["count"], 2)
+
     def test_segment_wait_starts_at_checkpoint_and_reaches_endpoint(self) -> None:
         statuses = [
             {"x": 1071.6, "y": -2303.4, "swimming": False},

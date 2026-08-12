@@ -394,9 +394,71 @@ def apply_checkpoint(
                 "status": st,
             }
 
-    # Tele and re-tele until live status is near the checkpoint.
+    if skip_wait:
+        # One-shot manual path (make lift-tele): the status file belongs to
+        # the BOT seat, so verifying a human character's pose against it can
+        # never succeed — the shared loop below therefore re-fired the tele
+        # every cycle and yanked a logged-in scout back to the checkpoint
+        # until its deadline (2026-08-10 lift-tele bug). One accepted SOAP
+        # tele IS the outcome here; retries cover only transport errors and
+        # an un-reloaded game_tele cache.
+        deadline = time.time() + 30.0
+        last_result = ""
+        attempt = 0
+        while time.time() < deadline:
+            attempt += 1
+            try:
+                last_result = soap_execute(cmd)
+                print(
+                    f"[traverse-checkpoint] SOAP attempt {attempt}: {last_result}",
+                    flush=True,
+                )
+            except SoapError as e:
+                print(
+                    f"[traverse-checkpoint] SOAP attempt {attempt} error: {e}",
+                    flush=True,
+                )
+                if "location not found" in str(e).lower():
+                    try:
+                        ensure_game_tele(pose)
+                    except Exception as e2:  # noqa: BLE001
+                        print(
+                            f"[traverse-checkpoint] re-ensure game_tele failed: {e2}",
+                            flush=True,
+                        )
+                time.sleep(3)
+                continue
+            if "not found" in last_result.lower():
+                try:
+                    ensure_game_tele(pose)
+                except Exception as e2:  # noqa: BLE001
+                    print(
+                        f"[traverse-checkpoint] re-ensure game_tele failed: {e2}",
+                        flush=True,
+                    )
+                time.sleep(2)
+                continue
+            return {
+                "ok": True,
+                "checkpoint": name,
+                "command": cmd,
+                "soap_result": last_result,
+                "one_shot": True,
+                "offline_tele": "offline" in last_result.lower(),
+                "attempts": attempt,
+            }
+        return {
+            "ok": False,
+            "checkpoint": name,
+            "command": cmd,
+            "soap_result": last_result,
+            "attempts": attempt,
+            "warning": "no accepted tele before the 30 s deadline",
+        }
+
+    # Bot path: tele and re-tele until live status is near the checkpoint.
     # Offline tele alone does not move an already-logged-in body.
-    deadline = time.time() + (30.0 if skip_wait else 120.0)
+    deadline = time.time() + 120.0
     last_result = ""
     best: dict[str, Any] | None = None
     best_d = 1e18
@@ -457,19 +519,6 @@ def apply_checkpoint(
                     "attempts": attempt,
                 }
         time.sleep(2)
-
-    soap_ok = "teleport" in last_result.lower() and "not found" not in last_result.lower()
-    if soap_ok and skip_wait:
-        return {
-            "ok": True,
-            "checkpoint": name,
-            "command": cmd,
-            "soap_result": last_result,
-            "dist": best_d if best else None,
-            "status": best,
-            "offline_tele": "offline" in last_result.lower(),
-            "attempts": attempt,
-        }
 
     return {
         "ok": best_d <= near_yards,
