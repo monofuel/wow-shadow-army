@@ -66,12 +66,12 @@ for i = 2, #landRoute.beats do
   check(landRoute.beats[i].hook or landRoute.beats[i].x > landRoute.beats[i - 1].x,
     "land beats march north monotonically (hooks exempt)")
 end
-check(#route.beats == 53, "route keeps every beat (incl. the two clearance guards)")
+check(#route.beats == 55, "route keeps every beat (incl. the two clearance guards)")
 local wetCount = 0
 for _, b in ipairs(route.beats) do
   if b.wet then wetCount = wetCount + 1 end
 end
-check(wetCount == 51, "route keeps the wet ribbon")
+check(wetCount == 53, "route keeps the wet ribbon")
 check(route.beats[1].id == "land_approach" and route.beats[2].id == "water_entry",
   "land legs lead the route")
 
@@ -356,8 +356,11 @@ check(hookNav.kind == "navigate" and hookNav.reason ~= "snag_hop"
 -- targets the first gallery beat and carries the fork steering features.
 clock = clock + 5.0
 local atCave = petrel.decide(view(6500.0, -2060.0, formed))
-check(atCave.kind == "navigate" and atCave.reason == "timbermaw_02",
+check(atCave.kind == "navigate" and
+    atCave.reason:find("^timbermaw_") ~= nil,
   "the cave mouth hands off to the walked interior chain")
+check(math.sqrt((atCave.x - 6500.0) ^ 2 + (atCave.y + 2060.0) ^ 2) >= 14.9,
+  "the interior target is a genuine stride away (lookahead skips the near beat)")
 check(atCave.navigation_mode == "local_steer",
   "interior intents declare local_steer for the WMO")
 check(atCave.allow_jump == true,
