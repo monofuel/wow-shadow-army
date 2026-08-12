@@ -32,7 +32,9 @@ void main() {
   fragColor = vec4(vColor * light, 1.0);
 }
 """
-  DefaultYaw* = 0.0'f32
+  ## Eye south of target looking north: world +X (north) up on screen,
+  ## matching in-game map orientation.
+  DefaultYaw* = -90.0'f32
   DefaultPitch* = -70.0'f32
   PitchMin* = -90.0'f32
   PitchMax* = -25.0'f32
@@ -352,11 +354,13 @@ proc planeHit*(
   result.y = nearP.y + dir.y * t
 
 proc panBasis(yawDeg: float32): tuple[forward, right: Vec2] =
-  ## Horizontal pan basis from yaw (degrees), Z-up world.
+  ## Camera-relative ground basis, Z-up world. The eye sits at
+  ## target + (sin yaw, cos yaw)·r, so camera forward is the negation and
+  ## screen-right is forward × up.
   let yawR = yawDeg.toRadians
   (
-    vec2(sin(yawR), cos(yawR)),
-    vec2(cos(yawR), -sin(yawR))
+    vec2(-sin(yawR), -cos(yawR)),
+    vec2(-cos(yawR), sin(yawR))
   )
 
 proc windowAspect(window: Window): float32 =
