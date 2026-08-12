@@ -26,7 +26,7 @@ class TestTraverseCheckpoint(unittest.TestCase):
         expected = {
             "water_entry": (-6784.5, -4833.9, 0.7),
             "duskwallow_coast": (-4627.01, -4869.45, -2.37),
-            "merchant_coast": (-1744.7, -3799.4, 6.6),
+            "merchant_coast": (-1816.8, -3899.5, -1.0),
             "top_barrens": (1071.6, -2303.4, 91.7),
             "felwood_cave_entrance": (6502.937, -2063.74, 576.017),
             "everlook": (6687.333052, -4647.667, 721.678),

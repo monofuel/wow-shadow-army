@@ -155,17 +155,17 @@ check(bay.kind == "navigate" and bay.reason == "swim_ribbon" and
     bay.x == -1652.0,
   "bay_center hooks west toward the sandbar saddle")
 
--- The merchant BEACH goal (monofuel's scouted point) captures dry on the
--- sand — honest ADT reports no liquid there — and hands off into the
--- departure cove on the offset line.
+-- The merchant WATER goal (monofuel's scouted inner-bay pose) captures
+-- swimming — 6.6+ yd of water across the ring, no grounding — and hands
+-- off into the departure line at inlet_out.
 clock = clock + 5.0
-local goal = petrel.decide(view(-1744.7, -3799.4,
-  { shapeshift_form_id = 0, is_swimming = false }))
+local goal = petrel.decide(view(-1816.8, -3899.5,
+  { shapeshift_form_id = 4, is_swimming = true }))
 check(goal.kind == "navigate" and goal.reason == "swim_ribbon" and
-    goal.x == -1802.0,
-  "merchant beach hands off into the departure cove")
+    goal.x == -1805.0,
+  "merchant water goal hands off into the departure line")
 check(goal.status and goal.status.dist_goal < 25.0,
-  "the beach handoff retains merchant closing distance")
+  "the goal handoff retains merchant closing distance")
 
 -- One decide at the last departure beat retires the whole outbound bay
 -- line (capture retires up to the farthest captured index), restoring the
