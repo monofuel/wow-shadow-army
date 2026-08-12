@@ -66,12 +66,12 @@ for i = 2, #landRoute.beats do
   check(landRoute.beats[i].hook or landRoute.beats[i].x > landRoute.beats[i - 1].x,
     "land beats march north monotonically (hooks exempt)")
 end
-check(#route.beats == 50, "route keeps every beat")
+check(#route.beats == 52, "route keeps every beat (incl. the two clearance guards)")
 local wetCount = 0
 for _, b in ipairs(route.beats) do
   if b.wet then wetCount = wetCount + 1 end
 end
-check(wetCount == 48, "route keeps the wet ribbon")
+check(wetCount == 50, "route keeps the wet ribbon")
 check(route.beats[1].id == "land_approach" and route.beats[2].id == "water_entry",
   "land legs lead the route")
 
