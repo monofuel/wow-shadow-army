@@ -7,7 +7,7 @@
 ## come from the repo's traverse configs.
 
 import
-  std/[algorithm, json, monotimes, os, strutils, times]
+  std/[algorithm, json, monotimes, os, times]
 
 const
   TraverseStartX* = -9187.0'f32
