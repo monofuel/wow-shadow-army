@@ -519,8 +519,11 @@ local function navigate_to(view, pos, beat, reason, opts)
     -- host's ascent toward a near-surface target is what launched the bot
     -- clear of the water (Aquatic auto-cancel, breath panic) — monofuel
     -- watched it happen repeatedly. Dive depths pass through untouched.
-    intent.z = beat.wet and
-      (beat.shore and beat.z or math.min(beat.z, -2.5)) or beat.z
+    -- NO exceptions: a "shore" bypass here once commanded z=+9.5 on a wet
+    -- beat and relaunched exactly that failure. Shore exits work by
+    -- steering the swimmer onto the shallow shelf (planar target) until
+    -- the client clears the swim flag — never by commanding air.
+    intent.z = beat.wet and math.min(beat.z, -2.5) or beat.z
   end
   -- Wet beats are declared water goals: the host commits to the water
   -- (wade steering at the bearing until the swim flag flips) instead of

@@ -152,6 +152,29 @@ check(goal.kind == "navigate" and goal.reason == "swim_ribbon" and
 check(goal.status and goal.status.dist_goal < 25.0,
   "the connector handoff retains merchant closing distance")
 
+-- The final shelf beat steers the swimmer onto the waterline at clamped
+-- depth — never above the surface. (A z=+9.5 "shore" bypass here once
+-- launched the bot clear of the water, Aquatic auto-cancel and all;
+-- monofuel watched it drown repeatedly. Gone for good.)
+clock = clock + 5.0
+local shelf = petrel.decide(view(-928.0, -3805.0,
+  { shapeshift_form_id = 4, is_swimming = true }))
+check(shelf.kind == "navigate" and shelf.x == -921.0,
+  "the shore approach targets the shelf beat at the waterline")
+check(shelf.z == -2.5, "the shelf beat is clamped to the draft floor")
+check(shelf.water == true, "the shelf beat stays a declared water goal")
+
+-- Schema: the shore bypass flag no longer exists on any wet route.
+for _, cfg in ipairs({
+  require("config.traverse_beats"),
+  require("config.traverse_coast_beats"),
+  require("config.traverse_connector_wet_beats"),
+}) do
+  for _, b in ipairs(cfg.beats) do
+    check(b.shore == nil, "no beat carries the removed shore flag: " .. b.id)
+  end
+end
+
 -- Once the shore beat has cleared swimming, Travel Form and the land road
 -- take over automatically.
 clock = clock + 20.0
