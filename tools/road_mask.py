@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Road detection for vanilla 1.12 Kalimdor, straight off the painted ADT terrain.
+"""Road detection for vanilla 1.12 ADT maps, straight off the painted ADT terrain.
 
 Roads in 1.12 are not data, they are paint: a tile's MTEX names one or more
 road tilesets (``Tileset\\Kalidar\\KalidarRoad.blp``,
@@ -9,7 +9,7 @@ point is "on road" when a road-textured layer is painted at that alpha cell.
 
 CALIBRATION (verified, do not re-derive by guessing)
 ----------------------------------------------------
-Tile file name: ``kalimdor_<a>_<b>.adt`` with
+Tile file name: ``<map>_<a>_<b>.adt`` with
 
     a = floor(32 - y / 533.3333)      # first index comes from world Y
     b = floor(32 - x / 533.3333)      # second index comes from world X
@@ -116,6 +116,7 @@ MCLQ_TILE_NO_LIQUID = 0x0F
 
 # A road layer counts as "on road" above this alpha (0-255).
 ROAD_ALPHA_THRESHOLD = 64
+ROAD_TEXTURE_MARKERS = ("road", "elwynncobblestone")
 
 DEFAULT_ADT_DIR = Path(
     os.environ.get(
@@ -188,7 +189,7 @@ class Probe:
 
 
 def tile_indices(x: float, y: float) -> tuple[int, int]:
-    """(a, b) of kalimdor_<a>_<b>.adt covering world point (x, y)."""
+    """(a, b) of <map>_<a>_<b>.adt covering world point (x, y)."""
     return (
         int(math.floor(32.0 - y / TILE_YD)),
         int(math.floor(32.0 - x / TILE_YD)),
@@ -196,7 +197,7 @@ def tile_indices(x: float, y: float) -> tuple[int, int]:
 
 
 def tile_origin(a: int, b: int) -> tuple[float, float]:
-    """Maximum-x / maximum-y corner of tile kalimdor_<a>_<b>."""
+    """Maximum-x / maximum-y corner of tile <map>_<a>_<b>."""
     return ((32.0 - b) * TILE_YD, (32.0 - a) * TILE_YD)
 
 
@@ -264,7 +265,7 @@ def liquid_vert_coords(x: float, y: float) -> tuple[float, float]:
 
 
 def is_road_texture(name: str) -> bool:
-    return "road" in name.lower()
+    return any(m in name.lower() for m in ROAD_TEXTURE_MARKERS)
 
 
 def mclq_tile_has_liquid(flag: int) -> bool:
@@ -580,14 +581,40 @@ class Tile:
 
 
 class RoadMask:
-    """is_road() / is_water() over a directory of Kalimdor ADTs, with tile caching."""
+    """is_road() / is_water() over a directory of map ADTs, with tile caching."""
 
-    def __init__(self, adt_dir: Path | str = DEFAULT_ADT_DIR) -> None:
+    def __init__(
+        self, adt_dir: Path | str = DEFAULT_ADT_DIR, map_name: str | None = None
+    ) -> None:
         self.adt_dir = Path(adt_dir)
+        self.map_name = (map_name or self.adt_dir.name).lower()
         self._tiles: dict[tuple[int, int], Tile | None] = {}
 
     def tile_path(self, a: int, b: int) -> Path:
-        return self.adt_dir / f"kalimdor_{a}_{b}.adt"
+        return self.adt_dir / f"{self.map_name}_{a}_{b}.adt"
+
+    def tile_coords(self) -> list[tuple[int, int]]:
+        coords: list[tuple[int, int]] = []
+        for path in sorted(self.adt_dir.glob(f"{self.map_name}_*_*.adt")):
+            parts = path.stem.rsplit("_", 2)
+            if len(parts) != 3:
+                continue
+            try:
+                coords.append((int(parts[1]), int(parts[2])))
+            except ValueError:
+                continue
+        return sorted(coords)
+
+    def ground_z(self, x: float, y: float) -> float | None:
+        a, b = tile_indices(x, y)
+        tile = self.tile(a, b)
+        if tile is None:
+            return None
+        ix, iy = chunk_indices(x, y)
+        index = chunk_array_index(ix, iy)
+        if index < 0 or index >= len(tile.chunks):
+            return None
+        return tile.ground_height(index, x, y)
 
     def tile(self, a: int, b: int) -> Tile | None:
         key = (a, b)
@@ -839,7 +866,7 @@ def cmd_probe(mask: RoadMask, args: argparse.Namespace) -> int:
     print(f"({args.x:.2f}, {args.y:.2f}) -> {verdict}")
     print(f"  texture={sample.texture} alpha={sample.alpha}")
     print(
-        f"  tile=kalimdor_{a}_{b}.adt chunk=(ix={ix}, iy={iy}) "
+        f"  tile={mask.map_name}_{a}_{b}.adt chunk=(ix={ix}, iy={iy}) "
         f"index={probe.chunk_index} cell=(cx={cx}, cy={cy}) "
         f"alpha_index={probe.alpha_index}"
     )
@@ -943,7 +970,7 @@ def cmd_water_probe(mask: RoadMask, args: argparse.Namespace) -> int:
         f"ground_z={probe.ground_z if probe.ground_z is not None else 'n/a'}"
     )
     print(
-        f"  tile=kalimdor_{a}_{b}.adt chunk=(ix={ix}, iy={iy}) "
+        f"  tile={mask.map_name}_{a}_{b}.adt chunk=(ix={ix}, iy={iy}) "
         f"index={probe.chunk_index} liquid_cell=(lx={lx}, ly={ly})"
     )
     print(
@@ -975,6 +1002,7 @@ def cmd_water_dump(mask: RoadMask, args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--adt-dir", type=Path, default=DEFAULT_ADT_DIR)
+    parser.add_argument("--map", default=None)
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_probe = sub.add_parser("probe", help="Road verdict plus tile/chunk/cell debug")
@@ -1019,10 +1047,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(list(argv) if argv is not None else None)
-    if not args.adt_dir.is_dir():
-        print(f"SKIP missing ADT dir: {args.adt_dir}", file=sys.stderr)
+    adt_dir = args.adt_dir
+    if args.map is not None and args.adt_dir == DEFAULT_ADT_DIR:
+        adt_dir = DEFAULT_ADT_DIR.parent / args.map
+    if not adt_dir.is_dir():
+        print(f"SKIP missing ADT dir: {adt_dir}", file=sys.stderr)
         return 0
-    return int(args.func(RoadMask(args.adt_dir), args))
+    return int(args.func(RoadMask(adt_dir, map_name=args.map), args))
 
 
 if __name__ == "__main__":

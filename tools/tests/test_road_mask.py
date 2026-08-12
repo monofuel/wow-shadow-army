@@ -17,6 +17,11 @@ import road_mask as rmask  # noqa: E402
 ADT_DIR = rmask.DEFAULT_ADT_DIR
 HAVE_ADT = ADT_DIR.is_dir() and any(ADT_DIR.glob("kalimdor_*.adt"))
 skip_no_adt = unittest.skipUnless(HAVE_ADT, f"no Kalimdor ADTs at {ADT_DIR}")
+AZEROTH_DIR = rmask.DEFAULT_ADT_DIR.parent / "azeroth"
+HAVE_AZEROTH = AZEROTH_DIR.is_dir() and any(AZEROTH_DIR.glob("azeroth_*.adt"))
+skip_no_azeroth = unittest.skipUnless(
+    HAVE_AZEROTH, f"no Azeroth ADTs at {AZEROTH_DIR}"
+)
 
 
 class TestTransformMath(unittest.TestCase):
@@ -124,8 +129,20 @@ class TestTransformMath(unittest.TestCase):
         self.assertTrue(rmask.is_road_texture("Tileset\\Felwood\\FelwoodRoad.blp"))
         self.assertTrue(rmask.is_road_texture("tileset/ashenvale/ashenvaleroad.blp"))
         self.assertTrue(rmask.is_road_texture("Tileset\\Barrens\\BarrensRoad01.blp"))
+        self.assertTrue(rmask.is_road_texture("KalidarRoad.blp"))
+        self.assertTrue(
+            rmask.is_road_texture("Tileset\\Elwynn\\ElwynnCobbleStoneBase.blp")
+        )
         self.assertFalse(rmask.is_road_texture("Tileset\\Felwood\\FelwoodDirt.blp"))
         self.assertFalse(rmask.is_road_texture("Tileset\\Generic\\Black.blp"))
+
+    def test_tile_path_infers_map_name_from_dir(self) -> None:
+        mask = rmask.RoadMask(Path("/nonexistent/azeroth"), map_name=None)
+        self.assertTrue(str(mask.tile_path(28, 28)).endswith("azeroth_28_28.adt"))
+
+    def test_explicit_map_name_overrides_dir(self) -> None:
+        mask = rmask.RoadMask(Path("/nonexistent/wrong"), map_name="azeroth")
+        self.assertTrue(str(mask.tile_path(28, 28)).endswith("azeroth_28_28.adt"))
 
 
 class TestMclqTileFlags(unittest.TestCase):
@@ -500,6 +517,25 @@ class TestWaterAnchors(unittest.TestCase):
         self.assertFalse(sample.is_water, msg=f"sample={sample}")
         probe = self.mask.water_probe(6502.9, -2063.7)
         self.assertLessEqual(probe.size_liquid, 8)
+
+
+@skip_no_azeroth
+class TestAzerothAdt(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.mask = rmask.RoadMask(AZEROTH_DIR)
+
+    def test_tile_28_28_has_tirisfall_road_textures(self) -> None:
+        tile = self.mask.tile(28, 28)
+        self.assertIsNotNone(tile)
+        self.assertTrue(tile.road_texture_ids)
+        self.assertTrue(any("tirisfall" in name.lower() for name in tile.textures))
+
+    def test_tile_coords_includes_28_28(self) -> None:
+        coords = self.mask.tile_coords()
+        self.assertTrue(coords)
+        self.assertIn((28, 28), coords)
+        self.assertEqual(coords, sorted(coords))
 
 
 if __name__ == "__main__":
