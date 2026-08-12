@@ -66,7 +66,7 @@ COMPOSE_FILE := infra/compose.vmangos.yml
 ACCOUNT_USER := monofuel
 ACCOUNT_PASS := password
 
-.PHONY: test test-lua test-nim system pin-check start-server stop-server server-logging logs account soap-account play play-classic play-classic-netlog play-xr traverse traverse-field traverse-replay traverse-pack-replay traverse-headed traverse-pol traverse-desert traverse-wet traverse-checkpoints traverse-lint traverse-lint-soft lift-tele quest-data warlock-account warlock-bot botwarrior-bot tusk-account tusk-bot beru-account beru-bot party-army navmesh-helper navmesh-status map-browser map-browser-once map-browser-debug map-browser-probe
+.PHONY: test test-lua test-nim system pin-check start-server stop-server server-logging logs account soap-account play play-classic play-classic-netlog play-xr traverse traverse-field traverse-replay traverse-pack-replay traverse-headed traverse-pol traverse-desert traverse-wet traverse-checkpoints traverse-lint traverse-lint-soft lift-tele quest-data warlock-account warlock-bot botwarrior-bot tusk-account tusk-bot beru-account beru-bot party-army navmesh-helper navmesh-status map-browser map-browser-once map-browser-probe
 
 # Unit tier: Lua tools + Nim host/system tests only (v2 DoD: no Python required
 # for bot correctness). If nim is missing, test-nim-soft skips rather than
@@ -183,8 +183,9 @@ system:
 		SYSTEM_ARMY_DIR="$${SYSTEM_ARMY_DIR:-$$(pwd)}" \
 		nix develop --command nim r system/system_server.nim
 
-# Map browser (docs/map-plan.md). Single window: 2D drill + client terrain 3D.
-# Zone view reuses fork runMapViewer terrain (fog off, no doodads).
+# Map browser: standalone bird's-eye WDL terrain viewer (no fork renderer).
+# MAP_BROWSER_STATS / MAP_BROWSER_AUTO are the agent-facing instrumentation
+# (formerly also MAP_BROWSER_DEBUG zone-drill probe — that era is gone).
 CLASSIC_CLIENT := $(abspath ../wow-classic-data/Coworld-WoW-Classic/client)
 ifeq ($(wildcard $(CLASSIC_CLIENT)/Data),)
   CLASSIC_CLIENT := $(abspath ../coworld-vanilla-wow/local_data/coworld-bundle/Coworld-WoW-Classic/client)
@@ -199,21 +200,11 @@ map-browser-once:
 		MAP_BROWSER_ONCE=1 \
 		nix develop --command nim r src/tools/map_browser.nim
 
-# Debug run: per-second [mb-debug] lines + stats JSON for agents.
-map-browser-debug:
-	VANILLA_WOW_EXTRACTED_DATA_DIR="$(VANILLA_WOW_EXTRACTED_DATA_DIR)" \
-	VANILLA_WOW_CLIENT_DATA_DIR="$${VANILLA_WOW_CLIENT_DATA_DIR:-$(CLASSIC_CLIENT)}" \
-		MAP_BROWSER_DEBUG=1 \
-		MAP_BROWSER_STATS=local_data/map_browser_stats.json \
-		nix develop --command nim r src/tools/map_browser.nim
-
-# Autopilot probe: drill a zone, stream, screenshot + stats, exit nonzero on
-# failure. Override with MAP_BROWSER_AUTO="zone=...,seconds=...,screenshot=...".
 map-browser-probe:
 	VANILLA_WOW_EXTRACTED_DATA_DIR="$(VANILLA_WOW_EXTRACTED_DATA_DIR)" \
 	VANILLA_WOW_CLIENT_DATA_DIR="$${VANILLA_WOW_CLIENT_DATA_DIR:-$(CLASSIC_CLIENT)}" \
-		MAP_BROWSER_DEBUG=1 \
-		MAP_BROWSER_AUTO="$${MAP_BROWSER_AUTO:-zone=Durotar,seconds=10,screenshot=local_data/map_browser_probe.png}" \
+		MAP_BROWSER_AUTO="$${MAP_BROWSER_AUTO:-seconds=8,screenshot=local_data/map_browser_probe.png}" \
+		MAP_BROWSER_STATS=local_data/map_browser_stats.json \
 		nix develop --command nim r src/tools/map_browser.nim
 
 # Pin-drift only: HEAD of ../coworld-vanilla-wow must match upstream.lock.

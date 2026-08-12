@@ -7,7 +7,7 @@
 ## come from the repo's traverse configs.
 
 import
-  std/[algorithm, json, monotimes, os, strutils, times]
+  std/[algorithm, json, monotimes, os, times]
 
 const
   TraverseStartX* = -9187.0'f32
@@ -41,6 +41,7 @@ type
 
   TraverseBeat* = object
     id*: string
+    mapId*: uint32
     x*, y*, z*: float32
     radius*: float32
 
@@ -181,9 +182,11 @@ proc loadTraverseBeats*(repoDir: string): seq[TraverseBeat] =
     return
   try:
     let root = parseJson(readFile(path))
+    let mapId = uint32(root{"map_id"}.getInt(1))
     for beat in root{"beats"}:
       result.add TraverseBeat(
         id: beat{"id"}.getStr(),
+        mapId: mapId,
         x: beat{"x"}.getFloat().float32,
         y: beat{"y"}.getFloat().float32,
         z: beat{"z"}.getFloat().float32,

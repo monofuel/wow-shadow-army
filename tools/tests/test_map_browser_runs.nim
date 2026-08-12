@@ -33,5 +33,8 @@ suite "traverse run parsing":
 
 suite "traverse overlays config":
   test "beats and checkpoints load from the repo":
-    check loadTraverseBeats(getCurrentDir()).len >= 5
+    let beats = loadTraverseBeats(getCurrentDir())
+    check beats.len >= 5
+    for beat in beats:
+      check beat.mapId == 1'u32
     check loadTraverseCheckpoints(getCurrentDir()).len >= 3

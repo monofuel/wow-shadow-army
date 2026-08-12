@@ -1,7 +1,7 @@
 ## Map-browser waypoint graph extraction against the fork world catalog.
 import std/unittest
 
-import map_browser/[terrain3d, waypoints]
+import map_browser/waypoints
 
 suite "waypoint graph":
   let graph = buildWaypointGraph()
@@ -35,22 +35,3 @@ suite "waypoint graph":
 
   test "activity regions expose city anchors":
     check activityRegions().len > 20
-
-suite "zone terrain support":
-  test "on-world kalimdor bounds are supported":
-    check zoneTerrainSupported(ZoneWorldBounds(
-      mapId: 1, minX: -7000, maxX: -6000, minY: -5000, maxY: -4000,
-      label: "Tanaris", mapDirectory: "Kalimdor"
-    ))
-
-  test "battleground instance maps are off-world":
-    check not zoneTerrainSupported(ZoneWorldBounds(
-      mapId: 30, minX: -1739, maxX: 1085, minY: -2456, maxY: 1781,
-      label: "Alterac Valley", mapDirectory: ""
-    ))
-
-  test "degenerate bounds are off-world":
-    check not zoneTerrainSupported(ZoneWorldBounds(
-      mapId: 1, minX: 100, maxX: 100, minY: 50, maxY: 50,
-      label: "broken", mapDirectory: "Kalimdor"
-    ))
