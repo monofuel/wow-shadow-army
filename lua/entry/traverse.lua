@@ -725,6 +725,24 @@ local function navigate_sparse_land(view, pos, route, phase, stalled)
     return nil
   end
   local beat = next_sparse_beat(route, pos.x, pos.y)
+  -- Interior lookahead: with beats every ~7 yd, re-targeting each one
+  -- replans the corridor every couple of seconds, and each replan is a
+  -- pause paid inside the Warder picket. Steer at the first beat a real
+  -- stride away; the skipped ones retire by capture as the seat passes,
+  -- and the corridor to a beat ~20 yd down the walked line still follows
+  -- the walked line. The goal beat is never skipped past.
+  local look = beat
+  while look and planar(pos.x, pos.y, look.x, look.y) < 15.0 do
+    local nxt = nil
+    local seen = false
+    for _, b in ipairs(route.beats) do
+      if seen and not skipped[b.id] then nxt = b break end
+      if b.id == look.id then seen = true end
+    end
+    if not nxt then break end
+    look = nxt
+  end
+  if look then beat = look end
   -- Same recovery the painted road gets: a sparse corridor pins a seat just
   -- as hard (Timbermaw interior, 2026-08-11), and an open hop window must
   -- win over re-issuing the corridor the client has already refused.
