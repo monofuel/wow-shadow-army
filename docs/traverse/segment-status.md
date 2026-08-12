@@ -6,91 +6,104 @@ updated per battery. Battery fixture:
 scorecard per run; `best_endpoint_distance_yards` = how far a failing run
 got. See [route-engineering.md](route-engineering.md) for the tooling.
 
-## Battery of 2026-08-11 (post coast-ribbon build, post upstream merges)
+## Battery of 2026-08-11 (post GPT-mess cleanup — all rows OUR verified runs)
 
 | # | Segment | Checkpoints | Verdict | Detail |
 |---|---|---|---|---|
-| A | Tanaris desert | `spawn → water_entry` | **PASS** | `traverse-desert`: coast reached, no stalls |
-| B | Fatigue swim | `wet_start → duskwallow_coast` | **FAIL — late-run blocker** | The packaged-liquid shoreline regression is fixed in the client fork (`22c612006`): the standard already-wet fixture enters swimming and Aquatic Form normally again. The current run reached 257.2 yd from Dustwallow, then late park/flag churn left it taking fatigue damage until death. See B analysis below |
-| C | Coastal swim (new) | `duskwallow_coast → merchant_coast` | **GATE MET** (2× consecutive) | 55/57 s, 36.4/32.8 yd, zero idle both. Three hazards found and fixed: two shallow sandbar legs (beats nudged via the water mask) and a sunken-ship doodad at (-3830,-4745) that dragged the seat 12 yd down and cleared the swim flag — deterministic across two runs, dodged 57 yd seaward (`coast_03b`). Wade machinery observed self-recovering surface-level flag desyncs (`nav=wading`) |
-| D | Barrens connector | `merchant_coast → top_barrens` | **GATE MET** (2× consecutive) | 55.0/51.5 s, 49.4/27.0 yd, zero deaths and zero snags. The swim-to-shore handoff, Travel Form transition, Ratchet climb, Crossroads, and northern road all complete. Quality warning: p95 cross-track was ~62 yd; run 2 recovered one brief terrain fall near (-570,-3000) |
-| E | Northern land run | `top_barrens → felwood_cave_entrance` | **PASS** | 110.6 s, 23.7 yd, idle 4.5% — the painted-road route |
-| F | Winterspring finale | `felwood_cave_entrance → everlook` | **PARTIAL — Timbermaw south blocked** | The route is built through Everlook. `timbermaw_north_tunnel → winterspring_west_entry` passes in 5.0 s with zero idle/deaths/snags. `winterspring_west_entry → everlook` reaches town with zero deaths/snags after dodging the Winterfall camp and a permanent collision trap. The remaining southern Timbermaw transition is a client/MMAP mismatch; see F analysis below |
+| A | Tanaris desert | `spawn → water_entry` | **PASS** | Stable; reconfirmed inside the stitched run |
+| B | Fatigue swim | `wet_start → duskwallow_coast` | **FORK-BLOCKED** | Two client-side blockers, both ledgered with evidence (see B analysis). Brain exonerated: it commanded the correct dive profile at the failure point |
+| C | Coastal swim | `duskwallow_coast → merchant_coast` | **GATE MET** | Reconfirmed post-fix: PASS 53.0 s / 39.0 yd |
+| D | Barrens connector | `merchant_coast → top_barrens` | **GATE MET (3× consecutive)** | 84.5 / 50.0 / 53.0 s, zero deaths, zero snags — after killing GPT 5.6 Sol's wet-z "shore" bypass (see D analysis) |
+| E | Northern land run | `top_barrens → felwood_cave_entrance` | **PASS** | Painted-road route, stable |
+| F | Winterspring finale | `felwood_cave_entrance → everlook` | **FORK-BLOCKED (route ready)** | The cave is now a 37-beat walked-ground interior chain resampled from monofuel's manual F9 logs; the exterior over-mountain node is deleted. Live navigation waits on two fork features (see F analysis) |
 
-`wet_start` is the standard B fixture: it lands already swimming and avoids
-testing a deliberately unsupported dry shoreline entry. The latest run proved
-that packaged liquid and Aquatic Form engage correctly, but did not restore
-the segment gate because the later park/fatigue failure killed the run.
+## Why D failed before (now GATE MET): the wet-z "shore" bypass
 
-## Why B still fails: entry fixed, late park/fatigue remains
+GPT 5.6 Sol's `barrens_shore` beat carried `shore = true` + z = +9.5,
+bypassing the -2.5 yd draft clamp. A swimming seat commanded above the
+surface holds swim-ascent JUMP and launches clear of the water (Aquatic
+auto-cancel, breath panic) — the exact documented failure the clamp was
+built against; monofuel watched it drown repeatedly. Fixes, live-proven:
 
-WETSTATEDBG had shown `liquid_surface_z = -500.0` even though terrain was
-above that packaged liquid plane. The fork now rejects a packaged liquid
-sample below decoded terrain, matching VMaNGOS water truth; the focused swim
-physics proof and Nim check pass. With that fix, `wet_start` immediately
-reports swimming, casts Aquatic Form, and advances normally.
+1. Draft clamp unconditional again; the `shore` flag is gone from the
+   schema (schema-level test forbids it).
+2. The exit beat's PLANAR target sits up the beach so the engine's 8 yd
+   stop ring lands on dry sand. Live-run evidence forced this: a waterline
+   target was "reached" at depth 1.4 with the swim flag still up — parked
+   wet forever. The swimmer must ground (stock client clears swimming on
+   the rising floor) before it can stop; the land connector owns the run
+   from there.
+3. `connector_swim_02` swung seaward off a sandbar 1.9 yd proud of the
+   surface that the old chord crossed (water-mask audit; C's sandbar
+   lesson, applied offline this time).
 
-The latest correct fixture then failed much later: near the end of the
-fatigue ribbon the seat entered the known park/flag-churn class, stopped
-making useful progress, and died with no combat flag after health fell
-2754 → 1586 → 490 → 0. Best remaining distance was 257.2 yd. This is no
-longer the old shoreline/sentinel regression, and B is not signed off until
-the late failure is fixed and two consecutive runs pass.
+Residual (non-blocking, upstream class): 1–6 transient mid-water Aquatic
+flickers per run, all self-recovered at the surface. Depth is what makes
+them lethal — see B.
 
-## Why F is partial: southern Timbermaw is not the Detour surface
+## Why B is fork-blocked: flag desync at depth + unknown shoreline liquid
 
-The finale route is complete on both sides of Timbermaw. A focused
-`timbermaw_north_tunnel → winterspring_west_entry` run passes, and the
-Winterspring corridor reaches Everlook while avoiding the dense Winterfall
-camp, a hostile spawn at the old lake beat, and the deterministic
-(6757,-4489) collision trap.
+Instrumented repro (2026-08-11): four Aquatic/swim-flag drops in one run
+(x -6692, -6263, -5961, -5653). Three self-recovered at the surface. The
+fourth hit the -5675 wall under-gap dive — the one deep point on the
+ribbon — and a deep seat with no swim flag has no water physics: it fell
+through the column (EV clip chain z -235 → -602) until the server
+failsafe relocated it 1,500 yd back. `FLIGHT` shows `nav=following` with
+the correct commanded dive profile — nothing brain-side to fix, and the
+seaward bypass around the wall costs a full fatigue bar (unaffordable).
 
-The unresolved leg is `timbermaw_hold → timbermaw_north_tunnel`. VMaNGOS
-Detour returns an exterior terrain route that climbs from the hold to about
-z692 (`ascending_slope=2.187`) while the rendered character is inside the
-Timbermaw WMO. Live, the client follows that incompatible corridor, wedges,
-then falls through collision until the server failsafe relocates it. Finale
-ownership now remains monotonic after that failsafe, so the failure stays
-visible instead of silently sending the bot south on segment E.
+Second blocker: after the failsafe the seat parked at the beach
+(-6776,-4828) with `WETSTATEDBG lk=false` — the fork's `22c612006`
+REJECTS the below-terrain liquid sample instead of correcting it, so
+`liquid_known=false` at the shoreline and the wade entry gate can never
+open. Dry entry (`water_entry` fixture) stays blocked; this replaces the
+old -500 sentinel as the entry blocker. Both ledgered with asks in
+`~/src/wow-coworld/upstream-health.md`.
 
-The downstream Winterspring pass is functional but not yet a clean quality
-gate: it recorded 22 clip events and p95 cross-track 103.6 yd while recovering
-from two client falls. Endpoint result was 39.0 s, 39.0 yd, zero deaths, zero
-snags.
+History: B gated 2× on 2026-08-10 pre-merge — the desync frequency is a
+post-merge regression, not a route problem.
 
-## Why C failed (now GATE MET): grounding + wreck doodad, both fixed
+## Why F waits on the fork: no steering, no jumping inside the WMO
 
-The seat swam ~800 yd in Aquatic Form (WETDBG: speed 7.08, submerged,
-surface 0.0), threw a form_lost/form_gained flicker, and then hung
-suspended at z -9 — in water 32 yd deep per the MCLQ water mask, so NOT
-grounded — with `is_swimming=false`, `nav planning→unavailable`
-("source projection unavailable": a non-swimming seat can't ground-plan
-from mid-ocean). Nothing recovers this state: the park detector requires
-the swim flag UP; the wade band is surface-relative; the snag hop is
-land-phase only. This is the known swim-flag flicker class (ledgered
-upstream) in a new, stickier form. Candidate brain-side recovery: a
-"sunk seat" detector (wet chain + submerged + not swimming + frozen) —
-but what input actually moves that seat is a fork-physics question;
-evidence first via WETSTATEDBG.
+Committed-contract research (2026-08-11): the lua-bot contract's only
+movement kind is Detour `navigate`; the sole bearing-steer is hard-gated
+on liquid; and NO call site can emit a jump. VMaNGOS Detour serves an
+exterior z692 over-the-mountain corridor inside Timbermaw that the client
+wedges on and falls through — and monofuel's manual walk proved the
+Felwood cave lip REJECTS plain forward walking (a jump is required; the
+1 Hz F9 log sampled between jump frames, see
+[reference-logs.md](reference-logs.md)).
 
-Ribbon depth audit (water mask): two beats sat near shallow sandbars
-(1.4 yd / 2.4 yd legs) — `coast_04`/`coast_09` nudged to ≥3.9 yd minimum
-leg depth. Unrelated to the z -9 freeze (that water is 32 yd deep) but
-removes future grounding risk.
+Ready and waiting traverse-side:
+- 37-beat walked-ground interior chain
+  (`lua/config/traverse_finale_interior_beats.*`) resampled from the
+  manual logs by `tools/resample_trace_beats.py`; all `hook = true`
+  (galleries double back in x), all declaring
+  `navigation_mode = local_steer` + `allow_jump` (forward-safe: the
+  committed parser ignores unknown intent keys).
+- Brain wiring: INTERIOR owns the run from the cave mouth until its last
+  beat retires, then the Winterspring finale line (exterior hold node
+  deleted; `timbermaw_north_tunnel → winterspring_west_entry` bridges the
+  unwalked exit tunnel — mesh probes REACH both targets at interior floor
+  z ≤ 588, worst slope 1.03, so the bridge is plausible pending the
+  encore walk).
 
-## Segment history (gates met before this battery)
+Fork asks (ledgered; monofuel assigned ownership to the fork agent):
+land `local_steer` (GPT draft on branch `gpt-sol-local-steer-wip`, needs
+trim + review) and intent-requestable `allow_jump`
+(`navigation_steering.nim:603` already supports advertised jumps behind a
+flag every lua-bot call site leaves false).
 
-- B (fatigue swim): gate met 2026-08-10 pre-merge (2× consecutive PASS,
-  24.6/23.7 yd) — the regression is environmental, not route.
-- E (painted road): gate met 2026-08-11 (2× consecutive PASS, zero deaths,
-  zero unplanned swims) — reconfirmed by this battery.
+Known walked-coverage gaps (encore F9 targets, ~60 s each): the mouth
+passage (6517 → 6579) including the jump lip, and the exit tunnel.
 
 ## Next actions
 
-1. Fix B's late park/flag-churn without changing the proven water ribbon,
-   then rerun the two-pass gate from `wet_start`.
-2. Add a narrowly scoped client-side WMO-interior steering solution for the
-   southern Timbermaw leg once the existing dirty lua-bot interface work is
-   safely integrated; do not route over the exterior z692 Detour surface.
-3. Remove the recovered terrain falls in D and downstream F, then require two
-   clean consecutive F passes before signing off the complete route.
+1. Fork agent: B's flag-stability + shoreline-liquid fixes; F's
+   local_steer + allow_jump. Everything else integrates the moment they
+   land.
+2. Stitched A–E gate (spawn → felwood_cave_entrance): in progress — note
+   it crosses B's fatigue ribbon, so it rides the same desync dice until
+   the fork fix lands; attempts double as desync statistics.
+3. monofuel (optional, ~2 min total): encore F9 walks of the cave mouth
+   passage and the exit tunnel.
