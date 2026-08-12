@@ -483,6 +483,36 @@ check(caveResume.kind == "navigate" and caveResume.reason == holdNextId,
   "after the interior hop window the same beat resumes")
 nav = { state = "following", failed_here = false, walkout_available = false }
 
+-- INDOORS FORM GATE: Travel Form is outdoor-only in 1.12. Inside a WMO
+-- the brain must keep navigating formless (one edge-triggered EV) instead
+-- of standing still to chat-cast a spell that can never succeed — the
+-- Timbermaw crawl of 2026-08-12. Fresh brain: interior ownership and the
+-- form-retry pacing are monotonic per run.
+package.loaded["traverse"] = nil
+local indoorPetrel = require("traverse")
+clock = clock + 100.0
+nav = { state = "following", failed_here = false, walkout_available = false }
+local indoorMove = indoorPetrel.decide(view(6600.0, -2085.0,
+  { shapeshift_form_id = 0, indoors_known = true, indoors = true }))
+check(indoorMove.kind == "navigate",
+  "an indoors formless seat navigates instead of casting")
+check(any_log_find("EV form_denied_indoors") ~= nil,
+  "the indoor denial logs one EV")
+check(indoorMove.stop_distance == 4.0,
+  "sparse stops stay strictly inside the capture radius")
+clock = clock + 6.0
+local indoorAgain = indoorPetrel.decide(view(6610.0, -2085.0,
+  { shapeshift_form_id = 0, indoors_known = true, indoors = true }))
+check(indoorAgain.kind == "navigate",
+  "still navigating formless while indoors")
+clock = clock + 20.0
+local outdoorCast = indoorPetrel.decide(view(6620.0, -2085.0,
+  { shapeshift_form_id = 0, indoors_known = true, indoors = false }))
+check(outdoorCast.kind == "cast_spell" and outdoorCast.spell == 783,
+  "stepping outside re-arms the Travel Form cast")
+check(any_log_find('"indoors":true') ~= nil,
+  "the flight recorder carries the indoors flag")
+
 -- DOCTRINE GUARD: the brain must never contain form-cancel chat commands or
 -- heal/defensive spells. Multiple AIs have now tried both; both are fatal
 -- on a speedrun (casting stands still, and the cancel command does not
