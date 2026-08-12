@@ -74,17 +74,29 @@ Bake knobs (see `tools/bake_road_waypoints.py`):
   exceeds the threshold. Meta field: `max_width_yd`. Bake stats include
   `dropped_wide`. Isolated wide blobs die; a blob 8-connected to a real
   road dilutes into the network mean and survives.
+- `--max-grade` (default `0.55`; `<=0` disables) skips lattice cells
+  whose local terrain grade (central difference over ±4 yd via
+  `ground_z`) exceeds the threshold. Meta field: `max_grade`. Sample
+  stats include `grade_skipped`. Walkability guard — kills cliff-face
+  paint.
+- `--min-component-length` (default `150.0`; `<=0` disables) drops
+  whole components whose total centerline arclength is under the
+  threshold. Meta field: `min_component_length_yd`. Bake stats include
+  `dropped_short`. Network-scale guard — isolated paint scraps die.
 - Meta also records `markers` (copy of `ROAD_TEXTURE_MARKERS`) and
   `overlay_only_markers` (copy of `OVERLAY_ONLY_MARKERS`).
 
 `ROAD_TEXTURE_MARKERS` (substring match, lowercased): `road`,
 `elwynncobblestone`, `duskwoodcobblestone`, `tanarisdirtfootprint`,
-`thousandneedlesdirt`. `OVERLAY_ONLY_MARKERS` is `thousandneedlesdirt`
-and `tanarisdirtfootprint`: those count as road only when painted as an
-overlay layer (alpha > 64), never as a chunk's base layer — zone-floor
-dirt is ground, brushed dirt is the trail. `thousandneedlesdirt` was
-dropped as a base-layer blob (the whole canyon floor is that dirt) and
-re-enabled overlay-only, so Thousand Needles now bakes trail segments.
+`thousandneedlesrockhighlight02`. `OVERLAY_ONLY_MARKERS` is
+`thousandneedlesrockhighlight02` and `tanarisdirtfootprint`: those
+count as road only when painted as an overlay layer (alpha > 64), never
+as a chunk's base layer. `thousandneedlesdirt` was tried twice and
+removed: as a base marker it blobbed the whole canyon floor; as
+overlay-only it painted cliff faces (median grade 1.02). The actual
+light-brown Thousand Needles road paint is
+`thousandneedlesrockhighlight02`. Overlay-only because mesa tops carry
+it as a base layer; dual-use on mesa rims is killed by `--max-grade`.
 
 Dev subset (does not replace the checked-in artifact):
 
@@ -111,10 +123,16 @@ with a newline.
   baked ends. Stitch with a `"source": "hand"` line (same as bridges).
 - **Tanaris paint is thin.** The extra marker is `tanarisdirtfootprint`
   (a footprint tileset, not a `*road*` tileset); coverage is sparse.
-  Overlay-only, same as Thousand Needles dirt.
-- **Thousand Needles trails are overlay dirt.** `thousandneedlesdirt`
-  is a marker again, overlay-only: canyon-floor base paint is ground,
-  brushed overlay is the trail.
+  Overlay-only, same as Thousand Needles highlight.
+- **Thousand Needles trail is overlay `thousandneedlesrockhighlight02`.**
+  Mesa-top base paint is not road; overlay is the trail. Dual-use on
+  mesa rims is dropped by `--max-grade`. The trail bakes sparse/dashed
+  (paint gaps + the grade and length gates), so hand stitches are
+  expected there.
+- **Isolated scraps under 150 yd never bake.** `--min-component-length`
+  drops whole components below that arclength. Roads matter as a
+  network — add a `"source": "hand"` line for anything genuinely
+  needed.
 - **Isolated wide blobs are auto-dropped** by `--max-width`. A blob
   fused (8-connected) to a real road dilutes into the network mean and
   survives — trim those by hand.

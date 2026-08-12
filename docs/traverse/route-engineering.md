@@ -95,12 +95,16 @@ Eastern Kingdoms: `--map azeroth`. `ROAD_TEXTURE_MARKERS` is the `*road*`
 substring plus `elwynncobblestone` (Elwynn's paved textures do not
 contain `road`), `duskwoodcobblestone` (same for Duskwood),
 `tanarisdirtfootprint` (Tanaris coverage is thin — sparse footprint
-paint), and `thousandneedlesdirt`. The last two are overlay-only
-(`OVERLAY_ONLY_MARKERS`): they count as road only when painted as an
-overlay layer (alpha > 64), never as a chunk's base layer — zone-floor
-dirt is ground, brushed dirt is the trail. `thousandneedlesdirt` was
-dropped as a base-layer blob (the whole canyon floor is that dirt) and
-re-enabled overlay-only, so Thousand Needles now bakes trail segments.
+paint), and `thousandneedlesrockhighlight02`. The last two are
+overlay-only (`OVERLAY_ONLY_MARKERS`): they count as road only when
+painted as an overlay layer (alpha > 64), never as a chunk's base
+layer. `thousandneedlesdirt` was tried twice and removed: as a base
+marker it blobbed the canyon floor; as overlay-only it painted cliff
+faces. The actual light-brown Thousand Needles road paint is
+`thousandneedlesrockhighlight02` — identified by correlating minimap
+BLP luminance with ADT paint signatures, a trick worth repeating on
+new zones. Overlay-only because mesa tops carry it as a base layer;
+dual-use on mesa rims is killed by the grade gate.
 
 Bake always Zhang-Suen-thins the paint mask first, so a wide road still
 yields a single centerline. Road cells whose MCLQ water depth exceeds
@@ -108,7 +112,13 @@ yields a single centerline. Road cells whose MCLQ water depth exceeds
 like the Pool of Tears no longer bake. `--max-width` (default 28.0 yd;
 `<=0` disables) drops whole components whose mean paint width (cell
 area / total centerline arclength) exceeds the threshold — isolated
-blobs die; a blob 8-connected to a real road survives.
+blobs die; a blob 8-connected to a real road survives. `--max-grade`
+(default 0.55; `<=0` disables) skips lattice cells whose local terrain
+grade (central difference over ±4 yd via `ground_z`) exceeds the
+threshold — walkability guard, kills cliff-face paint.
+`--min-component-length` (default 150.0 yd; `<=0` disables) drops
+whole components whose total centerline arclength is under the
+threshold — network-scale guard, kills isolated paint scraps.
 
 ## Technique: trace-pinning (walked ground is evidence)
 
