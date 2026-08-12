@@ -11,7 +11,7 @@ got. See [route-engineering.md](route-engineering.md) for the tooling.
 | # | Segment | Checkpoints | Verdict | Detail |
 |---|---|---|---|---|
 | A | Tanaris desert | `spawn → water_entry` | **PASS** | Stable; reconfirmed inside the stitched run |
-| B | Fatigue swim | `wet_start → duskwallow_coast` | **FORK-BLOCKED** | Two client-side blockers, both ledgered with evidence (see B analysis). Brain exonerated: it commanded the correct dive profile at the failure point |
+| B | Fatigue swim | `wet_start → duskwallow_coast` | **HARDENED + FORK-GATED** (3 PASSes: 39.0/37.5/33.5 s) | Route rebuilt on corrected terrain data (see B analysis); remaining failures are post-merge client flag desyncs whose sites move run to run. Gate pending the fork stability fix |
 | C | Coastal swim | `duskwallow_coast → merchant_coast` | **GATE MET** | Reconfirmed post-fix: PASS 53.0 s / 39.0 yd |
 | D | Barrens connector | `merchant_coast → top_barrens` | **GATE MET (3× consecutive)** | 84.5 / 50.0 / 53.0 s, zero deaths, zero snags — after killing GPT 5.6 Sol's wet-z "shore" bypass (see D analysis) |
 | E | Northern land run | `top_barrens → felwood_cave_entrance` | **PASS** | Painted-road route, stable |
@@ -41,7 +41,22 @@ Residual (non-blocking, upstream class): 1–6 transient mid-water Aquatic
 flickers per run, all self-recovered at the surface. Depth is what makes
 them lethal — see B.
 
-## Why B is fork-blocked: flag desync at depth + unknown shoreline liquid
+## Why B is fork-gated: the route is at its structural ceiling
+
+The 2026-08-11/12 hardening campaign (11 instrumented runs) fixed every
+terrain hazard the corrected sampler could see: the -5675 wall re-cut,
+the -5150 spur, the -5480 headland, two guard beats, the y=-4800
+chunk-seam freeze (three swimmers froze AT the seam — crossing removed),
+and a fatigue-ladder truth pass (042's refill flag was a phantom; 043's
+chunk is genuinely safe; 040 centered for real dwell). The road_mask
+MCVT/MCLQ axis transpose was found and fixed in the process — all prior
+slope depths were fiction. Three PASSes with improving times followed —
+but a 16-yd wander-band audit shows 26 of 49 legs under band: a coastal
+ribbon cannot out-route the 10x controller's ±18 yd wander. B gated 2×
+pre-merge on a TIGHTER route; the post-merge mid-swim flag desync is the
+sole remaining blocker (ledgered with statistics).
+
+## Older B analysis: flag desync at depth + unknown shoreline liquid
 
 Instrumented repro (2026-08-11): four Aquatic/swim-flag drops in one run
 (x -6692, -6263, -5961, -5653). Three self-recovered at the surface. The

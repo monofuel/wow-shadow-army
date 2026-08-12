@@ -66,12 +66,12 @@ for i = 2, #landRoute.beats do
   check(landRoute.beats[i].hook or landRoute.beats[i].x > landRoute.beats[i - 1].x,
     "land beats march north monotonically (hooks exempt)")
 end
-check(#route.beats == 50, "route keeps every beat")
+check(#route.beats == 52, "route keeps every beat (incl. the two clearance guards)")
 local wetCount = 0
 for _, b in ipairs(route.beats) do
   if b.wet then wetCount = wetCount + 1 end
 end
-check(wetCount == 48, "route keeps the wet ribbon")
+check(wetCount == 50, "route keeps the wet ribbon")
 check(route.beats[1].id == "land_approach" and route.beats[2].id == "water_entry",
   "land legs lead the route")
 
@@ -423,6 +423,65 @@ clock = clock + 0.1
 petrel.decide(view(1200.0, -2300.0, { shapeshift_form_id = 0 }))
 check(any_log_find("EV form_lost form=3") ~= nil,
   "form 3 -> 0 logs EV form_lost")
+
+-- SPARSE ROUTE RECOVERY: the walked Timbermaw chain is dispatched through
+-- the sparse navigator, which had no snag machinery at all — the run of
+-- 2026-08-11 walked 380 yd into the cave, froze to the millimeter at
+-- (6866.6, -2126.2) with nav=unavailable on timbermaw_17, and never
+-- attempted a single recovery. Interior ownership is monotonic for the life
+-- of a run, so the cave cannot be replayed on the instance that already
+-- finished it: take a fresh brain.
+package.loaded["traverse"] = nil
+local cavePetrel = require("traverse")
+clock = clock + 100.0
+nav = { state = "following", failed_here = false, walkout_available = false }
+-- Walk the gallery so the frozen pose steers at the next hold-chamber beat
+-- like the live run did (interior beats are all hooks: they retire by
+-- capture only). The chain is regenerated whenever spacing changes, so the
+-- expectation is looked up by COORDINATE (the walked point past the ramp),
+-- never by beat number.
+local holdNextId
+for _, b in ipairs(interiorRoute.beats) do
+  if math.abs(b.x - 6886.6) < 0.2 and math.abs(b.y + 2104.7) < 0.2 then
+    holdNextId = b.id
+  end
+end
+check(holdNextId ~= nil, "the hold-chamber walked point is in the chain")
+cavePetrel.decide(view(6854.6, -2114.7, formed))
+clock = clock + 1.0
+cavePetrel.decide(view(6876.1, -2115.8, formed))
+clock = clock + 1.0
+nav = { state = "unavailable", failed_here = true, walkout_available = false,
+  waypoint_count = 0 }
+local caveBeat = cavePetrel.decide(view(6866.6, -2126.2, formed))
+check(caveBeat.kind == "navigate" and caveBeat.reason == holdNextId,
+  "the frozen interior pose steers at the next hold-chamber beat")
+local caveHop = nil
+for _ = 1, 20 do
+  clock = clock + 1.0
+  local d = cavePetrel.decide(view(6866.6, -2126.2, formed))
+  if d.reason == "snag_hop" then caveHop = d break end
+end
+check(caveHop ~= nil and caveHop.kind == "navigate",
+  "a seat frozen inside Timbermaw hops instead of waiting forever")
+check(caveHop.stop_distance == 4.0 and
+    caveHop.route_profile == "prefer_ground",
+  "the interior hop keeps the hop intent shape")
+check(caveHop.status and caveHop.status.snag_hop == true and
+    caveHop.status.phase == "timbermaw",
+  "the interior hop reports the sparse phase")
+local caveDx = caveHop.x - 6866.6
+local caveDy = caveHop.y - (-2126.2)
+check(math.sqrt(caveDx * caveDx + caveDy * caveDy) > 10.0,
+  "the interior hop target is a genuine sidestep")
+
+-- ...and the hop is repositioning only: once the window closes the SAME
+-- beat is steered at again. Sparse routes never rotate a goal either.
+clock = clock + 60.0
+local caveResume = cavePetrel.decide(view(6866.6, -2126.2, formed))
+check(caveResume.kind == "navigate" and caveResume.reason == holdNextId,
+  "after the interior hop window the same beat resumes")
+nav = { state = "following", failed_here = false, walkout_available = false }
 
 -- DOCTRINE GUARD: the brain must never contain form-cancel chat commands or
 -- heal/defensive spells. Multiple AIs have now tried both; both are fatal

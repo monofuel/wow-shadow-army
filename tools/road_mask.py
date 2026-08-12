@@ -494,20 +494,24 @@ class Tile:
         origin_x, origin_y = chunk_origin(a, b, ix, iy)
         fx = (origin_x - x) / CHUNK_YD
         fy = (origin_y - y) / CHUNK_YD
-        # Outer 9x9 grid: vertex (i=y, j=x) lives at heights[i * 17 + j].
+        # Outer 9x9 grid: the 17-stride ROW index counts down X, the column
+        # counts down Y — heights[i_x * 17 + j_y]. Proven by chunk-edge
+        # continuity (2026-08-11): chunks sharing an X edge repeat a ROW,
+        # chunks sharing a Y edge repeat a COLUMN; the transposed read made
+        # ground_z discontinuous by 60-260 yd across every seam on slopes.
         gx = min(8.0, max(0.0, fx * 8.0))
         gy = min(8.0, max(0.0, fy * 8.0))
-        j0 = min(7, int(math.floor(gx)))
-        i0 = min(7, int(math.floor(gy)))
-        tx = gx - j0
-        ty = gy - i0
+        i0 = min(7, int(math.floor(gx)))
+        j0 = min(7, int(math.floor(gy)))
+        tx = gx - i0
+        ty = gy - j0
 
         def outer(i: int, j: int) -> float:
             return heights[i * 17 + j]
 
         h00 = outer(i0, j0)
-        h10 = outer(i0, j0 + 1)
-        h01 = outer(i0 + 1, j0)
+        h10 = outer(i0 + 1, j0)
+        h01 = outer(i0, j0 + 1)
         h11 = outer(i0 + 1, j0 + 1)
         rel = (
             h00 * (1.0 - tx) * (1.0 - ty)
@@ -549,16 +553,17 @@ class Tile:
             return None
         _min_h, _max_h, verts, _tiles = layer
         vx, vy = liquid_vert_coords(x, y)
-        j0 = min(7, int(math.floor(vx)))
-        i0 = min(7, int(math.floor(vy)))
-        tx = vx - j0
-        ty = vy - i0
+        # Same axis truth as MCVT: the 9-stride row counts down X.
+        i0 = min(7, int(math.floor(vx)))
+        j0 = min(7, int(math.floor(vy)))
+        tx = vx - i0
+        ty = vy - j0
 
         def vert(i: int, j: int) -> float:
             return verts[i * LIQUID_VERT_DIM + j]
 
-        h00, h10 = vert(i0, j0), vert(i0, j0 + 1)
-        h01, h11 = vert(i0 + 1, j0), vert(i0 + 1, j0 + 1)
+        h00, h10 = vert(i0, j0), vert(i0 + 1, j0)
+        h01, h11 = vert(i0, j0 + 1), vert(i0 + 1, j0 + 1)
         # FLT_MAX marks missing magma/slime verts -- fall back to nearest finite.
         candidates = (h00, h10, h01, h11)
         if not all(math.isfinite(h) and abs(h) < 1.0e30 for h in candidates):
