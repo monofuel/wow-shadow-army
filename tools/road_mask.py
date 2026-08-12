@@ -116,14 +116,16 @@ MCLQ_TILE_NO_LIQUID = 0x0F
 
 # A road layer counts as "on road" above this alpha (0-255).
 ROAD_ALPHA_THRESHOLD = 64
-# NOTE: thousandneedlesdirt was tried and dropped 2026-08-12 — the whole
-# canyon floor is that dirt, so the zone baked into one solid blob.
+# thousandneedlesdirt is overlay-only: zone-floor dirt as a base layer is
+# ground; dirt brushed as an overlay is the trail.
 ROAD_TEXTURE_MARKERS = (
     "road",
     "elwynncobblestone",
     "duskwoodcobblestone",
     "tanarisdirtfootprint",
+    "thousandneedlesdirt",
 )
+OVERLAY_ONLY_MARKERS = ("thousandneedlesdirt", "tanarisdirtfootprint")
 
 DEFAULT_ADT_DIR = Path(
     os.environ.get(
@@ -181,7 +183,8 @@ class Probe:
             if not layer.is_road:
                 continue
             if layer.index == 0:
-                # Base layer road paint covers the whole chunk.
+                if is_overlay_only_texture(layer.texture):
+                    continue  # zone-floor dirt: base layer is not road
                 return RoadSample(True, layer.texture, 255)
             if best is None or layer.alpha > best.alpha:
                 best = layer
@@ -273,6 +276,10 @@ def liquid_vert_coords(x: float, y: float) -> tuple[float, float]:
 
 def is_road_texture(name: str) -> bool:
     return any(m in name.lower() for m in ROAD_TEXTURE_MARKERS)
+
+
+def is_overlay_only_texture(name: str) -> bool:
+    return any(m in name.lower() for m in OVERLAY_ONLY_MARKERS)
 
 
 def mclq_tile_has_liquid(flag: int) -> bool:

@@ -143,9 +143,8 @@ class TestTransformMath(unittest.TestCase):
         self.assertTrue(
             rmask.is_road_texture("Tileset\\Tanaris\\TanarisDirtFootprint.blp")
         )
-        # thousandneedlesdirt marker was tried and dropped (whole canyon floor
-        # is that dirt -> zone baked to a blob); pin that it stays off.
-        self.assertFalse(
+        # overlay-only: still a road marker; Probe.sample ignores it as base.
+        self.assertTrue(
             rmask.is_road_texture(
                 "Tileset\\ThousandNeedles\\ThousandNeedlesDirt.blp"
             )
@@ -155,6 +154,27 @@ class TestTransformMath(unittest.TestCase):
         self.assertFalse(
             rmask.is_road_texture("Tileset\\Duskwood\\DuskwoodGrassBase.blp")
         )
+        self.assertTrue(
+            rmask.is_overlay_only_texture(
+                "Tileset\\ThousandNeedles\\ThousandNeedlesDirt.blp"
+            )
+        )
+        self.assertTrue(
+            rmask.is_overlay_only_texture(
+                "Tileset\\Tanaris\\TanarisDirtFootprint.blp"
+            )
+        )
+        self.assertFalse(rmask.is_overlay_only_texture("KalidarRoad.blp"))
+        self.assertFalse(
+            rmask.is_overlay_only_texture(
+                "Tileset\\Elwynn\\ElwynnCobbleStoneBase.blp"
+            )
+        )
+        self.assertFalse(
+            rmask.is_overlay_only_texture("Tileset\\Felwood\\FelwoodDirt.blp")
+        )
+        for marker in rmask.OVERLAY_ONLY_MARKERS:
+            self.assertTrue(rmask.is_road_texture(marker))
 
     def test_tile_path_infers_map_name_from_dir(self) -> None:
         mask = rmask.RoadMask(Path("/nonexistent/azeroth"), map_name=None)
@@ -294,6 +314,32 @@ class TestRoadSampleSelection(unittest.TestCase):
     def test_no_road_layers_reports_nothing(self) -> None:
         probe = self._probe([self._layer(0, False, 255), self._layer(1, False, 200)])
         self.assertEqual(probe.sample, (False, None, 0))
+
+    def test_base_layer_overlay_only_dirt_is_not_road(self) -> None:
+        dirt = r"Tileset\ThousandNeedles\ThousandNeedlesDirt.blp"
+        probe = self._probe([self._layer(0, True, 255, dirt)])
+        self.assertEqual(probe.sample, (False, None, 0))
+
+    def test_overlay_dirt_on_base_dirt_is_road(self) -> None:
+        dirt = r"Tileset\ThousandNeedles\ThousandNeedlesDirt.blp"
+        probe = self._probe(
+            [self._layer(0, True, 255, dirt), self._layer(1, True, 200, dirt)]
+        )
+        self.assertEqual(probe.sample, (True, dirt, 200))
+
+    def test_overlay_dirt_at_threshold_is_not_road(self) -> None:
+        dirt = r"Tileset\ThousandNeedles\ThousandNeedlesDirt.blp"
+        probe = self._probe(
+            [self._layer(0, False, 255), self._layer(1, True, 64, dirt)]
+        )
+        sample = probe.sample
+        self.assertFalse(sample.is_road)
+        self.assertEqual(sample.alpha, 64)
+        self.assertEqual(sample.texture, dirt)
+
+    def test_base_kalidar_road_still_full_coverage(self) -> None:
+        probe = self._probe([self._layer(0, True, 255, "KalidarRoad.blp")])
+        self.assertEqual(probe.sample, (True, "KalidarRoad.blp", 255))
 
 
 class TestLegReport(unittest.TestCase):
@@ -598,7 +644,9 @@ class TestBakeRoadWaypoints(unittest.TestCase):
             cells[(i, 0)] = 5.0
         for j in range(-12, 13):
             cells[(0, j)] = 5.0
-        paths, discarded = bake.extract_centerlines(set(cells), step, min_cells=6)
+        paths, discarded, _dropped = bake.extract_centerlines(
+            set(cells), step, min_cells=6
+        )
         self.assertGreaterEqual(len(paths), 2)
         path_xy = [(i * step, j * step) for path in paths for i, j in path]
         small = set()
@@ -666,7 +714,12 @@ class TestBakeRoadWaypoints(unittest.TestCase):
         self.assertEqual(obj["min_cells"], 6)
         self.assertEqual(obj["min_length_yd"], 30.0)
         self.assertEqual(obj["max_water_depth"], 0.5)
+        self.assertEqual(obj["max_width_yd"], 28.0)
         self.assertEqual(obj["markers"], list(rmask.ROAD_TEXTURE_MARKERS))
+        self.assertIn("thousandneedlesdirt", obj["markers"])
+        self.assertEqual(
+            obj["overlay_only_markers"], list(rmask.OVERLAY_ONLY_MARKERS)
+        )
         azeroth = json.loads(json.dumps(bake.make_meta("azeroth", 4.0, 15.0, 8)))
         self.assertEqual(azeroth["map_id"], 0)
         self.assertEqual(azeroth["decimate_yd"], 15.0)
@@ -710,7 +763,7 @@ class TestThinning(unittest.TestCase):
         self.assertEqual(bake.thin_cells(self._bar(2, 2)), set())
         blob = self._bar(2, 2)
         bar = {(i + 10, 0) for i in range(12)}
-        paths, _ = bake.extract_centerlines(blob | bar, step=4.0, min_cells=4)
+        paths, _, _ = bake.extract_centerlines(blob | bar, step=4.0, min_cells=4)
         self.assertEqual(len(paths), 1)
 
     def test_one_wide_l_and_plus_are_fixed_points(self) -> None:
@@ -740,7 +793,7 @@ class TestThinning(unittest.TestCase):
 
     def test_thick_bar_bakes_to_one_segment(self) -> None:
         cells = {(i, j): 10.0 for i in range(16) for j in range(5)}
-        segs = bake.bake_from_cells(cells, min_length=0.0)
+        segs = bake.bake_from_cells(cells, min_length=0.0, max_width=0.0)
         self.assertEqual(len(segs), 1)
 
     def test_thick_l_is_single_segment_tip_to_tip(self) -> None:
@@ -862,6 +915,51 @@ class TestWaterExclusion(unittest.TestCase):
         _cells, stats = bake.sample_road_cells(mask, 4.0, bbox=bbox)
         self.assertIn("water_skipped", stats)
         self.assertEqual(stats["water_skipped"], 3)
+
+
+class TestMaxWidth(unittest.TestCase):
+    """max_width filter — synthetic cells, no ADT files."""
+
+    def _block(self) -> dict[tuple[int, int], float]:
+        # Solid squares collapse under Zhang-Suen to 1 cell (no path, gate
+        # never fires). A 20x8 rectangle thins to a real centerline ~58 yd wide.
+        return {(i, j): 1.0 for i in range(20) for j in range(8)}
+
+    def test_solid_block_dropped_at_default(self) -> None:
+        segs = bake.bake_from_cells(self._block(), min_length=0.0)
+        self.assertEqual(len(segs), 0)
+
+    def test_max_width_zero_keeps_block(self) -> None:
+        segs = bake.bake_from_cells(self._block(), min_length=0.0, max_width=0.0)
+        self.assertGreaterEqual(len(segs), 1)
+
+    def test_thin_bar_kept_at_default(self) -> None:
+        cells = {(i, j): 1.0 for i in range(50) for j in range(3)}
+        segs = bake.bake_from_cells(cells, min_length=0.0)
+        self.assertEqual(len(segs), 1)
+
+    def test_extract_dropped_wide_counts(self) -> None:
+        block = set(self._block())
+        bar = {(i, j) for i in range(50) for j in range(3)}
+        _, _, dropped_block = bake.extract_centerlines(
+            block, step=4.0, min_cells=6, max_width=28.0
+        )
+        self.assertEqual(dropped_block, 1)
+        _, _, dropped_bar = bake.extract_centerlines(
+            bar, step=4.0, min_cells=6, max_width=28.0
+        )
+        self.assertEqual(dropped_bar, 0)
+
+    def test_block_dropped_thin_bar_survives(self) -> None:
+        cells = self._block()
+        for i in range(50):
+            for j in range(3):
+                cells[(i + 40, j)] = 1.0
+        segs = bake.bake_from_cells(cells, min_length=0.0)
+        self.assertEqual(len(segs), 1)
+        pts = segs[0]["pts"]
+        length = math.hypot(pts[-1][0] - pts[0][0], pts[-1][1] - pts[0][1])
+        self.assertGreater(length, 100.0)
 
 
 class TestMinLength(unittest.TestCase):

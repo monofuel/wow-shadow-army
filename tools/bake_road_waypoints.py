@@ -182,38 +182,57 @@ def thin_cells(comp: set[Cell]) -> set[Cell]:
     return working
 
 
+def _cell_path_length(path: Sequence[Cell], step: float) -> float:
+    return step * sum(
+        math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(path, path[1:])
+    )
+
+
 def extract_centerlines(
     cell_set: set[Cell],
     step: float,
     min_cells: int,
     erase_radius: float = ERASE_YD,
-) -> tuple[list[list[Cell]], list[set[Cell]]]:
-    # Zhang-Suen can annihilate small symmetric blobs entirely (a 2x2 block
-    # thins to nothing) -- drop empty skeletons or pending.sort(key=min) dies.
-    pending = [
-        skeleton
-        for c in connected_components(cell_set)
-        if len(c) >= min_cells
-        for skeleton in (thin_cells(c),)
-        if skeleton
-    ]
+    max_width: float = 0.0,
+) -> tuple[list[list[Cell]], list[set[Cell]], int]:
+    # Width gate only kills isolated pockets. A pocket 8-connected to a real
+    # road dilutes into the network mean and survives.
     paths: list[list[Cell]] = []
     discarded: list[set[Cell]] = []
-    while pending:
-        pending.sort(key=min)
-        comp = pending.pop(0)
+    dropped_wide = 0
+    for comp in sorted(connected_components(cell_set), key=min):
         if len(comp) < min_cells:
-            discarded.append(comp)
-            continue
-        path = diameter_path(comp)
-        paths.append(path)
-        remaining = erase_near_path(comp, path, step, erase_radius)
-        for rem in connected_components(remaining):
-            if len(rem) >= min_cells:
-                pending.append(rem)
-            else:
-                discarded.append(rem)
-    return paths, discarded
+            continue  # silent raw-size skip, as today
+        skeleton = thin_cells(comp)
+        if not skeleton:
+            continue  # annihilated-2x2 guard, unchanged
+        comp_paths: list[list[Cell]] = []
+        comp_discarded: list[set[Cell]] = []
+        pending = [skeleton]
+        while pending:
+            pending.sort(key=min)
+            piece = pending.pop(0)
+            if len(piece) < min_cells:
+                comp_discarded.append(piece)
+                continue
+            path = diameter_path(piece)
+            comp_paths.append(path)
+            for rem in connected_components(
+                erase_near_path(piece, path, step, erase_radius)
+            ):
+                (pending if len(rem) >= min_cells else comp_discarded).append(rem)
+        total_len = sum(_cell_path_length(p, step) for p in comp_paths)
+        if (
+            max_width > 0
+            and comp_paths
+            and total_len > 0
+            and len(comp) * step * step / total_len > max_width
+        ):
+            dropped_wide += 1
+            continue  # whole component is a blob, not a road
+        paths.extend(comp_paths)
+        discarded.extend(comp_discarded)
+    return paths, discarded, dropped_wide
 
 
 def cells_to_world(
@@ -278,8 +297,11 @@ def bake_from_cells(
     decimate_yd: float = 10.0,
     min_cells: int = 6,
     min_length: float = 30.0,
+    max_width: float = 28.0,
 ) -> list[dict]:
-    paths, _discarded = extract_centerlines(set(cells), step, min_cells)
+    paths, _discarded, _dropped_wide = extract_centerlines(
+        set(cells), step, min_cells, max_width=max_width
+    )
     return canonicalize_segments(
         _paths_to_segments(paths, cells, step, decimate_yd, min_length)
     )
@@ -292,6 +314,7 @@ def make_meta(
     min_cells: int,
     min_length: float = 30.0,
     max_water_depth: float = 0.5,
+    max_width: float = 28.0,
 ) -> dict:
     return {
         "meta": 1,
@@ -304,7 +327,9 @@ def make_meta(
         "min_cells": min_cells,
         "min_length_yd": min_length,
         "max_water_depth": max_water_depth,
+        "max_width_yd": max_width,
         "markers": list(rmask.ROAD_TEXTURE_MARKERS),
+        "overlay_only_markers": list(rmask.OVERLAY_ONLY_MARKERS),
     }
 
 
@@ -447,6 +472,7 @@ def bake_map(
     bbox: tuple[float, float, float, float] | None = None,
     min_length: float = 30.0,
     max_water_depth: float = 0.5,
+    max_width: float = 28.0,
 ) -> dict:
     t0 = time.monotonic()
     print(
@@ -468,11 +494,14 @@ def bake_map(
         file=sys.stderr,
         flush=True,
     )
-    paths, discarded = extract_centerlines(set(cells), step, min_cells)
+    paths, discarded, dropped_wide = extract_centerlines(
+        set(cells), step, min_cells, max_width=max_width
+    )
     n_components = len(connected_components(set(cells))) if cells else 0
     print(
         f"components={n_components} centerlines={len(paths)} "
-        f"discarded_remnants={len(discarded)} elapsed={time.monotonic() - t0:.1f}s",
+        f"discarded_remnants={len(discarded)} dropped_wide={dropped_wide} "
+        f"elapsed={time.monotonic() - t0:.1f}s",
         file=sys.stderr,
         flush=True,
     )
@@ -486,6 +515,7 @@ def bake_map(
         min_cells,
         min_length=min_length,
         max_water_depth=max_water_depth,
+        max_width=max_width,
     )
     existing = out_path.read_text(encoding="utf-8") if out_path.is_file() else ""
     hand = read_hand_lines(existing)
@@ -504,6 +534,7 @@ def bake_map(
             "components": n_components,
             "segments": len(baked),
             "hand": len(hand),
+            "dropped_wide": dropped_wide,
             "elapsed_s": elapsed,
         }
     )
@@ -537,6 +568,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.5,
         help="Skip road cells with MCLQ depth above this; <=0 disables",
     )
+    parser.add_argument(
+        "--max-width",
+        type=float,
+        default=28.0,
+        help="Drop components whose mean paint width exceeds this (yd); <=0 disables",
+    )
     parser.add_argument("--out", type=Path, default=None)
     parser.add_argument(
         "--bbox",
@@ -567,6 +604,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         bbox=bbox,
         min_length=args.min_length,
         max_water_depth=args.max_water_depth,
+        max_width=args.max_width,
     )
     return 0
 
