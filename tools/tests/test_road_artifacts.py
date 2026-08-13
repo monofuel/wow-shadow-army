@@ -107,6 +107,14 @@ class TestKalimdorRoadConnectivity(unittest.TestCase):
         "great_lift_lower": (-4677.066, -1853.667, -43.857),
         # Where the painted FeralasRoad descent ends on the 1kN side.
         "feralas_terminus": (-4280.0, -776.0, -49.4),
+        # Shimmering Flats racetrack; looser XY — the crossing may lawfully
+        # drift on featureless salt.
+        "racetrack_mid": (-6230.0, -3700.0, -60.0),
+        # Painted Tanaris road north end — ties the 1kN network to Tanaris.
+        "tanaris_road": (-6720.0, -3456.0, 86.0),
+    }
+    ANCHOR_RADIUS = {
+        "racetrack_mid": 150.0,
     }
 
     @classmethod
@@ -126,7 +134,10 @@ class TestKalimdorRoadConnectivity(unittest.TestCase):
 
     def test_thousand_needles_connects_to_neighbors(self) -> None:
         hits = {
-            name: self._anchor_hit(xyz) for name, xyz in self.ANCHORS.items()
+            name: self._anchor_hit(
+                xyz, self.ANCHOR_RADIUS.get(name, ANCHOR_RADIUS_YD)
+            )
+            for name, xyz in self.ANCHORS.items()
         }
         shared: set[int] | None = None
         for _nearest, _pt, comps in hits.values():
@@ -137,9 +148,8 @@ class TestKalimdorRoadConnectivity(unittest.TestCase):
         if shared:
             return
         lines = [
-            "Thousand Needles floor must share one component with both "
-            f"neighbor anchors (stitch={STITCH_YD} yd, "
-            f"reach={ANCHOR_RADIUS_YD} yd)."
+            "Thousand Needles floor must share one component with all "
+            f"neighbor anchors (stitch={STITCH_YD} yd)."
         ]
         for name, (nearest, pt, comps) in hits.items():
             if comps:
@@ -162,7 +172,9 @@ class TestKalimdorRoadConnectivity(unittest.TestCase):
         self.fail("\n".join(lines))
 
     def _anchor_hit(
-        self, xyz: tuple[float, float, float]
+        self,
+        xyz: tuple[float, float, float],
+        radius: float = ANCHOR_RADIUS_YD,
     ) -> tuple[float, Point | None, set[int]]:
         ax, ay, az = xyz
         nearest = float("inf")
@@ -174,7 +186,7 @@ class TestKalimdorRoadConnectivity(unittest.TestCase):
                 if dist < nearest:
                     nearest = dist
                     nearest_pt = pt
-                if dist <= ANCHOR_RADIUS_YD and abs(pt[2] - az) <= ANCHOR_Z_YD:
+                if dist <= radius and abs(pt[2] - az) <= ANCHOR_Z_YD:
                     comps.add(self.seg_to_comp[si])
         return nearest, nearest_pt, comps
 

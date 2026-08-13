@@ -1189,6 +1189,48 @@ class TestRouteEnterCost(unittest.TestCase):
             bake.route_enter_cost(40.0, 0.5, self.C0, self.K, self.SP), 1.0
         )
 
+    def test_z_corridor_inside_adds_zero(self) -> None:
+        corridor = (-120.0, -20.0, 10.0)
+        self.assertEqual(
+            bake.route_enter_cost(
+                40.0, 0.0, self.C0, self.K, self.SP, z=-50.0, z_corridor=corridor
+            ),
+            1.0,
+        )
+        self.assertEqual(
+            bake.route_enter_cost(
+                40.0, 0.0, self.C0, self.K, self.SP, z=-120.0, z_corridor=corridor
+            ),
+            1.0,
+        )
+        self.assertEqual(
+            bake.route_enter_cost(
+                40.0, 0.0, self.C0, self.K, self.SP, z=-20.0, z_corridor=corridor
+            ),
+            1.0,
+        )
+
+    def test_z_corridor_outside_adds_pen(self) -> None:
+        corridor = (-120.0, -20.0, 10.0)
+        self.assertEqual(
+            bake.route_enter_cost(
+                40.0, 0.0, self.C0, self.K, self.SP, z=-19.9, z_corridor=corridor
+            ),
+            11.0,
+        )
+        self.assertEqual(
+            bake.route_enter_cost(
+                40.0, 0.0, self.C0, self.K, self.SP, z=86.0, z_corridor=corridor
+            ),
+            11.0,
+        )
+        self.assertEqual(
+            bake.route_enter_cost(
+                40.0, 0.0, self.C0, self.K, self.SP, z=-120.1, z_corridor=corridor
+            ),
+            11.0,
+        )
+
 
 class _RgbSampler:
     def rgb(self, _x: float, _y: float) -> tuple[int, int, int] | None:
@@ -1275,9 +1317,72 @@ class TestDijkstraRoute(unittest.TestCase):
         self.assertEqual(bytes(str(path_a), "ascii"), bytes(str(path_b), "ascii"))
 
 
+class TestCorridorGate(unittest.TestCase):
+    """Synthetic path stats — 4% outside passes, 6% fails."""
+
+    def test_four_percent_outside_passes_six_fails(self) -> None:
+        lo, hi = -120.0, -20.0
+        path4 = [
+            (0.0, 0.0, -50.0),
+            (96.0, 0.0, -50.0),
+            (100.0, 0.0, 0.0),
+        ]
+        pct4, run4 = bake.corridor_path_stats(path4, lo, hi)
+        self.assertAlmostEqual(pct4, 4.0)
+        self.assertAlmostEqual(run4, 4.0)
+        bake.assert_corridor_gate(pct4, "toy4")
+        path6 = [
+            (0.0, 0.0, -50.0),
+            (94.0, 0.0, -50.0),
+            (100.0, 0.0, 0.0),
+        ]
+        pct6, run6 = bake.corridor_path_stats(path6, lo, hi)
+        self.assertAlmostEqual(pct6, 6.0)
+        self.assertAlmostEqual(run6, 6.0)
+        with self.assertRaises(SystemExit) as ctx:
+            bake.assert_corridor_gate(pct6, "toy6")
+        self.assertIn("corridor gate toy6", str(ctx.exception))
+        self.assertIn("6.0%", str(ctx.exception))
+
+
+class TestPerLegGradeWall(unittest.TestCase):
+    """grade 1.9 is unusable at 1.8, usable at 2.2."""
+
+    def _line(self) -> dict[tuple[int, int], bake.RouteCell]:
+        usable: dict[tuple[int, int], bake.RouteCell] = {}
+        for i, grade in ((0, 0.0), (1, 1.9), (2, 0.0)):
+            usable[(i, 0)] = bake.RouteCell(
+                x=float(i * 4),
+                y=0.0,
+                z=0.0,
+                g=200,
+                grade=grade,
+                contrast=40.0,
+            )
+        return usable
+
+    def test_grade_1_9_blocked_at_1_8_allowed_at_2_2(self) -> None:
+        usable = self._line()
+        kwargs = dict(
+            usable=usable,
+            start=(0, 0),
+            goal=(2, 0),
+            step=4.0,
+            contrast_c0=25.0,
+            contrast_k=22.0,
+            slope_penalty=2.0,
+        )
+        self.assertIsNone(bake.dijkstra_route(**kwargs, max_grade_wall=1.8))
+        path = bake.dijkstra_route(**kwargs, max_grade_wall=2.2)
+        self.assertEqual(path, [(0, 0), (1, 0), (2, 0)])
+
+
 class TestMinimapRouteConfig(unittest.TestCase):
     def test_leg_endpoints_inside_bbox_and_bbox_on_step_lattice(self) -> None:
         self.assertTrue(bake.MINIMAP_ROUTE_ZONES)
+        pairs: list[tuple[str, str]] = []
+        names: dict[str, tuple[float, float]] = {}
+        override_count = 0
         for _map_name, zones in bake.MINIMAP_ROUTE_ZONES.items():
             for zone in zones:
                 x0, y0, x1, y1 = zone["bbox"]
@@ -1285,12 +1390,22 @@ class TestMinimapRouteConfig(unittest.TestCase):
                     self.assertEqual(value / 4.0, float(int(value / 4.0)), msg=value)
                 lo_x, hi_x = (x0, x1) if x0 <= x1 else (x1, x0)
                 lo_y, hi_y = (y0, y1) if y0 <= y1 else (y1, y0)
-                for a_name, a_xy, b_name, b_xy in zone["legs"]:
+                for raw in zone["legs"]:
+                    a_name, a_xy, b_name, b_xy, opts = bake.parse_route_leg(raw)
+                    pairs.append((a_name, b_name))
+                    if "max_grade_wall" in opts:
+                        override_count += 1
                     for name, (x, y) in ((a_name, a_xy), (b_name, b_xy)):
                         self.assertGreaterEqual(x, lo_x, msg=name)
                         self.assertLessEqual(x, hi_x, msg=name)
                         self.assertGreaterEqual(y, lo_y, msg=name)
                         self.assertLessEqual(y, hi_y, msg=name)
+                        if name in names:
+                            self.assertEqual(names[name], (x, y), msg=name)
+                        else:
+                            names[name] = (x, y)
+        self.assertEqual(len(pairs), len(set(pairs)))
+        self.assertEqual(override_count, 1)
 
 
 if __name__ == "__main__":

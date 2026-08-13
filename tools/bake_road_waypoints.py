@@ -27,6 +27,8 @@ Point = tuple[float, float, float]
 MAP_IDS = {"kalimdor": 1, "azeroth": 0}
 GENERATOR = "tools/bake_road_waypoints.py"
 ERASE_YD = 6.0
+MAX_SNAP_YD = 20.0
+CORRIDOR_OUTSIDE_MAX_PCT = 5.0
 NEIGH8 = tuple(
     (di, dj)
     for di in (-1, 0, 1)
@@ -43,7 +45,7 @@ MINIMAP_ROUTE_ZONES = {
             # bbox ALIGNED to STEP multiples (lattice keys are global
             # integer indices; a misaligned bbox once caused
             # banker's-rounding key collisions in a prototype)
-            "bbox": (-6800.0, -3400.0, -4200.0, -600.0),
+            "bbox": (-7000.0, -4400.0, -4200.0, -600.0),
             "z_band": (-120.0, 100.0),
             "max_grade_wall": 1.8,
             "slope_penalty": 2.0,
@@ -52,30 +54,18 @@ MINIMAP_ROUTE_ZONES = {
             "block_yd": 64.0,
             "max_water_depth": 0.5,
             "legs": [
-                [
-                    "feralas_junction",
-                    (-4280.0, -776.0),
-                    "lift_lower",
-                    (-4677.066, -1853.667),
-                ],
-                [
-                    "lift_lower",
-                    (-4677.066, -1853.667),
-                    "freewind_base",
-                    (-5320.0, -2170.0),
-                ],
-                [
-                    "freewind_base",
-                    (-5320.0, -2170.0),
-                    "flats_mouth",
-                    (-5560.0, -2050.0),
-                ],
-                [
-                    "flats_mouth",
-                    (-5560.0, -2050.0),
-                    "tanaris_road",
-                    (-6256.0, -3336.0),
-                ],
+                ["feralas_junction", (-4280.0, -776.0),      "lift_lower",      (-4677.066, -1853.667), {"z_corridor": (-120.0, -20.0, 10.0)}],
+                ["lift_lower",       (-4677.066, -1853.667), "freewind_base",   (-5320.0, -2170.0),     {"z_corridor": (-120.0, -20.0, 10.0)}],
+                ["freewind_base",    (-5320.0, -2170.0),     "canyon_se",       (-5560.0, -2050.0),     {"z_corridor": (-120.0, -20.0, 10.0)}],
+                # canyon -> basin descent through the verified low-grade gap (seed (-5700,-3130) heading SSW,
+                # measured max grade 1.01, z stays within [-55,-20]); corridor hi -10 gives lip margin
+                ["canyon_se",        (-5560.0, -2050.0),     "basin_entry",     (-5848.0, -3424.0),     {"z_corridor": (-120.0, -10.0, 10.0)}],
+                ["basin_entry",      (-5848.0, -3424.0),     "racetrack_north", (-6100.0, -3500.0),     {"z_corridor": (-120.0, -20.0, 10.0)}],
+                ["racetrack_north",  (-6100.0, -3500.0),     "racetrack_mid",   (-6230.0, -3700.0),     {"z_corridor": (-120.0, -20.0, 10.0)}],
+                ["racetrack_mid",    (-6230.0, -3700.0),     "racetrack_south", (-6350.0, -3900.0),     {"z_corridor": (-120.0, -20.0, 10.0)}],
+                # basin -> Tanaris shelf: measured ramp pinch grade 1.78-1.79 sits AT the 1.8 global wall,
+                # so this leg gets its own wall with margin; climbs lawfully to z~86 -> no z corridor
+                ["racetrack_south",  (-6350.0, -3900.0),     "tanaris_road",    (-6720.0, -3456.0),     {"max_grade_wall": 2.2}],
             ],
         },
     ],
@@ -481,16 +471,83 @@ def _water_too_deep(
     return max_water_depth > 0 and mask.is_water(x, y).depth > max_water_depth
 
 
+def parse_route_leg(
+    raw: Sequence,
+) -> tuple[str, tuple[float, float], str, tuple[float, float], dict]:
+    a_name, a_xy, b_name, b_xy = raw[0], tuple(raw[1]), raw[2], tuple(raw[3])
+    opts = dict(raw[4]) if len(raw) > 4 and raw[4] is not None else {}
+    return a_name, a_xy, b_name, b_xy, opts
+
+
+def zone_collect_grade_wall(zone: dict) -> float:
+    wall = float(zone["max_grade_wall"])
+    for raw in zone.get("legs") or ():
+        opts = parse_route_leg(raw)[4]
+        if "max_grade_wall" in opts:
+            wall = max(wall, float(opts["max_grade_wall"]))
+    return wall
+
+
+def corridor_path_stats(
+    world: Sequence[Point], z_lo: float, z_hi: float
+) -> tuple[float, float]:
+    if len(world) < 2:
+        return 0.0, 0.0
+    total = 0.0
+    outside = 0.0
+    max_run = 0.0
+    run = 0.0
+    for prev, cur in zip(world, world[1:]):
+        length = math.hypot(cur[0] - prev[0], cur[1] - prev[1])
+        total += length
+        if cur[2] < z_lo or cur[2] > z_hi:
+            outside += length
+            run += length
+            if run > max_run:
+                max_run = run
+        else:
+            run = 0.0
+    pct = 0.0 if total <= 0.0 else 100.0 * outside / total
+    return pct, max_run
+
+
+def assert_corridor_gate(pct_outside: float, leg_name: str) -> None:
+    if pct_outside > CORRIDOR_OUTSIDE_MAX_PCT:
+        raise SystemExit(
+            f"minimap route FAILED: corridor gate {leg_name} "
+            f"pct_outside={pct_outside:.1f}% exceeds "
+            f"{CORRIDOR_OUTSIDE_MAX_PCT:.1f}%"
+        )
+
+
+def assert_snap_gate(
+    snap_a: float, snap_b: float, leg_name: str, a_name: str, b_name: str
+) -> None:
+    if snap_a > MAX_SNAP_YD or snap_b > MAX_SNAP_YD:
+        raise SystemExit(
+            f"minimap route FAILED: snap exceeds {MAX_SNAP_YD:.0f}yd "
+            f"for leg {leg_name}: {a_name}={snap_a:.2f}yd "
+            f"{b_name}={snap_b:.2f}yd"
+        )
+
+
 def route_enter_cost(
     contrast: float,
     grade: float,
     contrast_c0: float,
     contrast_k: float,
     slope_penalty: float,
+    z: float = 0.0,
+    z_corridor: tuple[float, float, float] | None = None,
 ) -> float:
     extra = max(0.0, contrast_c0 - contrast) / contrast_k
     slope = slope_penalty * (grade - 0.5) if grade > 0.5 else 0.0
-    return 1.0 + extra + slope
+    corridor = 0.0
+    if z_corridor is not None:
+        lo, hi, pen = z_corridor
+        if z < lo or z > hi:
+            corridor = pen
+    return 1.0 + extra + slope + corridor
 
 
 def route_edge_cost(
@@ -502,13 +559,15 @@ def route_edge_cost(
     contrast_c0: float,
     contrast_k: float,
     slope_penalty: float,
+    z: float = 0.0,
+    z_corridor: tuple[float, float, float] | None = None,
 ) -> float:
     return route_enter_cost(
-        contrast, grade, contrast_c0, contrast_k, slope_penalty
+        contrast, grade, contrast_c0, contrast_k, slope_penalty, z, z_corridor
     ) * step * math.hypot(di, dj)
 
 
-@dataclass
+@dataclass(slots=True)
 class RouteCell:
     x: float
     y: float
@@ -540,7 +599,8 @@ def collect_route_cells(
     lo_x, hi_x = (x0, x1) if x0 <= x1 else (x1, x0)
     lo_y, hi_y = (y0, y1) if y0 <= y1 else (y1, y0)
     z_lo, z_hi = zone["z_band"]
-    max_grade_wall = float(zone["max_grade_wall"])
+    max_grade_wall = zone_collect_grade_wall(zone)
+    zone_grade_wall = float(zone["max_grade_wall"])
     max_water_depth = float(zone["max_water_depth"])
     block_yd = float(zone["block_yd"])
     usable: dict[Cell, RouteCell] = {}
@@ -596,12 +656,15 @@ def collect_route_cells(
                 )
     blocks: dict[Cell, list[int]] = {}
     for key, rec in usable.items():
+        if rec.grade > zone_grade_wall:
+            continue
         blocks.setdefault(_block_index(key[0], key[1], step, block_yd), []).append(
             rec.g
         )
     medians = {bk: _median_int(gs) for bk, gs in blocks.items()}
     for key, rec in usable.items():
-        rec.contrast = rec.g - medians[_block_index(key[0], key[1], step, block_yd)]
+        bk = _block_index(key[0], key[1], step, block_yd)
+        rec.contrast = rec.g - medians[bk] if bk in medians else 0
     stats = {
         "cells": len(usable),
         "blocked": blocked,
@@ -641,6 +704,8 @@ def dijkstra_route(
     contrast_c0: float,
     contrast_k: float,
     slope_penalty: float,
+    max_grade_wall: float | None = None,
+    z_corridor: tuple[float, float, float] | None = None,
 ) -> list[Cell] | None:
     if start not in usable or goal not in usable:
         return None
@@ -661,6 +726,8 @@ def dijkstra_route(
             rec = usable.get(v)
             if rec is None:
                 continue
+            if max_grade_wall is not None and rec.grade > max_grade_wall:
+                continue
             nc = cost + route_edge_cost(
                 rec.contrast,
                 rec.grade,
@@ -670,6 +737,8 @@ def dijkstra_route(
                 contrast_c0,
                 contrast_k,
                 slope_penalty,
+                rec.z,
+                z_corridor,
             )
             prev = dist.get(v)
             if prev is None or nc < prev:
@@ -708,10 +777,16 @@ def route_minimap_legs(
     )
     legs_out: list[tuple[str, list[Point]]] = []
     leg_stats: list[dict] = []
-    for a_name, a_xy, b_name, b_xy in zone["legs"]:
+    zone_wall = float(zone["max_grade_wall"])
+    for raw in zone["legs"]:
+        a_name, a_xy, b_name, b_xy, opts = parse_route_leg(raw)
         leg_name = f"{a_name}->{b_name}"
         ax, ay = a_xy
         bx, by = b_xy
+        z_corridor = opts.get("z_corridor")
+        if z_corridor is not None:
+            z_corridor = (float(z_corridor[0]), float(z_corridor[1]), float(z_corridor[2]))
+        leg_wall = float(opts["max_grade_wall"]) if "max_grade_wall" in opts else zone_wall
         start, snap_a = _snap_anchor(usable, ax, ay, step)
         goal, snap_b = _snap_anchor(usable, bx, by, step)
         if snap_a > 0.0 or snap_b > 0.0:
@@ -721,6 +796,7 @@ def route_minimap_legs(
                 file=sys.stderr,
                 flush=True,
             )
+        assert_snap_gate(snap_a, snap_b, leg_name, a_name, b_name)
         path = dijkstra_route(
             usable,
             start,
@@ -729,6 +805,8 @@ def route_minimap_legs(
             contrast_c0,
             contrast_k,
             slope_penalty,
+            max_grade_wall=leg_wall,
+            z_corridor=z_corridor,
         )
         if path is None:
             raise SystemExit(
@@ -744,13 +822,22 @@ def route_minimap_legs(
             )
         path_yd = _planar_arclength(world)
         zs = [p[2] for p in world]
+        if z_corridor is None:
+            pct_outside, max_run = 0.0, 0.0
+        else:
+            pct_outside, max_run = corridor_path_stats(
+                world, z_corridor[0], z_corridor[1]
+            )
         print(
             f"minimap leg {leg_name}: path_cells={len(path)} "
             f"path_yd={path_yd:.1f} min_z={min(zs):.2f} max_z={max(zs):.2f} "
+            f"pct_outside={pct_outside:.1f}% max_run={max_run:.0f}yd "
             f"snap={snap_a:.2f},{snap_b:.2f}",
             file=sys.stderr,
             flush=True,
         )
+        if z_corridor is not None:
+            assert_corridor_gate(pct_outside, leg_name)
         legs_out.append((leg_name, pts))
         leg_stats.append(
             {
@@ -761,6 +848,8 @@ def route_minimap_legs(
                 "path_yd": path_yd,
                 "min_z": min(zs),
                 "max_z": max(zs),
+                "pct_outside": pct_outside,
+                "max_run": max_run,
                 "snap": [snap_a, snap_b],
             }
         )
