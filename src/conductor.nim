@@ -5,13 +5,16 @@
 # pure code — floor ratchet + assertions vs the champion run — and the
 # reviewer agent can only reject, never approve past a failing gate.
 #
-#   nim r src/conductor.nim <league> <once|run|status|baseline|gate>
+#   nim r src/conductor.nim <league> <once|run|status|baseline|hosted|gate>
 #
 # Config: <wow-coworld root>/conductor.json.  Design: docs/conductor.md.
 
 import
-  std/[os, sequtils, strutils, tables],
+  std/[json, os, sequtils, sets, strutils, tables],
+  scriptorium/git_ops,
   conductor/cfg,
+  conductor/evalgate,
+  conductor/ledger,
   conductor/state
 
 proc usage() =
@@ -19,6 +22,7 @@ proc usage() =
   echo "commands:"
   echo "  status    show config, state, pause/needs-human flags"
   echo "  baseline  evaluate lane HEAD and seed the score ledger"
+  echo "  hosted    ingest hosted episode scores into the hosted ledger"
   echo "  once      run a single tick (ticket -> agent -> gate -> merge)"
   echo "  run       daemon loop (single instance, pause via .conductor/pause)"
   echo "  gate      re-run the gate for the current in-flight candidate"
@@ -33,10 +37,46 @@ proc repoRoot(): string =
 proc monorepoRoot(repo: string): string =
   getEnv("CONDUCTOR_ROOT", repo.parentDir)
 
-proc cmdStatus(cfgAll: ConductorConfig, leagueName, repo: string) =
+proc laneDir(root: string, lc: LeagueConfig): string =
+  result = root / lc.laneCheckout
+  if lc.laneCheckout.len == 0 or not dirExists(result):
+    quit "conductor: laneCheckout '" & lc.laneCheckout &
+      "' not found under " & root
+  let (rc, branch) = gitRunCapture(result, @["rev-parse", "--abbrev-ref", "HEAD"])
+  if rc != 0 or branch.strip() != lc.laneBranch:
+    quit "conductor: " & result & " is on '" & branch.strip() &
+      "', expected lane branch '" & lc.laneBranch & "'"
+
+proc headSha(dir: string): string =
+  let (rc, output) = gitRunCapture(dir, @["rev-parse", "--short=9", "HEAD"])
+  if rc == 0: output.strip() else: "unknown"
+
+proc pinShas(root, lane: string): JsonNode =
+  %*{"wsa": headSha(lane), "fork": headSha(root / "monofuel-vanilla-wow")}
+
+proc reportSummary(report: JsonNode): string =
+  "northing=" & $report{"max_northing"}.getFloat() &
+    " ok=" & $report{"ok"}.getBool() &
+    " deaths=" & $report{"deaths"}.getInt() &
+    " warnings=" & $warningClasses(report).len
+
+proc commitLedger(lane, league, message: string) =
+  let (rcAdd, _) = gitRunCapture(lane, @["add", ScoresDirName])
+  if rcAdd != 0:
+    quit "conductor: git add " & ScoresDirName & " failed in " & lane
+  let (rcCommit, outCommit) = gitRunCapture(lane,
+    @["commit", "-m", message])
+  if rcCommit != 0 and "nothing to commit" notin outCommit:
+    quit "conductor: ledger commit failed: " & outCommit
+  let (rcPush, outPush) = gitRunCapture(lane, @["push"], timeoutMs = 120_000)
+  if rcPush != 0:
+    echo "conductor: WARN ledger push failed (will ride the next push): ",
+      outPush.strip().splitLines()[^1]
+
+proc cmdStatus(cfgAll: ConductorConfig, leagueName, repo, root: string) =
   let lc = cfgAll.league(leagueName)
   echo "conductor status — league: ", leagueName
-  echo "  lane branch:   ", lc.laneBranch
+  echo "  lane branch:   ", lc.laneBranch, " (checkout ", lc.laneCheckout, ")"
   echo "  eval:          make ", lc.evalMake.target, " (",
     lc.evalMake.vars.len, " vars)"
   echo "  floor metric:  ", lc.floorMetric
@@ -46,6 +86,12 @@ proc cmdStatus(cfgAll: ConductorConfig, leagueName, repo: string) =
     cfgAll.agents.coding.model
   echo "  review agent:  ", $cfgAll.agents.reviewer.harness, " / ",
     cfgAll.agents.reviewer.model
+  let champ = champion(ledgerPath(root / lc.laneCheckout, leagueName))
+  if champ.isNil:
+    echo "  champion:      (none — run `conductor ", leagueName, " baseline`)"
+  else:
+    echo "  champion:      ", reportSummary(champ{"report"}),
+      " [", champ{"action"}.getStr(), " ", champ{"ts"}.getStr(), "]"
   let st = loadState(repo)
   echo "  tick phase:    ", $st.phase,
     (if st.ticketId.len > 0: " (ticket " & st.ticketId & ")" else: "")
@@ -54,6 +100,101 @@ proc cmdStatus(cfgAll: ConductorConfig, leagueName, repo: string) =
     echo "  NEEDS-HUMAN:"
     for line in readFile(needsHumanPath(repo)).strip().splitLines():
       echo "    ", line
+
+proc cmdBaseline(cfgAll: ConductorConfig, leagueName, root: string) =
+  let lc = cfgAll.league(leagueName)
+  let lane = laneDir(root, lc)
+  echo "conductor: baseline eval of ", lc.laneBranch, " HEAD (",
+    headSha(lane), ") — this takes several minutes"
+  let res = runEval(lane, lc, "baseline")
+  case res.outcome
+  of evalBusy:
+    quit "conductor: eval slot busy — " & res.detail
+  of evalFailed:
+    quit "conductor: eval failed — " & res.detail
+  of evalOk:
+    let path = ledgerPath(lane, leagueName)
+    appendRow(path, makeRow(leagueName, "baseline", "", lc.laneBranch,
+      pinShas(root, lane), res.report,
+      %*{"pass": true, "reasons": ["baseline seed"]}))
+    commitLedger(lane, leagueName,
+      "scores: " & leagueName & " baseline — " &
+      reportSummary(res.report) & "\n\nCo-Authored-By: conductor")
+    echo "conductor: baseline row appended — ", reportSummary(res.report)
+    echo "conductor: archived log ", res.report{"archived_log"}.getStr()
+
+proc cmdHosted(cfgAll: ConductorConfig, leagueName, root: string) =
+  ## Pull hosted episodes (make traverse-field has its own flock and
+  ## exits 0 when busy) and append one summary row when new data landed.
+  let lc = cfgAll.league(leagueName)
+  let lane = laneDir(root, lc)
+  let (rc, output) = runCommandCapture(lane, "make", @["traverse-field"],
+    timeoutMs = 300_000)
+  if rc != 0:
+    quit "conductor: make traverse-field failed rc=" & $rc & "\n" &
+      output[max(0, output.len - 400) .. ^1]
+  let historyPath = lane / "local_data/traverse/episodes_history.json"
+  if not fileExists(historyPath):
+    quit "conductor: no " & historyPath & " after traverse-field"
+  var scores: seq[float]
+  var newest = ""
+  var newestCreated = ""
+  let history = parseJson(readFile(historyPath))
+  let entries =
+    if history.kind == JArray: history
+    else: history{"entries"}
+  if entries.isNil or entries.kind != JArray:
+    quit "conductor: episodes_history.json has no entries array"
+  for e in entries:
+    if e{"status"}.getStr() != "completed":
+      continue
+    let scoresNode = e{"scores"}
+    if scoresNode.isNil or scoresNode.kind != JArray or scoresNode.len == 0:
+      continue
+    scores.add(scoresNode[0]{"score"}.getFloat())
+    let created = e{"created_at"}.getStr()
+    if created > newestCreated:
+      newestCreated = created
+      newest = e{"id"}.getStr()
+  if scores.len == 0:
+    echo "conductor: hosted — no completed scored episodes yet"
+    return
+  let hostedPath = hostedLedgerPath(lane, leagueName)
+  let rows = readRows(hostedPath)
+  if rows.len > 0 and rows[^1]{"newest"}.getStr() == newest:
+    echo "conductor: hosted — no new episodes since ", newest
+    return
+  var floor = scores[0]
+  var best = scores[0]
+  var total = 0.0
+  for s in scores:
+    floor = min(floor, s)
+    best = max(best, s)
+    total += s
+  let summary = %*{
+    "ts": ledgerNowUtc(),
+    "league": leagueName,
+    "action": "hosted",
+    "newest": newest,
+    "episodes": scores.len,
+    "floor": floor,
+    "mean": total / float(scores.len),
+    "best": best,
+  }
+  appendRow(hostedPath, summary)
+  commitLedger(lane, leagueName,
+    "scores: " & leagueName & " hosted ingest — floor " & $floor &
+    " mean " & $(total / float(scores.len)) & " best " & $best &
+    " over " & $scores.len & " episodes\n\nCo-Authored-By: conductor")
+  echo "conductor: hosted — ", scores.len, " episodes, floor ", floor,
+    ", mean ", total / float(scores.len), ", best ", best
+  let champ = champion(ledgerPath(lane, leagueName))
+  if not champ.isNil:
+    let localFloor = champ{"report", "max_northing"}.getFloat()
+    if localFloor > 0 and floor < localFloor * 0.5:
+      echo "conductor: WARN hosted floor ", floor,
+        " << local champion northing ", localFloor,
+        " — PETREL_SWIM-class divergence, autopsy the hosted replays"
 
 proc main() =
   if paramCount() < 2:
@@ -68,10 +209,14 @@ proc main() =
       toSeq(cfgAll.leagues.keys).join(", ")
   case command
   of "status":
-    cmdStatus(cfgAll, leagueName, repo)
-  of "baseline", "once", "run", "gate":
+    cmdStatus(cfgAll, leagueName, repo, root)
+  of "baseline":
+    cmdBaseline(cfgAll, leagueName, root)
+  of "hosted":
+    cmdHosted(cfgAll, leagueName, root)
+  of "once", "run", "gate":
     quit "conductor: '" & command & "' lands in a later build phase " &
-      "(P2 baseline/gate, P3 once, P4 run)"
+      "(P3 once/gate, P4 run)"
   else:
     usage()
 

@@ -32,6 +32,7 @@ type
 
   LeagueConfig* = object
     repo*: string             ## repo dir name under the wow-coworld root
+    laneCheckout*: string     ## lane worktree dir name under the root
     laneBranch*: string
     ticketLane*: string       ## matches tickets' **Lane:** field
     evalMake*: EvalMake
