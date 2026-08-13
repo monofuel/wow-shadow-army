@@ -388,7 +388,7 @@ check(afterFinaleFall.kind == "navigate" and
 clock = clock + 5.0
 local tunnelNext = petrel.decide(view(6875.1, -2306.2, formed))
 check(tunnelNext.kind == "navigate" and
-    tunnelNext.reason == "timbermaw",
+    tunnelNext.reason:find("^timbermaw_tunnel") ~= nil,
   "the walked chain continues into the exit-tunnel line")
 
 -- Reaching the tunnel mouth retires the cave chain and hands the run to
@@ -396,8 +396,8 @@ check(tunnelNext.kind == "navigate" and
 clock = clock + 5.0
 local interiorDone = petrel.decide(view(6606.3, -2363.0, formed))
 check(interiorDone.kind == "navigate" and
-    interiorDone.reason == "timbermaw_north_tunnel",
-  "the interior goal hands off to the north tunnel bridge")
+    interiorDone.reason == "winterspring_west_entry",
+  "the interior goal hands off past the auto-captured tunnel bridge")
 
 clock = clock + 5.0
 local atEverlook = petrel.decide(view(6687.3, -4647.7, formed))
@@ -467,19 +467,21 @@ for _, b in ipairs(interiorRoute.beats) do
   end
 end
 check(holdNextId ~= nil, "the hold-chamber walked point is in the chain")
-cavePetrel.decide(view(6854.6, -2114.7, formed))
+-- cave decides run in bear (form 5): the approach gate now casts bear
+-- on any unformed/travel seat this deep into the finale band.
+cavePetrel.decide(view(6854.6, -2114.7, { shapeshift_form_id = 5 }))
 clock = clock + 1.0
-cavePetrel.decide(view(6876.1, -2115.8, formed))
+cavePetrel.decide(view(6876.1, -2115.8, { shapeshift_form_id = 5 }))
 clock = clock + 1.0
 nav = { state = "unavailable", failed_here = true, walkout_available = false,
   waypoint_count = 0 }
-local caveBeat = cavePetrel.decide(view(6866.6, -2126.2, formed))
+local caveBeat = cavePetrel.decide(view(6866.6, -2126.2, { shapeshift_form_id = 5 }))
 check(caveBeat.kind == "navigate" and caveBeat.reason == holdNextId,
   "the frozen interior pose steers at the next hold-chamber beat")
 local caveHop = nil
 for _ = 1, 20 do
   clock = clock + 1.0
-  local d = cavePetrel.decide(view(6866.6, -2126.2, formed))
+  local d = cavePetrel.decide(view(6866.6, -2126.2, { shapeshift_form_id = 5 }))
   if d.reason == "snag_hop" then caveHop = d break end
 end
 check(caveHop ~= nil and caveHop.kind == "navigate",
@@ -498,7 +500,7 @@ check(math.sqrt(caveDx * caveDx + caveDy * caveDy) > 10.0,
 -- ...and the hop is repositioning only: once the window closes the SAME
 -- beat is steered at again. Sparse routes never rotate a goal either.
 clock = clock + 60.0
-local caveResume = cavePetrel.decide(view(6866.6, -2126.2, formed))
+local caveResume = cavePetrel.decide(view(6866.6, -2126.2, { shapeshift_form_id = 5 }))
 check(caveResume.kind == "navigate" and caveResume.reason == holdNextId,
   "after the interior hop window the same beat resumes")
 nav = { state = "following", failed_here = false, walkout_available = false }
@@ -533,8 +535,12 @@ check(indoorAgain.kind == "navigate",
 clock = clock + 20.0
 local outdoorCast = indoorPetrel.decide(view(6620.0, -2085.0,
   { shapeshift_form_id = 0, indoors_known = true, indoors = false }))
-check(outdoorCast.kind == "cast_spell" and outdoorCast.spell == 783,
-  "stepping outside re-arms the Travel Form cast")
+-- Inside the cave-approach band the re-arm is BEAR: the seat is at the
+-- mouth where the indoors flag flickers, and Travel is what got the old
+-- runs killed re-casting into denial. True-outdoor Travel re-arms are
+-- covered by the road tests far from the cave.
+check(outdoorCast.kind == "cast_spell" and outdoorCast.spell == 5487,
+  "stepping outside at the mouth re-arms BEAR, not Travel")
 check(any_log_find('"indoors":true') ~= nil,
   "the flight recorder carries the indoors flag")
 
