@@ -15,7 +15,8 @@ import
   conductor/cfg,
   conductor/evalgate,
   conductor/ledger,
-  conductor/state
+  conductor/state,
+  conductor/tick
 
 proc usage() =
   echo "usage: conductor <league> <command>"
@@ -59,19 +60,6 @@ proc reportSummary(report: JsonNode): string =
     " ok=" & $report{"ok"}.getBool() &
     " deaths=" & $report{"deaths"}.getInt() &
     " warnings=" & $warningClasses(report).len
-
-proc commitLedger(lane, league, message: string) =
-  let (rcAdd, _) = gitRunCapture(lane, @["add", ScoresDirName])
-  if rcAdd != 0:
-    quit "conductor: git add " & ScoresDirName & " failed in " & lane
-  let (rcCommit, outCommit) = gitRunCapture(lane,
-    @["commit", "-m", message])
-  if rcCommit != 0 and "nothing to commit" notin outCommit:
-    quit "conductor: ledger commit failed: " & outCommit
-  let (rcPush, outPush) = gitRunCapture(lane, @["push"], timeoutMs = 120_000)
-  if rcPush != 0:
-    echo "conductor: WARN ledger push failed (will ride the next push): ",
-      outPush.strip().splitLines()[^1]
 
 proc cmdStatus(cfgAll: ConductorConfig, leagueName, repo, root: string) =
   let lc = cfgAll.league(leagueName)
@@ -117,7 +105,7 @@ proc cmdBaseline(cfgAll: ConductorConfig, leagueName, root: string) =
     appendRow(path, makeRow(leagueName, "baseline", "", lc.laneBranch,
       pinShas(root, lane), res.report,
       %*{"pass": true, "reasons": ["baseline seed"]}))
-    commitLedger(lane, leagueName,
+    commitLedger(lane,
       "scores: " & leagueName & " baseline — " &
       reportSummary(res.report) & "\n\nCo-Authored-By: conductor")
     echo "conductor: baseline row appended — ", reportSummary(res.report)
@@ -182,7 +170,7 @@ proc cmdHosted(cfgAll: ConductorConfig, leagueName, root: string) =
     "best": best,
   }
   appendRow(hostedPath, summary)
-  commitLedger(lane, leagueName,
+  commitLedger(lane,
     "scores: " & leagueName & " hosted ingest — floor " & $floor &
     " mean " & $(total / float(scores.len)) & " best " & $best &
     " over " & $scores.len & " episodes\n\nCo-Authored-By: conductor")
@@ -214,9 +202,35 @@ proc main() =
     cmdBaseline(cfgAll, leagueName, root)
   of "hosted":
     cmdHosted(cfgAll, leagueName, root)
-  of "once", "run", "gate":
-    quit "conductor: '" & command & "' lands in a later build phase " &
-      "(P3 once/gate, P4 run)"
+  of "once":
+    let st = loadState(repo)
+    if st.phase != tpIdle:
+      quit "conductor: a tick is already in flight (phase " & $st.phase &
+        ", ticket " & st.ticketId & ") — finish or clear .conductor/state.json"
+    if isPaused(repo):
+      quit "conductor: paused (" & pausePath(repo) & " exists)"
+    let res = runTick(cfgAll, leagueName, repo, root)
+    echo "conductor: tick outcome — ", $res.outcome,
+      (if res.ticketId.len > 0: " (ticket " & res.ticketId & ")" else: ""),
+      (if res.detail.len > 0: ": " & res.detail else: "")
+  of "gate":
+    let st = loadState(repo)
+    if st.worktree.len == 0 or not dirExists(st.worktree):
+      quit "conductor: no in-flight worktree in state — nothing to gate"
+    let lc = cfgAll.league(leagueName)
+    echo "conductor: fresh eval of in-flight candidate ", st.branch
+    let res = runEval(st.worktree, lc, st.ticketId & "-regate",
+      @[("FORK_CLIENT", root / "monofuel-vanilla-wow")])
+    if res.outcome != evalOk:
+      quit "conductor: eval " & $res.outcome & " — " & res.detail
+    let champ = champion(ledgerPath(root / lc.laneCheckout, leagueName))
+    let verdict = runGate(res.report,
+      (if champ.isNil: nil else: champ{"report"}), lc)
+    echo "conductor: gate ", (if verdict.pass: "PASS" else: "FAIL")
+    for reason in verdict.reasons:
+      echo "  - ", reason
+  of "run":
+    quit "conductor: 'run' lands in build phase P4"
   else:
     usage()
 

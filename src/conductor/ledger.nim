@@ -4,7 +4,8 @@
 ## (baseline | merged | shipped). Nothing ever edits a row.
 
 import
-  std/[json, os, strutils, times]
+  std/[json, os, strutils, times],
+  scriptorium/git_ops
 
 const ScoresDirName* = "scores"
 
@@ -71,3 +72,20 @@ proc champion*(path: string): JsonNode =
 
 proc lastShipped*(path: string): JsonNode =
   lastRowWithAction(path, ["shipped"])
+
+proc commitLedger*(laneDir, message: string) =
+  ## Commit + push scores/ on the lane checkout. A failed push is a
+  ## warning, not a wedge — the next successful push carries it.
+  let (rcAdd, _) = gitRunCapture(laneDir, @["add", ScoresDirName])
+  if rcAdd != 0:
+    raise newException(IOError, "git add " & ScoresDirName &
+      " failed in " & laneDir)
+  let (rcCommit, outCommit) = gitRunCapture(laneDir,
+    @["commit", "-m", message])
+  if rcCommit != 0 and "nothing to commit" notin outCommit:
+    raise newException(IOError, "ledger commit failed: " & outCommit)
+  let (rcPush, outPush) = gitRunCapture(laneDir, @["push"],
+    timeoutMs = 120_000)
+  if rcPush != 0:
+    echo "conductor: WARN ledger push failed (rides the next push): ",
+      outPush.strip().splitLines()[^1]

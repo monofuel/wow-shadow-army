@@ -1,0 +1,243 @@
+## One conductor tick: claim a ticket, let the coder work a branch, hold
+## it against the reviewer, the diff guards, the static tests, and the
+## code gate — then merge on pass or park on fail. Every decision point
+## journals state so a crash resumes instead of forgetting.
+
+import
+  std/[json, os, strutils],
+  scriptorium/git_ops,
+  ./agents,
+  ./cfg,
+  ./evalgate,
+  ./ledger,
+  ./state,
+  ./tickets
+
+type
+  TickOutcome* = enum
+    toNoWork = "no-work"
+    toMerged = "merged"
+    toParked = "parked"
+    toStuck = "stuck"
+    toBusy = "eval-busy"
+    toError = "error"
+
+  TickResult* = object
+    outcome*: TickOutcome
+    ticketId*: string
+    detail*: string
+
+proc forkClientVar(root: string): (string, string) =
+  ("FORK_CLIENT", root / "monofuel-vanilla-wow")
+
+proc pinShas(root, laneDir: string): JsonNode =
+  proc sha(dir: string): string =
+    let (rc, output) = gitRunCapture(dir, @["rev-parse", "--short=9", "HEAD"])
+    if rc == 0: output.strip() else: "unknown"
+  %*{"wsa": sha(laneDir), "fork": sha(root / "monofuel-vanilla-wow")}
+
+proc unclaim(root: string, inProgressPath, why: string) =
+  discard finishTicket(root, inProgressPath, "open",
+    "- conductor unclaimed (" & why & ") — no attempt charged")
+
+proc park(root: string, lc: LeagueConfig, repo: string,
+    ticket: TicketRef, inProgressPath, worktree, reason: string,
+    report: JsonNode, maxAttempts: int): TickResult =
+  ## Gate/review/guard failure: branch stays pushed for autopsy, the
+  ## ticket carries the falsification note, the attempt is charged.
+  let attempt = conductorAttempts(ticket.content) + 1
+  let branch = expBranchName(ticket.id, ticket.slug)
+  discard gitCheck(root / lc.repo, "push", "origin", branch)
+  let laneDirPath = root / lc.laneCheckout
+  appendRow(ledgerPath(laneDirPath, lc.ticketLane),
+    makeRow(lc.ticketLane, "parked", ticket.id, branch,
+      pinShas(root, laneDirPath),
+      (if report.isNil: newJObject() else: report),
+      %*{"pass": false, "reasons": [reason]}))
+  try:
+    commitLedger(laneDirPath, "scores: parked " & ticket.id & " — " & reason)
+  except IOError as e:
+    echo "conductor: WARN ", e.msg
+  let note = "- conductor attempt " & $attempt & ": PARKED — " & reason &
+    " (branch " & branch & " pushed for autopsy)"
+  let dest = if attempt >= maxAttempts: "stuck" else: "open"
+  discard finishTicket(root, inProgressPath, dest, note)
+  teardownWorktree(root, lc, worktree, ticket.id, ticket.slug,
+    keepBranch = true)
+  clearState(repo, lc.ticketLane)
+  TickResult(
+    outcome: (if dest == "stuck": toStuck else: toParked),
+    ticketId: ticket.id, detail: reason)
+
+proc runTick*(cfgAll: ConductorConfig, leagueName, repo, root: string): TickResult =
+  let lc = cfgAll.league(leagueName)
+  let laneDirPath = root / lc.laneCheckout
+
+  # 1. Find + claim work.
+  let ticket = nextOpenTicket(root, lc.ticketLane)
+  if ticket.id.len == 0:
+    return TickResult(outcome: toNoWork, detail: "no eligible open tickets")
+  if conductorAttempts(ticket.content) >= cfgAll.maxAttemptsPerTicket:
+    let moved = claimTicket(root, ticket)
+    discard finishTicket(root, moved, "stuck",
+      "- conductor: attempt budget exhausted (" &
+      $cfgAll.maxAttemptsPerTicket & ") — parking in stuck/")
+    return TickResult(outcome: toStuck, ticketId: ticket.id,
+      detail: "attempt budget exhausted")
+  let inProgressPath = claimTicket(root, ticket)
+  saveState(repo, ConductorState(league: leagueName, phase: tpTicketClaimed,
+    ticketId: ticket.id, ticketPath: inProgressPath))
+  echo "conductor: claimed ", ticket.id, " (", ticket.slug, ")"
+
+  # 2. Worktree on a fresh exp branch.
+  let worktree = setupWorktree(root, lc, ticket.id, ticket.slug)
+  saveState(repo, ConductorState(league: leagueName, phase: tpCoding,
+    ticketId: ticket.id, ticketPath: inProgressPath, worktree: worktree,
+    branch: expBranchName(ticket.id, ticket.slug)))
+
+  # 3. Code -> guards -> review, with one revision round on BLOCK.
+  var coderSummary = ""
+  var feedback = ""
+  var reviewed = false
+  for round in 1 .. 2:
+    echo "conductor: coding agent round ", round
+    let coded = runCodingAgent(cfgAll, lc, worktree, ticket.id,
+      ticket.content, feedback, round)
+    if not coded.ok:
+      return park(root, lc, repo, ticket, inProgressPath, worktree,
+        "coding agent failed: " & coded.summary, nil,
+        cfgAll.maxAttemptsPerTicket)
+    coderSummary = coded.summary
+    let violations = diffGuards(worktree, lc)
+    if violations.len > 0:
+      return park(root, lc, repo, ticket, inProgressPath, worktree,
+        "diff guards: " & violations.join("; "), nil,
+        cfgAll.maxAttemptsPerTicket)
+    saveState(repo, ConductorState(league: leagueName, phase: tpReview,
+      ticketId: ticket.id, ticketPath: inProgressPath, worktree: worktree,
+      branch: expBranchName(ticket.id, ticket.slug), attempt: round))
+    echo "conductor: reviewer round ", round
+    let verdict = runReviewer(cfgAll, lc, worktree, ticket.id,
+      ticket.content, coderSummary)
+    if verdict.ship:
+      reviewed = true
+      break
+    feedback = verdict.reason
+    echo "conductor: reviewer BLOCK — ", verdict.reason
+  if not reviewed:
+    return park(root, lc, repo, ticket, inProgressPath, worktree,
+      "reviewer blocked twice: " & feedback, nil, cfgAll.maxAttemptsPerTicket)
+
+  # 4. Static tests in the worktree (path-safe tiers only; nim smoke
+  # runs against the main checkout's sibling layout, not from here).
+  let (rcLua, outLua) = runCommandCapture(worktree, "make", @["test-lua"],
+    timeoutMs = 600_000)
+  if rcLua != 0:
+    return park(root, lc, repo, ticket, inProgressPath, worktree,
+      "make test-lua failed: " & outLua[max(0, outLua.len - 300) .. ^1],
+      nil, cfgAll.maxAttemptsPerTicket)
+
+  # 5. Eval gate: optional failure-site repro bracket first, then the
+  # full-course run against the champion.
+  saveState(repo, ConductorState(league: leagueName, phase: tpGate,
+    ticketId: ticket.id, ticketPath: inProgressPath, worktree: worktree,
+    branch: expBranchName(ticket.id, ticket.slug)))
+  let reproVars = parseRepro(ticket.content)
+  if reproVars.len > 0:
+    echo "conductor: repro bracket ", ticket.content.parseTicketField("Repro")
+    let repro = runEval(worktree, lc, ticket.id & "-repro",
+      reproVars & @[forkClientVar(root)])
+    case repro.outcome
+    of evalBusy:
+      unclaim(root, inProgressPath, "eval slot busy at repro: " & repro.detail)
+      teardownWorktree(root, lc, worktree, ticket.id, ticket.slug, false)
+      clearState(repo, leagueName)
+      return TickResult(outcome: toBusy, ticketId: ticket.id,
+        detail: repro.detail)
+    of evalFailed:
+      return park(root, lc, repo, ticket, inProgressPath, worktree,
+        "repro bracket harness failure: " & repro.detail, nil,
+        cfgAll.maxAttemptsPerTicket)
+    of evalOk:
+      if not repro.report{"ok"}.getBool():
+        return park(root, lc, repo, ticket, inProgressPath, worktree,
+          "repro bracket still failing: " &
+          repro.report{"reason"}.getStr("no reason"), repro.report,
+          cfgAll.maxAttemptsPerTicket)
+  echo "conductor: full-course eval (several minutes)"
+  let eval = runEval(worktree, lc, ticket.id, @[forkClientVar(root)])
+  case eval.outcome
+  of evalBusy:
+    unclaim(root, inProgressPath, "eval slot busy: " & eval.detail)
+    teardownWorktree(root, lc, worktree, ticket.id, ticket.slug, false)
+    clearState(repo, leagueName)
+    return TickResult(outcome: toBusy, ticketId: ticket.id,
+      detail: eval.detail)
+  of evalFailed:
+    flagNeedsHuman(repo, "eval harness failure on " & ticket.id & ": " &
+      eval.detail)
+    unclaim(root, inProgressPath, "eval harness failure: " & eval.detail)
+    teardownWorktree(root, lc, worktree, ticket.id, ticket.slug, false)
+    clearState(repo, leagueName)
+    return TickResult(outcome: toError, ticketId: ticket.id,
+      detail: eval.detail)
+  of evalOk:
+    discard
+
+  let champ = champion(ledgerPath(laneDirPath, leagueName))
+  let champReport = if champ.isNil: nil else: champ{"report"}
+  let gate = runGate(eval.report, champReport, lc)
+  if not gate.pass:
+    return park(root, lc, repo, ticket, inProgressPath, worktree,
+      gate.reasons.join("; "), eval.report, cfgAll.maxAttemptsPerTicket)
+
+  # 6. Merge to the lane: rebase the branch, then ff-only with a no-ff
+  # fallback, ledger row, ticket -> done, prune.
+  saveState(repo, ConductorState(league: leagueName, phase: tpMerge,
+    ticketId: ticket.id, ticketPath: inProgressPath, worktree: worktree,
+    branch: expBranchName(ticket.id, ticket.slug)))
+  let branch = expBranchName(ticket.id, ticket.slug)
+  let (rcRebase, outRebase) = gitRunCapture(worktree,
+    @["rebase", lc.laneBranch], timeoutMs = 120_000)
+  if rcRebase != 0:
+    discard gitCheck(worktree, "rebase", "--abort")
+    return park(root, lc, repo, ticket, inProgressPath, worktree,
+      "rebase onto " & lc.laneBranch & " failed: " &
+      outRebase[max(0, outRebase.len - 200) .. ^1], eval.report,
+      cfgAll.maxAttemptsPerTicket)
+  var (rcMerge, outMerge) = gitRunCapture(laneDirPath,
+    @["merge", "--ff-only", branch], timeoutMs = 60_000)
+  if rcMerge != 0:
+    (rcMerge, outMerge) = gitRunCapture(laneDirPath,
+      @["merge", "--no-ff", branch, "-m",
+        "conductor: merge " & branch & " (gate passed)"], timeoutMs = 60_000)
+  if rcMerge != 0:
+    discard gitCheck(laneDirPath, "merge", "--abort")
+    return park(root, lc, repo, ticket, inProgressPath, worktree,
+      "merge into " & lc.laneBranch & " failed: " &
+      outMerge[max(0, outMerge.len - 200) .. ^1], eval.report,
+      cfgAll.maxAttemptsPerTicket)
+  appendRow(ledgerPath(laneDirPath, leagueName),
+    makeRow(leagueName, "merged", ticket.id, branch,
+      pinShas(root, laneDirPath), eval.report,
+      %*{"pass": true, "reasons": gate.reasons}))
+  try:
+    commitLedger(laneDirPath, "scores: " & leagueName & " merged " &
+      ticket.id & " — northing " &
+      $eval.report{"max_northing"}.getFloat())
+  except IOError as e:
+    echo "conductor: WARN ", e.msg
+  let (rcPush, outPush) = gitRunCapture(laneDirPath, @["push"],
+    timeoutMs = 120_000)
+  if rcPush != 0:
+    echo "conductor: WARN lane push failed: ",
+      outPush.strip().splitLines()[^1]
+  discard finishTicket(root, inProgressPath, "done",
+    "- conductor: MERGED to " & lc.laneBranch & " (" & branch &
+    ") — gate: " & gate.reasons.join("; ") & "; northing " &
+    $eval.report{"max_northing"}.getFloat())
+  teardownWorktree(root, lc, worktree, ticket.id, ticket.slug,
+    keepBranch = false)
+  clearState(repo, leagueName)
+  TickResult(outcome: toMerged, ticketId: ticket.id,
+    detail: "northing " & $eval.report{"max_northing"}.getFloat())
