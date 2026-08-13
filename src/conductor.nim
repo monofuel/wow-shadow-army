@@ -10,7 +10,7 @@
 # Config: <wow-coworld root>/conductor.json.  Design: docs/conductor.md.
 
 import
-  std/[os, strutils, tables],
+  std/[os, sequtils, strutils, tables],
   conductor/cfg,
   conductor/state
 
