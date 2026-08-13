@@ -35,6 +35,7 @@ entry, NOT rank (see AGENTS.md).
 | v1 | 4c24e52f4 / eeb86be | 10,221 (lucky water entry; 14,088 yd, ~4.1 wall min) | 2,400 (#4) | waterline-spin cascade predates the fix: hosted episodes + monofuel's replay spin at the beach; the local 10.2k run rolled lucky entry dice |
 | v2 | e261c3d84 / 7936932 | 10,204 (0 stalls, 0 deaths, clock-limited at top_barrens) | pending first round | spin structurally dead (turn clamp + one seaward target + JUMP releases); known flaws: land zig-zag (ticket 0013), flag-flicker bobbing (0002), cave wall-stick (0012) |
 | v3 | 0f45b0aed / 2787505 | 9,980 phase-0 clean run; night median dragged by dice (wedges/fatigue/mobs) | submitted 2026-08-13 07:51Z, qualifying | BOTH wedge escapes live (0016+0016b, rescue demonstrated at the seam) + fatigue metric in FLIGHT; hypothesis: hosted 2.4k plateau = pre-water wedge family, v3 should climb past it; sub_1afb44aa, version ebf33966, guard over v2 c4c72440 |
+| v4 | 0f45b0aed / 592766f | (same bot as v3) | submitted 2026-08-13 08:5xZ, pending | THE FIX: ENV PETREL_SWIM=1 — v1/v2/v3 hosted episodes all ran with the wet chain OFF (env gate default-off, image never set it); every hosted run parked at the waterline = ~2,400 = water_entry landmark. v3 round 1703 scored 2,367 and confirmed the plateau on a wedge-escape build; expected hosted with swim on: ~10k. sub_eb972b1f, version 0b2886a3, guard over v3 ebf33966 |
 
 ## Standings history (append-only)
 
