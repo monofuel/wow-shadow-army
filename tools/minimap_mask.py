@@ -115,13 +115,19 @@ class MinimapSampler:
     def tile_pixel(self, x: float, y: float) -> tuple[tuple[int, int], tuple[int, int]]:
         return tile_pixel(x, y)
 
-    def luminance(self, x: float, y: float) -> int | None:
+    def rgb(self, x: float, y: float) -> tuple[int, int, int] | None:
         (a, b), (px, py) = tile_pixel(x, y)
         image = self._load_tile(a, b)
         if image is None:
             return None
         r, g, b_ = image.getpixel((px, py))
-        return _luma(r, g, b_)
+        return (int(r), int(g), int(b_))
+
+    def luminance(self, x: float, y: float) -> int | None:
+        pixel = self.rgb(x, y)
+        if pixel is None:
+            return None
+        return _luma(*pixel)
 
     def _load_tile(self, a: int, b: int):
         key = (a, b)

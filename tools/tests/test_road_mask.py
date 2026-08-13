@@ -143,17 +143,17 @@ class TestTransformMath(unittest.TestCase):
         self.assertTrue(
             rmask.is_road_texture("Tileset\\Tanaris\\TanarisDirtFootprint.blp")
         )
-        # overlay-only: still a road marker; Probe.sample ignores it as base.
-        self.assertTrue(
-            rmask.is_road_texture(
-                "Tileset\\ThousandNeedles\\ThousandNeedlesRockHighlight02.blp"
-            )
-        )
-        self.assertTrue(
-            rmask.is_overlay_only_texture(
-                "Tileset\\ThousandNeedles\\ThousandNeedlesRockHighlight02.blp"
-            )
-        )
+        # Three-flip history — do not flip again:
+        # 1) thousandneedlesdirt added then removed (base=canyon floor,
+        #    overlay=cliffs).
+        # 2) hl02 added as overlay-only; looked like the light-brown trail.
+        # 3) hl02 removed: paints mesa TOPS at alpha-255 overlay
+        #    (overlay-only can't help; flat tops pass grade gates) and its
+        #    canyon-floor footprint is one ~180yd patch. Floor road has no
+        #    texture signature; 1kN roads come from the minimap routing pass.
+        hl02 = "Tileset\\ThousandNeedles\\ThousandNeedlesRockHighlight02.blp"
+        self.assertFalse(rmask.is_road_texture(hl02))
+        self.assertFalse(rmask.is_overlay_only_texture(hl02))
         # substring specificity: Highlight (no 02) must not match Highlight02.
         self.assertFalse(
             rmask.is_road_texture(
@@ -191,7 +191,9 @@ class TestTransformMath(unittest.TestCase):
         self.assertFalse(
             rmask.is_overlay_only_texture("Tileset\\Felwood\\FelwoodDirt.blp")
         )
+        self.assertEqual(rmask.OVERLAY_ONLY_MARKERS, ("tanarisdirtfootprint",))
         for marker in rmask.OVERLAY_ONLY_MARKERS:
+            self.assertIn(marker, rmask.ROAD_TEXTURE_MARKERS)
             self.assertTrue(rmask.is_road_texture(marker))
 
     def test_tile_path_infers_map_name_from_dir(self) -> None:
@@ -333,27 +335,27 @@ class TestRoadSampleSelection(unittest.TestCase):
         probe = self._probe([self._layer(0, False, 255), self._layer(1, False, 200)])
         self.assertEqual(probe.sample, (False, None, 0))
 
-    def test_base_layer_overlay_only_hl02_is_not_road(self) -> None:
-        hl02 = r"Tileset\ThousandNeedles\ThousandNeedlesRockHighlight02.blp"
-        probe = self._probe([self._layer(0, True, 255, hl02)])
+    def test_base_layer_overlay_only_is_not_road(self) -> None:
+        tanaris = r"Tileset\Tanaris\TanarisDirtFootprint.blp"
+        probe = self._probe([self._layer(0, True, 255, tanaris)])
         self.assertEqual(probe.sample, (False, None, 0))
 
-    def test_overlay_hl02_on_base_hl02_is_road(self) -> None:
-        hl02 = r"Tileset\ThousandNeedles\ThousandNeedlesRockHighlight02.blp"
+    def test_overlay_only_on_matching_base_is_road(self) -> None:
+        tanaris = r"Tileset\Tanaris\TanarisDirtFootprint.blp"
         probe = self._probe(
-            [self._layer(0, True, 255, hl02), self._layer(1, True, 200, hl02)]
+            [self._layer(0, True, 255, tanaris), self._layer(1, True, 200, tanaris)]
         )
-        self.assertEqual(probe.sample, (True, hl02, 200))
+        self.assertEqual(probe.sample, (True, tanaris, 200))
 
-    def test_overlay_hl02_at_threshold_is_not_road(self) -> None:
-        hl02 = r"Tileset\ThousandNeedles\ThousandNeedlesRockHighlight02.blp"
+    def test_overlay_only_at_threshold_is_not_road(self) -> None:
+        tanaris = r"Tileset\Tanaris\TanarisDirtFootprint.blp"
         probe = self._probe(
-            [self._layer(0, False, 255), self._layer(1, True, 64, hl02)]
+            [self._layer(0, False, 255), self._layer(1, True, 64, tanaris)]
         )
         sample = probe.sample
         self.assertFalse(sample.is_road)
         self.assertEqual(sample.alpha, 64)
-        self.assertEqual(sample.texture, hl02)
+        self.assertEqual(sample.texture, tanaris)
 
     def test_base_kalidar_road_still_full_coverage(self) -> None:
         probe = self._probe([self._layer(0, True, 255, "KalidarRoad.blp")])
@@ -742,11 +744,13 @@ class TestBakeRoadWaypoints(unittest.TestCase):
         self.assertEqual(obj["max_grade"], 0.55)
         self.assertEqual(obj["min_component_length_yd"], 150.0)
         self.assertEqual(obj["markers"], list(rmask.ROAD_TEXTURE_MARKERS))
-        self.assertIn("thousandneedlesrockhighlight02", obj["markers"])
+        self.assertNotIn("thousandneedlesrockhighlight02", obj["markers"])
         self.assertNotIn("thousandneedlesdirt", obj["markers"])
         self.assertEqual(
             obj["overlay_only_markers"], list(rmask.OVERLAY_ONLY_MARKERS)
         )
+        self.assertEqual(obj["overlay_only_markers"], ["tanarisdirtfootprint"])
+        self.assertEqual(obj["minimap_route_zones"], [])
         azeroth = json.loads(json.dumps(bake.make_meta("azeroth", 4.0, 15.0, 8)))
         self.assertEqual(azeroth["map_id"], 0)
         self.assertEqual(azeroth["decimate_yd"], 15.0)
@@ -1141,6 +1145,152 @@ class TestMinComponentLength(unittest.TestCase):
             {c: 1.0 for c in bar}, min_length=0.0, min_component_length=0.0
         )
         self.assertEqual(len(segs), 1)
+
+
+class TestRouteEnterCost(unittest.TestCase):
+    """Pure cost math — no files, no sampler."""
+
+    C0 = 25.0
+    K = 22.0
+    SP = 2.0
+
+    def test_bright_flat_is_unit(self) -> None:
+        self.assertEqual(
+            bake.route_enter_cost(self.C0, 0.0, self.C0, self.K, self.SP), 1.0
+        )
+        self.assertEqual(
+            bake.route_enter_cost(40.0, 0.5, self.C0, self.K, self.SP), 1.0
+        )
+        self.assertAlmostEqual(
+            bake.route_edge_cost(40.0, 0.0, 1, 0, 4.0, self.C0, self.K, self.SP),
+            4.0,
+        )
+        self.assertAlmostEqual(
+            bake.route_edge_cost(40.0, 0.0, 1, 1, 4.0, self.C0, self.K, self.SP),
+            4.0 * math.sqrt(2.0),
+        )
+
+    def test_dark_adds_one(self) -> None:
+        contrast = self.C0 - self.K * 1.0
+        self.assertEqual(
+            bake.route_enter_cost(contrast, 0.0, self.C0, self.K, self.SP), 2.0
+        )
+        self.assertEqual(
+            bake.route_enter_cost(contrast - 1.0, 0.0, self.C0, self.K, self.SP),
+            1.0 + (self.C0 - (contrast - 1.0)) / self.K,
+        )
+
+    def test_steep_adds_slope_penalty(self) -> None:
+        self.assertEqual(
+            bake.route_enter_cost(40.0, 1.0, self.C0, self.K, self.SP),
+            1.0 + self.SP * 0.5,
+        )
+        self.assertEqual(
+            bake.route_enter_cost(40.0, 0.5, self.C0, self.K, self.SP), 1.0
+        )
+
+
+class _RgbSampler:
+    def rgb(self, _x: float, _y: float) -> tuple[int, int, int] | None:
+        return (80, 80, 80)
+
+
+class TestRouteUsableWalls(unittest.TestCase):
+    """grade > 1.8 is a hard wall — fake mask, no files."""
+
+    def test_steep_cell_excluded_from_usable(self) -> None:
+        pts = [(0.0, 0.0), (4.0, 0.0), (8.0, 0.0)]
+
+        def ground_fn(x: float, _y: float) -> float:
+            return 0.0 if x < 6.0 else 40.0
+
+        xs = [p[0] for p in pts]
+        ys = [p[1] for p in pts]
+        rect = (min(xs) - 1.0, min(ys) - 1.0, max(xs) + 1.0, max(ys) + 1.0)
+        mask = _FakeMask(rect, ground_fn=ground_fn)
+        zone = {
+            "name": "toy",
+            "bbox": (-4.0, -4.0, 12.0, 4.0),
+            "z_band": (-120.0, 100.0),
+            "max_grade_wall": 1.8,
+            "slope_penalty": 2.0,
+            "contrast_c0": 25.0,
+            "contrast_k": 22.0,
+            "block_yd": 64.0,
+            "max_water_depth": 0.5,
+            "legs": [],
+        }
+        usable, stats = bake.collect_route_cells(mask, _RgbSampler(), zone, 4.0)
+        self.assertGreater(stats["cells"], 0)
+        steep_keys = [
+            key
+            for key, rec in usable.items()
+            if rec.grade > 1.8
+        ]
+        self.assertEqual(steep_keys, [])
+        # Cell at x=8: z(x+4)=40, z(x-4)=0 -> grade 40/8 = 5.0, excluded.
+        self.assertNotIn(bake._world_to_cell(8.0, 0.0, 4.0), usable)
+        # Cell at x=0: neighbors 0/0 -> grade 0, kept.
+        self.assertIn(bake._world_to_cell(0.0, 0.0, 4.0), usable)
+
+
+class TestDijkstraRoute(unittest.TestCase):
+    """Synthetic 10x10 bright L — deterministic, no files."""
+
+    def _l_grid(self) -> dict[tuple[int, int], bake.RouteCell]:
+        step = 4.0
+        usable: dict[tuple[int, int], bake.RouteCell] = {}
+        for i in range(10):
+            for j in range(10):
+                on_l = j == 0 or i == 9
+                usable[(i, j)] = bake.RouteCell(
+                    x=i * step,
+                    y=j * step,
+                    z=0.0,
+                    g=200 if on_l else 10,
+                    grade=0.0,
+                    contrast=40.0 if on_l else -20.0,
+                )
+        return usable
+
+    def test_follows_bright_l_and_is_byte_identical(self) -> None:
+        usable = self._l_grid()
+        kwargs = dict(
+            usable=usable,
+            start=(0, 0),
+            goal=(9, 9),
+            step=4.0,
+            contrast_c0=25.0,
+            contrast_k=22.0,
+            slope_penalty=2.0,
+        )
+        path_a = bake.dijkstra_route(**kwargs)
+        path_b = bake.dijkstra_route(**kwargs)
+        self.assertIsNotNone(path_a)
+        self.assertEqual(path_a, path_b)
+        self.assertEqual(path_a[0], (0, 0))
+        self.assertEqual(path_a[-1], (9, 9))
+        for i, j in path_a:
+            self.assertTrue(j == 0 or i == 9, msg=f"left the lane at {(i, j)}")
+        self.assertEqual(bytes(str(path_a), "ascii"), bytes(str(path_b), "ascii"))
+
+
+class TestMinimapRouteConfig(unittest.TestCase):
+    def test_leg_endpoints_inside_bbox_and_bbox_on_step_lattice(self) -> None:
+        self.assertTrue(bake.MINIMAP_ROUTE_ZONES)
+        for _map_name, zones in bake.MINIMAP_ROUTE_ZONES.items():
+            for zone in zones:
+                x0, y0, x1, y1 = zone["bbox"]
+                for value in (x0, y0, x1, y1):
+                    self.assertEqual(value / 4.0, float(int(value / 4.0)), msg=value)
+                lo_x, hi_x = (x0, x1) if x0 <= x1 else (x1, x0)
+                lo_y, hi_y = (y0, y1) if y0 <= y1 else (y1, y0)
+                for a_name, a_xy, b_name, b_xy in zone["legs"]:
+                    for name, (x, y) in ((a_name, a_xy), (b_name, b_xy)):
+                        self.assertGreaterEqual(x, lo_x, msg=name)
+                        self.assertLessEqual(x, hi_x, msg=name)
+                        self.assertGreaterEqual(y, lo_y, msg=name)
+                        self.assertLessEqual(y, hi_y, msg=name)
 
 
 if __name__ == "__main__":

@@ -116,18 +116,23 @@ MCLQ_TILE_NO_LIQUID = 0x0F
 
 # A road layer counts as "on road" above this alpha (0-255).
 ROAD_ALPHA_THRESHOLD = 64
-# thousandneedlesdirt was tried and removed: its base layer is the entire
-# canyon floor and its overlay is cliff faces (median grade 1.02). The
-# actual light-brown Thousand Needles road paint is RockHighlight02.
-# Overlay-only because mesa tops carry it as a base layer.
+# Marker-history for Thousand Needles — three flips, do not add a fourth.
+# 1) thousandneedlesdirt was tried and removed: base layer is the entire
+#    canyon floor, overlay is cliff faces (median grade 1.02).
+# 2) thousandneedlesrockhighlight02 was added as overlay-only; it looked
+#    like the light-brown trail paint.
+# 3) hl02 was round-3's mistake: it paints mesa TOPS at alpha-255 overlay
+#    (overlay-only semantics can't help; flat tops pass grade gates) and
+#    its canyon-floor footprint is one ~180yd patch. The floor road has
+#    no texture signature at all; 1kN roads now come from the minimap
+#    routing pass in bake_road_waypoints.py.
 ROAD_TEXTURE_MARKERS = (
     "road",
     "elwynncobblestone",
     "duskwoodcobblestone",
     "tanarisdirtfootprint",
-    "thousandneedlesrockhighlight02",
 )
-OVERLAY_ONLY_MARKERS = ("thousandneedlesrockhighlight02", "tanarisdirtfootprint")
+OVERLAY_ONLY_MARKERS = ("tanarisdirtfootprint",)
 
 DEFAULT_ADT_DIR = Path(
     os.environ.get(

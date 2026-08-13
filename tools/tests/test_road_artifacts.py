@@ -24,6 +24,7 @@ STITCH_YD = 15.0
 # Keep these equal: a point the bake would claim is "at" the anchor must
 # also count as reaching it here.
 ANCHOR_RADIUS_YD = 100.0
+ANCHOR_Z_YD = 40.0
 
 Point = tuple[float, float, float]
 Segment = list[Point]
@@ -103,9 +104,9 @@ class TestKalimdorRoadConnectivity(unittest.TestCase):
         # Thousand Needles floor, lift lower dock; Barrens connectivity is
         # via the lift transport edge, so the FLOOR network only needs to
         # reach this dock.
-        "great_lift_lower": (-4677.066, -1853.667),
+        "great_lift_lower": (-4677.066, -1853.667, -43.857),
         # Where the painted FeralasRoad descent ends on the 1kN side.
-        "feralas_terminus": (-4280.0, -776.0),
+        "feralas_terminus": (-4280.0, -776.0, -49.4),
     }
 
     @classmethod
@@ -125,7 +126,7 @@ class TestKalimdorRoadConnectivity(unittest.TestCase):
 
     def test_thousand_needles_connects_to_neighbors(self) -> None:
         hits = {
-            name: self._anchor_hit(xy) for name, xy in self.ANCHORS.items()
+            name: self._anchor_hit(xyz) for name, xyz in self.ANCHORS.items()
         }
         shared: set[int] | None = None
         for _nearest, _pt, comps in hits.values():
@@ -148,16 +149,22 @@ class TestKalimdorRoadConnectivity(unittest.TestCase):
                 )
             else:
                 found = "none"
-            at = "" if pt is None else f" at ({pt[0]:.1f}, {pt[1]:.1f}, {pt[2]:.1f})"
+            if pt is None:
+                at = ""
+            else:
+                at = (
+                    f" at ({pt[0]:.1f}, {pt[1]:.1f}, {pt[2]:.1f}) "
+                    f"dz={pt[2] - self.ANCHORS[name][2]:.1f}"
+                )
             lines.append(
                 f"  {name}: nearest={nearest:.1f} yd{at} component={found}"
             )
         self.fail("\n".join(lines))
 
     def _anchor_hit(
-        self, xy: tuple[float, float]
+        self, xyz: tuple[float, float, float]
     ) -> tuple[float, Point | None, set[int]]:
-        ax, ay = xy
+        ax, ay, az = xyz
         nearest = float("inf")
         nearest_pt: Point | None = None
         comps: set[int] = set()
@@ -167,9 +174,32 @@ class TestKalimdorRoadConnectivity(unittest.TestCase):
                 if dist < nearest:
                     nearest = dist
                     nearest_pt = pt
-                if dist <= ANCHOR_RADIUS_YD:
+                if dist <= ANCHOR_RADIUS_YD and abs(pt[2] - az) <= ANCHOR_Z_YD:
                     comps.add(self.seg_to_comp[si])
         return nearest, nearest_pt, comps
+
+
+class TestAnchorReachZ(unittest.TestCase):
+    """A mesa fake within 89yd XY of the dock must not count as reaching it."""
+
+    def test_mesa_fake_rejected_on_dz(self) -> None:
+        dock = (-4677.066, -1853.667, -43.857)
+        mesa = (dock[0] + 89.0, dock[1], 86.0)
+        floor = (dock[0] + 10.0, dock[1], -44.0)
+        self.assertGreater(math.hypot(mesa[0] - dock[0], mesa[1] - dock[1]), 0.0)
+        self.assertLessEqual(
+            math.hypot(mesa[0] - dock[0], mesa[1] - dock[1]), ANCHOR_RADIUS_YD
+        )
+        self.assertGreater(abs(mesa[2] - dock[2]), ANCHOR_Z_YD)
+        self.assertLessEqual(
+            math.hypot(floor[0] - dock[0], floor[1] - dock[1]), ANCHOR_RADIUS_YD
+        )
+        self.assertLessEqual(abs(floor[2] - dock[2]), ANCHOR_Z_YD)
+        self.assertFalse(abs(mesa[2] - dock[2]) <= ANCHOR_Z_YD)
+        self.assertTrue(
+            math.hypot(floor[0] - dock[0], floor[1] - dock[1]) <= ANCHOR_RADIUS_YD
+            and abs(floor[2] - dock[2]) <= ANCHOR_Z_YD
+        )
 
 
 if __name__ == "__main__":

@@ -114,6 +114,20 @@ class TestSyntheticLuminance(unittest.TestCase):
                 (299 * 0 + 587 * 0 + 114 * 255) // 1000,
             )
 
+    def test_rgb_returns_planted_pixel(self) -> None:
+        from PIL import Image
+
+        img = Image.new("RGB", (256, 256), (0, 0, 0))
+        img.putpixel((0, 0), (255, 0, 0))
+        img.putpixel((128, 96), (100, 150, 200))
+        img.putpixel((255, 255), (0, 0, 255))
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            sampler = self._sampler(tmp, img)
+            self.assertEqual(sampler.rgb(-4800.0, -4.0 * mmask.TILE_YD), (255, 0, 0))
+            self.assertEqual(sampler.rgb(-5000.0, -2400.0), (100, 150, 200))
+            self.assertEqual(sampler.rgb(-5333.0, -2666.0), (0, 0, 255))
+
     def test_missing_tile_returns_none(self) -> None:
         from PIL import Image
 
@@ -122,6 +136,8 @@ class TestSyntheticLuminance(unittest.TestCase):
             sampler = self._sampler(Path(raw), img)
             self.assertIsNone(sampler.luminance(0.0, 0.0))
             self.assertIsNone(sampler.luminance(1.0e6, 1.0e6))
+            self.assertIsNone(sampler.rgb(0.0, 0.0))
+            self.assertIsNone(sampler.rgb(1.0e6, 1.0e6))
 
 
 @skip_no_pillow
@@ -159,6 +175,10 @@ class TestRealMinimap(unittest.TestCase):
         self.assertIsInstance(floor_luma, int)
         self.assertIsInstance(mesa_luma, int)
         self.assertNotEqual(floor_luma, mesa_luma)
+        dock_rgb = sampler.rgb(*LIFT_DOCK)
+        self.assertIsInstance(dock_rgb, tuple)
+        self.assertEqual(len(dock_rgb), 3)
+        self.assertTrue(all(isinstance(c, int) for c in dock_rgb))
 
 
 if __name__ == "__main__":

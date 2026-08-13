@@ -8,14 +8,17 @@ deterministic: no timestamps, stable ids assigned after sort.
 from __future__ import annotations
 
 import argparse
+import heapq
 import json
 import math
 import sys
 import time
 from collections import deque
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
 
+import minimap_mask as mmask
 import road_mask as rmask
 
 Cell = tuple[int, int]
@@ -30,6 +33,54 @@ NEIGH8 = tuple(
     for dj in (-1, 0, 1)
     if not (di == 0 and dj == 0)
 )
+# Zones whose painted ADT signature is useless: route least-cost paths
+# between known anchors over minimap local brightness + walkability.
+# Constants are session-calibrated; do not "improve" them.
+MINIMAP_ROUTE_ZONES = {
+    "kalimdor": [
+        {
+            "name": "thousand_needles",
+            # bbox ALIGNED to STEP multiples (lattice keys are global
+            # integer indices; a misaligned bbox once caused
+            # banker's-rounding key collisions in a prototype)
+            "bbox": (-6800.0, -3400.0, -4200.0, -600.0),
+            "z_band": (-120.0, 100.0),
+            "max_grade_wall": 1.8,
+            "slope_penalty": 2.0,
+            "contrast_c0": 25.0,
+            "contrast_k": 22.0,
+            "block_yd": 64.0,
+            "max_water_depth": 0.5,
+            "legs": [
+                [
+                    "feralas_junction",
+                    (-4280.0, -776.0),
+                    "lift_lower",
+                    (-4677.066, -1853.667),
+                ],
+                [
+                    "lift_lower",
+                    (-4677.066, -1853.667),
+                    "freewind_base",
+                    (-5320.0, -2170.0),
+                ],
+                [
+                    "freewind_base",
+                    (-5320.0, -2170.0),
+                    "flats_mouth",
+                    (-5560.0, -2050.0),
+                ],
+                [
+                    "flats_mouth",
+                    (-5560.0, -2050.0),
+                    "tanaris_road",
+                    (-6256.0, -3336.0),
+                ],
+            ],
+        },
+    ],
+}
+
 # Frozen clockwise Zhang-Suen ring P2..P9. Orientation-agnostic; do not
 # "fix" for world-axis direction.
 _ZS_RING = (
@@ -327,6 +378,7 @@ def make_meta(
     max_width: float = 28.0,
     max_grade: float = 0.55,
     min_component_length: float = 150.0,
+    minimap_route_zones: Sequence[dict] | None = None,
 ) -> dict:
     return {
         "meta": 1,
@@ -344,6 +396,7 @@ def make_meta(
         "min_component_length_yd": min_component_length,
         "markers": list(rmask.ROAD_TEXTURE_MARKERS),
         "overlay_only_markers": list(rmask.OVERLAY_ONLY_MARKERS),
+        "minimap_route_zones": list(minimap_route_zones or []),
     }
 
 
@@ -396,6 +449,329 @@ def _lattice_range(lo: float, hi: float, step: float) -> range:
     if i_hi < i_lo:
         return range(0)
     return range(i_lo, i_hi + 1)
+
+
+def _world_to_cell(x: float, y: float, step: float) -> Cell:
+    # floor(x/step + 0.5), not round(): Python round() is banker's and
+    # once collided lattice keys on a half-step prototype.
+    return (
+        int(math.floor(x / step + 0.5)),
+        int(math.floor(y / step + 0.5)),
+    )
+
+
+def _central_diff_grade(
+    mask: rmask.RoadMask, x: float, y: float
+) -> tuple[float | None, float | None]:
+    zc = mask.ground_z(x, y)
+    zxp = mask.ground_z(x + 4.0, y)
+    zxm = mask.ground_z(x - 4.0, y)
+    zyp = mask.ground_z(x, y + 4.0)
+    zym = mask.ground_z(x, y - 4.0)
+    if zc is None:
+        return None, None
+    if None in (zxp, zxm, zyp, zym):
+        return zc, None
+    return zc, max(abs(zxp - zxm), abs(zyp - zym)) / 8.0
+
+
+def _water_too_deep(
+    mask: rmask.RoadMask, x: float, y: float, max_water_depth: float
+) -> bool:
+    return max_water_depth > 0 and mask.is_water(x, y).depth > max_water_depth
+
+
+def route_enter_cost(
+    contrast: float,
+    grade: float,
+    contrast_c0: float,
+    contrast_k: float,
+    slope_penalty: float,
+) -> float:
+    extra = max(0.0, contrast_c0 - contrast) / contrast_k
+    slope = slope_penalty * (grade - 0.5) if grade > 0.5 else 0.0
+    return 1.0 + extra + slope
+
+
+def route_edge_cost(
+    contrast: float,
+    grade: float,
+    di: int,
+    dj: int,
+    step: float,
+    contrast_c0: float,
+    contrast_k: float,
+    slope_penalty: float,
+) -> float:
+    return route_enter_cost(
+        contrast, grade, contrast_c0, contrast_k, slope_penalty
+    ) * step * math.hypot(di, dj)
+
+
+@dataclass
+class RouteCell:
+    x: float
+    y: float
+    z: float
+    g: int
+    grade: float
+    contrast: float = 0.0
+
+
+def _block_index(i: int, j: int, step: float, block_yd: float) -> Cell:
+    return (
+        int(math.floor(i * step / block_yd)),
+        int(math.floor(j * step / block_yd)),
+    )
+
+
+def _median_int(values: Sequence[int]) -> int:
+    ordered = sorted(values)
+    return ordered[len(ordered) // 2]
+
+
+def collect_route_cells(
+    mask: rmask.RoadMask,
+    sampler: mmask.MinimapSampler,
+    zone: dict,
+    step: float,
+) -> tuple[dict[Cell, RouteCell], dict[str, int]]:
+    x0, y0, x1, y1 = zone["bbox"]
+    lo_x, hi_x = (x0, x1) if x0 <= x1 else (x1, x0)
+    lo_y, hi_y = (y0, y1) if y0 <= y1 else (y1, y0)
+    z_lo, z_hi = zone["z_band"]
+    max_grade_wall = float(zone["max_grade_wall"])
+    max_water_depth = float(zone["max_water_depth"])
+    block_yd = float(zone["block_yd"])
+    usable: dict[Cell, RouteCell] = {}
+    blocked = 0
+    scanned = 0
+    z_cache: dict[tuple[float, float], float | None] = {}
+
+    def _gz(px: float, py: float) -> float | None:
+        key = (px, py)
+        if key not in z_cache:
+            z_cache[key] = mask.ground_z(px, py)
+        return z_cache[key]
+
+    for i in _lattice_range(lo_x, hi_x, step):
+        x = i * step
+        for j in _lattice_range(lo_y, hi_y, step):
+            y = j * step
+            scanned += 1
+            zc = _gz(x, y)
+            zxp = _gz(x + 4.0, y)
+            zxm = _gz(x - 4.0, y)
+            zyp = _gz(x, y + 4.0)
+            zym = _gz(x, y - 4.0)
+            if zc is None:
+                grade = None
+            elif None in (zxp, zxm, zyp, zym):
+                grade = None
+            else:
+                grade = max(abs(zxp - zxm), abs(zyp - zym)) / 8.0
+            if zc is None or zc < z_lo or zc > z_hi:
+                blocked += 1
+                continue
+            if _water_too_deep(mask, x, y, max_water_depth):
+                blocked += 1
+                continue
+            cell_grade = 0.0 if grade is None else grade
+            if grade is not None and cell_grade > max_grade_wall:
+                blocked += 1
+                continue
+            pixel = sampler.rgb(x, y)
+            if pixel is None:
+                blocked += 1
+                continue
+            usable[(i, j)] = RouteCell(
+                x=x, y=y, z=zc, g=pixel[1], grade=cell_grade
+            )
+            if scanned % 100000 == 0:
+                print(
+                    f"  route scan scanned={scanned} usable={len(usable)} "
+                    f"blocked={blocked}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+    blocks: dict[Cell, list[int]] = {}
+    for key, rec in usable.items():
+        blocks.setdefault(_block_index(key[0], key[1], step, block_yd), []).append(
+            rec.g
+        )
+    medians = {bk: _median_int(gs) for bk, gs in blocks.items()}
+    for key, rec in usable.items():
+        rec.contrast = rec.g - medians[_block_index(key[0], key[1], step, block_yd)]
+    stats = {
+        "cells": len(usable),
+        "blocked": blocked,
+        "scanned": scanned,
+    }
+    return usable, stats
+
+
+def _snap_anchor(
+    usable: dict[Cell, RouteCell], x: float, y: float, step: float
+) -> tuple[Cell, float]:
+    exact = _world_to_cell(x, y, step)
+    if exact in usable:
+        return exact, 0.0
+    if not usable:
+        raise SystemExit(
+            f"minimap route FAILED: no usable cells to snap anchor ({x}, {y})"
+        )
+    best: Cell | None = None
+    best_d2 = 0.0
+    for key, rec in usable.items():
+        dx = rec.x - x
+        dy = rec.y - y
+        d2 = dx * dx + dy * dy
+        if best is None or d2 < best_d2 or (d2 == best_d2 and key < best):
+            best = key
+            best_d2 = d2
+    assert best is not None
+    return best, math.sqrt(best_d2)
+
+
+def dijkstra_route(
+    usable: dict[Cell, RouteCell],
+    start: Cell,
+    goal: Cell,
+    step: float,
+    contrast_c0: float,
+    contrast_k: float,
+    slope_penalty: float,
+) -> list[Cell] | None:
+    if start not in usable or goal not in usable:
+        return None
+    if start == goal:
+        return [start]
+    dist: dict[Cell, float] = {start: 0.0}
+    parent: dict[Cell, Cell | None] = {start: None}
+    heap: list[tuple[float, Cell]] = [(0.0, start)]
+    while heap:
+        cost, u = heapq.heappop(heap)
+        if cost != dist[u]:
+            continue
+        if u == goal:
+            break
+        ui, uj = u
+        for di, dj in NEIGH8:
+            v = (ui + di, uj + dj)
+            rec = usable.get(v)
+            if rec is None:
+                continue
+            nc = cost + route_edge_cost(
+                rec.contrast,
+                rec.grade,
+                di,
+                dj,
+                step,
+                contrast_c0,
+                contrast_k,
+                slope_penalty,
+            )
+            prev = dist.get(v)
+            if prev is None or nc < prev:
+                dist[v] = nc
+                parent[v] = u
+                heapq.heappush(heap, (nc, v))
+    if goal not in parent:
+        return None
+    path = [goal]
+    while path[-1] != start:
+        prev = parent[path[-1]]
+        if prev is None:
+            return None
+        path.append(prev)
+    path.reverse()
+    return path
+
+
+def route_minimap_legs(
+    mask: rmask.RoadMask,
+    sampler: mmask.MinimapSampler,
+    zone: dict,
+    step: float,
+    decimate_yd: float = 10.0,
+) -> tuple[list[tuple[str, list[Point]]], list[dict]]:
+    usable, build_stats = collect_route_cells(mask, sampler, zone, step)
+    contrast_c0 = float(zone["contrast_c0"])
+    contrast_k = float(zone["contrast_k"])
+    slope_penalty = float(zone["slope_penalty"])
+    zone_name = zone["name"]
+    print(
+        f"minimap zone {zone_name}: cells={build_stats['cells']} "
+        f"blocked={build_stats['blocked']} scanned={build_stats['scanned']}",
+        file=sys.stderr,
+        flush=True,
+    )
+    legs_out: list[tuple[str, list[Point]]] = []
+    leg_stats: list[dict] = []
+    for a_name, a_xy, b_name, b_xy in zone["legs"]:
+        leg_name = f"{a_name}->{b_name}"
+        ax, ay = a_xy
+        bx, by = b_xy
+        start, snap_a = _snap_anchor(usable, ax, ay, step)
+        goal, snap_b = _snap_anchor(usable, bx, by, step)
+        if snap_a > 0.0 or snap_b > 0.0:
+            print(
+                f"minimap snap {leg_name}: {a_name}={snap_a:.2f}yd "
+                f"{b_name}={snap_b:.2f}yd",
+                file=sys.stderr,
+                flush=True,
+            )
+        path = dijkstra_route(
+            usable,
+            start,
+            goal,
+            step,
+            contrast_c0,
+            contrast_k,
+            slope_penalty,
+        )
+        if path is None:
+            raise SystemExit(
+                f"minimap route FAILED: no path for leg {leg_name} "
+                f"({ax}, {ay}) -> ({bx}, {by}) in zone {zone_name}"
+            )
+        world = [(usable[c].x, usable[c].y, usable[c].z) for c in path]
+        pts = decimate(world, decimate_yd)
+        if len(pts) < 2:
+            raise SystemExit(
+                f"minimap route FAILED: decimated leg {leg_name} "
+                f"in zone {zone_name} has {len(pts)} point(s)"
+            )
+        path_yd = _planar_arclength(world)
+        zs = [p[2] for p in world]
+        print(
+            f"minimap leg {leg_name}: path_cells={len(path)} "
+            f"path_yd={path_yd:.1f} min_z={min(zs):.2f} max_z={max(zs):.2f} "
+            f"snap={snap_a:.2f},{snap_b:.2f}",
+            file=sys.stderr,
+            flush=True,
+        )
+        legs_out.append((leg_name, pts))
+        leg_stats.append(
+            {
+                "leg": leg_name,
+                "cells": build_stats["cells"],
+                "blocked": build_stats["blocked"],
+                "path_cells": len(path),
+                "path_yd": path_yd,
+                "min_z": min(zs),
+                "max_z": max(zs),
+                "snap": [snap_a, snap_b],
+            }
+        )
+    return legs_out, leg_stats
+
+
+def _bboxes_overlap(
+    a: tuple[float, float, float, float],
+    b: tuple[float, float, float, float],
+) -> bool:
+    return _bbox_overlap(a[0], a[1], a[2], a[3], b) is not None
 
 
 def _road_chunk_indices(tile: rmask.Tile) -> frozenset[int]:
@@ -505,8 +881,18 @@ def bake_map(
     max_width: float = 28.0,
     max_grade: float = 0.55,
     min_component_length: float = 150.0,
+    no_minimap: bool = False,
 ) -> dict:
     t0 = time.monotonic()
+    configured_zones = list(MINIMAP_ROUTE_ZONES.get(map_name, []))
+    if no_minimap:
+        print("skipping minimap route pass (--no-minimap)", file=sys.stderr, flush=True)
+        meta_zones: list[dict] = []
+    else:
+        meta_zones = configured_zones
+        if configured_zones and not mmask.HAVE_PILLOW:
+            print(mmask.PILLOW_REQUIRED, file=sys.stderr, flush=True)
+            raise SystemExit(2)
     print(
         f"bake {map_name} adt={adt_dir} step={step} decimate={decimate_yd} "
         f"min_cells={min_cells} min_length={min_length} "
@@ -543,9 +929,26 @@ def bake_map(
         file=sys.stderr,
         flush=True,
     )
-    baked = canonicalize_segments(
-        _paths_to_segments(paths, cells, step, decimate_yd, min_length)
-    )
+    polylines = _paths_to_segments(paths, cells, step, decimate_yd, min_length)
+    route_stats: list[dict] = []
+    if not no_minimap and configured_zones:
+        sampler = mmask.MinimapSampler(mmask.DEFAULT_ASSETS_DIR, map_name)
+        for zone in configured_zones:
+            zone_bbox = tuple(zone["bbox"])
+            if bbox is not None and not _bboxes_overlap(zone_bbox, bbox):
+                print(
+                    f"skipping minimap zone {zone['name']} (outside bbox)",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                continue
+            routed, zstats = route_minimap_legs(
+                mask, sampler, zone, step, decimate_yd=decimate_yd
+            )
+            for _leg_name, pts in routed:
+                polylines.append(pts)
+            route_stats.extend(zstats)
+    baked = canonicalize_segments(polylines)
     meta = make_meta(
         map_name,
         step,
@@ -556,6 +959,7 @@ def bake_map(
         max_width=max_width,
         max_grade=max_grade,
         min_component_length=min_component_length,
+        minimap_route_zones=meta_zones,
     )
     existing = out_path.read_text(encoding="utf-8") if out_path.is_file() else ""
     hand = read_hand_lines(existing)
@@ -577,6 +981,7 @@ def bake_map(
             "dropped_wide": dropped_wide,
             "dropped_short": dropped_short,
             "elapsed_s": elapsed,
+            "minimap_route": route_stats,
         }
     )
     return stats
@@ -636,6 +1041,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional world-bbox subset for sampling",
     )
+    parser.add_argument(
+        "--no-minimap",
+        action="store_true",
+        help="Skip minimap-routed zone legs",
+    )
     return parser
 
 
@@ -660,6 +1070,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         max_width=args.max_width,
         max_grade=args.max_grade,
         min_component_length=args.min_component_length,
+        no_minimap=args.no_minimap,
     )
     return 0
 

@@ -84,7 +84,7 @@ test-traverse-checkpoint:
 	@python3 tools/tests/test_traverse_route_lint.py
 	@python3 tools/tests/test_road_mask.py
 	@python3 tools/tests/test_minimap_mask.py
-# TODO(round-5): fold into test-traverse-checkpoint once the 1kN re-bake ships
+	@python3 tools/tests/test_road_artifacts.py
 test-road-artifacts:
 	@python3 tools/tests/test_road_artifacts.py
 # Offline land-beat corridor lint (Detour helper + spawn TSV). Exits 0 on SKIP
