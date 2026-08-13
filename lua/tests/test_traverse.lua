@@ -495,10 +495,15 @@ package.loaded["traverse"] = nil
 local indoorPetrel = require("traverse")
 clock = clock + 100.0
 nav = { state = "following", failed_here = false, walkout_available = false }
-local indoorMove = indoorPetrel.decide(view(6600.0, -2085.0,
+local indoorBear = indoorPetrel.decide(view(6600.0, -2085.0,
   { shapeshift_form_id = 0, indoors_known = true, indoors = true }))
+check(indoorBear.kind == "cast_spell" and indoorBear.spell == 5487,
+  "an indoors formless seat armors up in Bear (never Travel)")
+clock = clock + 5.0
+local indoorMove = indoorPetrel.decide(view(6600.0, -2085.0,
+  { shapeshift_form_id = 1, indoors_known = true, indoors = true }))
 check(indoorMove.kind == "navigate",
-  "an indoors formless seat navigates instead of casting")
+  "an indoors bear-form seat navigates — no further casting")
 check(any_log_find("EV form_denied_indoors") ~= nil,
   "the indoor denial logs one EV")
 check(indoorMove.stop_distance == 4.0,

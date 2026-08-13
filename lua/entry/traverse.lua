@@ -34,6 +34,8 @@ local FINALE = require("config.traverse_finale_beats")
 local SWIM = os.getenv("PETREL_SWIM") == "1"
 
 local TRAVEL_FORM_SPELL = 783
+-- Bear (rank-agnostic at the stance bar; 5487 = base Bear Form)
+local BEAR_FORM_SPELL = 5487
 local TRAVEL_FORM_ID = 3
 local AQUATIC_FORM_SPELL = 1066
 local AQUATIC_FORM_ID = 4
@@ -185,6 +187,10 @@ end
 local function in_travel_form(view)
   return view.shapeshift_form_id == TRAVEL_FORM_ID or
     view.shapeshift_form_spell_id == TRAVEL_FORM_SPELL
+end
+
+local function in_bear_form(view)
+  return view.shapeshift_form_id == 1
 end
 
 local function in_aquatic_form(view)
@@ -989,6 +995,17 @@ function M.decide(view)
         mark_ev()
         wow.log(string.format(
           "EV form_denied_indoors x=%.1f y=%.1f", pos.x, pos.y))
+      end
+      -- BEAR works indoors (only Travel/Aquatic are outdoor-only): same
+      -- run speed, far more armor and health. The Timbermaw crossing is
+      -- ~40 s inside the Warder picket's train; a formless seat burned
+      -- 2,582 hp and died at beat 67 (2026-08-13 roll 1). The stance
+      -- press is rank-agnostic (SHAPESHIFTBUTTON1 casts whatever bear
+      -- the character knows). Still never fighting - bear is armor, not
+      -- claws.
+      if not in_bear_form(view) then
+        local cast = want_form(view, pos, BEAR_FORM_SPELL, "bear_form")
+        if cast then return cast end
       end
     else
       formDeniedLogged = false
