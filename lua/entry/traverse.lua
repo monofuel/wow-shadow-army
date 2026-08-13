@@ -1012,7 +1012,16 @@ function M.decide(view)
       end
     else
       formDeniedLogged = false
-      if not in_travel_form(view) then
+      -- Approaching the cave mouth: armor up OUTDOORS so the seat enters
+      -- the picket already in bear, with no indoor cast dance and no
+      -- form-bonus reset mid-crossing (rolls 2-4 re-cast inside).
+      if finaleStarted and not interiorComplete and pos.x > 6440.0 and
+          pos.y > -2160.0 then
+        if not in_bear_form(view) then
+          local cast = want_form(view, pos, BEAR_FORM_SPELL, "bear_form")
+          if cast then return cast end
+        end
+      elseif not in_travel_form(view) then
         local cast = want_form(view, pos, TRAVEL_FORM_SPELL, "travel_form")
         if cast then return cast end
       end

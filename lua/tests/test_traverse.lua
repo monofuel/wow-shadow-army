@@ -352,10 +352,18 @@ check(hookNav.kind == "navigate" and hookNav.reason ~= "snag_hop"
   "hook beat timbermaw_road_11 is not x-skipped past its X band")
 
 -- The cave mouth is a handoff: the walked interior chain owns Timbermaw.
+-- Approaching the mouth in Travel now armors up OUTDOORS first: the seat
+-- enters the picket already in bear (rolls 2-4 paid an indoor cast).
+clock = clock + 20.0
+local preBear = petrel.decide(view(6500.0, -2060.0, formed))
+check(preBear.kind == "cast_spell" and preBear.spell == 5487,
+  "the cave approach armors up in bear before entering")
+
 -- timbermaw_01 (the mouth itself) captures immediately; the next intent
 -- targets the first gallery beat and carries the fork steering features.
 clock = clock + 5.0
-local atCave = petrel.decide(view(6500.0, -2060.0, formed))
+local atCave = petrel.decide(view(6500.0, -2060.0,
+  { shapeshift_form_id = 5 }))
 check(atCave.kind == "navigate" and
     atCave.reason:find("^timbermaw_") ~= nil,
   "the cave mouth hands off to the walked interior chain")
