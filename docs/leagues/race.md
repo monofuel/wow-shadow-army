@@ -1,10 +1,43 @@
-# Race Wow — standings over time
+# Race Wow — standings, competitors, and petrel progress
 
-Scoring: farthest authoritative northing across Kalimdor (spawn x=-9187
-to Everlook x=+6687; full course ~15,874) inside one 45-sim-minute
-episode at 10x. Division: Kalimdor Race. Rounds every ~30 min.
+Scoring: farthest authoritative **northing** across Kalimdor
+(`world_x + 9187`; spawn = 0, Everlook goal ≈ 15,874) inside one
+45-sim-minute episode at 10x. Division: Kalimdor Race. Rounds every
+~30 min (observed round #1678, 2026-08-13). `is_champion` = OUR active
+entry, NOT rank (see AGENTS.md).
+
+## Course landmarks (northing from spawn)
+
+| landmark | world x | northing |
+|---|---|---|
+| spawn (south Tanaris) | -9187 | 0 |
+| water_entry (Tanaris coast) | -6784 | 2,403 |
+| duskwallow_coast | -4627 | 4,560 |
+| merchant_coast (inner bay) | -1817 | 7,370 |
+| barrens_shore (Ratchet) | -910 | 8,277 |
+| top_barrens | 1071 | 10,258 |
+| felwood_cave_entrance | 6503 | 15,690 |
+| Everlook (goal) | 6687 | 15,874 |
+
+## Competitors (fill names from the leaderboard web UI — the CLI does
+## not expose the entrant roll; observe/coworld return empty players)
+
+| entrant | best score | last seen | notes |
+|---|---|---|---|
+| andre | 10,700 | 2026-08-13 | league leader; ~just past top_barrens |
+| (petrel — us) | 2,400 hosted / 10,221 local | 2026-08-13 | see progress table |
+| (several entrants) | 0 | 2026-08-13 | scoring zeros — league possibly flaky (monofuel) |
+
+## Petrel version progress
+
+| version | frozen SHAs (fork / wsa) | local best northing | hosted best | notes |
+|---|---|---|---|---|
+| v1 | 4c24e52f4 / eeb86be | 10,221 (lucky water entry; 14,088 yd, ~4.1 wall min) | 2,400 (#4) | waterline-spin cascade predates the fix: hosted episodes + monofuel's replay spin at the beach; the local 10.2k run rolled lucky entry dice |
+| v2 | e261c3d84 / 7936932 | 10,204 (0 stalls, 0 deaths, clock-limited at top_barrens) | pending first round | spin structurally dead (turn clamp + one seaward target + JUMP releases); known flaws: land zig-zag (ticket 0013), flag-flicker bobbing (0002), cave wall-stick (0012) |
+
+## Standings history (append-only)
 
 | date (UTC) | our champion | our score | our rank | leader | leader score | notes |
 |---|---|---|---|---|---|---|
-| 2026-08-13 | petrel:v1 | ~2,400 | #4 | andre | 10,700 | v1 froze BEFORE the waterline-spin fixes: hosted episodes spin at the water entry (northing 2.4k = the beach, exactly). Several entrants scoring 0 (league possibly flaky). Local stable build confirms 10,204 northing — v2 submission in flight. |
-| 2026-08-13 | petrel:v2 (submitted, reconciling) | — | — | andre | 10,700 | v2 = the stable spin-free build (local 10,204 northing, 0 stalls/deaths; fork e261c3d84 / wsa 7936932). Champion-guard replacement of v1 (sub_6ef950c7). Expect ~10.2k on the next authoritative round — within ~500 of andre; cave (0012) or pace (0011) closes the rest. |
+| 2026-08-13 | petrel:v1 | ~2,400 | #4 | andre | 10,700 | v1 froze before the spin fixes; hosted runs stall at the beach. Several entrants at 0. |
+| 2026-08-13 | petrel:v2 (submitted, qualifying) | — | — | andre | 10,700 | sub_6ef950c7, champion-guard replacement; expect ~10.2k when its round lands |
