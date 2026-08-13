@@ -46,15 +46,20 @@ are assigned after a stable sort and **renumber every re-bake**.
 ### Regeneration
 
 From the repo root, with Kalimdor / Azeroth ADTs available
-(`VANILLA_WOW_ADT_DIR` or the default flat dump):
+(`VANILLA_WOW_ADT_DIR` or the default flat dump). Kalimdor's bake
+runs the Thousand Needles minimap-route pass and needs Pillow;
+Azeroth has no `MINIMAP_ROUTE_ZONES` entry and does not:
 
 ```sh
-python3 tools/bake_road_waypoints.py --map kalimdor
+nix-shell -p python3Packages.pillow --run \
+  'python3 tools/bake_road_waypoints.py --map kalimdor'
 python3 tools/bake_road_waypoints.py --map azeroth
 ```
 
+`--no-minimap` skips the route pass (Kalimdor then needs no Pillow).
 Defaults write `tools/data/road_waypoints_<map>.jsonl`. A second run of
 the same command must leave `git diff --stat tools/data/` empty.
+Current artifacts: kalimdor **179** segments, azeroth **236**.
 
 Bake knobs (see `tools/bake_road_waypoints.py`):
 
@@ -83,20 +88,67 @@ Bake knobs (see `tools/bake_road_waypoints.py`):
   whole components whose total centerline arclength is under the
   threshold. Meta field: `min_component_length_yd`. Bake stats include
   `dropped_short`. Network-scale guard — isolated paint scraps die.
-- Meta also records `markers` (copy of `ROAD_TEXTURE_MARKERS`) and
-  `overlay_only_markers` (copy of `OVERLAY_ONLY_MARKERS`).
+- Meta also records `markers` (copy of `ROAD_TEXTURE_MARKERS`),
+  `overlay_only_markers` (copy of `OVERLAY_ONLY_MARKERS`), and
+  `minimap_route_zones` (copy of the zones actually run; empty under
+  `--no-minimap`).
+- `--no-minimap` skips `MINIMAP_ROUTE_ZONES`. Without it, a Kalimdor
+  bake with no Pillow exits 2 (`nix-shell -p python3Packages.pillow`).
+
+`MINIMAP_ROUTE_ZONES` (Kalimdor only today: zone `thousand_needles`)
+is a per-zone dict, not a CLI flag. Fields:
+
+- `bbox` — world box, **STEP-aligned** (lattice keys are global
+  integer indices).
+- `z_band` — search bound only; cells outside are dropped, not costed.
+- `max_grade_wall` (1.8) — hard skip. Mesa tops sit behind cliff-grade
+  rings, so they are unreachable from the floor.
+- `slope_penalty` (2.0) — extra cost on grade above 0.5:
+  `penalty * (grade - 0.5)`.
+- `contrast_c0` (25) / `contrast_k` (22) / `block_yd` (64) — contrast
+  term is `max(0, c0 - (G - 64yd-block-median-G)) / k`. `G` is the
+  minimap green channel.
+- `max_water_depth` (0.5) — hard skip, same meaning as the paint gate.
+- `legs` — `[name_a, (x, y), name_b, (x, y), options?]`. Each leg
+  emits one decimated `"source": "baked"` segment. No path (or a
+  1-point decimation) aborts with `minimap route FAILED`. Per-leg
+  options (round-6):
+  - `z_corridor: (lo, hi, penalty_per_yd)` — cost penalty (not a
+    wall) added while the cell's z is outside `[lo, hi]`. Floor legs
+    use `(-120, -20, 10.0)`: the Thousand Needles road never leaves
+    the canyon bottom, and +10/yd makes any rim detour unaffordable.
+  - `max_grade_wall` — per-leg override of the zone wall. Only the
+    basin→Tanaris ramp uses it (2.2; the measured ramp pinch is
+    1.78–1.79, right at the 1.8 zone wall). Cells between the zone
+    wall and a leg override never feed the block-median contrast
+    baseline, so one leg's wall cannot drift another leg's path.
+  - The bake hard-fails if a corridor leg spends >5% of its length
+    outside its corridor (per-leg stderr shows `pct_outside` and the
+    max contiguous run) or if any anchor snaps >20 yd — the two
+    failure modes that shipped round-5's rim-walking leg.
+
+Dijkstra is deterministic: heap keyed `(cost, cell)`. Shipped legs:
+`feralas_junction` → `lift_lower` → `freewind_base` → `canyon_se` →
+`basin_entry` → `racetrack_north` → `racetrack_mid` →
+`racetrack_south` → `tanaris_road`. The chain descends the measured
+low-grade scarp cut into the Shimmering Flats basin, crosses the
+salt past the racetrack (three waypoints keep the line off the drag
+strip), and climbs the southwest ramp to the painted Tanaris road.
 
 `ROAD_TEXTURE_MARKERS` (substring match, lowercased): `road`,
-`elwynncobblestone`, `duskwoodcobblestone`, `tanarisdirtfootprint`,
-`thousandneedlesrockhighlight02`. `OVERLAY_ONLY_MARKERS` is
-`thousandneedlesrockhighlight02` and `tanarisdirtfootprint`: those
-count as road only when painted as an overlay layer (alpha > 64), never
-as a chunk's base layer. `thousandneedlesdirt` was tried twice and
-removed: as a base marker it blobbed the whole canyon floor; as
-overlay-only it painted cliff faces (median grade 1.02). The actual
-light-brown Thousand Needles road paint is
-`thousandneedlesrockhighlight02`. Overlay-only because mesa tops carry
-it as a base layer; dual-use on mesa rims is killed by `--max-grade`.
+`elwynncobblestone`, `duskwoodcobblestone`, `tanarisdirtfootprint`.
+`OVERLAY_ONLY_MARKERS` is `tanarisdirtfootprint`: it counts as road
+only when painted as an overlay layer (alpha > 64), never as a
+chunk's base layer. Thousand Needles marker history — three flips,
+do not add a fourth: (1) `thousandneedlesdirt` tried and removed —
+base blobbed the whole canyon floor; overlay-only painted cliff
+faces (median grade 1.02). (2) `thousandneedlesrockhighlight02`
+added as overlay-only; looked like the light-brown trail. (3) hl02
+removed (round-3's mistake): it paints mesa TOPS at alpha-255
+overlay (overlay-only semantics cannot save it; flat tops pass
+`--max-grade`) and its canyon-floor footprint is one ~180yd patch.
+The floor road has no texture signature; 1kN roads come from the
+minimap routing pass.
 
 Dev subset (does not replace the checked-in artifact):
 
@@ -123,12 +175,11 @@ with a newline.
   baked ends. Stitch with a `"source": "hand"` line (same as bridges).
 - **Tanaris paint is thin.** The extra marker is `tanarisdirtfootprint`
   (a footprint tileset, not a `*road*` tileset); coverage is sparse.
-  Overlay-only, same as Thousand Needles highlight.
-- **Thousand Needles trail is overlay `thousandneedlesrockhighlight02`.**
-  Mesa-top base paint is not road; overlay is the trail. Dual-use on
-  mesa rims is dropped by `--max-grade`. The trail bakes sparse/dashed
-  (paint gaps + the grade and length gates), so hand stitches are
-  expected there.
+  Overlay-only.
+- **Thousand Needles floor is routed, not painted.** `MINIMAP_ROUTE_ZONES`
+  legs are re-derived every bake as `"source": "baked"` segments.
+  Tune the zone config, do not hand-edit those lines — the next bake
+  replaces them. Hand lines still survive **byte-identical**.
 - **Isolated scraps under 150 yd never bake.** `--min-component-length`
   drops whole components below that arclength. Roads matter as a
   network — add a `"source": "hand"` line for anything genuinely

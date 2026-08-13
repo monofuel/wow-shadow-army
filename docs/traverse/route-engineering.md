@@ -93,18 +93,12 @@ never key other tooling on baked ids) live in `tools/data/README.md`.
 
 Eastern Kingdoms: `--map azeroth`. `ROAD_TEXTURE_MARKERS` is the `*road*`
 substring plus `elwynncobblestone` (Elwynn's paved textures do not
-contain `road`), `duskwoodcobblestone` (same for Duskwood),
+contain `road`), `duskwoodcobblestone` (same for Duskwood), and
 `tanarisdirtfootprint` (Tanaris coverage is thin — sparse footprint
-paint), and `thousandneedlesrockhighlight02`. The last two are
-overlay-only (`OVERLAY_ONLY_MARKERS`): they count as road only when
-painted as an overlay layer (alpha > 64), never as a chunk's base
-layer. `thousandneedlesdirt` was tried twice and removed: as a base
-marker it blobbed the canyon floor; as overlay-only it painted cliff
-faces. The actual light-brown Thousand Needles road paint is
-`thousandneedlesrockhighlight02` — identified by correlating minimap
-BLP luminance with ADT paint signatures, a trick worth repeating on
-new zones. Overlay-only because mesa tops carry it as a base layer;
-dual-use on mesa rims is killed by the grade gate.
+paint). `OVERLAY_ONLY_MARKERS` is `tanarisdirtfootprint`: it counts
+as road only when painted as an overlay layer (alpha > 64), never as
+a chunk's base layer. Thousand Needles is not a texture-marker zone
+anymore — see the round-5 section below.
 
 Bake always Zhang-Suen-thins the paint mask first, so a wide road still
 yields a single centerline. Road cells whose MCLQ water depth exceeds
@@ -119,6 +113,63 @@ threshold — walkability guard, kills cliff-face paint.
 `--min-component-length` (default 150.0 yd; `<=0` disables) drops
 whole components whose total centerline arclength is under the
 threshold — network-scale guard, kills isolated paint scraps.
+
+## Technique: minimap routing when paint has no signature (round-5)
+
+Texture markers cannot find the Thousand Needles floor road. Marker
+history is three flips (do not add a fourth): `thousandneedlesdirt`
+blobbed the canyon floor as a base and painted cliff faces as
+overlay-only (median grade 1.02); `thousandneedlesrockhighlight02`
+was added overlay-only as the supposed light-brown trail, then
+removed — it paints mesa TOPS at alpha-255 overlay (overlay-only
+semantics cannot save it; those flat tops pass `--max-grade`). Its
+canyon-floor footprint was one ~180yd patch. The floor road has no
+texture signature. Round-3's verification tested flatness when it
+needed elevation and connectivity.
+
+`MINIMAP_ROUTE_ZONES` in `bake_road_waypoints.py` is the replacement:
+per zone, a STEP-aligned bbox, a `z_band` used only as a search
+bound, hard walls at `max_water_depth` 0.5 and `max_grade_wall` 1.8
+(mesa tops sit behind cliff-grade rings, so they are unreachable
+from the floor), `slope_penalty` on grade above 0.5, and contrast
+cost `max(0, c0 - (G - 64yd-block-median-G)) / k` with `c0=25`,
+`k=22`. Deterministic Dijkstra (heap keyed `(cost, cell)`). Each
+configured leg emits one decimated `"source": "baked"` segment; a
+leg with no path aborts the bake (`minimap route FAILED`). Legs
+carry optional round-6 fields: `z_corridor (lo, hi, penalty/yd)` —
+an altitude prior (the 1kN road never leaves the canyon bottom;
+floor legs pay +10/yd outside −120..−20, so rim detours lose) — and
+`max_grade_wall` (only the basin→Tanaris ramp: 2.2 vs measured
+pinch 1.78–1.79). The bake hard-fails if a corridor leg exceeds 5%
+of its length outside corridor or an anchor snaps >20 yd. Shipped
+legs: `feralas_junction` → `lift_lower` → `freewind_base` →
+`canyon_se` → `basin_entry` → `racetrack_north` → `racetrack_mid` →
+`racetrack_south` → `tanaris_road`: down the measured scarp cut,
+across the Shimmering Flats past the racetrack, up the southwest
+ramp to the painted Tanaris road — a nav-road line, not a paint
+centerline. Routed legs are re-derived every bake; tune the zone
+config, not the artifact. Meta records
+`minimap_route_zones`. Kalimdor bake needs Pillow
+(`nix-shell -p python3Packages.pillow`); Azeroth has no route
+zones. `--no-minimap` skips the pass.
+
+The sampler is `tools/minimap_mask.py`: `md5translate.trs` index,
+world→pixel transform landmark-pinned at the Great Lift lower dock
+(axes read transposed — do not "fix"), native 256px nearest/floor
+pixel (no resampling), integer ITU-R 601 luma and RGB. Routing
+uses the green channel.
+
+Connectivity doctrine (`tools/tests/test_road_artifacts.py`, now
+in `make test-traverse-checkpoint`): if the network is not
+connected to the neighboring regions, it is not correct. One
+artifact component must reach the Great Lift lower dock, the
+Feralas junction, the racetrack (planar 150 yd — the salt crossing
+may lawfully drift), and the painted Tanaris road — all in ONE
+component, planar-gated AND `|dz|<=40`. The z-gate
+exists because a mesa fake at z=86 sat 89 yd XY from the dock
+(z=-43.857). Segments are located geometrically, never by baked
+id. Barrens connectivity is via the lower dock; the lift itself
+is a transport edge.
 
 ## Technique: trace-pinning (walked ground is evidence)
 
