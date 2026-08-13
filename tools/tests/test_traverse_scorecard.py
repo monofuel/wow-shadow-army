@@ -100,6 +100,30 @@ class TestTraverseScorecard(unittest.TestCase):
         self.assertEqual(out["events"]["counts"], {})
         self.assertEqual(out["warnings"], [])
 
+    def test_stutter_metric_catches_subsample_metronome(self) -> None:
+        # 1 yd/s in form 0 (7.0 expected): every sample shows displacement,
+        # so stopped_s stays 0 — only the pace metric sees the crawl (the
+        # 2026-08-13 lease metronome hid exactly like this).
+        lines = [_flight(5.0 * i, 5.0 * i, 0.0) for i in range(5)]
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "run.log"
+            path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            out = sc.parse_run_log(path)
+        self.assertEqual(out["stopped_s_total"], 0.0)
+        self.assertEqual(out["stutter_s"], 20.0)
+        self.assertLess(out["pace_frac"], 0.2)
+        self.assertTrue(any("WARN pace" in w for w in out["warnings"]))
+
+    def test_full_pace_run_has_no_stutter_warn(self) -> None:
+        lines = [_flight(5.0 * i, 35.0 * i, 0.0) for i in range(5)]
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "run.log"
+            path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            out = sc.parse_run_log(path)
+        self.assertEqual(out["stutter_s"], 0.0)
+        self.assertGreaterEqual(out["pace_frac"], 0.99)
+        self.assertFalse(any("WARN pace" in w for w in out["warnings"]))
+
     def test_cli_json(self) -> None:
         import io
         from unittest import mock
