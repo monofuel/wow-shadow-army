@@ -331,6 +331,20 @@ peregrine-image: lua-bot-player-image
 	test "$$(docker image inspect $(PEREGRINE_IMAGE) --format '{{.Architecture}}')" = amd64; \
 	echo "built $(PEREGRINE_IMAGE) (policy name: peregrine)"
 
+# Petrel: hosted Traverse policy image (rendered lua-bot + this lua/,
+# entry=traverse). Same shape as Peregrine; see Dockerfile.petrel and
+# playbooks/upload-bot.md. Does NOT upload or submit.
+PETREL_IMAGE ?= petrel:latest
+.PHONY: petrel-image
+petrel-image: lua-bot-player-image
+	@set -e; \
+	docker build --platform linux/amd64 \
+		-f Dockerfile.petrel \
+		--build-arg LUA_BOT_PLAYER_IMAGE=$(LUA_BOT_PLAYER_IMAGE) \
+		-t $(PETREL_IMAGE) .; \
+	test "$$(docker image inspect $(PETREL_IMAGE) --format '{{.Architecture}}')" = amd64; \
+	echo "built $(PETREL_IMAGE) (policy name: petrel)"
+
 .PHONY: backup-server
 backup-server:
 	@tools/backup_server.sh $(LABEL)

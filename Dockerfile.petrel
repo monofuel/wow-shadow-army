@@ -1,0 +1,26 @@
+# Petrel — hosted Traverse policy (rendered lua-bot + the traverse entry).
+#
+# Base image is monofuel-vanilla-wow's lua_bot_player_runtime (vanilla-wow-player
+# built with -d:luaBotVm). This layer only bakes the league lua/ tree and locks
+# the entry module. The spawn→Everlook speedrun brain: desert crossing, fatigue
+# swim, Merchant Bay, Barrens connector, painted northern roads.
+#
+# Build (from this worktree, after the base image exists):
+#   make petrel-image
+#
+# Upload (see playbooks/upload-bot.md — upload is NOT submit):
+#   uv run coworld upload-policy petrel:latest --name petrel
+#   uv run --extra dev vanilla-wow submit petrel:vN \
+#     --league league_0f38d762-930a-41d3-9979-1858dd52c1ae --json
+
+# syntax=docker/dockerfile:1.7
+
+ARG LUA_BOT_PLAYER_IMAGE=coworld-lua-bot-player:latest
+FROM ${LUA_BOT_PLAYER_IMAGE}
+
+COPY lua/ /opt/policy/lua/
+
+ENV COWORLD_LUA_REPO=/opt/policy
+ENV COWORLD_LUA_ENTRY=traverse
+
+CMD ["tini", "--", "/usr/local/bin/lua_bot_entry.sh"]
