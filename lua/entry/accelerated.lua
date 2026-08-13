@@ -45,8 +45,10 @@ local NUKES_BY_CLASS = {
 }
 
 -- Buff once per life: cheap, and a level 1 character has almost no stats.
+-- Tables are highest rank first; first usable on the action bar wins.
 local BUFFS_BY_CLASS = {
-  [11] = 1126, -- druid: Mark of the Wild
+  [11] = { 1126 },       -- druid: Mark of the Wild
+  [9] = { 696, 687 },    -- warlock: Demon Skin r2/r1
 }
 
 local ENGAGE_YARDS = 4.0
@@ -526,11 +528,19 @@ function M.decide(view)
   end
 
   -- One buff per life, while nothing is hitting us.
-  local buff = BUFFS_BY_CLASS[view.class_id or 0]
-  if buff and not engaged and not view.in_combat and buffedAt ~= view.level and
-      usable_spell(view, buff) then
-    buffedAt = view.level
-    return { kind = "cast_spell", spell = buff, reason = "buff", status = progress_status(view) }
+  local buffs = BUFFS_BY_CLASS[view.class_id or 0]
+  if buffs and not engaged and not view.in_combat and buffedAt ~= view.level then
+    for i = 1, #buffs do
+      if usable_spell(view, buffs[i]) then
+        buffedAt = view.level
+        return {
+          kind = "cast_spell",
+          spell = buffs[i],
+          reason = "buff",
+          status = progress_status(view),
+        }
+      end
+    end
   end
 
   -- Keep fighting what is already engaged; only fresh pulls face the gates.
