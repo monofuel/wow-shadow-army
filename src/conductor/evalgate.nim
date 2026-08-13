@@ -97,15 +97,19 @@ proc runEval*(checkoutDir: string, lc: LeagueConfig, slug: string,
 
   let (rc, output) = runCommandCapture(checkoutDir, "make", args,
     timeoutMs = (wallTimeout + 900) * 1000)
-  if rc == 2:
+  # GNU make exits 2 for ANY failing recipe, so the exit code cannot
+  # distinguish "flock held" from "waiter verdict not-ok" (rc=1 inside
+  # the recipe — NORMAL while no run reaches the end checkpoint). Decide
+  # by evidence: the lock message, then run.log freshness.
+  if "another live Traverse run owns" in output:
     return EvalResult(outcome: evalBusy,
-      detail: "make rc=2 (eval lock held or bracket args): " &
-        output[max(0, output.len - 300) .. ^1])
+      detail: "eval flock held by another live run")
 
   if not fileExists(runLogPath) or
       getLastModificationTime(runLogPath) <= beforeMtime:
     return EvalResult(outcome: evalBusy,
-      detail: "run.log not refreshed — lost the slot race, no fresh run")
+      detail: "run.log not refreshed — lost the slot race, no fresh run" &
+        " (make rc=" & $rc & ")")
 
   # Archive before anything else can truncate it (ticket 0017).
   let archiveDir = checkoutDir / ArchiveRelDir
