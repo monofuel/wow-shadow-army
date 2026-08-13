@@ -58,9 +58,12 @@ proc defaultConductorConfig*(): ConductorConfig =
       coding: AgentConfig(harness: harnessClaudeCode, model: "claude-opus-5",
         reasoningEffort: "", hardTimeout: 3_600_000,
         noOutputTimeout: 300_000, progressTimeout: 900_000),
+      # Review is a verdict task: grok-4.6's default xhigh reasoning goes
+      # silent >300s on large diffs (probed 2026-08-13: 127KB review =
+      # 5s at low effort vs >5min with silent gaps at xhigh).
       reviewer: AgentConfig(harness: harnessGrokBuild, model: "grok-4.6",
-        reasoningEffort: "", hardTimeout: 1_800_000,
-        noOutputTimeout: 300_000, progressTimeout: 600_000),
+        reasoningEffort: "low", hardTimeout: 1_800_000,
+        noOutputTimeout: 600_000, progressTimeout: 600_000),
     ),
     maxAttemptsPerTicket: 3,
     evalLockRetrySeconds: 120,

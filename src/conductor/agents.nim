@@ -55,9 +55,14 @@ proc teardownWorktree*(root: string, lc: LeagueConfig,
 
 proc runWorker(agent: AgentConfig, prompt, workingDir, ticketId: string,
     attempt: int): AgentRunResult =
+  # Logs must OUTLIVE the worktree (default logRoot lives inside it and
+  # dies at teardown, orphaning every parked-tick autopsy). Worktrees sit
+  # at <repo>/.conductor/worktrees/<slug>, so hop up to .conductor/logs.
+  let logRoot = workingDir.parentDir.parentDir / "logs"
   runAgent(AgentRunRequest(
     prompt: prompt,
     workingDir: workingDir,
+    logRoot: logRoot,
     harness: agent.harness,
     model: agent.model,
     reasoningEffort: agent.reasoningEffort,
