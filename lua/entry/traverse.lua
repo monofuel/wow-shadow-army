@@ -968,7 +968,11 @@ function M.decide(view)
   -- defensive cooldowns, no form canceling — casting means standing still,
   -- and standing still is the only way this bot dies (doctrine,
   -- docs/traverse/README.md).
-  if swimming then
+  -- Aquatic also re-arms while WADING: grounding on a waterline shelf
+  -- auto-cancels the form, and waiting for the swim flag to return left
+  -- the seat formless for the whole shelf crossing (2026-08-13 water
+  -- entry). Forms are instant and movement-safe (stance-bar press).
+  if swimming or wading(view, pos) then
     if not in_aquatic_form(view) then
       local cast = want_form(view, pos, AQUATIC_FORM_SPELL, "aquatic_form")
       if cast then return cast end
