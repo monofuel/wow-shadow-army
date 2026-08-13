@@ -1,13 +1,4 @@
--- Wet-chain contract for the Petrel brain. The SWIM gate is read from the
--- process environment at module load, so this file re-runs itself with
--- PETREL_SWIM=1 rather than mutating what a process cannot mutate.
-if os.getenv("PETREL_SWIM") ~= "1" then
-  local lua = arg and arg[-1] or "lua"
-  local ok = os.execute('PETREL_SWIM=1 "' .. lua .. '" "' .. arg[0] .. '"')
-  -- Lua 5.1 os.execute returns a number; 5.2+ returns a boolean first.
-  if ok == true or ok == 0 then os.exit(0) end
-  os.exit(1)
-end
+-- Wet-chain contract for the Petrel brain (the wet chain is unconditional).
 
 package.path = "lua/?.lua;lua/entry/?.lua;lua/tools/?.lua;;"
 
@@ -55,10 +46,10 @@ end
 
 local aquatic = { shapeshift_form_id = 4 }
 
--- Dry on the sand inside the entry band: the gate is on, so the brain
--- presses toward the first wet beat instead of holding for a swim pass.
+-- Dry on the sand inside the entry band: the brain presses toward the
+-- first wet beat instead of holding.
 local entry = petrel.decide(view(-6790.0, -4840.0, { shapeshift_form_id = 3 }))
-check(entry.kind == "navigate", "gate on: no awaiting_swim_pass hold")
+check(entry.kind == "navigate", "no hold at the entry band")
 check(entry.reason == "enter_water", "dry entry uses the entry reason")
 check(entry.x == -6737.63, "dry entry targets the first wet beat")
 check(entry.z == nil,

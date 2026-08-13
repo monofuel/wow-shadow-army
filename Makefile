@@ -694,16 +694,15 @@ traverse-pack-replay:
 	@tools/pack_traverse_replay.sh
 
 # Petrel on the lua-bot host (docs/traverse/README.md). Headless full run.
-# The wet chain runs by default: traverse/traverse-headed attempt the
-# ENTIRE course (desert + swim). SWIM=0 opts out; traverse-desert and
-# traverse-pol pin land-only semantics themselves.
-SWIM ?=
+# The wet chain is unconditional (the PETREL_SWIM gate is gone, ticket
+# 0015): every traverse run is the full course — desert, swim, connector,
+# finale. The harness passes NO behavior-changing env vars; what runs
+# locally is what ships.
 # CHECKPOINT=<name> SOAP-teleports the character after login (local debug;
 # names from `make traverse-checkpoints`). The episode realm is recreated
 # per launch, so SOAP is enabled at birth and a background watcher waits
 # for the traverse container before applying — it never touches the
-# persistent realm. A checkpoint run is a wet run: PETREL_SWIM defaults on
-# (override with SWIM=0). wet_start lands swimming; water_entry lands DRY
+# persistent realm. wet_start lands swimming; water_entry lands DRY
 # on the sand (the shoreline entry is a known-open gap on the lua-bot
 # host — you will see the bot work the waterline, not the ribbon).
 # END_CHECKPOINT=<name> turns either launcher into a bounded segment test. It
@@ -714,7 +713,6 @@ END_CHECKPOINT ?=
 END_TIMEOUT ?=2700
 TRAVERSE_SEGMENT_RESULT := $(CURDIR)/local_data/traverse-segment-result.json
 TRAVERSE_LIVE_LOCK := $(CURDIR)/local_data/traverse-live.lock
-TRAVERSE_SWIM_EFFECTIVE = $(or $(SWIM),1)
 define TRAVERSE_ACQUIRE_LOCK
 	mkdir -p "$(CURDIR)/local_data"; \
 	exec 8>"$(TRAVERSE_LIVE_LOCK)"; \
@@ -753,7 +751,7 @@ define TRAVERSE_RUN
 	mkdir -p "$(CURDIR)/local_data/traverse-status"; \
 	if [ -n "$(END_CHECKPOINT)" ]; then \
 		cd $(FORK_CLIENT); \
-		PETREL_SWIM=$(TRAVERSE_SWIM_EFFECTIVE) setsid sh -c '$(TRAVERSE_LAUNCH) --presentation=$(1) 2>&1 | tee "$(CURDIR)/local_data/traverse-status/run.log"' & \
+		setsid sh -c '$(TRAVERSE_LAUNCH) --presentation=$(1) 2>&1 | tee "$(CURDIR)/local_data/traverse-status/run.log"' & \
 		run_pid=$$!; \
 		cleanup() { \
 			kill -TERM -- -$$run_pid 2>/dev/null || true; \
@@ -770,7 +768,7 @@ define TRAVERSE_RUN
 		exit $$segment_rc; \
 	else \
 		cd $(FORK_CLIENT) && set -o pipefail && \
-		PETREL_SWIM=$(TRAVERSE_SWIM_EFFECTIVE) $(TRAVERSE_LAUNCH) --presentation=$(1) 2>&1 | \
+		$(TRAVERSE_LAUNCH) --presentation=$(1) 2>&1 | \
 			tee "$(CURDIR)/local_data/traverse-status/run.log"; \
 	fi
 endef
@@ -788,7 +786,7 @@ traverse-headed:
 # Fast regression: proof-of-life (level 60, map 1, movement + inputs).
 traverse-pol:
 	@$(TRAVERSE_ACQUIRE_LOCK); \
-	cd $(FORK_CLIENT) && PETREL_SWIM=0 $(TRAVERSE_LAUNCH) --proof-of-life
+	cd $(FORK_CLIENT) && $(TRAVERSE_LAUNCH) --proof-of-life
 
 # Land-leg proof: spawn → desert ocean coast (water_entry), with client CPU
 # sampling for the streaming-starvation investigation. Readback at exit.

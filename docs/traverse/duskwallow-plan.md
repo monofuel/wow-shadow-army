@@ -513,7 +513,7 @@ Score is still max northing X; this file does not optimize for Everlook.
 
 | Field | Value |
 |---|---|
-| Mode | **`make traverse-wet`** (lua-bot host; SOAP tele to `wet_start`, headless, PETREL_SWIM=1) — locked 2026-08-10 |
+| Mode | **`make traverse-wet`** (lua-bot host; SOAP tele to `wet_start`, headless) — locked 2026-08-10; the PETREL_SWIM gate was removed 2026-08-13 (wet chain unconditional) |
 | Metric | `best_planar_to_duskwallow_wet` (lower better; computed by the harness from status samples with swimming + Aquatic) |
 | **Baseline Number** | **295.8** (best; sibling configs 378.8 / 403.1) |
 | **Baseline run id** | health-log stamp `20260810T024114Z` (v8 dense carpet); current line v12 `20260810T033603Z` = 403.1 |

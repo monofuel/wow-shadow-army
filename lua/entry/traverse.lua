@@ -11,8 +11,8 @@
 --
 -- Route: sparse beats in lua/config/traverse_beats.lua — a land approach to
 -- the Tanaris coast, then the manual-run cheese ribbon to the Dustwallow
--- coast. This pass drives only the land legs; SWIM gates the wet chain until
--- the swim segment is proven separately (see docs/traverse/README.md).
+-- coast, wet chain, Barrens connector, and finale
+-- (see docs/traverse/README.md).
 
 local M = { name = "petrel" }
 
@@ -28,10 +28,6 @@ local CONNECT_LAND = require("config.traverse_connector_land_beats")
 -- beats route like any others and the finale stays blocked at the cave.
 local INTERIOR = require("config.traverse_finale_interior_beats")
 local FINALE = require("config.traverse_finale_beats")
-
--- Wet-chain gate: PETREL_SWIM=1 opts a run into the wet chain. Default off
--- keeps traverse-desert's land-only PASS semantics ("awaiting_swim_pass").
-local SWIM = os.getenv("PETREL_SWIM") == "1"
 
 local TRAVEL_FORM_SPELL = 783
 -- Bear (rank-agnostic at the stance bar; 5487 = base Bear Form)
@@ -332,9 +328,7 @@ end
 
 local function bot_status(view, pos, beat, extra)
   local water = beat_by_id("water_entry")
-  -- Wet chain reports distance to merchant_coast; land-only still uses
-  -- the ROUTE segment goal (duskwallow_coast).
-  local goal = beat_by_id(SWIM and COAST.goal_id or ROUTE.goal_id)
+  local goal = beat_by_id(COAST.goal_id)
   local status = {
     beat = beat and beat.id or "?",
     x = pos.x,
@@ -806,7 +800,7 @@ end
 function M.decide(view)
   if not gateLogged then
     gateLogged = true
-    wow.log("petrel: wet chain " .. (SWIM and "ON (PETREL_SWIM=1)" or "off"))
+    wow.log("petrel: wet chain ON (hardwired)")
   end
   -- Death = the speedrun is over. No release, no corpse run, no recovery.
   if view.is_dead or view.is_ghost then
@@ -842,7 +836,7 @@ function M.decide(view)
   -- translates. Requires sustained frames so test harnesses with jumpy
   -- clocks cannot trip it, and active fatigue so safe-water pauses (form
   -- casts, beat handoffs) are left alone.
-  if SWIM and view.is_swimming then
+  if view.is_swimming then
     local now = wow.time()
     if parkCheckPos == nil or
         planar(pos.x, pos.y, parkCheckPos.x, parkCheckPos.y) > 2.0 then
@@ -870,7 +864,7 @@ function M.decide(view)
   -- Segment C: seat suspended mid-column, swim flag false, unrecovered.
   -- Log the client's liquid observation whenever the wet chain would want
   -- water but the seat is NOT swimming. Remove after the fork report.
-  if SWIM and not view.is_swimming then
+  if not view.is_swimming then
     local near_beach = planar(pos.x, pos.y, -6784.5, -4833.9) < 250.0
     local submerged_odd = view.liquid_submerged or
       (view.liquid_known and type(view.liquid_surface_z) == "number" and
@@ -891,7 +885,7 @@ function M.decide(view)
   end
 
   -- TEMP WETDBG: frozen-swimmer investigation (2026-08-10). Remove after.
-  if SWIM and view.is_swimming then
+  if view.is_swimming then
     local now = wow.time()
     -- Fine-grained inside the wall corridor: the parks live there.
     local dbg_window = pos.x > -5760.0 and pos.x < -5540.0
@@ -943,7 +937,7 @@ function M.decide(view)
   -- the seat back in Felwood; reverting to the northern-land route there
   -- hides the actual finale failure and sends the bot south. Checkpoint runs
   -- start a fresh process, so no in-run reset is needed.
-  if SWIM and not connectorStarted and
+  if not connectorStarted and
       ((pos.x >= -920.0 and pos.x < LAND.start_x) or
        planar(pos.x, pos.y, goal.x, goal.y) <= goal.radius + 20.0) then
     connectorStarted = true
@@ -1089,36 +1083,7 @@ function M.decide(view)
       status = bot_status(view, pos, beat, { phase = "north_land" }) }
   end
 
-  if not SWIM then
-    -- Land legs only: prove the seat can cross Tanaris to the coast.
-    if water_dist <= water.radius then
-      -- Holding by choice is not a stall; keep the watchdog quiet here.
-      lastPos, lastProgressAt, stallSince = { x = pos.x, y = pos.y },
-        wow.time(), nil
-      wow.set_status(string.format("at the coast (%.0fyd), awaiting swim pass",
-        water_dist))
-      return { kind = "hold", reason = "awaiting_swim_pass",
-        status = bot_status(view, pos, water) }
-    end
-    local beat = water
-    if not skipped[land.id] and land_dist > land.radius and
-        water_dist > 400.0 and pos.x < land.x + PASSED_YARDS then
-      beat = land
-    end
-    local intent = navigate_to(view, pos, beat, beat.id,
-      { status = { stalled_seconds = stalled } })
-    if intent then
-      wow.set_status(string.format("%s %.0fyd%s", beat.id,
-        planar(pos.x, pos.y, beat.x, beat.y),
-        stalled > 0 and string.format(" STALLED %.0fs", stalled) or ""))
-      return intent
-    end
-    -- Beat just skipped; next frame re-plans against what is left.
-    return { kind = "hold", reason = "replanning",
-      status = bot_status(view, pos, beat) }
-  end
-
-  -- Wet chain (SWIM=true): cheese ribbon through Duskwallow and Merchant
+  -- Wet chain: cheese ribbon through Duskwallow and Merchant
   -- Bay, then the final coastal approach to the Barrens shore.
 
   -- The wet chain also engages dry inside the entry band: standing on the

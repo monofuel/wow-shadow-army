@@ -2,7 +2,7 @@
 # Petrel wet-lab: SOAP-tele the traverse episode character to the
 # water_entry checkpoint and prove the cheese-coast swim to Dustwallow on
 # the lua-bot host. Local debug only — the fair prove is the full run from
-# stock spawn (PETREL_SWIM=1 make traverse).
+# stock spawn (make traverse).
 #
 # PASS: lua-bot-status.json ends holding intent_reason=duskwallow_coast
 # while swimming. FAIL: run_over (death — a policy bug to fix, never to
@@ -34,7 +34,7 @@ export VMANGOS_MANGOSD_CONFIG_OVERRIDES
 echo "traverse-wet: $RUN_SECONDS s headless run -> $RUN_LOG"
 (
   cd "$FORK" &&
-  PETREL_SWIM=1 nix develop "$FORK" --command \
+  nix develop "$FORK" --command \
     timeout "$RUN_SECONDS" nim r tools/launch_nim_player.nim -- \
     --league=race --bot=lua-bot \
     --lua-status-dir="$ROOT/local_data/traverse-status" \

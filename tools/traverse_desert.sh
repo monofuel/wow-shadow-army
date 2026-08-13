@@ -4,9 +4,10 @@
 # RPB-CPU/world-streaming starvation (bot outruns terrain streaming and
 # sticks). Evidence capture only — no recovery, no retries.
 #
-# Success: lua-bot-status.json ends with bot.beat=water_entry and a small
-# bot.dist_water (hold reason awaiting_swim_pass). Death or a stall is a
-# finding, not something this script works around.
+# The brain has no dry mode: on reaching the coast it enters the water.
+# Success: lua-bot-status.json ends swimming or within arm's reach of
+# water_entry. Death or a stall is a finding, not something this script
+# works around.
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -25,7 +26,7 @@ rm -f "$STATUS"
 echo "traverse-desert: $RUN_SECONDS s headless run -> $RUN_LOG"
 (
   cd "$FORK" &&
-  PETREL_SWIM=0 nix develop "$FORK" --command \
+  nix develop "$FORK" --command \
     timeout "$RUN_SECONDS" nim r tools/launch_nim_player.nim -- \
     --league=race --bot=lua-bot \
     --lua-status-dir="$ROOT/local_data/traverse-status" \
@@ -83,7 +84,9 @@ print(f'  position     x={bot.get("x")} y={bot.get("y")}')
 print(f'  dist_water   {bot.get("dist_water")}')
 print(f'  stalled      {bot.get("stalled_seconds")}')
 reason = s.get("intent_reason")
-if reason == "awaiting_swim_pass":
+dist_water = bot.get("dist_water")
+if bot.get("swimming") or (
+        isinstance(dist_water, (int, float)) and 0 <= dist_water <= 15):
     print("RESULT: PASS — reached the desert ocean coast")
 elif reason == "run_over":
     print("RESULT: FAIL — died (speedrun over; find what stopped the movement)")

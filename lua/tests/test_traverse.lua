@@ -126,12 +126,12 @@ local coastward = petrel.decide(view(-7050.0, -4650.0, formed))
 check(coastward.kind == "navigate" and coastward.x == -6784.5,
   "second leg is the water entry")
 
--- At the coast the land pass is complete: hold for the swim pass, do not
--- enter the water.
+-- At the coast the wet chain takes over: press into the water, never hold.
+-- (Target details are pinned by test_traverse_wet.lua.)
 clock = clock + 5.0
 local arrived = petrel.decide(view(-6790.0, -4840.0, formed))
-check(arrived.kind == "hold" and arrived.reason == "awaiting_swim_pass",
-  "holds at the coast awaiting the swim pass")
+check(arrived.kind == "navigate" and arrived.reason == "enter_water",
+  "presses into the water at the coast")
 
 -- SPEEDRUN RULE: never fight. A hostile on top of us changes nothing.
 clock = clock + 5.0
