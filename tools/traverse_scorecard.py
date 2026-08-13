@@ -66,6 +66,8 @@ def _parse_flight(line: str) -> dict[str, Any] | None:
             "nav": str(obj.get("nav") or ""),
             "beat": str(obj.get("beat") or ""),
             "xt": float(obj["xt"]) if obj.get("xt") is not None else -1.0,
+            # Absent in pre-0018 logs: None means "not recorded", never 1.0.
+            "fat": float(obj["fat"]) if obj.get("fat") is not None else None,
         }
     except (KeyError, TypeError, ValueError):
         return None
@@ -137,6 +139,8 @@ def parse_run_log(path: Path | str) -> dict[str, Any]:
     stutter_s = 0.0
     expected_yd = 0.0
     swim_s = 0.0
+    fatigue_s = 0.0
+    fat_min: float | None = None
     hp_loss_by_bin: dict[int, float] = defaultdict(float)
     xts: list[float] = []
 
@@ -192,6 +196,16 @@ def parse_run_log(path: Path | str) -> dict[str, Any]:
                 stutter_s += dt
         if fl.get("swim") and str(fl.get("beat") or "") != "-" and dt > 0:
             swim_s += dt
+        # Fatigue exposure: the bar only depletes in fatigue water, and
+        # three 2026-08-13 runs died of it with no metric (ticket 0018).
+        # Any time below a full bar is route-margin debt.
+        fat = fl.get("fat")
+        if fat is not None:
+            fat_v = float(fat)
+            if fat_min is None or fat_v < fat_min:
+                fat_min = fat_v
+            if fat_v < 1.0 and dt > 0:
+                fatigue_s += dt
         hp0, hp1 = int(prev.get("hp", -1)), int(fl.get("hp", -1))
         if hp0 >= 0 and hp1 >= 0 and hp1 < hp0:
             loss = float(hp0 - hp1)
@@ -274,6 +288,12 @@ def parse_run_log(path: Path | str) -> dict[str, Any]:
                 f"WARN hp: bin x={b} loss={loss:.0f} (>800)"
             )
             break
+    if fat_min is not None and fat_min < 1.0:
+        band = "DEATH-BAND " if fat_min < 0.35 else ""
+        warnings.append(
+            f"WARN fatigue: {band}min bar {fat_min:.2f}, "
+            f"{fatigue_s:.1f}s in fatigue water (target 0 — ticket 0018)"
+        )
 
     return {
         "duration_s": round(duration_s, 3),
@@ -293,6 +313,8 @@ def parse_run_log(path: Path | str) -> dict[str, Any]:
         },
         "events": events_out,
         "swim_s": round(swim_s, 3),
+        "fatigue_s": round(fatigue_s, 3),
+        "fat_min": round(fat_min, 3) if fat_min is not None else None,
         "hp_map": hp_map,
         "snags": snags,
         "warnings": warnings,
@@ -310,6 +332,7 @@ def format_table(sc: dict[str, Any]) -> str:
         f"stutter_s    {sc.get('stutter_s')}  pace_frac={sc.get('pace_frac')}",
         f"cross_track  {sc.get('cross_track')}",
         f"swim_s       {sc.get('swim_s')}",
+        f"fatigue_s    {sc.get('fatigue_s')}  fat_min={sc.get('fat_min')}",
         f"events       {sc.get('events', {}).get('counts')}",
         f"snags        total={sc.get('snags', {}).get('total')}  "
         f"{sc.get('snags', {}).get('clusters')}",
