@@ -58,8 +58,8 @@ def tile_extents(
 def atlas_size(
     a_min: int, a_max: int, b_min: int, b_max: int, px_per_tile: int
 ) -> tuple[int, int]:
-    width = (b_max - b_min + 1) * px_per_tile
-    height = (a_max - a_min + 1) * px_per_tile
+    width = (a_max - a_min + 1) * px_per_tile
+    height = (b_max - b_min + 1) * px_per_tile
     return width, height
 
 
@@ -88,13 +88,20 @@ def stitch_atlas(
 ):
     """Compose the continent atlas. Returns (image, placed, missing).
 
-    Verified placement — same convention as every mosaic in this project.
-    Do NOT transpose:
-      atlas row band = tile a (a increases downward; a from world y, west->east)
-      atlas col band = tile b (b increases rightward; b from world x, north->south)
-      within a tile: image row = x north->south, image col = y west->east
-      (BLPs are already oriented this way; paste as-is)
-    tile (a, b) pastes at ((b - b_min) * px, (a - a_min) * px).
+    Two distinct conventions — do not conflate them.
+
+    Per-tile pixel mapping (world -> pixel WITHIN a tile): landmark-verified
+    (Great Lift dock). Image row = x north->south, image col = y west->east.
+    BLPs are already oriented this way; paste each tile as-is.
+
+    Band arrangement (tile -> position in a continuous mosaic): seam-verified
+    2026-08-12. Index A advances the horizontal axis (A is y-derived); index
+    B advances the vertical axis (B is x-derived). A previous "verified
+    convention" claim conflated these two; per-tile checks cannot catch
+    band scrambling.
+
+    tile (a, b) pastes at ((a - a_min) * px, (b - b_min) * px).
+    Atlas width = aCount * px, height = bCount * px.
     """
     require_pillow()
     if px_per_tile < 1:
@@ -118,8 +125,8 @@ def stitch_atlas(
             continue
         if px_per_tile != mmask.TILE_PX:
             tile = tile.resize((px_per_tile, px_per_tile), Image.LANCZOS)
-        x = (b - b_min) * px_per_tile
-        y = (a - a_min) * px_per_tile
+        x = (a - a_min) * px_per_tile
+        y = (b - b_min) * px_per_tile
         atlas.paste(tile, (x, y))
         placed += 1
     return atlas, placed, missing

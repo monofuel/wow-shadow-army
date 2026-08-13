@@ -7,6 +7,7 @@ cleanly when the decoder or the flat minimap dump is not present.
 from __future__ import annotations
 
 import json
+import random
 import sys
 import tempfile
 import unittest
@@ -252,10 +253,11 @@ class TestMinimapAtlasBake(unittest.TestCase):
             self.assertEqual(atlas.size, (2 * self.PX, 2 * self.PX))
             # (a_min, b_min) band origin is atlas (0, 0).
             self.assertEqual(atlas.getpixel((0, 0)), (255, 0, 0, 255))
-            # (a_min, b_min+1) band origin is x-offset px_per_tile.
-            self.assertEqual(atlas.getpixel((self.PX, 0)), (0, 255, 0, 255))
-            # missing tile (a_min+1, b_min) stays fully transparent.
-            self.assertEqual(atlas.getpixel((0, self.PX))[3], 0)
+            # Old pins encoded the transposed layout that shipped garbled:
+            # (a_min, b_min+1) at x-offset, (a_min+1, b_min) at y-offset.
+            # Corrected arrangement: A horizontal, B vertical.
+            self.assertEqual(atlas.getpixel((0, self.PX)), (0, 255, 0, 255))
+            self.assertEqual(atlas.getpixel((self.PX, 0))[3], 0)
 
             raw_json = json_path.read_text(encoding="utf-8")
             data = json.loads(raw_json)
@@ -294,6 +296,277 @@ class TestMinimapAtlasBake(unittest.TestCase):
                 (out_a / "minimap_atlas_kalimdor.json").read_text(encoding="utf-8"),
                 (out_b / "minimap_atlas_kalimdor.json").read_text(encoding="utf-8"),
             )
+
+
+ATLAS_DIR = ROOT / "local_data" / "map_browser"
+KALIMDOR_ATLAS_PNG = ATLAS_DIR / "minimap_atlas_kalimdor.png"
+KALIMDOR_ATLAS_JSON = ATLAS_DIR / "minimap_atlas_kalimdor.json"
+HAVE_KALIMDOR_ATLAS = (
+    HAVE_PILLOW and KALIMDOR_ATLAS_PNG.is_file() and KALIMDOR_ATLAS_JSON.is_file()
+)
+skip_no_kalimdor_atlas = unittest.skipUnless(
+    HAVE_KALIMDOR_ATLAS,
+    "need Pillow and baked kalimdor atlas at local_data/map_browser/",
+)
+
+WORLD_TILE_ORIGIN = 32.0
+SEAM_PAIR_N = 20
+SEAM_RNG_SEED = 20260812
+
+LANDMARKS = {
+    "kalimdor": (
+        (-4677.066, -1853.667),  # Great Lift dock
+        (-5128.0, -1954.0),  # Freewind mesa
+        (-4280.0, -776.0),  # Feralas junction
+        (-6230.0, -3700.0),  # racetrack
+        (-1000.0, -500.0),
+        (2000.0, 1000.0),
+    ),
+    "azeroth": (
+        (-8900.0, -100.0),  # Elwynn-ish
+        (1800.0, 240.0),  # Tirisfal-ish
+        (-14200.0, 300.0),
+    ),
+}
+
+
+def _load_atlas_meta(map_name: str):
+    json_path = ATLAS_DIR / f"minimap_atlas_{map_name}.json"
+    png_path = ATLAS_DIR / f"minimap_atlas_{map_name}.png"
+    if not json_path.is_file() or not png_path.is_file():
+        return None
+    meta = json.loads(json_path.read_text(encoding="utf-8"))
+    from PIL import Image
+
+    image = Image.open(png_path).convert("RGBA")
+    return image, meta
+
+
+def _trs_tiles(map_name: str) -> set[tuple[int, int]]:
+    index = mmask.parse_trs(TRS_PATH)
+    return {(a, b) for (mp, a, b) in index if mp == map_name}
+
+
+def _band_origin(a: int, b: int, meta: dict) -> tuple[int, int]:
+    px = meta["px_per_tile"]
+    return ((a - meta["a_min"]) * px, (b - meta["b_min"]) * px)
+
+
+def _column(image, x: int, y0: int, length: int):
+    width, height = image.size
+    if x < 0 or x >= width or y0 < 0 or y0 + length > height:
+        return None
+    return [image.getpixel((x, y0 + i))[:3] for i in range(length)]
+
+
+def _row(image, y: int, x0: int, length: int):
+    width, height = image.size
+    if y < 0 or y >= height or x0 < 0 or x0 + length > width:
+        return None
+    return [image.getpixel((x0 + i, y))[:3] for i in range(length)]
+
+
+def _is_flat(strip) -> bool:
+    return strip is None or len(set(strip)) <= 1
+
+
+def _mean_abs_rgb(left, right) -> float:
+    acc = 0.0
+    n = len(left)
+    for p, q in zip(left, right):
+        acc += abs(p[0] - q[0]) + abs(p[1] - q[1]) + abs(p[2] - q[2])
+    return acc / (n * 3.0)
+
+
+def _edge_adjacent(t1: tuple[int, int], t2: tuple[int, int]) -> bool:
+    (a1, b1), (a2, b2) = t1, t2
+    return (a1 == a2 and abs(b1 - b2) == 1) or (b1 == b2 and abs(a1 - a2) == 1)
+
+
+def _horiz_strips(image, a: int, b: int, meta: dict):
+    px = meta["px_per_tile"]
+    ox, oy = _band_origin(a, b, meta)
+    left = _column(image, ox + px - 1, oy, px)
+    right = _column(image, ox + px, oy, px)
+    return left, right
+
+
+def _vert_strips(image, a: int, b: int, meta: dict):
+    px = meta["px_per_tile"]
+    ox, oy = _band_origin(a, b, meta)
+    bottom = _row(image, oy + px - 1, ox, px)
+    top = _row(image, oy + px, ox, px)
+    return bottom, top
+
+
+def _atlas_uv_pixel(meta: dict, x: float, y: float) -> tuple[int, int]:
+    t = float(meta["tile_yd"])
+    a_count = meta["a_max"] - meta["a_min"] + 1
+    b_count = meta["b_max"] - meta["b_min"] + 1
+    u_origin = (WORLD_TILE_ORIGIN - meta["a_min"]) * t
+    u_scale = 1.0 / (a_count * t)
+    v_origin = (WORLD_TILE_ORIGIN - meta["b_min"]) * t
+    v_scale = 1.0 / (b_count * t)
+    u = (u_origin - y) * u_scale
+    v = (v_origin - x) * v_scale
+    px = int(u * meta["width"])
+    py = int(v * meta["height"])
+    return px, py
+
+
+def _downscaled_tile_rgb_at(
+    md5_name: str, px_per_tile: int, local_x: int, local_y: int
+):
+    from PIL import Image
+
+    path = TILES_DIR / md5_name
+    if not path.is_file():
+        return None
+    with Image.open(path) as src:
+        tile = src.convert("RGBA")
+        if px_per_tile != mmask.TILE_PX:
+            tile = tile.resize((px_per_tile, px_per_tile), Image.LANCZOS)
+        pix = tile.getpixel((local_x, local_y))
+    return pix[:3]
+
+
+@skip_no_kalimdor_atlas
+class TestAtlasSeamContinuity(unittest.TestCase):
+    """World-adjacent tile seams must beat random non-adjacent pairs.
+
+    Fails on the transposed atlas that shipped garbled: that layout puts
+    A-neighbors on the vertical axis, so the fixed-arrangement border
+    strips are unrelated pixels.
+    """
+
+    def test_horizontal_and_vertical_seams_beat_random(self) -> None:
+        if not HAVE_MINIMAP:
+            self.skipTest(f"need minimap assets at {ASSETS_DIR}")
+        loaded = _load_atlas_meta("kalimdor")
+        self.assertIsNotNone(loaded)
+        image, meta = loaded
+        present = _trs_tiles("kalimdor")
+        self._assert_direction(image, meta, present, horizontal=True)
+        self._assert_direction(image, meta, present, horizontal=False)
+
+    def _assert_direction(
+        self, image, meta: dict, present: set, horizontal: bool
+    ) -> None:
+        adjacent = self._adjacent_pairs(image, meta, present, horizontal)
+        random_pairs = self._random_pairs(image, meta, present, horizontal)
+        self.assertGreaterEqual(
+            len(adjacent),
+            SEAM_PAIR_N,
+            "not enough non-uniform adjacent pairs",
+        )
+        self.assertGreaterEqual(
+            len(random_pairs),
+            SEAM_PAIR_N,
+            "not enough non-uniform random pairs",
+        )
+        adjacent_mean = sum(adjacent) / len(adjacent)
+        random_mean = sum(random_pairs) / len(random_pairs)
+        self.assertLess(adjacent_mean, 0.5 * random_mean)
+
+    def _adjacent_pairs(
+        self, image, meta: dict, present: set, horizontal: bool
+    ) -> list[float]:
+        mads: list[float] = []
+        for a, b in sorted(present):
+            neighbor = (a + 1, b) if horizontal else (a, b + 1)
+            if neighbor not in present:
+                continue
+            left, right = (
+                _horiz_strips(image, a, b, meta)
+                if horizontal
+                else _vert_strips(image, a, b, meta)
+            )
+            if _is_flat(left) or _is_flat(right):
+                continue
+            mads.append(_mean_abs_rgb(left, right))
+            if len(mads) >= SEAM_PAIR_N:
+                break
+        return mads
+
+    def _random_pairs(
+        self, image, meta: dict, present: set, horizontal: bool
+    ) -> list[float]:
+        tiles = sorted(present)
+        rng = random.Random(SEAM_RNG_SEED)
+        mads: list[float] = []
+        seen: set[tuple] = set()
+        for _ in range(20000):
+            if len(mads) >= SEAM_PAIR_N:
+                break
+            t1, t2 = rng.sample(tiles, 2)
+            key = tuple(sorted((t1, t2)))
+            if key in seen or _edge_adjacent(t1, t2):
+                continue
+            seen.add(key)
+            a, b = t1
+            na, nb = t2
+            if horizontal:
+                px = meta["px_per_tile"]
+                ox, oy = _band_origin(a, b, meta)
+                nox, noy = _band_origin(na, nb, meta)
+                left = _column(image, ox + px - 1, oy, px)
+                right = _column(image, nox, noy, px)
+            else:
+                px = meta["px_per_tile"]
+                ox, oy = _band_origin(a, b, meta)
+                nox, noy = _band_origin(na, nb, meta)
+                left = _row(image, oy + px - 1, ox, px)
+                right = _row(image, noy, nox, px)
+            if _is_flat(left) or _is_flat(right):
+                continue
+            mads.append(_mean_abs_rgb(left, right))
+        return mads
+
+
+@skip_no_kalimdor_atlas
+class TestAtlasLandmarkAgreement(unittest.TestCase):
+    """Atlas UV sample equals the Lanczos-downscaled source tile pixel."""
+
+    def test_landmarks_match_downscaled_tiles(self) -> None:
+        if not HAVE_MINIMAP:
+            self.skipTest(f"need minimap assets at {ASSETS_DIR}")
+        index = mmask.parse_trs(TRS_PATH)
+        checked = 0
+        for map_name, points in LANDMARKS.items():
+            loaded = _load_atlas_meta(map_name)
+            if loaded is None:
+                continue
+            image, meta = loaded
+            width, height = image.size
+            px_per_tile = meta["px_per_tile"]
+            for x, y in points:
+                (a, b), _ = mmask.tile_pixel(x, y)
+                md5_name = index.get((map_name, a, b))
+                if md5_name is None:
+                    continue
+                ax, ay = _atlas_uv_pixel(meta, x, y)
+                if ax < 0 or ay < 0 or ax >= width or ay >= height:
+                    continue
+                ox, oy = _band_origin(a, b, meta)
+                self.assertTrue(
+                    ox <= ax < ox + px_per_tile and oy <= ay < oy + px_per_tile,
+                    f"{map_name} ({x}, {y}) UV atlas({ax}, {ay}) "
+                    f"missed tile ({a}, {b}) origin ({ox}, {oy})",
+                )
+                expected = _downscaled_tile_rgb_at(
+                    md5_name, px_per_tile, ax - ox, ay - oy
+                )
+                if expected is None:
+                    continue
+                actual = image.getpixel((ax, ay))[:3]
+                self.assertEqual(
+                    actual,
+                    expected,
+                    f"{map_name} ({x}, {y}) tile ({a}, {b}) "
+                    f"atlas({ax}, {ay}) != downscaled",
+                )
+                checked += 1
+        self.assertGreater(checked, 0)
 
 
 if __name__ == "__main__":
