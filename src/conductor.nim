@@ -15,6 +15,7 @@ import
   conductor/cfg,
   conductor/evalgate,
   conductor/ledger,
+  conductor/shiplib,
   conductor/state,
   conductor/tick
 
@@ -27,6 +28,8 @@ proc usage() =
   echo "  once      run a single tick (ticket -> agent -> gate -> merge)"
   echo "  run       daemon loop (single instance, pause via .conductor/pause)"
   echo "  gate      re-run the gate for the current in-flight candidate"
+  echo "  ship [guard-uuid]  manual ship of the champion (guard required"
+  echo "            for the first ship, taken from the ledger afterwards)"
   quit 1
 
 proc repoRoot(): string =
@@ -228,7 +231,11 @@ proc cmdRun(leagueName, repo, root: string) =
         of toBusy:
           sleep(max(30, cfgAll.evalLockRetrySeconds) * 1000)
         of toMerged:
-          # P5 wires the auto-ship evaluation in here.
+          if not res.report.isNil:
+            let ship = maybeShip(root, cfgAll.league(leagueName), repo,
+              root / cfgAll.league(leagueName).laneCheckout, res.report)
+            echo "conductor: ship — ",
+              (if ship.shipped: "SHIPPED " else: "held: "), ship.detail
           sleep(30_000)
         else:
           sleep(60_000)
@@ -287,6 +294,28 @@ proc main() =
       echo "  - ", reason
   of "run":
     cmdRun(leagueName, repo, root)
+  of "ship":
+    let lc = cfgAll.league(leagueName)
+    let lane = laneDir(root, lc)
+    let champ = champion(ledgerPath(lane, leagueName))
+    if champ.isNil:
+      quit "conductor: no champion row — baseline or merge something first"
+    let deaths = openDeathTickets(root, lc.ticketLane)
+    if deaths.len > 0:
+      quit "conductor: refusing to ship with open severity-death tickets: " &
+        deaths.join(", ")
+    let guardArg = if paramCount() >= 3: paramStr(3) else: ""
+    if guardArg.len == 0:
+      # Full ratchet path — requires a last-shipped row.
+      let (ok, why) = shipRatchet(root, lc, lane, champ{"report"})
+      if not ok:
+        quit "conductor: ship ratchet held: " & why
+    echo "conductor: manual ship of champion (", champ{"ts"}.getStr(), ")"
+    let outcome = executeShip(root, lc, repo, lane, champ{"report"}, guardArg)
+    if outcome.shipped:
+      echo "conductor: SHIPPED — ", outcome.detail
+    else:
+      quit "conductor: ship failed — " & outcome.detail
   else:
     usage()
 

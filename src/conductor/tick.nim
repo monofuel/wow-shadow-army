@@ -26,6 +26,7 @@ type
     outcome*: TickOutcome
     ticketId*: string
     detail*: string
+    report*: JsonNode   ## the merged candidate's RunReport (toMerged only)
 
 proc forkClientVar(root: string): (string, string) =
   ("FORK_CLIENT", root / "monofuel-vanilla-wow")
@@ -266,4 +267,5 @@ proc runTick*(cfgAll: ConductorConfig, leagueName, repo, root: string): TickResu
     keepBranch = false)
   clearState(repo, leagueName)
   TickResult(outcome: toMerged, ticketId: ticket.id,
-    detail: "northing " & $eval.report{"max_northing"}.getFloat())
+    detail: "northing " & $eval.report{"max_northing"}.getFloat(),
+    report: eval.report)
