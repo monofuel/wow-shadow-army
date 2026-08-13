@@ -24,6 +24,11 @@ SNAG_RE = re.compile(
 )
 STALL_RE = re.compile(r"STALL:")
 
+# Kalimdor race scoring line (tools/pack_traverse_replay.sh):
+# northing = clamp(x, ..GOAL) - START; spawn = 0, Everlook ~= 15,874.
+NORTHING_START_X = -9187.0
+NORTHING_GOAL_X = 6687.333052
+
 
 def planar(x0: float, y0: float, x1: float, y1: float) -> float:
     return math.hypot(x1 - x0, y1 - y0)
@@ -143,6 +148,20 @@ def parse_run_log(path: Path | str) -> dict[str, Any]:
     fat_min: float | None = None
     hp_loss_by_bin: dict[int, float] = defaultdict(float)
     xts: list[float] = []
+    # Form casts: a transition INTO a form id is one observed cast. The
+    # bot should cast Aquatic (4) exactly once per run, at water entry —
+    # every extra cast is the churn cascade masking a route bug (0002).
+    form_casts: dict[int, int] = defaultdict(int)
+    # Northing (the race score): every southward yard and every second
+    # the high-water mark fails to advance is waste (0014 double-back).
+    backtrack_yd = 0.0
+    no_progress_s = 0.0
+    backtrack_episodes: list[dict[str, float]] = []
+    peak_northing: float | None = None
+    cur_episode: dict[str, float] | None = None
+
+    def northing(x: float) -> float:
+        return max(0.0, min(x, NORTHING_GOAL_X) - NORTHING_START_X)
 
     # Map stream index: for each consecutive flight pair, any SNAG between them
     snag_between: dict[tuple[int, int], bool] = {}
@@ -185,6 +204,33 @@ def parse_run_log(path: Path | str) -> dict[str, Any]:
         # under 70% as stuttered time and accumulate the expected-pace
         # denominator for a whole-run duty cycle.
         form_id = int(fl.get("form") or 0)
+        if form_id != int(prev.get("form") or 0) and form_id != 0:
+            form_casts[form_id] += 1
+        # Score-progress accounting off the running northing peak.
+        n1 = northing(float(fl["x"]))
+        if peak_northing is None:
+            peak_northing = northing(float(prev["x"]))
+        if n1 < northing(float(prev["x"])):
+            backtrack_yd += northing(float(prev["x"])) - n1
+        if dt > 0 and n1 <= peak_northing + 0.5:
+            no_progress_s += dt
+        below = peak_northing - n1
+        if below > 5.0:
+            if cur_episode is None:
+                cur_episode = {
+                    "x": float(fl["x"]), "y": float(fl["y"]),
+                    "depth_yd": below, "dur_s": dt,
+                }
+            else:
+                cur_episode["dur_s"] += dt
+                if below > cur_episode["depth_yd"]:
+                    cur_episode["depth_yd"] = below
+                    cur_episode["x"] = float(fl["x"])
+                    cur_episode["y"] = float(fl["y"])
+        elif cur_episode is not None:
+            backtrack_episodes.append(cur_episode)
+            cur_episode = None
+        peak_northing = max(peak_northing, n1)
         expected = (
             (10.4 if form_id == 4 else 4.7)
             if fl.get("swim")
@@ -212,10 +258,33 @@ def parse_run_log(path: Path | str) -> dict[str, Any]:
             bin_key = int(math.floor(float(fl["x"]) / 100.0) * 100)
             hp_loss_by_bin[bin_key] += loss
 
+    if cur_episode is not None:
+        backtrack_episodes.append(cur_episode)
+
     if len(flights) >= 2:
         duration_s = max(0.0, float(flights[-1]["t"]) - float(flights[0]["t"]))
     elif len(flights) == 1:
         duration_s = 0.0
+
+    aquatic_casts = form_casts.get(4, 0)
+    max_northing = peak_northing if peak_northing is not None else (
+        northing(float(flights[0]["x"])) if flights else 0.0
+    )
+    worst_episodes = sorted(
+        backtrack_episodes, key=lambda e: -e["depth_yd"]
+    )[:5]
+    backtrack = {
+        "total_yd": round(backtrack_yd, 1),
+        "count": len(backtrack_episodes),
+        "worst": [
+            {
+                "x": round(e["x"], 1), "y": round(e["y"], 1),
+                "depth_yd": round(e["depth_yd"], 1),
+                "dur_s": round(e["dur_s"], 1),
+            }
+            for e in worst_episodes
+        ],
+    }
 
     avg_speed = (distance_yd / duration_s) if duration_s > 0 else 0.0
 
@@ -294,6 +363,27 @@ def parse_run_log(path: Path | str) -> dict[str, Any]:
             f"WARN fatigue: {band}min bar {fat_min:.2f}, "
             f"{fatigue_s:.1f}s in fatigue water (target 0 — ticket 0018)"
         )
+    if aquatic_casts > 1:
+        warnings.append(
+            f"WARN form_casts: Aquatic cast {aquatic_casts}x (target 1 — "
+            f"every extra cast masks a route bug, ticket 0002)"
+        )
+    if backtrack_yd > 25.0:
+        worst = worst_episodes[0] if worst_episodes else None
+        at = (
+            f" (worst {worst['depth_yd']:.0f} yd at "
+            f"({worst['x']:.0f}, {worst['y']:.0f}))" if worst else ""
+        )
+        warnings.append(
+            f"WARN backtrack: {backtrack_yd:.0f} yd southward over "
+            f"{len(backtrack_episodes)} episodes{at} — ticket 0014"
+        )
+    np_frac = (no_progress_s / duration_s) if duration_s > 0 else 0.0
+    if duration_s > 0 and np_frac > 0.30:
+        warnings.append(
+            f"WARN no_progress: {no_progress_s:.1f}s ({np_frac:.0%} of run) "
+            f"with the score not advancing"
+        )
 
     return {
         "duration_s": round(duration_s, 3),
@@ -315,6 +405,12 @@ def parse_run_log(path: Path | str) -> dict[str, Any]:
         "swim_s": round(swim_s, 3),
         "fatigue_s": round(fatigue_s, 3),
         "fat_min": round(fat_min, 3) if fat_min is not None else None,
+        "max_northing": round(max_northing, 1),
+        "aquatic_casts": aquatic_casts,
+        "form_casts": {str(k): v for k, v in sorted(form_casts.items())},
+        "backtrack_yd": round(backtrack_yd, 1),
+        "backtrack": backtrack,
+        "no_progress_s": round(no_progress_s, 3),
         "hp_map": hp_map,
         "snags": snags,
         "warnings": warnings,
@@ -333,6 +429,11 @@ def format_table(sc: dict[str, Any]) -> str:
         f"cross_track  {sc.get('cross_track')}",
         f"swim_s       {sc.get('swim_s')}",
         f"fatigue_s    {sc.get('fatigue_s')}  fat_min={sc.get('fat_min')}",
+        f"northing     max={sc.get('max_northing')}  "
+        f"backtrack_yd={sc.get('backtrack_yd')}  "
+        f"no_progress_s={sc.get('no_progress_s')}",
+        f"form_casts   aquatic={sc.get('aquatic_casts')}  "
+        f"{sc.get('form_casts')}",
         f"events       {sc.get('events', {}).get('counts')}",
         f"snags        total={sc.get('snags', {}).get('total')}  "
         f"{sc.get('snags', {}).get('clusters')}",

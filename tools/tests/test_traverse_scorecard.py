@@ -18,6 +18,7 @@ def _flight(
     y: float,
     *,
     hp: int = 1000,
+    form: int = 0,
     swim: bool = False,
     nav: str = "following",
     beat: str = "desert",
@@ -25,7 +26,7 @@ def _flight(
 ) -> str:
     return (
         f'lua-bot[traverse]: FLIGHT {{"t":{t},"x":{x},"y":{y},"z":0,'
-        f'"hp":{hp},"form":0,"swim":{"true" if swim else "false"},'
+        f'"hp":{hp},"form":{form},"swim":{"true" if swim else "false"},'
         f'"combat":false,"nav":"{nav}","beat":"{beat}","xt":{xt}}}'
     )
 
@@ -84,7 +85,10 @@ class TestTraverseScorecard(unittest.TestCase):
         self.assertIn("WARN unplanned_swim:", warns)
         self.assertIn("WARN clip:", warns)
         self.assertIn("WARN hp:", warns)
-        self.assertEqual(len(out["warnings"]), 5)
+        # The 10s stop at t=5..15 is a third of the run with the score
+        # flat, so the no_progress warning legitimately fires too.
+        self.assertIn("WARN no_progress:", warns)
+        self.assertEqual(len(out["warnings"]), 6)
 
     def test_garbage_lines_ignored(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -123,6 +127,66 @@ class TestTraverseScorecard(unittest.TestCase):
         self.assertEqual(out["stutter_s"], 0.0)
         self.assertGreaterEqual(out["pace_frac"], 0.99)
         self.assertFalse(any("WARN pace" in w for w in out["warnings"]))
+
+    def test_aquatic_cast_counting(self) -> None:
+        # Forms 0,0,4,4,3,4: two transitions INTO Aquatic (churn), one
+        # into Bear-ish 3. Target is exactly one Aquatic cast per run.
+        forms = [0, 0, 4, 4, 3, 4]
+        lines = [
+            _flight(5.0 * i, 40.0 * i, 0.0, form=f, swim=(f == 4))
+            for i, f in enumerate(forms)
+        ]
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "run.log"
+            path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            out = sc.parse_run_log(path)
+        self.assertEqual(out["aquatic_casts"], 2)
+        self.assertEqual(out["form_casts"], {"3": 1, "4": 2})
+        self.assertTrue(any("WARN form_casts:" in w for w in out["warnings"]))
+
+    def test_single_aquatic_cast_is_clean(self) -> None:
+        forms = [0, 0, 4, 4, 4]
+        lines = [
+            _flight(5.0 * i, 60.0 * i, 0.0, form=f, swim=(f == 4))
+            for i, f in enumerate(forms)
+        ]
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "run.log"
+            path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            out = sc.parse_run_log(path)
+        self.assertEqual(out["aquatic_casts"], 1)
+        self.assertFalse(any("WARN form_casts" in w for w in out["warnings"]))
+
+    def test_backtrack_and_no_progress(self) -> None:
+        # Advance 200 yd, reverse 100 yd over 10s, recover. The reversal
+        # plus the below-peak recovery time is all no-progress time.
+        xs = [0.0, 100.0, 200.0, 150.0, 100.0, 150.0, 250.0]
+        lines = [_flight(5.0 * i, x, 0.0) for i, x in enumerate(xs)]
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "run.log"
+            path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            out = sc.parse_run_log(path)
+        self.assertEqual(out["backtrack_yd"], 100.0)
+        self.assertEqual(out["backtrack"]["count"], 1)
+        worst = out["backtrack"]["worst"][0]
+        self.assertEqual(worst["depth_yd"], 100.0)
+        self.assertEqual(worst["x"], 100.0)
+        # Below-peak samples: t15 (150), t20 (100), t25 (150) = 15s.
+        self.assertEqual(out["no_progress_s"], 15.0)
+        self.assertTrue(any("WARN backtrack:" in w for w in out["warnings"]))
+        self.assertTrue(any("WARN no_progress:" in w for w in out["warnings"]))
+        self.assertEqual(out["max_northing"], 9187.0 + 250.0)
+
+    def test_monotonic_run_has_no_backtrack(self) -> None:
+        lines = [_flight(5.0 * i, 40.0 * i, 0.0) for i in range(6)]
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "run.log"
+            path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            out = sc.parse_run_log(path)
+        self.assertEqual(out["backtrack_yd"], 0.0)
+        self.assertEqual(out["backtrack"]["count"], 0)
+        self.assertEqual(out["no_progress_s"], 0.0)
+        self.assertFalse(any("WARN backtrack" in w for w in out["warnings"]))
 
     def test_cli_json(self) -> None:
         import io
