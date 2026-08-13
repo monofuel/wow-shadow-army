@@ -211,6 +211,10 @@ map-browser-probe:
 		MAP_BROWSER_STATS=local_data/map_browser_stats.json \
 		nix develop --command nim r src/tools/map_browser.nim
 
+.PHONY: minimap-atlas
+minimap-atlas:
+	nix-shell -p python3Packages.pillow --run 'python3 tools/bake_minimap_atlas.py --map kalimdor && python3 tools/bake_minimap_atlas.py --map azeroth'
+
 # Pin-drift only: HEAD of ../coworld-vanilla-wow must match upstream.lock.
 # Pure shell — no Python. Format of upstream.lock: "<name> <sha>".
 pin-check:

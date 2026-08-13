@@ -6,14 +6,15 @@
 ##
 ## Env: VANILLA_WOW_EXTRACTED_DATA_DIR, VANILLA_WOW_CLIENT_DATA_DIR,
 ##      MAP_BROWSER_ONCE=1, MAP_BROWSER_STATS, MAP_BROWSER_AUTO,
-##      MAP_BROWSER_MAP=0|1 (window startup continent; 0 Azeroth, 1 Kalimdor)
+##      MAP_BROWSER_MAP=0|1 (window startup continent; 0 Azeroth, 1 Kalimdor),
+##      MAP_BROWSER_ATLAS_DIR (minimap atlas PNG+JSON root)
 
 import
-  std/[math, monotimes, os, strutils, tables, times],
+  std/[math, monotimes, options, os, strutils, tables, times],
   chroma, opengl, pixie, silky, vmath, windy,
   environment/client/localpaths,
   environment/client/world_catalogs,
-  map_browser/[debug, gl_view, overlay_gl, roads, runs, waypoints, wdl_terrain]
+  map_browser/[atlas, debug, gl_view, overlay_gl, roads, runs, waypoints, wdl_terrain]
 
 const
   AppTitle = "map browser"
@@ -21,7 +22,7 @@ const
   ClearG = 0.14'f32
   ClearB = 0.18'f32
   AtlasOut = "local_data" / "map_browser_atlas.png"
-  HeaderHints = "1 wp | 2 taxi | 3 roads | L runs | X xray | WASD/drag pan | wheel zoom | RMB orbit | Tab continent | Home reset"
+  HeaderHints = "1 wp | 2 taxi | 3 roads | 4 tex | L runs | X xray | WASD/drag pan | wheel zoom | RMB orbit | Tab continent | Home reset"
   HeaderBg = rgbx(24, 28, 36, 230)
   HeaderText = rgbx(230, 220, 190, 255)
   HeaderMuted = rgbx(160, 150, 130, 255)
@@ -159,6 +160,11 @@ proc headerStatusLine(): string =
     parts &= "  |  taxi " & $oc.taxiPaths
   if browser.showRoads:
     parts &= "  |  roads " & $oc.roadSegments
+  if currentHasAtlas():
+    if atlasEnabled:
+      parts &= "  |  tex"
+    else:
+      parts &= "  |  tex off"
   if browser.selectedRuns.len > 0:
     parts &= "  |  runs " & $oc.runsLoaded
   if browser.xray:
@@ -217,6 +223,8 @@ proc handleOverlayKeys(window: Window) =
   if window.buttonPressed[Key3]:
     browser.showRoads = not browser.showRoads
     markOverlaysDirty()
+  if window.buttonPressed[Key4]:
+    atlasEnabled = not atlasEnabled
   if window.buttonPressed[KeyX]:
     browser.xray = not browser.xray
   if window.buttonPressed[KeyL]:
@@ -392,6 +400,20 @@ proc runHeadlessOnce() =
     azerothMapNodes, " (", formatFloat(azerothPct, ffDecimal, 1), "%)"
   doAssert azerothMapNodes > 0
   doAssert azerothAligned * 100 >= azerothMapNodes * 70
+
+  let
+    kalJson = atlasDir() / "minimap_atlas_kalimdor.json"
+    azeJson = atlasDir() / "minimap_atlas_azeroth.json"
+  if fileExists(kalJson) and fileExists(azeJson):
+    for pair in [(1'u32, "kalimdor"), (0'u32, "azeroth")]:
+      let loaded = loadAtlas(pair[0])
+      doAssert loaded.isSome, "atlas load failed for " & pair[1]
+      let a = loaded.get()
+      doAssert a.width > 0 and a.width <= 16384
+      doAssert a.height > 0 and a.height <= 16384
+      echo "map_browser: atlas ", pair[1], " ", a.width, "x", a.height
+  else:
+    echo "map_browser: atlas skip (not baked)"
 
 proc runWindow() =
   ## Real window: WDL terrain + overlays + bird's-eye camera + silky UI.

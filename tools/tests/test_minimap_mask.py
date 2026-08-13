@@ -6,6 +6,7 @@ cleanly when the decoder or the flat minimap dump is not present.
 """
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 import unittest
@@ -13,6 +14,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "tools"))
+import bake_minimap_atlas as baker  # noqa: E402
 import minimap_mask as mmask  # noqa: E402
 
 HAVE_PILLOW = mmask.HAVE_PILLOW
@@ -181,5 +183,119 @@ class TestRealMinimap(unittest.TestCase):
         self.assertTrue(all(isinstance(c, int) for c in dock_rgb))
 
 
+ATLAS_JSON_KEYS = {
+    "a_max",
+    "a_min",
+    "b_max",
+    "b_min",
+    "height",
+    "map",
+    "map_id",
+    "px_per_tile",
+    "tile_yd",
+    "width",
+}
+
+
+@skip_no_pillow
+class TestMinimapAtlasBake(unittest.TestCase):
+    """Synthetic 3-tile trs + 2 PNGs. Placement, schema, determinism."""
+
+    PX = 32
+
+    def _layout(self, tmp: Path):
+        from PIL import Image
+
+        tiles = tmp / "tiles"
+        tiles.mkdir()
+        Image.new("RGBA", (256, 256), (255, 0, 0, 255)).save(tiles / "t0.png")
+        Image.new("RGBA", (256, 256), (0, 255, 0, 255)).save(tiles / "t1.png")
+        trs = tmp / "md5translate.trs"
+        trs.write_text(
+            "Kalimdor\\map10_20.blp\tt0.png\n"
+            "Kalimdor\\map10_21.blp\tt1.png\n"
+            "Kalimdor\\map11_20.blp\tmissing.png\n"
+            "Azeroth\\map1_2.blp\tother.png\n",
+            encoding="ascii",
+        )
+        return trs, tiles
+
+    def test_placement_extents_and_schema(self) -> None:
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            trs, tiles = self._layout(tmp)
+            out = tmp / "out"
+            meta = baker.bake_atlas(
+                "kalimdor",
+                assets_dir=tmp,
+                px_per_tile=self.PX,
+                out_dir=out,
+                trs_path=trs,
+                tiles_dir=tiles,
+            )
+            self.assertEqual(meta["a_min"], 10)
+            self.assertEqual(meta["a_max"], 11)
+            self.assertEqual(meta["b_min"], 20)
+            self.assertEqual(meta["b_max"], 21)
+            self.assertEqual(meta["width"], 2 * self.PX)
+            self.assertEqual(meta["height"], 2 * self.PX)
+            self.assertEqual(meta["map"], "kalimdor")
+            self.assertEqual(meta["map_id"], 1)
+            self.assertEqual(meta["px_per_tile"], self.PX)
+            self.assertEqual(meta["tile_yd"], mmask.TILE_YD)
+
+            png_path = out / "minimap_atlas_kalimdor.png"
+            json_path = out / "minimap_atlas_kalimdor.json"
+            atlas = Image.open(png_path).convert("RGBA")
+            self.assertEqual(atlas.size, (2 * self.PX, 2 * self.PX))
+            # (a_min, b_min) band origin is atlas (0, 0).
+            self.assertEqual(atlas.getpixel((0, 0)), (255, 0, 0, 255))
+            # (a_min, b_min+1) band origin is x-offset px_per_tile.
+            self.assertEqual(atlas.getpixel((self.PX, 0)), (0, 255, 0, 255))
+            # missing tile (a_min+1, b_min) stays fully transparent.
+            self.assertEqual(atlas.getpixel((0, self.PX))[3], 0)
+
+            raw_json = json_path.read_text(encoding="utf-8")
+            data = json.loads(raw_json)
+            self.assertEqual(set(data.keys()), ATLAS_JSON_KEYS)
+            self.assertEqual(data, meta)
+            self.assertEqual(
+                raw_json, json.dumps(data, indent=2, sort_keys=True) + "\n"
+            )
+
+    def test_determinism(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            trs, tiles = self._layout(tmp)
+            out_a = tmp / "a"
+            out_b = tmp / "b"
+            baker.bake_atlas(
+                "kalimdor",
+                assets_dir=tmp,
+                px_per_tile=self.PX,
+                out_dir=out_a,
+                trs_path=trs,
+                tiles_dir=tiles,
+            )
+            baker.bake_atlas(
+                "kalimdor",
+                assets_dir=tmp,
+                px_per_tile=self.PX,
+                out_dir=out_b,
+                trs_path=trs,
+                tiles_dir=tiles,
+            )
+            a_bytes = (out_a / "minimap_atlas_kalimdor.png").read_bytes()
+            b_bytes = (out_b / "minimap_atlas_kalimdor.png").read_bytes()
+            self.assertEqual(a_bytes, b_bytes)
+            self.assertEqual(
+                (out_a / "minimap_atlas_kalimdor.json").read_text(encoding="utf-8"),
+                (out_b / "minimap_atlas_kalimdor.json").read_text(encoding="utf-8"),
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
+

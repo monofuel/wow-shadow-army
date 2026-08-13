@@ -19,6 +19,7 @@ OpenGL + windy window (`src/map_browser/gl_view.nim`,
 | `make map-browser` | Interactive GL window |
 | `make map-browser-once` | Headless smoke (`MAP_BROWSER_ONCE=1`): catalog + waypoint graph + both continents' WDL meshes and road artifact counts; no window |
 | `make map-browser-probe` | Autopilot window: N seconds, screenshot + stats JSON, exit nonzero if mesh/overlays never ready |
+| `make minimap-atlas` | Bake `local_data/map_browser/minimap_atlas_<map>.{png,json}` from the minimap BLPs (needs nix Pillow; ~40 s both continents). The viewer drapes these over terrain when present. |
 
 ## Env vars
 
@@ -30,6 +31,7 @@ OpenGL + windy window (`src/map_browser/gl_view.nim`,
 | `MAP_BROWSER_STATS=path.json` | Rewrite stats every ~2s and on exit (fps, frame p50/p95, camera, tile/vertex counts, overlay counts). |
 | `MAP_BROWSER_AUTO="seconds=N,screenshot=path.png"` | Autopilot; default probe uses `seconds=8` and `local_data/map_browser_probe.png`. |
 | `MAP_BROWSER_MAP` | Startup continent: `0` Azeroth / `1` Kalimdor (default `1`). |
+| `MAP_BROWSER_ATLAS_DIR` | Minimap atlas dir (default `local_data/map_browser`). Missing atlases → flat shading, no error. |
 
 ## Controls
 
@@ -40,6 +42,7 @@ From `gl_view.nim` / `map_browser.nim` (defaults: waypoints on, taxi on, roads o
 | `1` | Toggle waypoint graph (city routes) |
 | `2` | Toggle taxi flight network |
 | `3` | Toggle road waypoints |
+| `4` | Toggle minimap texture drape (needs baked atlases; header shows `tex`) |
 | `L` | Toggle traverse-runs panel (click a row to load/plot) |
 | `X` | Toggle xray (overlays ignore depth) |
 | `WASD` | Pan target (speed scales with camera height) |
@@ -72,7 +75,7 @@ See [../navigation.md](../navigation.md) for every navigation data system
 ## Known limits
 
 - WDL is coarse (~33 yd cells) — fine for whole-continent nav debug, not close-up terrain.
-- No textures: elevation + slope shading only (vertex colors).
+- Textures come from the minimap atlas drape (key `4`); without baked atlases it falls back to elevation + slope vertex colors. The drape is imagery over coarse WDL geometry — close-ups smear.
 - No doodads / objects by design.
 - Continents are separate meshes; no ocean pan between them — `Tab` switches.
 - Waypoint edges are reconstructed by `worldRoutePath` probing, not exported from the fork.
@@ -81,7 +84,7 @@ See [../navigation.md](../navigation.md) for every navigation data system
 
 ## Follow-ups
 
-- [ ] Minimap BLP texture drape (fork `minimaps.nim` has md5translate parsing)
+- [x] Minimap BLP texture drape — `make minimap-atlas` + key `4` (2026-08-12; offline Pillow baker, pixie/GL drape, world→UV uses the landmark-verified transform from `tools/minimap_mask.py`)
 - [ ] vmangos `.map` higher-res heights
 - [ ] Click-to-inspect node
 - [ ] Run playback scrubbing

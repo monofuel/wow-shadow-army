@@ -2,9 +2,9 @@
 ## No fork renderer imports — pure OpenGL + vmath + windy input.
 
 import
-  std/[math, tables],
+  std/[math, options, tables],
   opengl, vmath, windy,
-  map_browser/wdl_terrain
+  map_browser/[atlas, wdl_terrain]
 
 const
   VertSrc = """
@@ -15,21 +15,37 @@ layout(location = 2) in vec3 aColor;
 uniform mat4 uMVP;
 out vec3 vColor;
 out vec3 vNormal;
+out vec2 vWorldXY;
 void main() {
   gl_Position = uMVP * vec4(aPos, 1.0);
   vColor = aColor;
   vNormal = aNormal;
+  vWorldXY = aPos.xy;
 }
 """
   FragSrc = """
 #version 330 core
 in vec3 vColor;
 in vec3 vNormal;
+in vec2 vWorldXY;
+uniform int uAtlasOn;
+uniform sampler2D uAtlasTex;
+uniform vec2 uAtlasU;
+uniform vec2 uAtlasV;
 out vec4 fragColor;
 void main() {
   vec3 n = normalize(vNormal);
   float light = max(dot(n, normalize(vec3(0.35, 0.5, 0.8))), 0.25);
-  fragColor = vec4(vColor * light, 1.0);
+  vec3 base = vColor;
+  if (uAtlasOn != 0) {
+    vec2 uv = vec2(
+      (uAtlasU.x - vWorldXY.y) * uAtlasU.y,
+      (uAtlasV.x - vWorldXY.x) * uAtlasV.y
+    );
+    vec4 t = texture(uAtlasTex, uv);
+    if (t.a > 0.5) base = t.rgb;
+  }
+  fragColor = vec4(base * light, 1.0);
 }
 """
   ## Eye south of target looking north: world +X (north) up on screen,
@@ -68,16 +84,28 @@ type
     vertexCount*: int
     bounds*: MeshBounds
 
+  AtlasGpu = object
+    ready: bool
+    tex: GLuint
+    uOrigin, uScale, vOrigin, vScale: float32
+    width, height: int
+
   TerrainGpu* = object
     program: GLuint
     mvpLoc: GLint
+    atlasOnLoc: GLint
+    atlasTexLoc: GLint
+    atlasULoc: GLint
+    atlasVLoc: GLint
     meshes: Table[uint32, GpuMesh]
+    atlases: Table[uint32, AtlasGpu]
     currentMapId*: uint32
 
 var
   terrainGpu*: TerrainGpu
   birdCam*: BirdCamera
   continentLoadError*: string
+  atlasEnabled*: bool = true
   rightDragActive: bool
 
 proc compileShader(kind: GLenum; source: string): GLuint =
@@ -124,7 +152,12 @@ proc initTerrainGpu*() =
     frag = compileShader(GL_FRAGMENT_SHADER, FragSrc)
   terrainGpu.program = linkProgram(vert, frag)
   terrainGpu.mvpLoc = glGetUniformLocation(terrainGpu.program, "uMVP")
+  terrainGpu.atlasOnLoc = glGetUniformLocation(terrainGpu.program, "uAtlasOn")
+  terrainGpu.atlasTexLoc = glGetUniformLocation(terrainGpu.program, "uAtlasTex")
+  terrainGpu.atlasULoc = glGetUniformLocation(terrainGpu.program, "uAtlasU")
+  terrainGpu.atlasVLoc = glGetUniformLocation(terrainGpu.program, "uAtlasV")
   terrainGpu.meshes = initTable[uint32, GpuMesh]()
+  terrainGpu.atlases = initTable[uint32, AtlasGpu]()
 
 proc meshBounds(mesh: ContinentMesh): MeshBounds =
   ## Axis-aligned bounds of a continent mesh in VMaNGOS world coords.
@@ -199,11 +232,72 @@ proc uploadContinentMesh*(mapId: uint32; mesh: ContinentMesh): bool =
   terrainGpu.currentMapId = mapId
   true
 
+proc uploadAtlas*(mapId: uint32) =
+  ## Upload a minimap atlas texture for mapId if a baked PNG+JSON is present.
+  initTerrainGpu()
+  if mapId in terrainGpu.atlases and terrainGpu.atlases[mapId].ready:
+    return
+  let loaded = loadAtlas(mapId)
+  if loaded.isNone:
+    return
+  let atlas = loaded.get()
+  if atlas.image == nil or atlas.image.data.len == 0:
+    return
+  var maxSize: GLint
+  glGetIntegerv(GL_MAX_TEXTURE_SIZE, maxSize.addr)
+  if atlas.width > maxSize or atlas.height > maxSize:
+    stderr.writeLine(
+      "map_browser: atlas ", atlasMapName(mapId), " ",
+      atlas.width, "x", atlas.height,
+      " exceeds GL_MAX_TEXTURE_SIZE ", maxSize
+    )
+    return
+  let uv = atlasUvParams(atlas)
+  var tex: GLuint
+  glGenTextures(1, tex.addr)
+  glBindTexture(GL_TEXTURE_2D, tex)
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR)
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+  glTexImage2D(
+    GL_TEXTURE_2D,
+    0,
+    GLint(GL_RGBA8),
+    GLsizei(atlas.width),
+    GLsizei(atlas.height),
+    0,
+    GL_RGBA,
+    GL_UNSIGNED_BYTE,
+    addr atlas.image.data[0]
+  )
+  glGenerateMipmap(GL_TEXTURE_2D)
+  glBindTexture(GL_TEXTURE_2D, 0)
+  terrainGpu.atlases[mapId] = AtlasGpu(
+    ready: true,
+    tex: tex,
+    uOrigin: uv.uOrigin,
+    uScale: uv.uScale,
+    vOrigin: uv.vOrigin,
+    vScale: uv.vScale,
+    width: atlas.width,
+    height: atlas.height
+  )
+
+proc hasAtlas*(mapId: uint32): bool =
+  ## True when a GPU atlas texture is ready for this continent.
+  mapId in terrainGpu.atlases and terrainGpu.atlases[mapId].ready
+
+proc currentHasAtlas*(): bool =
+  ## True when the active continent has a GPU atlas texture.
+  hasAtlas(terrainGpu.currentMapId)
+
 proc ensureContinent*(mapId: uint32): bool =
   ## Load + upload a continent mesh if not already cached.
   if mapId in terrainGpu.meshes and terrainGpu.meshes[mapId].ready:
     terrainGpu.currentMapId = mapId
     continentLoadError = ""
+    uploadAtlas(mapId)
     return true
   try:
     let mesh = loadContinentMesh(mapId)
@@ -211,6 +305,7 @@ proc ensureContinent*(mapId: uint32): bool =
     if result:
       terrainGpu.currentMapId = mapId
       continentLoadError = ""
+      uploadAtlas(mapId)
   except CatchableError as err:
     echo "map_browser: loadContinentMesh(", mapId, ") failed: ", err.msg
     continentLoadError = "map " & $mapId & " load failed: " & err.msg
@@ -293,6 +388,16 @@ proc drawTerrain*(viewProj: Mat4) =
     GL_FALSE,
     cast[ptr GLfloat](m.addr)
   )
+  if atlasEnabled and hasAtlas(terrainGpu.currentMapId):
+    let a = terrainGpu.atlases[terrainGpu.currentMapId]
+    glActiveTexture(GL_TEXTURE0)
+    glBindTexture(GL_TEXTURE_2D, a.tex)
+    glUniform1i(terrainGpu.atlasOnLoc, 1)
+    glUniform1i(terrainGpu.atlasTexLoc, 0)
+    glUniform2f(terrainGpu.atlasULoc, a.uOrigin, a.uScale)
+    glUniform2f(terrainGpu.atlasVLoc, a.vOrigin, a.vScale)
+  else:
+    glUniform1i(terrainGpu.atlasOnLoc, 0)
   glEnable(GL_DEPTH_TEST)
   glDepthFunc(GL_LESS)
   glDisable(GL_BLEND)
