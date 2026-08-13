@@ -33,6 +33,23 @@ type
     report*: JsonNode
     detail*: string
 
+proc countFlightSamples*(runLogPath: string): int =
+  ## Valid FLIGHT lines in the log. Zero on a "fresh" run means the
+  ## client/server never got airborne — an infra fault, never a
+  ## candidate score.
+  if not fileExists(runLogPath):
+    return 0
+  for line in lines(runLogPath):
+    let idx = line.find("FLIGHT {")
+    if idx < 0:
+      continue
+    try:
+      let node = parseJson(line[idx + len("FLIGHT ") .. ^1])
+      if node.kind == JObject and node.hasKey("x"):
+        inc result
+    except CatchableError:
+      discard
+
 proc computeMaxNorthing*(runLogPath: string): float =
   ## Best northing over the run's FLIGHT samples; 0.0 when none parse.
   result = 0.0
@@ -111,12 +128,19 @@ proc runEval*(checkoutDir: string, lc: LeagueConfig, slug: string,
       detail: "run.log not refreshed — lost the slot race, no fresh run" &
         " (make rc=" & $rc & ")")
 
-  # Archive before anything else can truncate it (ticket 0017).
+  # Archive before anything else can truncate it (ticket 0017). Store
+  # the symlink-resolved path — worktree-relative paths die at teardown.
   let archiveDir = checkoutDir / ArchiveRelDir
   createDir(archiveDir)
-  let archived = archiveDir / ("run-" &
+  var archived = archiveDir / ("run-" &
     now().utc.format("yyyyMMdd-HHmmss") & "-" & slug & ".log")
   copyFile(runLogPath, archived)
+  archived = try: expandFilename(archived) except OSError: archived
+
+  if countFlightSamples(archived) == 0:
+    return EvalResult(outcome: evalFailed,
+      detail: "fresh run produced zero FLIGHT telemetry — client/server " &
+        "prep failure, not a candidate result (log: " & archived & ")")
 
   let segmentPath = checkoutDir / SegmentResultRelPath
   var report: JsonNode

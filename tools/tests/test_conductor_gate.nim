@@ -32,6 +32,8 @@ FLIGHT {"t":5.0,"y":-1.0}
 let northing = computeMaxNorthing(logPath)
 check(abs(northing - 8105.6) < 0.01, "max northing from best sample")
 check(computeMaxNorthing(tmp / "missing.log") == 0.0, "missing log -> 0")
+check(countFlightSamples(logPath) == 4, "valid FLIGHT samples counted")
+check(countFlightSamples(tmp / "missing.log") == 0, "missing log -> 0 samples")
 
 # --- jsonNumber dot paths ---
 let report = parseJson("""

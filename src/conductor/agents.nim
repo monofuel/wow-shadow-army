@@ -43,6 +43,17 @@ proc setupWorktree*(root: string, lc: LeagueConfig,
   let sharedData = root / "local_data"
   if dirExists(sharedData) and not symlinkExists(result / "local_data"):
     createSymlink(sharedData, result / "local_data")
+  # The Makefile resolves sibling checkouts relative to CURDIR
+  # (UPSTREAM := ../coworld-vanilla-wow, FORK_CLIENT := ../monofuel-
+  # vanilla-wow); from a nested worktree those walks land inside
+  # .conductor/worktrees/. Symlink the real siblings in once so the
+  # layout holds (first live eval died on missing vmangos data here).
+  for sibling in ["coworld-vanilla-wow", "monofuel-vanilla-wow",
+      "wow-classic-data"]:
+    let target = root / sibling
+    let link = result.parentDir / sibling
+    if dirExists(target) and not symlinkExists(link):
+      createSymlink(target, link)
 
 proc teardownWorktree*(root: string, lc: LeagueConfig,
     worktree, ticketId, slug: string, keepBranch: bool) =
