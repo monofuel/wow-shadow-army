@@ -185,22 +185,32 @@ proc runGate*(candidate, champion: JsonNode,
     result.reasons.add("floor regress: " & lc.floorMetric & " " &
       $candFloor.get() & " < champion " & $champFloor.get())
 
-  # (b) configured assertions.
+  # (b) configured assertions. Accumulator axes (perDurationS) compare
+  # per-1000-sim-s rates so surviving longer is never itself a failure.
+  let candDur = jsonNumber(candidate, "scorecard.duration_s")
+  let champDur = jsonNumber(champion, "scorecard.duration_s")
   for a in lc.assertions:
-    let cand = jsonNumber(candidate, a.field)
+    var cand = jsonNumber(candidate, a.field)
     if cand.isNone:
       result.pass = false
       result.reasons.add("candidate missing " & a.field)
       continue
+    var champ = jsonNumber(champion, a.field)
+    var suffix = ""
+    if a.perDurationS:
+      if candDur.isSome and candDur.get() > 0:
+        cand = some(cand.get() / candDur.get() * 1000.0)
+      if champ.isSome and champDur.isSome and champDur.get() > 0:
+        champ = some(champ.get() / champDur.get() * 1000.0)
+      suffix = "/ks"
     let reference =
       if a.vsChampion:
-        let champ = jsonNumber(champion, a.field)
         if champ.isSome: champ.get() else: a.value
       else:
         a.value
     if not compareVals(a.op, cand.get(), reference):
       result.pass = false
-      result.reasons.add("assert " & a.field & " " & a.op & " " &
+      result.reasons.add("assert " & a.field & suffix & " " & a.op & " " &
         $reference & " failed (candidate " & $cand.get() & ")")
 
   # (c) no new warning classes vs the champion run.

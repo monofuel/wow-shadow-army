@@ -109,6 +109,24 @@ better["max_northing"] = %12000.0
 verdict = runGate(better, report, lc)
 check(verdict.pass, "strict improvement passes")
 
+# duration normalization: a run surviving 2x as long with the same RATE
+# of form losses must pass a perDurationS assertion, and fail without it.
+var lcRate = LeagueConfig(floorMetric: "max_northing")
+lcRate.assertions = @[GateAssertion(field: "scorecard.events.counts.form_lost",
+  op: "<=", vsChampion: true, perDurationS: true)]
+var champShort = report.copy()
+champShort["scorecard"]["duration_s"] = %1000.0   # 3 losses / ks
+var candLong = report.copy()
+candLong["scorecard"]["duration_s"] = %2000.0
+candLong["scorecard"]["events"]["counts"]["form_lost"] = %5  # 2.5 / ks
+candLong["max_northing"] = %12000.0
+verdict = runGate(candLong, champShort, lcRate)
+check(verdict.pass, "longer run with better rate passes perDurationS")
+var lcAbs = lcRate
+lcAbs.assertions[0].perDurationS = false
+verdict = runGate(candLong, champShort, lcAbs)
+check(not verdict.pass, "absolute comparison still fails (duration bias)")
+
 # --- ledger ---
 let lpath = tmp / "scores" / "traverse.jsonl"
 check(champion(lpath).isNil, "empty ledger has no champion")

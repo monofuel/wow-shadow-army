@@ -23,6 +23,9 @@ type
     op*: string         ## "<=" | ">=" | "=="
     vsChampion*: bool   ## compare against champion's value (else `value`)
     value*: float
+    perDurationS*: bool ## accumulator axis: compare per-1000-sim-s rates,
+                        ## not totals — a run that survives longer must not
+                        ## be punished for accumulating over more clock
 
   ShipConfig* = object
     policy*: string
