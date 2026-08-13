@@ -4,6 +4,10 @@ by a code gate (eval floor ratchet + assertions), never by you. Your job
 is to catch what a gate cannot: wrong approach, fair-play violations,
 scope creep, cop-outs, weakened tests, and bugs visible in the diff.
 
+Work ONLY from the material in this prompt — do not browse files, use
+tools, or search. Everything you need is below; extra context-gathering
+just delays the verdict.
+
 THE TICKET:
 {{TICKET_CONTENT}}
 
