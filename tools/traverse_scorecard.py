@@ -134,6 +134,8 @@ def parse_run_log(path: Path | str) -> dict[str, Any]:
     distance_yd = 0.0
     stopped_by: dict[str, float] = defaultdict(float)
     stopped_total = 0.0
+    stutter_s = 0.0
+    expected_yd = 0.0
     swim_s = 0.0
     hp_loss_by_bin: dict[int, float] = defaultdict(float)
     xts: list[float] = []
@@ -171,6 +173,23 @@ def parse_run_log(path: Path | str) -> dict[str, Any]:
             )
             stopped_by[reason] += dt
             stopped_total += dt
+        # Sub-sample stutter: stop-and-go faster than the FLIGHT cadence
+        # shows displacement every sample and NEVER trips the stopped
+        # counter, yet it can halve the run (post-sync lease metronome
+        # 2026-08-13: 3.3 yd/s at "stopped 7.8s"). Compare each sample's
+        # pace against the active form's expected speed; count samples
+        # under 70% as stuttered time and accumulate the expected-pace
+        # denominator for a whole-run duty cycle.
+        form_id = int(fl.get("form") or 0)
+        expected = (
+            (10.4 if form_id == 4 else 4.7)
+            if fl.get("swim")
+            else (9.8 if form_id == 3 else 7.0)
+        )
+        if dt > 0:
+            expected_yd += expected * dt
+            if 1.0 <= d < 0.7 * expected * dt:
+                stutter_s += dt
         if fl.get("swim") and str(fl.get("beat") or "") != "-" and dt > 0:
             swim_s += dt
         hp0, hp1 = int(prev.get("hp", -1)), int(fl.get("hp", -1))
@@ -229,6 +248,13 @@ def parse_run_log(path: Path | str) -> dict[str, Any]:
             f"WARN idle: stopped {stopped_total:.1f}s / {duration_s:.1f}s "
             f"({idle_frac:.1%})"
         )
+    pace_frac = (distance_yd / expected_yd) if expected_yd > 0 else 1.0
+    if expected_yd > 0 and pace_frac < 0.7:
+        warnings.append(
+            f"WARN pace: {pace_frac:.1%} of form speed "
+            f"(stutter {stutter_s:.1f}s) — a passing run can still be "
+            f"crawling; see the 2026-08-13 lease metronome"
+        )
     p95 = cross_track["p95"]
     if p95 is not None and p95 > 25:
         warnings.append(f"WARN cross_track: p95={p95:.1f} yd (>25)")
@@ -257,6 +283,10 @@ def parse_run_log(path: Path | str) -> dict[str, Any]:
         "stopped_s_by_reason": {
             k: round(v, 3) for k, v in sorted(stopped_by.items())
         },
+        "stutter_s": round(stutter_s, 3),
+        "pace_frac": round(
+            (distance_yd / expected_yd) if expected_yd > 0 else 1.0, 4
+        ),
         "cross_track": {
             k: (round(v, 3) if isinstance(v, float) else v)
             for k, v in cross_track.items()
@@ -277,6 +307,7 @@ def format_table(sc: dict[str, Any]) -> str:
         f"avg_speed    {sc.get('avg_speed')}",
         f"stopped_s    {sc.get('stopped_s_total')}  "
         f"{sc.get('stopped_s_by_reason')}",
+        f"stutter_s    {sc.get('stutter_s')}  pace_frac={sc.get('pace_frac')}",
         f"cross_track  {sc.get('cross_track')}",
         f"swim_s       {sc.get('swim_s')}",
         f"events       {sc.get('events', {}).get('counts')}",
