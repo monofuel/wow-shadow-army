@@ -111,19 +111,20 @@ proc cmdBaseline(cfgAll: ConductorConfig, leagueName, root: string) =
     echo "conductor: baseline row appended — ", reportSummary(res.report)
     echo "conductor: archived log ", res.report{"archived_log"}.getStr()
 
-proc cmdHosted(cfgAll: ConductorConfig, leagueName, root: string) =
+proc ingestHosted(cfgAll: ConductorConfig, leagueName, root: string) =
   ## Pull hosted episodes (make traverse-field has its own flock and
   ## exits 0 when busy) and append one summary row when new data landed.
+  ## Raises on harness trouble — the daemon logs and moves on.
   let lc = cfgAll.league(leagueName)
   let lane = laneDir(root, lc)
   let (rc, output) = runCommandCapture(lane, "make", @["traverse-field"],
     timeoutMs = 300_000)
   if rc != 0:
-    quit "conductor: make traverse-field failed rc=" & $rc & "\n" &
-      output[max(0, output.len - 400) .. ^1]
+    raise newException(IOError, "make traverse-field failed rc=" & $rc &
+      ": " & output[max(0, output.len - 400) .. ^1])
   let historyPath = lane / "local_data/traverse/episodes_history.json"
   if not fileExists(historyPath):
-    quit "conductor: no " & historyPath & " after traverse-field"
+    raise newException(IOError, "no " & historyPath & " after traverse-field")
   var scores: seq[float]
   var newest = ""
   var newestCreated = ""
@@ -132,7 +133,8 @@ proc cmdHosted(cfgAll: ConductorConfig, leagueName, root: string) =
     if history.kind == JArray: history
     else: history{"entries"}
   if entries.isNil or entries.kind != JArray:
-    quit "conductor: episodes_history.json has no entries array"
+    raise newException(ValueError,
+      "episodes_history.json has no entries array")
   for e in entries:
     if e{"status"}.getStr() != "completed":
       continue
@@ -184,6 +186,60 @@ proc cmdHosted(cfgAll: ConductorConfig, leagueName, root: string) =
         " << local champion northing ", localFloor,
         " — PETREL_SWIM-class divergence, autopsy the hosted replays"
 
+proc cmdRun(leagueName, repo, root: string) =
+  ## The daemon: forever { recover -> tick -> pace }. Agent/harness
+  ## failures (5xx, timeouts, flock races) are consumed by attempts and
+  ## this try — the loop itself never dies from them. Pause by touching
+  ## .conductor/pause; stop with SIGTERM (systemd) or ctrl-c.
+  if not acquirePidGuard(repo):
+    quit "conductor: another conductor owns " &
+      conductorDir(repo) / "conductor.pid"
+  echo "conductor: daemon up — league ", leagueName,
+    "; pause file: ", pausePath(repo)
+  var backoff = 30
+  var pausedLogged = false
+  try:
+    while true:
+      try:
+        let cfgAll = loadConductorConfig(root)
+        if leagueName notin cfgAll.leagues:
+          raise newException(ValueError,
+            "league '" & leagueName & "' missing from conductor.json")
+        if isPaused(repo):
+          if not pausedLogged:
+            echo "conductor: paused — remove ", pausePath(repo), " to resume"
+            pausedLogged = true
+          sleep(60_000)
+          continue
+        pausedLogged = false
+        discard recoverCrashedTick(cfgAll, leagueName, repo, root)
+        let res = runTick(cfgAll, leagueName, repo, root)
+        echo "conductor: tick — ", $res.outcome,
+          (if res.ticketId.len > 0: " (ticket " & res.ticketId & ")" else: ""),
+          (if res.detail.len > 0: ": " & res.detail else: "")
+        backoff = 30
+        case res.outcome
+        of toNoWork:
+          try:
+            ingestHosted(cfgAll, leagueName, root)
+          except CatchableError as e:
+            echo "conductor: WARN hosted ingest: ", e.msg
+          sleep(600_000)
+        of toBusy:
+          sleep(max(30, cfgAll.evalLockRetrySeconds) * 1000)
+        of toMerged:
+          # P5 wires the auto-ship evaluation in here.
+          sleep(30_000)
+        else:
+          sleep(60_000)
+      except CatchableError as e:
+        echo "conductor: tick EXCEPTION — ", e.msg,
+          " (backing off ", backoff, "s)"
+        sleep(backoff * 1000)
+        backoff = min(backoff * 2, 600)
+  finally:
+    releasePidGuard(repo)
+
 proc main() =
   if paramCount() < 2:
     usage()
@@ -201,7 +257,7 @@ proc main() =
   of "baseline":
     cmdBaseline(cfgAll, leagueName, root)
   of "hosted":
-    cmdHosted(cfgAll, leagueName, root)
+    ingestHosted(cfgAll, leagueName, root)
   of "once":
     let st = loadState(repo)
     if st.phase != tpIdle:
@@ -230,7 +286,7 @@ proc main() =
     for reason in verdict.reasons:
       echo "  - ", reason
   of "run":
-    quit "conductor: 'run' lands in build phase P4"
+    cmdRun(leagueName, repo, root)
   else:
     usage()
 

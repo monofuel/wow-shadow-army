@@ -69,6 +69,32 @@ proc park(root: string, lc: LeagueConfig, repo: string,
     outcome: (if dest == "stuck": toStuck else: toParked),
     ticketId: ticket.id, detail: reason)
 
+proc recoverCrashedTick*(cfgAll: ConductorConfig,
+    leagueName, repo, root: string): bool =
+  ## A non-idle state at loop entry means a previous tick died mid-way.
+  ## Unwind honestly: ticket back to open (no attempt charged), worktree
+  ## torn down (branch kept for autopsy), state cleared. Returns true
+  ## when something was recovered.
+  let st = loadState(repo)
+  if st.phase == tpIdle:
+    return false
+  echo "conductor: recovering crashed tick — phase ", $st.phase,
+    ", ticket ", st.ticketId
+  let lc = cfgAll.league(leagueName)
+  if st.ticketPath.len > 0 and fileExists(root / st.ticketPath):
+    discard finishTicket(root, st.ticketPath, "open",
+      "- conductor: restarted mid-tick (phase " & $st.phase &
+      ") — unwound, no attempt charged")
+  if st.worktree.len > 0 and dirExists(st.worktree):
+    var slug = ""
+    let prefix = "monofuel/exp-" & st.ticketId & "-"
+    if st.branch.startsWith(prefix):
+      slug = st.branch[prefix.len .. ^1]
+    teardownWorktree(root, lc, st.worktree, st.ticketId, slug,
+      keepBranch = true)
+  clearState(repo, leagueName)
+  true
+
 proc runTick*(cfgAll: ConductorConfig, leagueName, repo, root: string): TickResult =
   let lc = cfgAll.league(leagueName)
   let laneDirPath = root / lc.laneCheckout

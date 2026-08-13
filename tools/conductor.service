@@ -1,0 +1,29 @@
+# Conductor daemon — user systemd unit (NOT auto-installed).
+#
+# Install:
+#   mkdir -p ~/.config/systemd/user
+#   cp tools/conductor.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now conductor
+#
+# Pause without stopping:  touch <wsa>/.conductor/pause
+# Logs:                    journalctl --user -u conductor -f
+# The PID guard inside conductor also refuses a second instance, so a
+# manual `nim r src/conductor.nim traverse run` alongside is safe.
+
+[Unit]
+Description=wow-coworld conductor (traverse autoresearch loop)
+After=network-online.target docker.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/src/wow-coworld/wow-shadow-army
+ExecStart=/usr/bin/env nix develop --command nim r src/conductor.nim traverse run
+Restart=always
+RestartSec=30
+# The eval stack (docker episode realm + nim client) inherits this nice
+# level, keeping monofuel's interactive use of the box responsive.
+Nice=5
+
+[Install]
+WantedBy=default.target
