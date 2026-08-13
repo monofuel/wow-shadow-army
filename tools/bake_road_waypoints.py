@@ -54,29 +54,12 @@ MINIMAP_ROUTE_ZONES = {
             "block_yd": 64.0,
             "max_water_depth": 0.5,
             "legs": [
-                # Round-7 canyon pins (cyn_*): monofuel hand-traced the real road
-                # (2026-08-12 screenshot); pins are floor-centroid stations snapped
-                # to floor cells (z -26..-57, grade <= 0.58), ~200yd spacing so the
-                # router's beeline between pins matches the drawn line. Long
-                # unpinned legs drift wherever the trail paint dashes out.
-                ["feralas_junction", (-4280.0, -776.0),      "cyn_w1",          (-4552.0, -1228.0),     {"z_corridor": (-120.0, -20.0, 10.0)}],
-                ["cyn_w1",           (-4552.0, -1228.0),     "cyn_w2",          (-4632.0, -1404.0),     {"z_corridor": (-120.0, -20.0, 10.0)}],
-                ["cyn_w2",           (-4632.0, -1404.0),     "cyn_w3",          (-4664.0, -1620.0),     {"z_corridor": (-120.0, -20.0, 10.0)}],
-                ["cyn_w3",           (-4664.0, -1620.0),     "lift_lower",      (-4677.066, -1853.667), {"z_corridor": (-120.0, -20.0, 10.0)}],
-                ["lift_lower",       (-4677.066, -1853.667), "cyn_m1",          (-4928.0, -1964.0),     {"z_corridor": (-120.0, -20.0, 10.0)}],
-                ["cyn_m1",           (-4928.0, -1964.0),     "cyn_m2",          (-5112.0, -2068.0),     {"z_corridor": (-120.0, -20.0, 10.0)}],
-                ["cyn_m2",           (-5112.0, -2068.0),     "freewind_base",   (-5320.0, -2170.0),     {"z_corridor": (-120.0, -20.0, 10.0)}],
-                ["freewind_base",    (-5320.0, -2170.0),     "cyn_e1",          (-5424.0, -2100.0),     {"z_corridor": (-120.0, -20.0, 10.0)}],
-                ["cyn_e1",           (-5424.0, -2100.0),     "canyon_se",       (-5560.0, -2050.0),     {"z_corridor": (-120.0, -20.0, 10.0)}],
+                ["feralas_junction", (-4280.0, -776.0),      "lift_lower",      (-4677.066, -1853.667), {"z_corridor": (-120.0, -20.0, 10.0)}],
+                ["lift_lower",       (-4677.066, -1853.667), "freewind_base",   (-5320.0, -2170.0),     {"z_corridor": (-120.0, -20.0, 10.0)}],
+                ["freewind_base",    (-5320.0, -2170.0),     "canyon_se",       (-5560.0, -2050.0),     {"z_corridor": (-120.0, -20.0, 10.0)}],
                 # canyon -> basin descent through the verified low-grade gap (seed (-5700,-3130) heading SSW,
                 # measured max grade 1.01, z stays within [-55,-20]); corridor hi -10 gives lip margin
-                ["canyon_se",        (-5560.0, -2050.0),     "cyn_s1",          (-5584.0, -2244.0),     {"z_corridor": (-120.0, -10.0, 10.0)}],
-                ["cyn_s1",           (-5584.0, -2244.0),     "cyn_s2",          (-5640.0, -2436.0),     {"z_corridor": (-120.0, -10.0, 10.0)}],
-                ["cyn_s2",           (-5640.0, -2436.0),     "cyn_s3",          (-5656.0, -2604.0),     {"z_corridor": (-120.0, -10.0, 10.0)}],
-                ["cyn_s3",           (-5656.0, -2604.0),     "cyn_s4",          (-5616.0, -2908.0),     {"z_corridor": (-120.0, -10.0, 10.0)}],
-                ["cyn_s4",           (-5616.0, -2908.0),     "cyn_s5",          (-5672.0, -3068.0),     {"z_corridor": (-120.0, -10.0, 10.0)}],
-                ["cyn_s5",           (-5672.0, -3068.0),     "cyn_s6",          (-5752.0, -3252.0),     {"z_corridor": (-120.0, -10.0, 10.0)}],
-                ["cyn_s6",           (-5752.0, -3252.0),     "basin_entry",     (-5848.0, -3424.0),     {"z_corridor": (-120.0, -10.0, 10.0)}],
+                ["canyon_se",        (-5560.0, -2050.0),     "basin_entry",     (-5848.0, -3424.0),     {"z_corridor": (-120.0, -10.0, 10.0)}],
                 ["basin_entry",      (-5848.0, -3424.0),     "racetrack_north", (-6100.0, -3500.0),     {"z_corridor": (-120.0, -20.0, 10.0)}],
                 ["racetrack_north",  (-6100.0, -3500.0),     "racetrack_mid",   (-6230.0, -3700.0),     {"z_corridor": (-120.0, -20.0, 10.0)}],
                 ["racetrack_mid",    (-6230.0, -3700.0),     "racetrack_south", (-6350.0, -3900.0),     {"z_corridor": (-120.0, -20.0, 10.0)}],
