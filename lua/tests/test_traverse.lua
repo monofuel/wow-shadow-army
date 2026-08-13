@@ -374,10 +374,19 @@ check(afterFinaleFall.kind == "navigate" and
     afterFinaleFall.reason == "timbermaw_02",
   "finale ownership survives a Timbermaw failsafe relocation")
 
--- Reaching the last walked interior beat retires the cave chain and hands
--- the run to the Winterspring finale line.
+-- The last WALKED beat now continues into the hand-authored exit-tunnel
+-- line (no walked coverage there; roll 2 died when the route engine took
+-- over at this exact pose).
 clock = clock + 5.0
-local interiorDone = petrel.decide(view(6875.1, -2306.2, formed))
+local tunnelNext = petrel.decide(view(6875.1, -2306.2, formed))
+check(tunnelNext.kind == "navigate" and
+    tunnelNext.reason == "timbermaw",
+  "the walked chain continues into the exit-tunnel line")
+
+-- Reaching the tunnel mouth retires the cave chain and hands the run to
+-- the Winterspring finale line.
+clock = clock + 5.0
+local interiorDone = petrel.decide(view(6606.3, -2363.0, formed))
 check(interiorDone.kind == "navigate" and
     interiorDone.reason == "timbermaw_north_tunnel",
   "the interior goal hands off to the north tunnel bridge")

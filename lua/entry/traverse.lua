@@ -190,7 +190,10 @@ local function in_travel_form(view)
 end
 
 local function in_bear_form(view)
-  return view.shapeshift_form_id == 1
+  -- 1 = Bear, 5 = Dire Bear: the rank-agnostic stance press gives
+  -- whichever the character knows (roll 2 re-cast once because Dire
+  -- Bear's form id was unmatched).
+  return view.shapeshift_form_id == 1 or view.shapeshift_form_id == 5
 end
 
 local function in_aquatic_form(view)
