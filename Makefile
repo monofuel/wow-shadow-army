@@ -106,7 +106,8 @@ traverse-lint:
 # Every Nim entrypoint/module must at least compile (`nim check`), even where
 # no unit suite imports it yet (army_host, msgpack_json).
 NIM_CHECK_FILES = system/system_server.nim \
-	tools/fair_play_audit.nim tools/party_promote.nim
+	tools/fair_play_audit.nim tools/party_promote.nim \
+	src/conductor.nim
 
 .PHONY: test-smoke test-smoke-lua test-smoke-nim test-smoke-nim-soft
 test-smoke: test-smoke-lua test-smoke-nim-soft
