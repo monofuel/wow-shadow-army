@@ -55,7 +55,7 @@ type
 proc defaultConductorConfig*(): ConductorConfig =
   ConductorConfig(
     agents: ConductorAgents(
-      coding: AgentConfig(harness: harnessClaudeCode, model: "claude-opus-4-6",
+      coding: AgentConfig(harness: harnessClaudeCode, model: "claude-opus-5",
         reasoningEffort: "", hardTimeout: 3_600_000,
         noOutputTimeout: 300_000, progressTimeout: 900_000),
       reviewer: AgentConfig(harness: harnessGrokBuild, model: "grok-4-6",
