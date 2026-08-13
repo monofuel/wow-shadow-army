@@ -66,10 +66,22 @@ check(entry.z == nil,
 check(entry.status and entry.status.dist_goal and entry.status.dist_goal > 0,
   "status carries planar distance to the goal")
 
--- Wading at the shoreline still drives the same entry.
+-- Wading at the shoreline now arms Aquatic FIRST (2026-08-13: a
+-- waterline-shelf grounding auto-cancels the form and waiting for the
+-- swim flag left the seat formless for the whole crossing).
+clock = clock + 20.0
+local wadeCast = petrel.decide(view(-6780.0, -4850.0, {
+  shapeshift_form_id = 3,
+  liquid_known = true, liquid_coverage_known = true,
+  liquid_surface_z = 0.0,
+}))
+check(wadeCast.kind == "cast_spell" and wadeCast.spell == 1066,
+  "formless wading casts Aquatic before pressing on")
+
+-- Already-aquatic wading still drives the same entry.
 clock = clock + 5.0
 local wade = petrel.decide(view(-6780.0, -4850.0, {
-  shapeshift_form_id = 3,
+  shapeshift_form_id = 4,
   liquid_known = true, liquid_coverage_known = true,
   liquid_surface_z = 0.0,
 }))
@@ -79,7 +91,8 @@ check(wade.z == -2.5,
   "with liquid observable the draft clamp owns the wet z again")
 
 -- Swimming without Aquatic Form casts it before anything else.
-clock = clock + 5.0
+-- (clock clears the form-retry window consumed by the wading cast above)
+clock = clock + 20.0
 local unformed = petrel.decide(view(-6600.0, -4865.0, { is_swimming = true }))
 check(unformed.kind == "cast_spell" and unformed.spell == 1066,
   "swimming casts aquatic form first")
