@@ -464,15 +464,23 @@ local function flight_recorder(view, pos, land_route)
     lastFlightAt = now
     local hp = -1
     if view.health_known then hp = math.floor(view.health or 0) end
+    -- fat: fatigue bar fraction remaining (1.0 = safe water/land, active
+    -- timer counts DOWN; three 2026-08-13 runs died with no metric —
+    -- ticket 0018's observation-to-metric duty).
+    local fat = 1.0
+    if view.fatigue_timer and view.fatigue_timer.active then
+      fat = view.fatigue_timer.remaining_fraction or 0.0
+    end
     wow.log(string.format(
       'FLIGHT {"t":%.1f,"x":%.1f,"y":%.1f,"z":%.1f,"hp":%d,"form":%d,' ..
-      '"swim":%s,"combat":%s,"indoors":%s,"nav":"%s","beat":"%s","xt":%.1f}',
+      '"swim":%s,"combat":%s,"indoors":%s,"nav":"%s","beat":"%s","xt":%.1f,' ..
+      '"fat":%.2f}',
       now, pos.x, pos.y, pos.z or 0, hp, formId,
       swimming and "true" or "false",
       (view.in_combat == true) and "true" or "false",
       (view.indoors_known == true and view.indoors == true) and "true" or "false",
       tostring(wow.nav_progress().state or "?"),
-      beatId, xt))
+      beatId, xt, fat))
   end
 end
 

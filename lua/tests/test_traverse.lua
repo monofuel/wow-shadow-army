@@ -409,6 +409,8 @@ local flightLine = any_log("FLIGHT ")
 check(flightLine ~= nil, "land navigation logs a FLIGHT line")
 check(flightLine:find('"beat":', 1, true) ~= nil, "FLIGHT carries beat")
 check(flightLine:find('"xt":', 1, true) ~= nil, "FLIGHT carries xt")
+check(flightLine:find('"fat":', 1, true) ~= nil,
+  "FLIGHT carries fatigue fraction (ticket 0018)")
 
 -- EV unplanned_swim on land-phase swim (before aquatic form cast return).
 loggedLines = {}
