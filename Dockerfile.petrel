@@ -22,5 +22,11 @@ COPY lua/ /opt/policy/lua/
 
 ENV COWORLD_LUA_REPO=/opt/policy
 ENV COWORLD_LUA_ENTRY=traverse
+# The wet chain is env-gated with default OFF (traverse.lua: SWIM =
+# getenv("PETREL_SWIM") == "1"). Local evals set it via the Makefile;
+# this image never did — v1/v2/v3 all plateaued at hosted ~2,400
+# (= water_entry) because every hosted episode walked to the waterline
+# with the wet chain off (ticket 0015 root cause, 2026-08-13).
+ENV PETREL_SWIM=1
 
 CMD ["tini", "--", "/usr/local/bin/lua_bot_entry.sh"]
