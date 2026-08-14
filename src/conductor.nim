@@ -325,8 +325,15 @@ proc main() =
       quit "conductor: no champion row — baseline or merge something first"
     let deaths = openDeathTickets(root, lc.ticketLane)
     if deaths.len > 0:
-      quit "conductor: refusing to ship with open severity-death tickets: " &
-        deaths.join(", ")
+      # Best-of leaderboards cannot go down, so a fragile ship is pure
+      # upside there; monofuel may override the death-ticket block
+      # explicitly (2026-08-14 ruling for the race board).
+      if getEnv("CONDUCTOR_SHIP_OVERRIDE_DEATHS") == "1":
+        echo "conductor: WARN shipping past open severity-death tickets (",
+          deaths.join(", "), ") — explicit override"
+      else:
+        quit "conductor: refusing to ship with open severity-death tickets: " &
+          deaths.join(", ") & " (CONDUCTOR_SHIP_OVERRIDE_DEATHS=1 to override)"
     let guardArg = if paramCount() >= 3: paramStr(3) else: ""
     if guardArg.len == 0:
       # Full ratchet path — requires a last-shipped row.
