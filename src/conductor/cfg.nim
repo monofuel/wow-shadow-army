@@ -32,6 +32,8 @@ type
     leagueId*: string
     image*: string
     auto*: bool
+    playerId*: string          ## pinned identity (playbook §5, multi-player accounts)
+    overrideDeathTickets*: bool ## best-of boards cannot go down (monofuel 2026-08-14)
 
   LeagueConfig* = object
     repo*: string             ## repo dir name under the wow-coworld root

@@ -72,7 +72,11 @@ proc shipRatchet*(root: string, lc: LeagueConfig,
   ## Stricter than the merge gate; every clause must hold.
   let deaths = openDeathTickets(root, lc.ticketLane)
   if deaths.len > 0:
-    return (false, "open severity-death tickets: " & deaths.join(", "))
+    if lc.ship.overrideDeathTickets:
+      echo "conductor: WARN ship ratchet ignoring open death tickets (",
+        deaths.join(", "), ") — best-of board override (config)"
+    else:
+      return (false, "open severity-death tickets: " & deaths.join(", "))
   let shipped = lastShipped(ledgerPath(laneDirPath, lc.ticketLane))
   if shipped.isNil:
     return (false, "no last-shipped ledger row — seed one (manual ship " &
@@ -110,9 +114,11 @@ proc executeShip*(root: string, lc: LeagueConfig, repo, laneDirPath: string,
     "--json"])
   if rcList != 0:
     return ShipOutcome(detail: "coworld player list failed")
-  # CONDUCTOR_PLAYER pins the identity explicitly (a human choice in
-  # config/env) and satisfies playbook §5 on multi-player accounts.
-  var playerId = getEnv("CONDUCTOR_PLAYER")
+  # Identity pinning (playbook §5 on multi-player accounts): config
+  # first, then the CONDUCTOR_PLAYER env, then a solo roster.
+  var playerId = lc.ship.playerId
+  if playerId.len == 0:
+    playerId = getEnv("CONDUCTOR_PLAYER")
   if playerId.len == 0:
     try:
       let players = parseJson(outList.strip())

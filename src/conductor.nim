@@ -290,6 +290,12 @@ proc main() =
     echo "conductor: tick outcome — ", $res.outcome,
       (if res.ticketId.len > 0: " (ticket " & res.ticketId & ")" else: ""),
       (if res.detail.len > 0: ": " & res.detail else: "")
+    # once-chained operation ships after gated merges just like the daemon.
+    if res.outcome == toMerged and not res.report.isNil:
+      let ship = maybeShip(root, cfgAll.league(leagueName), repo,
+        root / cfgAll.league(leagueName).laneCheckout, res.report)
+      echo "conductor: ship — ",
+        (if ship.shipped: "SHIPPED " else: "held: "), ship.detail
   of "gate":
     let st = loadState(repo)
     if st.worktree.len == 0 or not dirExists(st.worktree):
