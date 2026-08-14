@@ -114,13 +114,17 @@ else
     "memberships -l '$LEAGUE' --mine --limit 1000 --json"
 fi
 
-echo "→ episodes --mine (division)"
+# The --mine membership filter went dead 2026-08-05 (returns [] while the
+# policy filter keeps working) — query by policy name instead. Override
+# with TRAVERSE_POLICY for a different lineage.
+POLICY=${TRAVERSE_POLICY:-petrel}
+echo "→ episodes -p $POLICY (division)"
 if [ -n "$CW_BIN" ]; then
   run_cw_json "$OUTDIR/episodes_mine.json" \
-    episodes -d "$DIV" --mine --limit "$LIMIT" --json
+    episodes -d "$DIV" -p "$POLICY" --limit "$LIMIT" --json
 else
   run_cw_json "$OUTDIR/episodes_mine.json" \
-    "episodes -d '$DIV' --mine --limit $LIMIT --json"
+    "episodes -d '$DIV' -p '$POLICY' --limit $LIMIT --json"
 fi
 
 echo "→ merge into episodes_history.json"
