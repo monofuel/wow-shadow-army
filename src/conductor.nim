@@ -294,6 +294,15 @@ proc main() =
       echo "  - ", reason
   of "run":
     cmdRun(leagueName, repo, root)
+  of "gate-branch":
+    if paramCount() < 4:
+      quit "usage: conductor <league> gate-branch <branch> <ticketId>"
+    let res = runGateBranch(cfgAll, leagueName, repo, root,
+      paramStr(3), paramStr(4))
+    echo "conductor: gate-branch — ", $res.outcome,
+      (if res.detail.len > 0: ": " & res.detail else: "")
+    if res.outcome != toMerged:
+      quit 1
   of "ship":
     let lc = cfgAll.league(leagueName)
     let lane = laneDir(root, lc)

@@ -70,6 +70,98 @@ proc park(root: string, lc: LeagueConfig, repo: string,
     outcome: (if dest == "stuck": toStuck else: toParked),
     ticketId: ticket.id, detail: reason)
 
+proc findTicketFile(root, ticketId: string): string =
+  ## Repo-relative path of a ticket in any lifecycle dir; "" if absent.
+  for stateDir in ["open", "in-progress", "stuck", "done"]:
+    for file in walkFiles(root / "tickets" / stateDir / (ticketId & "-*.md")):
+      return "tickets/" & stateDir & "/" & file.extractFilename()
+  ""
+
+proc runGateBranch*(cfgAll: ConductorConfig,
+    leagueName, repo, root, branch, ticketId: string): TickResult =
+  ## Recovery path: run an EXISTING branch (e.g. a preserved parked
+  ## candidate) through the same static checks + eval + gate + merge as
+  ## a tick. No agents involved; ledger + ticket notes stay honest.
+  let lc = cfgAll.league(leagueName)
+  let laneDirPath = root / lc.laneCheckout
+  let repoDir = root / lc.repo
+  let worktree = repoDir / WorktreeRelRoot / ("gate-" & ticketId)
+  discard gitCheck(repoDir, "worktree", "remove", "--force", worktree)
+  discard gitCheck(repoDir, "worktree", "prune")
+  gitRun(repoDir, "worktree", "add", "--force", worktree, branch)
+  defer:
+    discard gitCheck(repoDir, "worktree", "remove", "--force", worktree)
+    discard gitCheck(repoDir, "worktree", "prune")
+    forceRemoveDir(worktree)
+  let sharedData = root / "local_data"
+  if dirExists(sharedData) and not symlinkExists(worktree / "local_data"):
+    createSymlink(sharedData, worktree / "local_data")
+
+  let violations = diffGuards(worktree, lc)
+  if violations.len > 0:
+    return TickResult(outcome: toParked, ticketId: ticketId,
+      detail: "diff guards: " & violations.join("; "))
+  let (rcLua, outLua) = runCommandCapture(worktree, "make", @["test-lua"],
+    timeoutMs = 600_000)
+  if rcLua != 0:
+    return TickResult(outcome: toParked, ticketId: ticketId,
+      detail: "make test-lua failed: " & outLua[max(0, outLua.len - 200) .. ^1])
+  echo "conductor: gate-branch full-course eval (several minutes)"
+  let eval = runEval(worktree, lc, ticketId & "-gatebranch",
+    @[forkClientVar(root)])
+  if eval.outcome != evalOk:
+    return TickResult(outcome: toBusy, ticketId: ticketId,
+      detail: $eval.outcome & ": " & eval.detail)
+  let champ = champion(ledgerPath(laneDirPath, leagueName))
+  let gate = runGate(eval.report,
+    (if champ.isNil: nil else: champ{"report"}), lc)
+  if not gate.pass:
+    appendRow(ledgerPath(laneDirPath, leagueName),
+      makeRow(leagueName, "parked", ticketId, branch,
+        pinShas(root, laneDirPath), eval.report,
+        %*{"pass": false, "reasons": gate.reasons}))
+    try:
+      commitLedger(laneDirPath, "scores: gate-branch parked " & ticketId)
+    except IOError as e:
+      echo "conductor: WARN ", e.msg
+    return TickResult(outcome: toParked, ticketId: ticketId,
+      detail: gate.reasons.join("; "))
+  let (rcRebase, outRebase) = gitRunCapture(worktree,
+    @["rebase", lc.laneBranch], timeoutMs = 120_000)
+  if rcRebase != 0:
+    discard gitCheck(worktree, "rebase", "--abort")
+    return TickResult(outcome: toParked, ticketId: ticketId,
+      detail: "rebase failed: " & outRebase[max(0, outRebase.len - 200) .. ^1])
+  var (rcMerge, outMerge) = gitRunCapture(laneDirPath,
+    @["merge", "--ff-only", branch], timeoutMs = 60_000)
+  if rcMerge != 0:
+    (rcMerge, outMerge) = gitRunCapture(laneDirPath,
+      @["merge", "--no-ff", branch, "-m",
+        "conductor: gate-branch merge " & branch], timeoutMs = 60_000)
+  if rcMerge != 0:
+    discard gitCheck(laneDirPath, "merge", "--abort")
+    return TickResult(outcome: toParked, ticketId: ticketId,
+      detail: "merge failed: " & outMerge[max(0, outMerge.len - 200) .. ^1])
+  appendRow(ledgerPath(laneDirPath, leagueName),
+    makeRow(leagueName, "merged", ticketId, branch,
+      pinShas(root, laneDirPath), eval.report,
+      %*{"pass": true, "reasons": gate.reasons}))
+  try:
+    commitLedger(laneDirPath, "scores: " & leagueName & " gate-branch merged " &
+      ticketId & " — northing " & $eval.report{"max_northing"}.getFloat())
+  except IOError as e:
+    echo "conductor: WARN ", e.msg
+  discard gitRunCapture(laneDirPath, @["push"], timeoutMs = 120_000)
+  let ticketPath = findTicketFile(root, ticketId)
+  if ticketPath.len > 0:
+    discard finishTicket(root, ticketPath, "done",
+      "- conductor: gate-branch MERGED " & branch & " to " & lc.laneBranch &
+      " — gate: " & gate.reasons.join("; ") & "; northing " &
+      $eval.report{"max_northing"}.getFloat())
+  TickResult(outcome: toMerged, ticketId: ticketId,
+    detail: "northing " & $eval.report{"max_northing"}.getFloat(),
+    report: eval.report)
+
 proc recoverCrashedTick*(cfgAll: ConductorConfig,
     leagueName, repo, root: string): bool =
   ## A non-idle state at loop entry means a previous tick died mid-way.
