@@ -29,7 +29,7 @@ was wrong.
 | entrant | best score | last seen | notes |
 |---|---|---|---|
 | andre | 10,700 | 2026-08-13 | league leader; ~just past top_barrens |
-| (petrel — us) | 2,400 hosted / 10,221 local | 2026-08-13 | see progress table |
+| (petrel — us) | 8,262 hosted (v5) / 11,085 local | 2026-08-14 | see progress table |
 | (several entrants) | 0 | 2026-08-13 | scoring zeros — league possibly flaky (monofuel) |
 
 ## Petrel version progress
@@ -50,3 +50,4 @@ was wrong.
 | 2026-08-13 | petrel:v2 (submitted, qualifying) | — | — | andre | 10,700 | sub_6ef950c7, champion-guard replacement; expect ~10.2k when its round lands |
 | 2026-08-13 | petrel:v4 (champion, competing) | mean ~2,106 / median 1,996 / max 8,106 | — | andre | 10,700 | 93 hosted episodes 08:51–18:18Z: swim fix CONFIRMED live — 2 episodes scored 8,105.6 (x=-1081, ≈ Ratchet/barrens_shore, far past the old 2,400 dry plateau). BUT 87/93 stop at EXACTLY 1996.05 (x=-7190.95, 414 yd SHORT of water_entry) — a deterministic hosted-only wall v3 did not have (v3 scored 2,367 = waterline). Suspect: SWIM=1 changes pre-water routing/wedge on hosted terrain. Both outlier classes have replay_url — replay autopsy is the next probe (ereq_c94931d1 = 8105 run, any 1996 run for the wall). |
 | 2026-08-14 | petrel:v5 (submitted, qualifying) | board mark 8,105.6 (best-of, v4) | ~#2 | andre | 10,700 | v5 = 11,085 local champion; wall-escape episodes now roll the new line |
+| 2026-08-14 | petrel:v5 (competing) | best 8,262 / median 1,996 | — | andre | 10,700 | 110 scored episodes 04:52–17:29Z (~1 per 7 min): 3 wall-escapes (8,249.7 / 8,194.1 / 8,262.1 — new all-time best, +156 over v4) but 107/110 stop at EXACTLY 1996.05 — the 0015 wall persists on v5 at the same x=-7191. Escape rate ~2.7% (v4: ~2.2%). Even escaped episodes cap ~8.2k vs 11,085 local — the wall autopsy (0015) is now the single highest-leverage hosted item. CLI note: episodes --mine went dead + {episodes,cursor} envelope 2026-08-05; field pull fixed 2026-08-14. |
