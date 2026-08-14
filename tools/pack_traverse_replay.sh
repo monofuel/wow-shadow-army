@@ -208,7 +208,9 @@ for row in base.get("leaderboard") or []:
 results = ResultsArtifact.model_validate(base)
 extraction = ReplayExtractionRequest(
     capture_dir=cap,
-    simulation_time_scale=1,
+    # Race episodes run at 10x; declaring scale 1 truncated replays to
+    # the first tenth of the run (the desert) and desynced playback.
+    simulation_time_scale=int(os.environ.get("TRAVERSE_SIM_SCALE") or 10),
     povs=[
         ReplayCapturePov(guid=guid, name=name)
         for guid, name in sorted(by_guid.items(), key=lambda item: item[1].casefold())
