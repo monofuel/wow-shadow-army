@@ -134,6 +134,9 @@ from pathlib import Path
 out = Path("$OUTDIR")
 hist_path = out / "episodes_history.json"
 pull = json.loads((out / "episodes_mine.json").read_text())
+if isinstance(pull, dict):
+    # 2026-08 API change: episodes come in a {episodes, cursor} envelope
+    pull = pull.get("episodes") or pull.get("items") or pull.get("entries") or []
 if not isinstance(pull, list):
     pull = []
 hist = []
