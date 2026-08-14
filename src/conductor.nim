@@ -120,8 +120,18 @@ proc ingestHosted(cfgAll: ConductorConfig, leagueName, root: string) =
   ## Raises on harness trouble — the daemon logs and moves on.
   let lc = cfgAll.league(leagueName)
   let lane = laneDir(root, lc)
-  let (rc, output) = runCommandCapture(lane, "make", @["traverse-field"],
-    timeoutMs = 300_000)
+  # pull_traverse_field.sh resolves the coworld CLI via COWORLD_BIN ->
+  # PATH -> a crewrift bots repo that this machine lacks; point it at
+  # the fork's venv, which is how every other coworld call runs here.
+  let coworldBin = root / "monofuel-vanilla-wow" / ".venv" / "bin" / "coworld"
+  let (rc, output) =
+    if fileExists(coworldBin):
+      runCommandCapture(lane, "env",
+        @["COWORLD_BIN=" & coworldBin, "make", "traverse-field"],
+        timeoutMs = 300_000)
+    else:
+      runCommandCapture(lane, "make", @["traverse-field"],
+        timeoutMs = 300_000)
   if rc != 0:
     raise newException(IOError, "make traverse-field failed rc=" & $rc &
       ": " & output[max(0, output.len - 400) .. ^1])
