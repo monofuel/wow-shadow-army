@@ -4,7 +4,11 @@ Scoring: farthest authoritative **northing** across Kalimdor
 (`world_x + 9187`; spawn = 0, Everlook goal ≈ 15,874) inside one
 45-sim-minute episode at 10x. Division: Kalimdor Race. Rounds every
 ~30 min (observed round #1678, 2026-08-13). `is_champion` = OUR active
-entry, NOT rank (see AGENTS.md).
+entry, NOT rank (see AGENTS.md). LEADERBOARD IS BEST-OF across
+versions/rounds (docs/traverse/traverse_wow.md; confirmed on the web
+UI 2026-08-14: our mark = 8,105.6 from v4's two wall-escape episodes,
+NOT the round mean) — an earlier note here said mean_round_score; that
+was wrong.
 
 ## Course landmarks (northing from spawn)
 
@@ -35,6 +39,7 @@ entry, NOT rank (see AGENTS.md).
 | v1 | 4c24e52f4 / eeb86be | 10,221 (lucky water entry; 14,088 yd, ~4.1 wall min) | 2,400 (#4) | waterline-spin cascade predates the fix: hosted episodes + monofuel's replay spin at the beach; the local 10.2k run rolled lucky entry dice |
 | v2 | e261c3d84 / 7936932 | 10,204 (0 stalls, 0 deaths, clock-limited at top_barrens) | pending first round | spin structurally dead (turn clamp + one seaward target + JUMP releases); known flaws: land zig-zag (ticket 0013), flag-flicker bobbing (0002), cave wall-stick (0012) |
 | v3 | 0f45b0aed / 2787505 | 9,980 phase-0 clean run; night median dragged by dice (wedges/fatigue/mobs) | submitted 2026-08-13 07:51Z, qualifying | BOTH wedge escapes live (0016+0016b, rescue demonstrated at the seam) + fatigue metric in FLIGHT; hypothesis: hosted 2.4k plateau = pre-water wedge family, v3 should climb past it; sub_1afb44aa, version ebf33966, guard over v2 c4c72440 |
+| v5 | 0f45b0aed / c6228a791 (lane) | 11,085 (champion, zero deaths, clock-limited) | submitted 2026-08-14 04:53Z (sub_868e629f, version aff09683), qualifying, guard over v4 | the 0014 bay recut line + PETREL_SWIM removal; best-of board means any wall-escape episode rolls the 11k line — target: beat our 8,105.6 mark, andre at 10,700 |
 | v4 | 0f45b0aed / 592766f | (same bot as v3) | submitted 2026-08-13 08:5xZ, pending | THE FIX: ENV PETREL_SWIM=1 — v1/v2/v3 hosted episodes all ran with the wet chain OFF (env gate default-off, image never set it); every hosted run parked at the waterline = ~2,400 = water_entry landmark. v3 round 1703 scored 2,367 and confirmed the plateau on a wedge-escape build; expected hosted with swim on: ~10k. sub_eb972b1f, version 0b2886a3, guard over v3 ebf33966 |
 
 ## Standings history (append-only)
@@ -44,3 +49,4 @@ entry, NOT rank (see AGENTS.md).
 | 2026-08-13 | petrel:v1 | ~2,400 | #4 | andre | 10,700 | v1 froze before the spin fixes; hosted runs stall at the beach. Several entrants at 0. |
 | 2026-08-13 | petrel:v2 (submitted, qualifying) | — | — | andre | 10,700 | sub_6ef950c7, champion-guard replacement; expect ~10.2k when its round lands |
 | 2026-08-13 | petrel:v4 (champion, competing) | mean ~2,106 / median 1,996 / max 8,106 | — | andre | 10,700 | 93 hosted episodes 08:51–18:18Z: swim fix CONFIRMED live — 2 episodes scored 8,105.6 (x=-1081, ≈ Ratchet/barrens_shore, far past the old 2,400 dry plateau). BUT 87/93 stop at EXACTLY 1996.05 (x=-7190.95, 414 yd SHORT of water_entry) — a deterministic hosted-only wall v3 did not have (v3 scored 2,367 = waterline). Suspect: SWIM=1 changes pre-water routing/wedge on hosted terrain. Both outlier classes have replay_url — replay autopsy is the next probe (ereq_c94931d1 = 8105 run, any 1996 run for the wall). |
+| 2026-08-14 | petrel:v5 (submitted, qualifying) | board mark 8,105.6 (best-of, v4) | ~#2 | andre | 10,700 | v5 = 11,085 local champion; wall-escape episodes now roll the new line |
