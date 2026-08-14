@@ -7,6 +7,7 @@ import std/[json, options, os, sequtils, sets, strutils]
 import ../../src/conductor/cfg
 import ../../src/conductor/evalgate
 import ../../src/conductor/ledger
+import ../../src/conductor/shiplib
 
 var passed = 0
 proc check(cond: bool; name: string) =
@@ -164,6 +165,37 @@ f.write("{\"torn\": ")
 f.close()
 check(champion(lpath){"action"}.getStr() == "merged",
   "torn tail line ignored")
+
+# --- ship ratchet: absolute minNorthing mode (monofuel's 8.6k rule) ---
+# Fixture: empty ticket tree (no death tickets), a lane ledger with one
+# shipped row carrying a policy_version_id for the guard chain.
+let shipRoot = tmp / "ship-root"
+createDir(shipRoot / "tickets" / "open")
+createDir(shipRoot / "tickets" / "in-progress")
+let shipLane = shipRoot / "lane"
+createDir(shipLane)
+var shippedRow = makeRow("traverse", "shipped", "", "monofuel/traverse",
+  %*{"wsa": "aaa"}, report, %*{"pass": true})
+shippedRow["ship"] = %*{"policy_version_id": "ver-123"}
+appendRow(ledgerPath(shipLane, "traverse"), shippedRow)
+var lcShip = LeagueConfig(floorMetric: "max_northing",
+  ticketLane: "traverse")
+lcShip.ship.minNorthing = 8600.0
+var candidate9k = report.copy()
+candidate9k["max_northing"] = %9000.0
+var ratchet = shipRatchet(shipRoot, lcShip, shipLane, candidate9k)
+check(ratchet.ok, "minNorthing mode ships a 9k candidate (guard vs " &
+  "last-shipped axes bypassed)")
+var candidate8k = report.copy()
+candidate8k["max_northing"] = %8100.0
+ratchet = shipRatchet(shipRoot, lcShip, shipLane, candidate8k)
+check(not ratchet.ok, "minNorthing mode refuses below the absolute floor")
+check(ratchet.why.contains("minNorthing"), "refusal names the floor")
+# without minNorthing the old vs-last-shipped gate applies (9k < shipped
+# 10204 floor -> refused)
+lcShip.ship.minNorthing = 0.0
+ratchet = shipRatchet(shipRoot, lcShip, shipLane, candidate9k)
+check(not ratchet.ok, "legacy mode still gates vs last-shipped floor")
 
 removeDir(tmp)
 echo "test_conductor_gate: ", passed, " ok"

@@ -83,6 +83,18 @@ proc shipRatchet*(root: string, lc: LeagueConfig,
       "or a hand-written shipped row) before auto-ship can ratchet")
   if shipped{"ship", "policy_version_id"}.getStr() == "":
     return (false, "last-shipped row has no policy_version_id for the guard")
+  if lc.ship.minNorthing > 0:
+    # Absolute floor mode (best-of board): any candidate at/above the
+    # configured northing ships, regardless of the last-shipped run's
+    # axes — the board keeps the max, so a 9k ship after an 11k local
+    # fluke is pure upside. Guard chain and death-ticket clause above
+    # still apply.
+    let northing = candidateReport{"max_northing"}.getFloat()
+    if northing < lc.ship.minNorthing:
+      return (false, "below ship.minNorthing: " & $northing & " < " &
+        $lc.ship.minNorthing)
+    return (true, "clears ship.minNorthing " & $lc.ship.minNorthing &
+      " (northing " & $northing & ")")
   let verdict = runGate(candidateReport, shipped{"report"}, lc)
   if not verdict.pass:
     return (false, "ship ratchet vs last-shipped: " &

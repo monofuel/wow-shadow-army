@@ -34,6 +34,10 @@ type
     auto*: bool
     playerId*: string          ## pinned identity (playbook §5, multi-player accounts)
     overrideDeathTickets*: bool ## best-of boards cannot go down (monofuel 2026-08-14)
+    minNorthing*: float        ## >0: ship any candidate at/above this absolute
+                               ## northing instead of gating vs last-shipped
+                               ## (monofuel 2026-08-14: "scores higher than
+                               ## 8.6k, ship it" — best-of board, no downside)
 
   LeagueConfig* = object
     repo*: string             ## repo dir name under the wow-coworld root
