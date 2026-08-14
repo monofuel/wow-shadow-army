@@ -110,17 +110,21 @@ proc executeShip*(root: string, lc: LeagueConfig, repo, laneDirPath: string,
     "--json"])
   if rcList != 0:
     return ShipOutcome(detail: "coworld player list failed")
-  var playerId = ""
-  try:
-    let players = parseJson(outList.strip())
-    let arr = if players.kind == JArray: players else: players{"players"}
-    if arr.isNil or arr.kind != JArray or arr.len != 1:
-      flagNeedsHuman(repo, "ship stopped: player roster is not exactly " &
-        "one player — pick identity by hand (playbook §5)")
-      return ShipOutcome(detail: "player roster ambiguous — NEEDS-HUMAN")
-    playerId = arr[0]{"id"}.getStr(arr[0]{"player_id"}.getStr())
-  except CatchableError:
-    return ShipOutcome(detail: "player list output unparseable")
+  # CONDUCTOR_PLAYER pins the identity explicitly (a human choice in
+  # config/env) and satisfies playbook §5 on multi-player accounts.
+  var playerId = getEnv("CONDUCTOR_PLAYER")
+  if playerId.len == 0:
+    try:
+      let players = parseJson(outList.strip())
+      let arr = if players.kind == JArray: players else: players{"players"}
+      if arr.isNil or arr.kind != JArray or arr.len != 1:
+        flagNeedsHuman(repo, "ship stopped: player roster is not exactly " &
+          "one player — pick identity by hand (playbook §5) or set " &
+          "CONDUCTOR_PLAYER")
+        return ShipOutcome(detail: "player roster ambiguous — NEEDS-HUMAN")
+      playerId = arr[0]{"id"}.getStr(arr[0]{"player_id"}.getStr())
+    except CatchableError:
+      return ShipOutcome(detail: "player list output unparseable")
   if playerId.len == 0:
     return ShipOutcome(detail: "player id missing from roster")
   discard uvRun(forkDir, @["coworld", "player", "use", playerId])
