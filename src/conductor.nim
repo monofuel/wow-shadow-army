@@ -316,9 +316,12 @@ proc main() =
     cmdRun(leagueName, repo, root)
   of "gate-branch":
     if paramCount() < 4:
-      quit "usage: conductor <league> gate-branch <branch> <ticketId>"
+      quit "usage: conductor <league> gate-branch <branch> <ticketId>" &
+        " [--allow-protected]"
+    let allowProtected = paramCount() >= 5 and
+      paramStr(5) == "--allow-protected"
     let res = runGateBranch(cfgAll, leagueName, repo, root,
-      paramStr(3), paramStr(4))
+      paramStr(3), paramStr(4), allowProtected)
     echo "conductor: gate-branch — ", $res.outcome,
       (if res.detail.len > 0: ": " & res.detail else: "")
     if res.outcome != toMerged:

@@ -182,14 +182,21 @@ proc isBehaviorChange*(files: seq[string]): bool =
       return true
   false
 
-proc diffGuards*(worktree: string, lc: LeagueConfig): seq[string] =
+proc diffGuards*(worktree: string, lc: LeagueConfig,
+    allowProtected = false): seq[string] =
   ## Structural rejections no agent can argue with. Empty = clean.
-  for file in changedFiles(worktree, lc):
-    for protected in lc.protectedPaths:
-      if file == protected or
-          (protected.endsWith("/") and file.startsWith(protected)) or
-          file.startsWith(protected & "/"):
-        result.add("protected path touched: " & file)
+  ## allowProtected is the HUMAN-lane escape hatch (gate-branch
+  ## --allow-protected): protected paths exist to stop agents from
+  ## touching the eval fixture, not to stop reviewed human work — the
+  ## eval + floor gate still applies either way. Never reachable from
+  ## the agent tick path.
+  if not allowProtected:
+    for file in changedFiles(worktree, lc):
+      for protected in lc.protectedPaths:
+        if file == protected or
+            (protected.endsWith("/") and file.startsWith(protected)) or
+            file.startsWith(protected & "/"):
+          result.add("protected path touched: " & file)
   let before = countTestAssertions(worktree, lc.laneBranch)
   let after = countTestAssertions(worktree, "HEAD")
   if before >= 0 and after >= 0 and after < before:

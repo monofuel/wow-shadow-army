@@ -78,7 +78,8 @@ proc findTicketFile(root, ticketId: string): string =
   ""
 
 proc runGateBranch*(cfgAll: ConductorConfig,
-    leagueName, repo, root, branch, ticketId: string): TickResult =
+    leagueName, repo, root, branch, ticketId: string,
+    allowProtected = false): TickResult =
   ## Recovery path: run an EXISTING branch (e.g. a preserved parked
   ## candidate) through the same static checks + eval + gate + merge as
   ## a tick. No agents involved; ledger + ticket notes stay honest.
@@ -97,7 +98,7 @@ proc runGateBranch*(cfgAll: ConductorConfig,
   if dirExists(sharedData) and not symlinkExists(worktree / "local_data"):
     createSymlink(sharedData, worktree / "local_data")
 
-  let violations = diffGuards(worktree, lc)
+  let violations = diffGuards(worktree, lc, allowProtected)
   if violations.len > 0:
     return TickResult(outcome: toParked, ticketId: ticketId,
       detail: "diff guards: " & violations.join("; "))
