@@ -69,6 +69,14 @@ is the parent dir (or `CONDUCTOR_ROOT`).
    `parked` row.
 9. **Ship** (daemon, `ship.auto: true`) — see below.
 
+### Eval mode doctrine
+
+Headless evals are AUTHORITATIVE (the tournament runs headless on
+servers). Headed runs are timing-inaccurate on the 10x client and roll
+worse; behavior inspection = pack + replay a headless run
+(tools/pack_traverse_replay.sh, TRAVERSE_REPLAY=<file>
+tools/traverse_replay.sh), never a headed test's outcome.
+
 ## The ship ratchet
 
 Stricter than the merge gate: the merged report must beat the

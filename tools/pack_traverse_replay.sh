@@ -59,17 +59,20 @@ uv run python - <<'PY'
 from __future__ import annotations
 
 import json
+import math
 import os
 import time
 from pathlib import Path
 
-from game.replay import (
+# Upstream 2026-08-14: game.replay -> game.replays.artifact,
+# game.replay_sessions -> game.replays.sessions.
+from game.replays.artifact import (
     ReplayCapturePov,
     ReplayExtractionRequest,
     ReplayPlaybackWindowRequest,
     finalize_replay,
 )
-from game.replay_sessions import read_godview_sessions
+from game.replays.sessions import read_godview_sessions
 from game.results import ResultsArtifact
 
 cap = Path(os.environ["PACK_CAPTURES_DIR"])
@@ -124,6 +127,13 @@ template_path = run / "results.json"
 if template_path.is_file():
     base = json.loads(template_path.read_text())
 else:
+    # Upstream 2026-08-14: every per-slot list is typed and non-empty.
+    seat_name = (last_player.get("name") or "Northbound")
+    char_score = {
+        "slot": 0, "name": seat_name, "character_found": True,
+        "character_id": "1", "character_name": seat_name,
+        "level": level, "xp": 0, "total_xp": 0,
+    }
     base = {
         "game": "vanilla_wow_local",
         "scenario_id": "kalimdor-south-to-north",
@@ -131,14 +141,25 @@ else:
         "score_metric": "kalimdor_northing_yards",
         "session_score_metric": "top_character_xp_gained",
         "session_xp_gained": [0],
-        "session_scores": [],
-        "leaderboard": [],
-        "initial_character_scores": [],
-        "character_scores": [],
-        "episode_xp_awarded": 0,
+        "session_scores": [{
+            "slot": 0, "name": seat_name,
+            "start_character_id": "1", "start_character_name": seat_name,
+            "start_total_xp": 0,
+            "end_character_id": "1", "end_character_name": seat_name,
+            "end_total_xp": 0, "xp_gained": 0,
+        }],
+        "leaderboard": [{
+            "rank": 1, "slot": 0, "name": seat_name,
+            "character_name": seat_name, "level": level,
+            "score_metric": "kalimdor_northing_yards",
+            "score": northing, "xp_gained": 0, "total_xp": 0,
+        }],
+        "initial_character_scores": [dict(char_score)],
+        "character_scores": [dict(char_score)],
+        "episode_xp_awarded": [0],
         "outcome": "completed",
-        "objectives": [],
-        "deaths": [],
+        "objectives": [{"id": "kalimdor-south-to-north", "complete": False}],
+        "deaths": [0],
         "leveling": None,
         "tower": None,
         "dungeon": None,
@@ -153,7 +174,9 @@ base["ticks"] = len(session.frames)
 kt = dict(base.get("kalimdor_traversal") or {})
 kt.update(
     {
-        "protocol": kt.get("protocol") or "vanilla_wow.kalimdor_traversal.v1",
+        # Upstream results schema v2 (2026-08-14): full goal pose +
+        # radius are required; protocol literal bumped.
+        "protocol": "vanilla_wow.kalimdor_traversal.v2",
         "score_metric": "kalimdor_northing_yards",
         "map_id": map_id,
         "zone_id": kt.get("zone_id"),
@@ -162,6 +185,13 @@ kt.update(
         "world_z": z,
         "start_world_x": START_X,
         "goal_world_x": GOAL_X,
+        "goal_world_y": -4647.667,
+        "goal_world_z": 721.678,
+        "goal_radius_yards": 50.0,
+        "goal_distance_yards": (
+            math.dist((x, y, z), (GOAL_X, -4647.667, 721.678))
+            if score_valid else None
+        ),
         "northing_yards": northing,
         "reached_goal": bool(score_valid and x >= GOAL_X),
         "score_valid": score_valid,
@@ -169,6 +199,7 @@ kt.update(
     }
 )
 base["kalimdor_traversal"] = kt
+
 for row in base.get("leaderboard") or []:
     if isinstance(row, dict):
         row["score"] = northing
