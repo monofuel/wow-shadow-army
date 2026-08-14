@@ -213,11 +213,21 @@ proc runGate*(candidate, champion: JsonNode,
       result.reasons.add("assert " & a.field & suffix & " " & a.op & " " &
         $reference & " failed (candidate " & $cand.get() & ")")
 
-  # (c) no new warning classes vs the champion run.
+  # (c) no new warning classes vs the champion run — but only when the
+  # floor did not strictly improve. A candidate that pushes further than
+  # the champion ever reached will legitimately meet new terrain and its
+  # warning classes (extent bias: a champion that died in the bay has
+  # pristine land axes for land it never touched). Cop-out protection is
+  # preserved where it matters: no floor progress = no new badness.
+  let floorImproved = candFloor.isSome and champFloor.isSome and
+    candFloor.get() > champFloor.get()
   let newClasses = warningClasses(candidate) - warningClasses(champion)
   for cls in newClasses:
-    result.pass = false
-    result.reasons.add("new warning class vs champion: " & cls)
+    if floorImproved:
+      result.reasons.add("note: new warning class on extended run: " & cls)
+    else:
+      result.pass = false
+      result.reasons.add("new warning class vs champion: " & cls)
 
   if result.pass:
     result.reasons.add("floor + " & $lc.assertions.len &

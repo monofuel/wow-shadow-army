@@ -24,6 +24,7 @@ suite "road waypoint parsing":
         foundHand = true
     check foundHand
     check hand.source == "hand"
+    check hand.confidence == 1.0'f32
     check hand.id == "h0001"
     check hand.points.len == 2
     check hand.points[0].x == 100.0'f32

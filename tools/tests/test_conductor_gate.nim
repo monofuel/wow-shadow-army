@@ -82,13 +82,22 @@ deadly["deaths"] = %2
 verdict = runGate(deadly, report, lc)
 check(not verdict.pass, "deaths regress fails")
 
-# new warning class -> fail
+# new warning class without floor progress -> fail
 var noisy = report.copy()
 noisy["scorecard"]["warnings"].add(%"WARN fatigue: [DEATH-BAND] min bar 0.1")
 verdict = runGate(noisy, report, lc)
 check(not verdict.pass, "new warning class fails")
 check(verdict.reasons.anyIt(it.contains("WARN fatigue")),
   "new class named in reasons")
+
+# new warning class WITH strict floor progress -> tolerated (extent bias:
+# further runs meet new terrain and its warnings)
+var explorer = noisy.copy()
+explorer["max_northing"] = %13000.0
+verdict = runGate(explorer, report, lc)
+check(verdict.pass, "new class tolerated when floor strictly improves")
+check(verdict.reasons.anyIt(it.contains("note: new warning class")),
+  "tolerated class still noted")
 
 # champion missing an assertion field -> falls back to fixed value
 var oldChampion = report.copy()

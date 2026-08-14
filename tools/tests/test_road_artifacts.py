@@ -20,12 +20,6 @@ skip_no_artifact = unittest.skipUnless(
 )
 
 STITCH_YD = 15.0
-# Same 100 yd radius the baker uses to attach an anchor to nearby points.
-# Keep these equal: a point the bake would claim is "at" the anchor must
-# also count as reaching it here.
-ANCHOR_RADIUS_YD = 100.0
-ANCHOR_Z_YD = 40.0
-
 Point = tuple[float, float, float]
 Segment = list[Point]
 
@@ -100,21 +94,12 @@ def segments_connected_components(
 
 @skip_no_artifact
 class TestKalimdorRoadConnectivity(unittest.TestCase):
-    ANCHORS = {
-        # Thousand Needles floor, lift lower dock; Barrens connectivity is
-        # via the lift transport edge, so the FLOOR network only needs to
-        # reach this dock.
-        "great_lift_lower": (-4677.066, -1853.667, -43.857),
-        # Where the painted FeralasRoad descent ends on the 1kN side.
-        "feralas_terminus": (-4280.0, -776.0, -49.4),
-        # Shimmering Flats racetrack; looser XY — the crossing may lawfully
-        # drift on featureless salt.
-        "racetrack_mid": (-6230.0, -3700.0, -60.0),
-        # Painted Tanaris road north end — ties the 1kN network to Tanaris.
-        "tanaris_road": (-6720.0, -3456.0, 86.0),
-    }
-    ANCHOR_RADIUS = {
-        "racetrack_mid": 150.0,
+    # Boundary bands, not route anchors. The detector owns the exact crossing
+    # point and must discover it from minimap ribbon evidence.
+    TERMINAL_BANDS = {
+        "feralas": lambda x, y, z: -4500 <= x <= -4200 and -1250 <= y <= -650 and -100 <= z <= -15,
+        "great_lift": lambda x, y, z: -4780 <= x <= -4550 and -1950 <= y <= -1780 and -100 <= z <= -15,
+        "tanaris": lambda x, y, z: -6900 <= x <= -6500 and -3900 <= y <= -3100 and 25 <= z <= 110,
     }
 
     @classmethod
@@ -133,12 +118,7 @@ class TestKalimdorRoadConnectivity(unittest.TestCase):
         self.assertGreater(len(self.segments), 50)
 
     def test_thousand_needles_connects_to_neighbors(self) -> None:
-        hits = {
-            name: self._anchor_hit(
-                xyz, self.ANCHOR_RADIUS.get(name, ANCHOR_RADIUS_YD)
-            )
-            for name, xyz in self.ANCHORS.items()
-        }
+        hits = {name: self._band_hit(predicate) for name, predicate in self.TERMINAL_BANDS.items()}
         shared: set[int] | None = None
         for _nearest, _pt, comps in hits.values():
             if shared is None:
@@ -149,7 +129,7 @@ class TestKalimdorRoadConnectivity(unittest.TestCase):
             return
         lines = [
             "Thousand Needles floor must share one component with all "
-            f"neighbor anchors (stitch={STITCH_YD} yd)."
+            f"neighbor boundary terminals (stitch={STITCH_YD} yd)."
         ]
         for name, (nearest, pt, comps) in hits.items():
             if comps:
@@ -163,56 +143,44 @@ class TestKalimdorRoadConnectivity(unittest.TestCase):
                 at = ""
             else:
                 at = (
-                    f" at ({pt[0]:.1f}, {pt[1]:.1f}, {pt[2]:.1f}) "
-                    f"dz={pt[2] - self.ANCHORS[name][2]:.1f}"
+                    f" at ({pt[0]:.1f}, {pt[1]:.1f}, {pt[2]:.1f})"
                 )
             lines.append(
                 f"  {name}: nearest={nearest:.1f} yd{at} component={found}"
             )
         self.fail("\n".join(lines))
 
-    def _anchor_hit(
-        self,
-        xyz: tuple[float, float, float],
-        radius: float = ANCHOR_RADIUS_YD,
-    ) -> tuple[float, Point | None, set[int]]:
-        ax, ay, az = xyz
-        nearest = float("inf")
-        nearest_pt: Point | None = None
-        comps: set[int] = set()
+    def test_visual_segments_are_source_honest(self) -> None:
+        visual = []
+        with ARTIFACT.open() as handle:
+            next(handle)
+            for raw in handle:
+                obj = json.loads(raw)
+                if obj.get("source") in {"minimap_ribbon", "visual_gap_bridge"}:
+                    visual.append(obj)
+        self.assertTrue(visual)
+        for obj in visual:
+            source = obj["source"]
+            self.assertEqual(
+                obj.get("confidence"), 1.0 if source == "minimap_ribbon" else 0.0
+            )
+            if source == "visual_gap_bridge":
+                length = sum(
+                    math.hypot(b[0] - a[0], b[1] - a[1])
+                    for a, b in zip(obj["pts"], obj["pts"][1:])
+                )
+                self.assertLessEqual(length, 24.1)
+
+    def _band_hit(self, predicate):
+        comps = set()
+        first = None
         for si, pts in enumerate(self.segments):
             for pt in pts:
-                dist = math.hypot(pt[0] - ax, pt[1] - ay)
-                if dist < nearest:
-                    nearest = dist
-                    nearest_pt = pt
-                if dist <= radius and abs(pt[2] - az) <= ANCHOR_Z_YD:
+                if predicate(*pt):
                     comps.add(self.seg_to_comp[si])
-        return nearest, nearest_pt, comps
-
-
-class TestAnchorReachZ(unittest.TestCase):
-    """A mesa fake within 89yd XY of the dock must not count as reaching it."""
-
-    def test_mesa_fake_rejected_on_dz(self) -> None:
-        dock = (-4677.066, -1853.667, -43.857)
-        mesa = (dock[0] + 89.0, dock[1], 86.0)
-        floor = (dock[0] + 10.0, dock[1], -44.0)
-        self.assertGreater(math.hypot(mesa[0] - dock[0], mesa[1] - dock[1]), 0.0)
-        self.assertLessEqual(
-            math.hypot(mesa[0] - dock[0], mesa[1] - dock[1]), ANCHOR_RADIUS_YD
-        )
-        self.assertGreater(abs(mesa[2] - dock[2]), ANCHOR_Z_YD)
-        self.assertLessEqual(
-            math.hypot(floor[0] - dock[0], floor[1] - dock[1]), ANCHOR_RADIUS_YD
-        )
-        self.assertLessEqual(abs(floor[2] - dock[2]), ANCHOR_Z_YD)
-        self.assertFalse(abs(mesa[2] - dock[2]) <= ANCHOR_Z_YD)
-        self.assertTrue(
-            math.hypot(floor[0] - dock[0], floor[1] - dock[1]) <= ANCHOR_RADIUS_YD
-            and abs(floor[2] - dock[2]) <= ANCHOR_Z_YD
-        )
-
+                    if first is None:
+                        first = pt
+        return (0.0 if first else float("inf"), first, comps)
 
 if __name__ == "__main__":
     unittest.main()

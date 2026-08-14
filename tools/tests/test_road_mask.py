@@ -1378,34 +1378,8 @@ class TestPerLegGradeWall(unittest.TestCase):
 
 
 class TestMinimapRouteConfig(unittest.TestCase):
-    def test_leg_endpoints_inside_bbox_and_bbox_on_step_lattice(self) -> None:
-        self.assertTrue(bake.MINIMAP_ROUTE_ZONES)
-        pairs: list[tuple[str, str]] = []
-        names: dict[str, tuple[float, float]] = {}
-        override_count = 0
-        for _map_name, zones in bake.MINIMAP_ROUTE_ZONES.items():
-            for zone in zones:
-                x0, y0, x1, y1 = zone["bbox"]
-                for value in (x0, y0, x1, y1):
-                    self.assertEqual(value / 4.0, float(int(value / 4.0)), msg=value)
-                lo_x, hi_x = (x0, x1) if x0 <= x1 else (x1, x0)
-                lo_y, hi_y = (y0, y1) if y0 <= y1 else (y1, y0)
-                for raw in zone["legs"]:
-                    a_name, a_xy, b_name, b_xy, opts = bake.parse_route_leg(raw)
-                    pairs.append((a_name, b_name))
-                    if "max_grade_wall" in opts:
-                        override_count += 1
-                    for name, (x, y) in ((a_name, a_xy), (b_name, b_xy)):
-                        self.assertGreaterEqual(x, lo_x, msg=name)
-                        self.assertLessEqual(x, hi_x, msg=name)
-                        self.assertGreaterEqual(y, lo_y, msg=name)
-                        self.assertLessEqual(y, hi_y, msg=name)
-                        if name in names:
-                            self.assertEqual(names[name], (x, y), msg=name)
-                        else:
-                            names[name] = (x, y)
-        self.assertEqual(len(pairs), len(set(pairs)))
-        self.assertEqual(override_count, 1)
+    def test_no_hand_anchored_minimap_zones_remain(self) -> None:
+        self.assertEqual(bake.MINIMAP_ROUTE_ZONES, {})
 
 
 if __name__ == "__main__":

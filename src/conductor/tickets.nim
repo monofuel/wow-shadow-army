@@ -41,9 +41,11 @@ proc parseRepro*(content: string): seq[(string, string)] =
       result.add((token[0 ..< eq], token[eq + 1 .. ^1]))
 
 proc conductorAttempts*(content: string): int =
-  ## Attempts are counted from the append-only notes.
+  ## Attempts are counted from the append-only notes. Only the park
+  ## charge format counts — analysis prose mentioning attempts must not
+  ## burn budget (that phantom-charged 0014 to stuck on 2026-08-13).
   for line in content.splitLines():
-    if line.contains("conductor attempt "):
+    if line.contains("conductor attempt ") and line.contains(": PARKED"):
       inc result
 
 proc dependsSatisfied(ticketsRepo, content: string): bool =

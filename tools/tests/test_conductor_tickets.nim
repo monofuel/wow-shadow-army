@@ -39,6 +39,9 @@ check(repro.len == 2 and repro[0] == ("CHECKPOINT", "felwood_cave_entrance") and
   repro[1] == ("END_CHECKPOINT", "everlook"), "repro vars parsed")
 check(parseRepro("no repro here") .len == 0, "no repro -> empty")
 check(conductorAttempts(sample) == 2, "attempts counted from notes")
+check(conductorAttempts(sample &
+  "\n- conductor attempt 1 rate-fair analysis: prose, not a charge\n") == 2,
+  "analysis prose mentioning attempts does not charge budget")
 
 # --- nextOpenTicket against a fixture tree ---
 let tmp = getTempDir() / "conductor-tickets-test-" & $getCurrentProcessId()
