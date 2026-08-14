@@ -172,6 +172,16 @@ proc countTestAssertions(worktree, rev: string): int =
       except ValueError:
         discard
 
+proc isBehaviorChange*(files: seq[string]): bool =
+  ## Bot behavior lives under lua/ (brain + beat configs). A candidate
+  ## that touches none of it cannot move the eval, so forcing it to
+  ## out-roll the champion is pure dice tax — tooling-only diffs merge
+  ## on tests + review + guards.
+  for f in files:
+    if f.startsWith("lua/"):
+      return true
+  false
+
 proc diffGuards*(worktree: string, lc: LeagueConfig): seq[string] =
   ## Structural rejections no agent can argue with. Empty = clean.
   for file in changedFiles(worktree, lc):

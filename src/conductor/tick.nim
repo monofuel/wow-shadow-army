@@ -257,58 +257,69 @@ proc runTick*(cfgAll: ConductorConfig, leagueName, repo, root: string): TickResu
       nil, cfgAll.maxAttemptsPerTicket)
 
   # 5. Eval gate: optional failure-site repro bracket first, then the
-  # full-course run against the champion.
+  # full-course run against the champion. Tooling-only candidates (no
+  # lua/ behavior files) skip the eval — they cannot move it, and
+  # demanding a champion-beating roll from them is a dice tax.
   saveState(repo, ConductorState(league: leagueName, phase: tpGate,
     ticketId: ticket.id, ticketPath: inProgressPath, worktree: worktree,
     branch: expBranchName(ticket.id, ticket.slug)))
-  let reproVars = parseRepro(ticket.content)
-  if reproVars.len > 0:
-    echo "conductor: repro bracket ", ticket.content.parseTicketField("Repro")
-    let repro = runEval(worktree, lc, ticket.id & "-repro",
-      reproVars & @[forkClientVar(root)])
-    case repro.outcome
+  let toolingOnly = not isBehaviorChange(changedFiles(worktree, lc))
+  var candReport = %*{"tooling_only": true}
+  var gateReasons = @["tooling-only diff: tests + review + guards " &
+    "(eval skipped — no lua/ behavior files touched)"]
+  if toolingOnly:
+    echo "conductor: tooling-only diff — eval skipped"
+  else:
+    let reproVars = parseRepro(ticket.content)
+    if reproVars.len > 0:
+      echo "conductor: repro bracket ", ticket.content.parseTicketField("Repro")
+      let repro = runEval(worktree, lc, ticket.id & "-repro",
+        reproVars & @[forkClientVar(root)])
+      case repro.outcome
+      of evalBusy:
+        unclaim(root, inProgressPath, "eval slot busy at repro: " & repro.detail)
+        teardownWorktree(root, lc, worktree, ticket.id, ticket.slug, false)
+        clearState(repo, leagueName)
+        return TickResult(outcome: toBusy, ticketId: ticket.id,
+          detail: repro.detail)
+      of evalFailed:
+        return park(root, lc, repo, ticket, inProgressPath, worktree,
+          "repro bracket harness failure: " & repro.detail, nil,
+          cfgAll.maxAttemptsPerTicket)
+      of evalOk:
+        if not repro.report{"ok"}.getBool():
+          return park(root, lc, repo, ticket, inProgressPath, worktree,
+            "repro bracket still failing: " &
+            repro.report{"reason"}.getStr("no reason"), repro.report,
+            cfgAll.maxAttemptsPerTicket)
+    echo "conductor: full-course eval (several minutes)"
+    let eval = runEval(worktree, lc, ticket.id, @[forkClientVar(root)])
+    case eval.outcome
     of evalBusy:
-      unclaim(root, inProgressPath, "eval slot busy at repro: " & repro.detail)
+      unclaim(root, inProgressPath, "eval slot busy: " & eval.detail)
       teardownWorktree(root, lc, worktree, ticket.id, ticket.slug, false)
       clearState(repo, leagueName)
       return TickResult(outcome: toBusy, ticketId: ticket.id,
-        detail: repro.detail)
+        detail: eval.detail)
     of evalFailed:
-      return park(root, lc, repo, ticket, inProgressPath, worktree,
-        "repro bracket harness failure: " & repro.detail, nil,
-        cfgAll.maxAttemptsPerTicket)
+      flagNeedsHuman(repo, "eval harness failure on " & ticket.id & ": " &
+        eval.detail)
+      unclaim(root, inProgressPath, "eval harness failure: " & eval.detail)
+      teardownWorktree(root, lc, worktree, ticket.id, ticket.slug, false)
+      clearState(repo, leagueName)
+      return TickResult(outcome: toError, ticketId: ticket.id,
+        detail: eval.detail)
     of evalOk:
-      if not repro.report{"ok"}.getBool():
-        return park(root, lc, repo, ticket, inProgressPath, worktree,
-          "repro bracket still failing: " &
-          repro.report{"reason"}.getStr("no reason"), repro.report,
-          cfgAll.maxAttemptsPerTicket)
-  echo "conductor: full-course eval (several minutes)"
-  let eval = runEval(worktree, lc, ticket.id, @[forkClientVar(root)])
-  case eval.outcome
-  of evalBusy:
-    unclaim(root, inProgressPath, "eval slot busy: " & eval.detail)
-    teardownWorktree(root, lc, worktree, ticket.id, ticket.slug, false)
-    clearState(repo, leagueName)
-    return TickResult(outcome: toBusy, ticketId: ticket.id,
-      detail: eval.detail)
-  of evalFailed:
-    flagNeedsHuman(repo, "eval harness failure on " & ticket.id & ": " &
-      eval.detail)
-    unclaim(root, inProgressPath, "eval harness failure: " & eval.detail)
-    teardownWorktree(root, lc, worktree, ticket.id, ticket.slug, false)
-    clearState(repo, leagueName)
-    return TickResult(outcome: toError, ticketId: ticket.id,
-      detail: eval.detail)
-  of evalOk:
-    discard
+      discard
 
-  let champ = champion(ledgerPath(laneDirPath, leagueName))
-  let champReport = if champ.isNil: nil else: champ{"report"}
-  let gate = runGate(eval.report, champReport, lc)
-  if not gate.pass:
-    return park(root, lc, repo, ticket, inProgressPath, worktree,
-      gate.reasons.join("; "), eval.report, cfgAll.maxAttemptsPerTicket)
+    let champ = champion(ledgerPath(laneDirPath, leagueName))
+    let champReport = if champ.isNil: nil else: champ{"report"}
+    let gate = runGate(eval.report, champReport, lc)
+    if not gate.pass:
+      return park(root, lc, repo, ticket, inProgressPath, worktree,
+        gate.reasons.join("; "), eval.report, cfgAll.maxAttemptsPerTicket)
+    candReport = eval.report
+    gateReasons = gate.reasons
 
   # 6. Merge to the lane: rebase the branch, then ff-only with a no-ff
   # fallback, ledger row, ticket -> done, prune.
@@ -322,7 +333,7 @@ proc runTick*(cfgAll: ConductorConfig, leagueName, repo, root: string): TickResu
     discard gitCheck(worktree, "rebase", "--abort")
     return park(root, lc, repo, ticket, inProgressPath, worktree,
       "rebase onto " & lc.laneBranch & " failed: " &
-      outRebase[max(0, outRebase.len - 200) .. ^1], eval.report,
+      outRebase[max(0, outRebase.len - 200) .. ^1], candReport,
       cfgAll.maxAttemptsPerTicket)
   var (rcMerge, outMerge) = gitRunCapture(laneDirPath,
     @["merge", "--ff-only", branch], timeoutMs = 60_000)
@@ -334,16 +345,16 @@ proc runTick*(cfgAll: ConductorConfig, leagueName, repo, root: string): TickResu
     discard gitCheck(laneDirPath, "merge", "--abort")
     return park(root, lc, repo, ticket, inProgressPath, worktree,
       "merge into " & lc.laneBranch & " failed: " &
-      outMerge[max(0, outMerge.len - 200) .. ^1], eval.report,
+      outMerge[max(0, outMerge.len - 200) .. ^1], candReport,
       cfgAll.maxAttemptsPerTicket)
   appendRow(ledgerPath(laneDirPath, leagueName),
     makeRow(leagueName, "merged", ticket.id, branch,
-      pinShas(root, laneDirPath), eval.report,
-      %*{"pass": true, "reasons": gate.reasons}))
+      pinShas(root, laneDirPath), candReport,
+      %*{"pass": true, "reasons": gateReasons}))
   try:
     commitLedger(laneDirPath, "scores: " & leagueName & " merged " &
-      ticket.id & " — northing " &
-      $eval.report{"max_northing"}.getFloat())
+      ticket.id & (if toolingOnly: " (tooling-only)" else: " — northing " &
+      $candReport{"max_northing"}.getFloat()))
   except IOError as e:
     echo "conductor: WARN ", e.msg
   let (rcPush, outPush) = gitRunCapture(laneDirPath, @["push"],
@@ -353,11 +364,13 @@ proc runTick*(cfgAll: ConductorConfig, leagueName, repo, root: string): TickResu
       outPush.strip().splitLines()[^1]
   discard finishTicket(root, inProgressPath, "done",
     "- conductor: MERGED to " & lc.laneBranch & " (" & branch &
-    ") — gate: " & gate.reasons.join("; ") & "; northing " &
-    $eval.report{"max_northing"}.getFloat())
+    ") — gate: " & gateReasons.join("; ") &
+    (if toolingOnly: "" else: "; northing " &
+      $candReport{"max_northing"}.getFloat()))
   teardownWorktree(root, lc, worktree, ticket.id, ticket.slug,
     keepBranch = false)
   clearState(repo, leagueName)
   TickResult(outcome: toMerged, ticketId: ticket.id,
-    detail: "northing " & $eval.report{"max_northing"}.getFloat(),
-    report: eval.report)
+    detail: (if toolingOnly: "tooling-only merge" else:
+      "northing " & $candReport{"max_northing"}.getFloat()),
+    report: (if toolingOnly: nil else: candReport))
