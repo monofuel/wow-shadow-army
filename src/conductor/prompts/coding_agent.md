@@ -24,6 +24,19 @@ HARD RULES (violations are auto-rejected by a code gate, not a judge):
   behavior; state in your commit message WHAT evidence drove the change.
 - Stay in scope: implement THIS ticket, nothing else.
 
+ROUTE/BEAT WORK (beat configs, waypoints, checkpoints) — MANDATORY:
+- NEVER invent coordinates. Verify every new or moved beat and every
+  chord between consecutive beats BEFORE committing:
+  water legs -> probe depth along the line (python3 - <<'EOF' with
+  sys.path.insert(0,'tools'); from road_mask import RoadMask;
+  RoadMask().water_probe(x, y) — fatigue-safe is depth <= ~35 yd,
+  wet beats need depth >= ~1.5 yd; sample chords every ~25 yd);
+  land legs -> make traverse-lint must stay green.
+- Keep .lua and .json beat files EXACTLY in sync (the reviewer rejects
+  parity breaks).
+- Cite your probe results (positions + depths) in the commit message —
+  unverified beats are how the last four candidates died.
+
 WORKFLOW:
 1. Read the ticket's referenced files and evidence first.
 2. Implement the smallest change that satisfies the ticket.
