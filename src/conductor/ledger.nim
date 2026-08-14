@@ -60,11 +60,13 @@ proc readRows*(path: string): seq[JsonNode] =
       discard  # a torn tail line must never wedge the loop
 
 proc lastRowWithAction(path: string, actions: openArray[string]): JsonNode =
-  ## nil when no row matches.
+  ## nil when no row matches. Rows without run telemetry (tooling-only
+  ## merges) never qualify — comparing a run against an empty report
+  ## makes every warning "new" and blinds the floor (bug, 2026-08-14).
   result = nil
   for row in readRows(path):
     let action = row{"action"}.getStr("")
-    if action in actions:
+    if action in actions and not row{"report", "max_northing"}.isNil:
       result = row
 
 proc champion*(path: string): JsonNode =

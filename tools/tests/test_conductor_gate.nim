@@ -153,6 +153,11 @@ check(champ{"action"}.getStr() == "merged", "merged row becomes champion")
 check(champ{"report", "max_northing"}.getFloat() == 12000.0,
   "champion carries its report")
 check(lastShipped(lpath).isNil, "no shipped row yet")
+# tooling-only merges (no run telemetry) never become champion
+appendRow(lpath, makeRow("traverse", "merged", "0099", "tool",
+  %*{"wsa": "jkl"}, %*{"tooling_only": true}, %*{"pass": true}))
+check(champion(lpath){"report", "max_northing"}.getFloat() == 12000.0,
+  "tooling-only merge does not steal the champion pointer")
 # torn tail line must not wedge reads
 let f = open(lpath, fmAppend)
 f.write("{\"torn\": ")
