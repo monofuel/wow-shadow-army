@@ -276,6 +276,10 @@ proc main() =
   of "hosted":
     ingestHosted(cfgAll, leagueName, root)
   of "once":
+    # A stale non-idle state is a killed/crashed tick; unwind it the
+    # same way the daemon does (ticket back to open uncharged) instead
+    # of demanding manual state surgery.
+    discard recoverCrashedTick(cfgAll, leagueName, repo, root)
     let st = loadState(repo)
     if st.phase != tpIdle:
       quit "conductor: a tick is already in flight (phase " & $st.phase &
