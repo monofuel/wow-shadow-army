@@ -1,59 +1,70 @@
 # Bot roster
 
-The shadow army cast: who exists, which account/slot drives them, and how to
-bring each seat up. This is the canonical list for this repo.
+This is the canonical persistent-home roster. Murist is the human party
+leader; the other four characters are embedded Lua bot seats.
 
-**Scope:** only the seats below are ours. The coworld framework ships its own
-foundation characters (`BOT1`–`BOT5`, `COWORLD`, `COWCAM` accounts) for
-framework testing — they are not part of the army and are not documented
-here. monofuel also keeps his own manual-testing characters; those are his
-list, not this one.
+| Character | Account | Race / class | Party role | Foreground target |
+|---|---|---|---|---|
+| Murist | `monofuel` | undead / warlock | human leader | `make play-classic` |
+| Shadowfel | `shadow1` | undead / warlock | caster DPS | `make warlock-bot` |
+| Igris | `shadow2` | undead / warlock | caster DPS | `make igris-bot` |
+| Tusk | `shadow3` | undead / warrior | tank | `make tusk-bot` |
+| Beru | `shadow4` | undead / priest | healer | `make beru-bot` |
 
-## The cast
+Persona notes: [Tusk](personas/tusk.md) and [Beru](personas/beru.md).
 
-Control socket is `41114 + slot`. Runtime dir is
-`local_data/nim-runtime-slot<N>/`.
+## Lifecycle
 
-| Character | Account | Race / class | Role | Slot | Bring-up |
-|-----------|---------|--------------|------|------|----------|
-| Murist | `monofuel` | undead / warlock | human-played leader | — | `make play-classic` (real client) |
-| Shadowfel | `shadow1` | undead / warlock | caster DPS | 2 | `make warlock-account` → `make warlock-bot` |
-| Igris | `shadow2` | undead / warlock | caster DPS | 3 | `make igris-account` → `make igris-bot` |
-| Tusk | `shadow3` | undead / warrior | tank | 4 | `make tusk-account` → `make tusk-bot` |
-| Beru | `shadow4` | undead / priest | healer | 5 | `make beru-account` → `make beru-bot` |
+Realm and bot lifecycle are separate on purpose. Start the persistent realm
+with `make start-server`; start the bot clients only when wanted:
 
-Persona theses: [personas/tusk.md](personas/tusk.md),
-[personas/beru.md](personas/beru.md). Shadowfel and Igris don't have persona
-docs yet — they run the warlock seat described in
-[warlock-seat.md](warlock-seat.md).
-
-Standing army: `make escort-army` drives slots 2–5 through
-`tools/army_host` + `lua/tools/escort_leader`, party
-`Murist,Shadowfel,Igris,Tusk,Beru`, invites accepted from Murist only.
-
-## Milestones
-
-- **2026-07-25** — Murist grinds 1→6 solo (Deathknell); later 7 in party.
-- **2026-07-27** — Shadowfel, Igris, Tusk, Beru all reach level 6 by
-  overnight party grinding in Tirisfal. Verified legit against the realm's
-  `LevelUp.log` (every intermediate ding, hours apart, moving grind
-  positions) and a GM-command sweep of `Server.log`/`Ra.log`/`Chat.log`
-  (no level/xp/modify commands). Shadowfel's larger banked XP (2314) is
-  from grinding ~6 extra hours at 6 while dragging the others over the line.
-- Next: Summon Imp via quest 1470 for the warlock seats (docs/v2.md).
-
-Live levels/XP come from the realm DB, not this doc:
-
-```
-docker exec coworld-vmangos-coworld-game-1 mariadb -umangos -pmangos characters \
-  -e "SELECT name, level, xp, played_time_total FROM characters WHERE account >= 100008"
+```sh
+make home-army-start
+make home-army-status
+make home-army-stop
+make home-army-restart
 ```
 
-## Rules that apply to every seat
+`make party-army` remains an alias for `home-army-start`. Individual detached
+lifecycle targets are `shadowfel-start`/`shadowfel-stop`, `igris-*`, `tusk-*`,
+and `beru-*`. The foreground targets in the table are useful for debugging.
+None of these targets creates accounts, rewrites characters, or starts the
+realm.
 
-- Fair play: no GM progress, no DB pokes, no out-of-band seat collusion
-  (`AGENTS.md`). Local GM is observation/ops only (revive, tele for tests).
-- Policy lives in `lua/tools/`; the Nim host is glue (docs/v2.md).
-- Realm-side evidence for milestone claims:
-  `../coworld-vanilla-wow/local_data/coworld-run/logs/LevelUp.log` plus the
-  fair-play audit JSONL (`local_data/audit/fair-play.jsonl`, once wired).
+Each seat has isolated runtime files under
+`local_data/home-army/<Character>/`:
+
+- `launcher.pid` and `launcher.log`
+- `status/status.json`, updated each frame by the embedded policy
+- `observer/`, the rendered-client observation evidence
+
+The System uses the launcher PID plus a status heartbeat no older than 30
+seconds. The retired `nim_control` ports are not part of the current runtime.
+
+## Home policy
+
+All four clients launch `lua/entry/home.lua` through the generic `lua-bot`
+interface in `../monofuel-vanilla-wow`.
+
+- Accept party invitations only from Murist.
+- If the bot is leader and Murist is in the party, promote Murist.
+- Follow Murist with a hard leash and assist his observed hostile target.
+- Apply class roles: warlock damage, Tusk tank/threat, Beru healing,
+  protection, resurrection, and damage when healing is not needed.
+- On death, accept resurrection; briefly wait for a living nearby Beru;
+  otherwise release, navigate to the corpse, and reclaim.
+- If Murist is offline, absent from the party, or not observable, run the
+  solo `accelerated` policy instead of standing idle.
+- Do not issue `pet_attack`; the pet's normal combat behavior owns that.
+
+The policy can only act on the current character's typed Observation. Party
+membership, leader, targets, positions, health, auras, spells, and casts are
+mirrored by the generic fork interface; there is no shared bot process or
+out-of-band party state.
+
+## Rules
+
+- Fair play: no GM progress, DB edits, or out-of-band seat collusion.
+- Bot policy belongs here; only generic Observation/intent plumbing belongs
+  in `../monofuel-vanilla-wow`.
+- Build, test, and run through each repository's `nix develop` environment.

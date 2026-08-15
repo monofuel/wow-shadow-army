@@ -11,7 +11,7 @@ govern how we work in the sibling wow repos too:
 - `../coworld-vanilla-wow` — **upstream** checkout (read-only, see hard rules).
   Actively developed by other Softmax engineers; staying current with it is a
   competition requirement.
-- `../coworld-vanilla-wow-fork` — **the fork**, where our changes live.
+- `../monofuel-vanilla-wow` — **the fork**, where our changes live.
   **Client customizations only — never touch server components** (take
   upstream's server code verbatim). Sync upstream `main` regularly; merge
   conflicts in client files are expected and get resolved, not avoided.
@@ -49,13 +49,12 @@ Our tools need to be fast and robust. we only have a week for each coworld compe
   either (a) call **upstream** (Nim client / existing goals / control
   surface) or (b) add a **Lua** tool. One-off host scripts outside the bot
   army are monofuel's call, not an agent default.
-- **Rely on upstream as much as possible.** `../coworld-vanilla-wow` already
-  owns perception, pathing, combat sequencing, looting, formation, recovery,
-  and the `nim_control.v2` socket. Under v2 there is **no external action
-  selection** (`docs/nim-control-v2-external-select.md`): per-frame policy runs
-  in-process upstream, configured by typed goals. Do not reimplement that
-  stack here. If upstream is missing a capability, document the gap and
-  tell monofuel — do not paper over it with a local policy brain.
+- **Rely on the client stack as much as possible.** The fork already owns
+  typed perception and actions, rendering, pathing, combat mechanics, and the
+  generic embedded `lua-bot` boundary. Persistent-home strategy lives in
+  `lua/entry/home.lua`; generic Observation projection, intent validation, and
+  lowering live in `../monofuel-vanilla-wow/bots/lua_bot/`. Do not recreate
+  client mechanics in the policy.
 - **DO NOT CHEAT.** We need to do things properly so we can win in the
   tournament. If you cheat, you only make things harder: you mask real
   issues in pathing, combat, quests, party, and recovery that we would
@@ -83,9 +82,9 @@ Our tools need to be fast and robust. we only have a week for each coworld compe
   Any edge that depends on our seats recognizing each other out-of-band is
   cheating: mark WONT FIX. Same rule as coworld-playbook/AGENTS.md.
 - **Upstream is read-only.** Never commit to `../coworld-vanilla-wow`, never
-  vendor client source here. We consume it at the `upstream.lock` pin through
-  the `nim_control.v1` boundary. Client changes we need go on **the fork**
-  (`../coworld-vanilla-wow-fork`) — client code only, never server components
+  vendor client source here. We track it with `upstream.lock`; client changes
+  we need go on **the fork**
+  (`../monofuel-vanilla-wow`) — client code only, never server components
   (see Scope and `docs/terms.md`). If an upstream bug blocks us, document it
   and tell monofuel — he decides whether to report it.
 - **Respect the client/bot boundary.** Our layer sees typed frames and
@@ -125,11 +124,11 @@ Our tools need to be fast and robust. we only have a week for each coworld compe
   `make play-classic` (and in-game play / bug reports). That is the
   intended human surface.
 - **Do not instruct the user to run commands.** Agents must not say
-  “please run `make escort-army`”, “restart the bots”, “check the log
+  “please run `make home-army-start`”, “restart the bots”, “check the log
   with …”, or hand off shell steps. Execute those yourself.
 - **Agents own everything else automatically:** realm/server bring-up,
-  logging config, accounts, headless bot seats, `army_host` / escort /
-  grind brains, SOAP/admin recovery when used for **setup only**, log
+  logging config, accounts, embedded Lua headless bot seats, SOAP/admin
+  recovery when used for **setup only**, log
   greps, rebuilds, tests, upstream pulls/rebases (fork), pin updates,
   and postmortems. Prefer Makefile targets already in-repo.
 - If something needs a human decision (force-push, report upstream bug,

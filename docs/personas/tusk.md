@@ -7,19 +7,21 @@ a fancy rotation while the party is still learning formation.
 | | |
 |---|---|
 | Account | `shadow3` / `shadow3` |
-| Character | `Tusk` (wire-created on first login) |
+| Character | `Tusk` (persistent realm) |
 | Race / class | undead / warrior |
 | Role | tank |
-| Control slot | **4** → `127.0.0.1:41118` |
-| Runtime dir | `local_data/nim-runtime-slot4/` |
-| Bring-up | `make tusk-account` then `make tusk-bot` (fork client) |
+| Runtime dir | `local_data/home-army/Tusk/` |
+| Policy | `lua/entry/home.lua` |
+| Lifecycle | `make tusk-start` / `make tusk-stop` |
 
 ## Day-0 behavior
 
-Uses the same `escort_leader` brain as the locks: accept Murist invites,
-rejoin formation, assist when in combat. Warrior-specific threat (Sunder,
-Heroic Strike priority, taunt) is **not** implemented yet — nearest-hostile
-attack + follow is the acceptance bar for "in the party and standing up."
+Accepts Murist's invite, promotes him if necessary, holds a hard follow leash,
+and assists his observed target. In combat it taunts enemies attacking another
+party member, then prioritizes Sunder Armor, Revenge, Heroic Strike, Thunder
+Clap, Demoralizing Shout, and Battle Shout from the spells it actually knows.
+When Murist is unavailable it uses the solo accelerated policy. Corpse recovery
+is shared with the other home seats.
 
 ## Not this persona
 

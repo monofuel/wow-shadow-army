@@ -3,7 +3,7 @@
 ## No network, no docker, no realm — pure functions only.
 
 import
-  std/[json, options, strutils, unittest],
+  std/[json, options, os, strutils, unittest],
   ../system_server
 
 suite "server lifecycle ops":
@@ -181,14 +181,13 @@ suite "server status views":
 suite "seat cell":
   test "seat cell is always a terse On/Off (detail in tooltip only)":
     let off = renderSeatCell(Character(
-      name: "Tusk", online: false, controlPort: 41118, controlUp: false))
+      name: "Tusk", online: false, controlPort: 0, controlUp: false))
     check "no-ctrl" notin off
     check ">Off<" in off
     let on = renderSeatCell(Character(
-      name: "Igris", online: true, controlPort: 41117, controlUp: true))
+      name: "Igris", online: true, controlPort: 0, controlUp: true))
     check ">On<" in on
-    # Port shows up only inside the title attribute, never as cell text.
-    check " :41117" notin on
+    check "heartbeat is fresh" in on
     check "title=" in on
 
   test "human seat is terse too":
@@ -199,23 +198,45 @@ suite "seat cell":
 
 suite "bot seat lifecycle":
   test "seat make targets cover the bot seats only":
-    check seatMakeTarget("Shadowfel") == "warlock-bot"
-    check seatMakeTarget("Igris") == "igris-bot"
-    check seatMakeTarget("Tusk") == "tusk-bot"
-    check seatMakeTarget("Beru") == "beru-bot"
+    check seatMakeTarget("Shadowfel") == "shadowfel-start"
+    check seatMakeTarget("Igris") == "igris-start"
+    check seatMakeTarget("Tusk") == "tusk-start"
+    check seatMakeTarget("Beru") == "beru-start"
+    check seatStopTarget("Shadowfel") == "shadowfel-stop"
+    check seatStopTarget("Beru") == "beru-stop"
     check seatMakeTarget("Murist") == ""
     check seatMakeTarget("Botwarrior") == ""
     check seatMakeTarget("") == ""
 
-  test "seat slots match seatControlPort":
+  test "embedded seats do not expose retired control ports":
     for seat in SeatMakeTargets:
-      check seatControlPort(seat.name) == 41114 + seat.slot
+      check seatControlPort(seat.name) == 0
+      check seatRuntimeDir(seat.name).endsWith("local_data/home-army/" & seat.name)
+
+  test "seat liveness requires both a live pid and a fresh heartbeat":
+    let
+      oldRoot = getEnv("SYSTEM_ARMY_DIR", "")
+      scratch = getTempDir() / "shadow_army_seat_runtime_test"
+    defer:
+      if oldRoot.len > 0: putEnv("SYSTEM_ARMY_DIR", oldRoot)
+      else: delEnv("SYSTEM_ARMY_DIR")
+      if dirExists(scratch): removeDir(scratch)
+    if dirExists(scratch): removeDir(scratch)
+    putEnv("SYSTEM_ARMY_DIR", scratch)
+    createDir(parentDir(seatStatusPath("Tusk")))
+    writeFile(seatPidPath("Tusk"), $getCurrentProcessId() & "\n")
+    check not seatRuntimeUp("Tusk")
+    writeFile(seatStatusPath("Tusk"), "{}\n")
+    check seatRuntimeUp("Tusk")
+    writeFile(seatPidPath("Tusk"), "999999999\n")
+    check not seatRuntimeUp("Tusk")
+    check not seatRuntimeUp("Murist")
 
   test "bot cell: Start when seat down, Stop when up, dash for humans":
-    let down = renderBotCell(Character(name: "Tusk", controlPort: 41118, controlUp: false))
+    let down = renderBotCell(Character(name: "Tusk", controlPort: 0, controlUp: false))
     check "Start" in down
     check "/bots/start?name=Tusk" in down
-    let up = renderBotCell(Character(name: "Tusk", controlPort: 41118, controlUp: true))
+    let up = renderBotCell(Character(name: "Tusk", controlPort: 0, controlUp: true))
     check "Stop" in up
     check "/bots/stop?name=Tusk" in up
     let human = renderBotCell(Character(name: "Murist", controlPort: 0))
