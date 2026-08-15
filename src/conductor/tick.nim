@@ -10,6 +10,7 @@ import
   ./cfg,
   ./evalgate,
   ./ledger,
+  ./masterhealth,
   ./state,
   ./tickets
 
@@ -102,11 +103,12 @@ proc runGateBranch*(cfgAll: ConductorConfig,
   if violations.len > 0:
     return TickResult(outcome: toParked, ticketId: ticketId,
       detail: "diff guards: " & violations.join("; "))
-  let (rcLua, outLua) = runCommandCapture(worktree, "make", @["test-lua"],
-    timeoutMs = 600_000)
-  if rcLua != 0:
+  let (rcTests, outTests) = runCommandCapture(worktree, "make",
+    staticTestArgs(), timeoutMs = StaticTestTimeoutMs)
+  if rcTests != 0:
     return TickResult(outcome: toParked, ticketId: ticketId,
-      detail: "make test-lua failed: " & outLua[max(0, outLua.len - 200) .. ^1])
+      detail: staticTestCmd() & " failed: " &
+        outTests[max(0, outTests.len - 200) .. ^1])
   echo "conductor: gate-branch full-course eval (several minutes)"
   let eval = runEval(worktree, lc, ticketId & "-gatebranch",
     @[forkClientVar(root)])
@@ -248,13 +250,17 @@ proc runTick*(cfgAll: ConductorConfig, leagueName, repo, root: string): TickResu
     return park(root, lc, repo, ticket, inProgressPath, worktree,
       "reviewer blocked twice: " & feedback, nil, cfgAll.maxAttemptsPerTicket)
 
-  # 4. Static tests in the worktree (path-safe tiers only; nim smoke
-  # runs against the main checkout's sibling layout, not from here).
-  let (rcLua, outLua) = runCommandCapture(worktree, "make", @["test-lua"],
-    timeoutMs = 600_000)
-  if rcLua != 0:
+  # 4. Static tests in the worktree — the FULL unit tier (ticket 0044).
+  # setupWorktree symlinks the sibling checkouts next to the worktree and
+  # nim's parent-config walk still finds the main nim.cfg, so the Nim tier
+  # and the Python checkpoint/soap tiers run here too; running lua-only
+  # left exactly the suites `3def984` broke outside the gate.
+  let (rcTests, outTests) = runCommandCapture(worktree, "make",
+    staticTestArgs(), timeoutMs = StaticTestTimeoutMs)
+  if rcTests != 0:
     return park(root, lc, repo, ticket, inProgressPath, worktree,
-      "make test-lua failed: " & outLua[max(0, outLua.len - 300) .. ^1],
+      staticTestCmd() & " failed: " &
+      outTests[max(0, outTests.len - 300) .. ^1],
       nil, cfgAll.maxAttemptsPerTicket)
 
   # 5. Eval gate: optional failure-site repro bracket first, then the

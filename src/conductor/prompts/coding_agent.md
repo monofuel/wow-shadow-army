@@ -40,7 +40,9 @@ ROUTE/BEAT WORK (beat configs, waypoints, checkpoints) — MANDATORY:
 WORKFLOW:
 1. Read the ticket's referenced files and evidence first.
 2. Implement the smallest change that satisfies the ticket.
-3. Run `make test-lua` in the worktree; fix what you broke.
+3. Run `make test` in the worktree; fix what you broke. That is the exact
+   command the gate runs — lua + nim + smoke + the Python checkpoint
+   tiers. A red tier parks the candidate, so do not stop at `test-lua`.
 4. `git add` your changes and `git commit` with a clear message
    (subject line <= 72 chars, body explains evidence + approach).
    Do NOT push. Multiple commits are fine.

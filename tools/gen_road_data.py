@@ -34,7 +34,7 @@ import json
 import math
 import os
 import sys
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 # Same directory as this file, so a plain `python3 tools/gen_road_data.py`
 # resolves the sibling generator without any package plumbing.
@@ -59,6 +59,36 @@ MIN_POINT_GAP = 0.7
 
 # A polyline needs two points to be an edge; anything shorter is dropped.
 MIN_SEGMENT_POINTS = 2
+
+# --- capital-box resurfacing (ticket 0050) ---------------------------------
+# The five capital WorldMapArea boxes are axis-aligned rectangles laid over
+# open ground: Undercity's box covers the Ruins of Lordaeron, Ironforge's the
+# mountain road to its gates, Orgrimmar's a strip of Durotar, Darnassus' a
+# corner of Teldrassil. The smallest-box rule then files that OUTDOOR road
+# under the city, and a player standing in Tirisfal cannot see the road they
+# are walking on (ticket 0050: Brill -> Undercity entrance bailed short-hop
+# with all 57 points of the southern Tirisfal road hidden in zone 1497).
+#
+# The bake is the evidence that settles it. These polylines come from terrain
+# and minimap art, so the baker only ever saw SURFACE road -- it cannot see
+# Undercity's tunnels or Ironforge's halls. Whether a run of points inside a
+# city box is the city's own street or the zone's road underneath the box is
+# therefore answered by the polyline itself:
+#
+#   * a run that is CONTINUOUS with points outside the box (the same baked
+#     polyline crosses the box edge at walkable terrain height) is one road
+#     with the outdoor zone -> re-file it under that zone;
+#   * a polyline that never leaves the box is the capital's own network
+#     (Thunder Bluff's mesas, Darnassus' streets) -> leave it alone.
+#
+# Measured on this bake the split is total: every crossing run sits within
+# 27.2 world units of the surface it crosses into, and every capital-only
+# polyline is hundreds of units away in z from anything outside. The band
+# below is the guard that keeps it that way if a re-bake ever walks a ramp
+# from the parent zone up into a city (Thunder Bluff's lifts): the run stops
+# being "the same surface" once it climbs out of the band, and the rest of the
+# city keeps its roads. Negative disables the whole pass.
+CAPITAL_Z_BAND = 60.0
 
 # --- bridging pass ---------------------------------------------------------
 # RouteModel.build (ShadowArmy.lua) joins points from DIFFERENT polylines that
@@ -104,17 +134,22 @@ BRIDGE_BUDGET = 30
 ORPHAN_MIN_NODES = 4
 
 
-def load_segments(path: str) -> Tuple[int, List[List[Tuple[float, float]]]]:
-    """(map_id, [ [(worldX, worldY), ...], ... ]) from one JSONL artifact.
+def load_segments(path: str) -> Tuple[int, List[List[Tuple[float, float, float]]]]:
+    """(map_id, [ [(worldX, worldY, worldZ), ...], ... ]) from one JSONL artifact.
 
     Same contract as src/map_browser/roads.nim: a meta line first (`meta`,
     `map_id`, default 1), then one segment object per line with `pts` as world
     [x, y, z]. A missing file is an empty result rather than an error.
+
+    z is carried through the loader (it is dropped again the moment a point is
+    converted to zone percent) because it is the only evidence that separates a
+    capital's own streets from the outdoor road its map box overlays -- see
+    CAPITAL_Z_BAND and resurface_capitals.
     """
     if not os.path.isfile(path):
         return 1, []
     map_id = 1
-    out: List[List[Tuple[float, float]]] = []
+    out: List[List[Tuple[float, float, float]]] = []
     with open(path) as fh:
         for line in fh:
             line = line.strip()
@@ -132,29 +167,91 @@ def load_segments(path: str) -> Tuple[int, List[List[Tuple[float, float]]]]:
             pts = obj.get("pts")
             if not isinstance(pts, list):
                 continue
-            world: List[Tuple[float, float]] = []
+            world: List[Tuple[float, float, float]] = []
             for pt in pts:
                 if isinstance(pt, list) and len(pt) >= 2:
-                    world.append((float(pt[0]), float(pt[1])))
+                    z = float(pt[2]) if len(pt) >= 3 else 0.0
+                    world.append((float(pt[0]), float(pt[1]), z))
             if len(world) >= MIN_SEGMENT_POINTS:
                 out.append(world)
     return map_id, out
 
 
-def split_by_zone(world: Sequence[Tuple[float, float]], map_id: int,
-                  areas: MapAreas) -> List[Tuple[int, List[Tuple[float, float]]]]:
+Hit = Optional[Tuple[int, float, float]]
+
+
+def resurface_capitals(world: Sequence[Tuple[float, float, float]],
+                       hits: List[Hit], map_id: int, areas: MapAreas,
+                       capitals: Set[int], z_band: float) -> int:
+    """Re-file outdoor road out of the capital boxes that overlay it.
+
+    Walks the maximal runs of consecutive points that landed in one capital
+    box. A run whose neighbour on the polyline is an outdoor point at
+    compatible height is the same road as that neighbour -- the baker followed
+    one continuous surface across the box edge -- so every point of the run is
+    located again with the capital boxes excluded, which drops it into the
+    outdoor zone the box sits in. A polyline that never leaves the box has no
+    such neighbour and keeps its city zone.
+
+    Mutates `hits` in place; returns how many points moved.
+    """
+    if not capitals or z_band < 0.0:
+        return 0
+    moved = 0
+    i, n = 0, len(hits)
+    while i < n:
+        here = hits[i]
+        if here is None or here[0] not in capitals:
+            i += 1
+            continue
+        city = here[0]
+        j = i
+        while j < n and hits[j] is not None and hits[j][0] == city:
+            j += 1
+        # Heights of the outdoor points the run is attached to, if any.
+        anchors: List[float] = []
+        for k in (i - 1, j):
+            if 0 <= k < n and hits[k] is not None and hits[k][0] not in capitals:
+                anchors.append(world[k][2])
+        if anchors and all(
+                min(abs(world[k][2] - az) for az in anchors) <= z_band
+                for k in range(i, j)):
+            parent = areas.capital_parent.get(city, 0)
+            for k in range(i, j):
+                wx, wy = world[k][0], world[k][1]
+                # The zone the city sits in gets first refusal, so the road
+                # stays one road instead of being sliced up by whichever
+                # neighbour's box happens to clip which end of it.
+                pct = areas.project(parent, wx, wy) if parent else None
+                if pct is not None:
+                    hits[k] = (parent, pct[0], pct[1])
+                else:
+                    hits[k] = areas.locate(map_id, wx, wy, exclude=capitals)
+                moved += 1
+        i = j
+    return moved
+
+
+def split_by_zone(world: Sequence[Tuple[float, float, float]], map_id: int,
+                  areas: MapAreas, capitals: Optional[Set[int]] = None,
+                  z_band: float = CAPITAL_Z_BAND
+                  ) -> Tuple[List[Tuple[int, List[Tuple[float, float]]]], int]:
     """Cut one world polyline into runs of consecutive same-zone points.
 
     A continent road crosses zone boundaries constantly and the addon's map
     space is per-zone, so a crossing is a segment split, not a long edge into
     another coordinate system. Points with no zone map at all (open sea, the
     handful of unmapped strips between zones) end the current run.
+
+    Returns (runs, points re-filed out of a capital box).
     """
+    hits: List[Hit] = [areas.locate(map_id, wx, wy) for wx, wy, _ in world]
+    moved = resurface_capitals(world, hits, map_id, areas, capitals or set(),
+                               z_band)
     runs: List[Tuple[int, List[Tuple[float, float]]]] = []
     zone = 0
     current: List[Tuple[float, float]] = []
-    for wx, wy in world:
-        hit = areas.locate(map_id, wx, wy)
+    for hit in hits:
         if hit is None:
             if len(current) >= MIN_SEGMENT_POINTS:
                 runs.append((zone, current))
@@ -168,7 +265,7 @@ def split_by_zone(world: Sequence[Tuple[float, float]], map_id: int,
         current.append((mx, my))
     if len(current) >= MIN_SEGMENT_POINTS:
         runs.append((zone, current))
-    return runs
+    return runs, moved
 
 
 def decimate(points: Sequence[Tuple[float, float]],
@@ -435,6 +532,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     help="max bridges per zone (0 disables bridging)")
     ap.add_argument("--orphan-min", type=int, default=ORPHAN_MIN_NODES,
                     help="drop islands smaller than this many nodes (0 keeps)")
+    ap.add_argument("--capital-z-band", type=float, default=CAPITAL_Z_BAND,
+                    help="height band, in world units, within which a road run"
+                         " inside a capital's map box counts as the outdoor"
+                         " road that box overlays (negative disables)")
     args = ap.parse_args(argv)
 
     tiers = BRIDGE_TIERS
@@ -448,10 +549,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 1
 
     areas = MapAreas(args.dbc_dir)
+    capitals = areas.capital_zones
 
     by_zone: Dict[int, List[List[Tuple[float, float]]]] = {}
     in_segments = in_points = 0
     dropped = 0
+    resurfaced = 0
     for name in ROAD_FILES:
         map_id, segments = load_segments(os.path.join(args.data_dir, name))
         if not segments:
@@ -459,7 +562,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         for world in segments:
             in_segments += 1
             in_points += len(world)
-            for zone, pts in split_by_zone(world, map_id, areas):
+            runs, moved = split_by_zone(world, map_id, areas, capitals,
+                                        args.capital_z_band)
+            resurfaced += moved
+            for zone, pts in runs:
                 kept = decimate(pts, args.min_gap)
                 if len(kept) < MIN_SEGMENT_POINTS:
                     dropped += 1
@@ -520,6 +626,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         % args.min_gap,
         "coords are zone-normalized percent (GetPlayerMapPosition * 100),"
         " flat x,y pairs",
+        "re-filed %d points out of the %d capital map boxes and into the"
+        % (resurfaced, len(capitals)),
+        "outdoor zone each box overlays: a baked run that stays within %s"
+        % ("%.0f world units" % args.capital_z_band
+           if args.capital_z_band >= 0 else "(pass disabled)"),
+        "of the surface it crosses into is that surface's road, not the city's",
         "bridged %d baker-cut gaps between segment endpoints; the longer the"
         % bridges_total,
         "bridge the straighter it must be -- max gap%% : max deg = %s"
@@ -546,6 +658,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     print("  out segments/points : %d / %d" % (out_segments, out_points))
     print("  zones               : %d" % len(by_zone))
     print("  runs too short      : %d" % dropped)
+    print("  capital -> outdoors : %d points" % resurfaced)
     print("  bridges added       : %d" % bridges_total)
     print("  orphan points cut   : %d" % orphan_nodes)
     print("  zones 3+ components : %d -> %d" % (frag_before, frag_after))

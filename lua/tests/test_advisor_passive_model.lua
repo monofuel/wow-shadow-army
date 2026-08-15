@@ -73,14 +73,49 @@ r = model.evaluate(snapshot({ hasPet = true,
 check(button(r, "buff:armor").spell == "Demon Armor",
   "buff button follows the preferred trained rank")
 
+-- r49 (ticket 0058) DELIBERATELY REPLACES the r42 expectation
+-- "an auto-cast buff never becomes a button". Live report: the panel showed
+-- "armor: auto (Demon Skin)" with the buff MISSING and no way to cast it by
+-- hand. Autocast ARMED is not autocast FIRED (verify windows, GCD/failure
+-- gates, texture capture in progress), so the button is the human's escape
+-- hatch and the auto state is now secondary info, not a suppressor.
 r = model.evaluate(snapshot({ hasPet = true, buffs = { armor({ auto = true }) } }))
-check(#r.buttons == 0, "an auto-cast buff never becomes a button")
-check(r.notes[1].text == "armor: auto (Demon Skin)", "auto-cast buff keeps its status note")
-check(r.notes[1].tone == "ok", "auto-cast note stays green")
+check(button(r, "buff:armor") ~= nil,
+  "a MISSING auto-cast buff still offers the manual button (ticket 0058)")
+check(button(r, "buff:armor").spell == "Demon Skin"
+  and button(r, "buff:armor").selfCast,
+  "the auto-cast buff's button self-casts the trained rank like any other")
+check(button(r, "buff:armor").auto,
+  "the button carries the auto flag so the tooltip can explain the overlap")
+check(r.notes[1].text == "armor: auto (Demon Skin)",
+  "the auto status note survives alongside the button")
+check(r.notes[1].tone == "ok",
+  "the auto note stays green: a note that is not ok triggers the chat nag, "
+  .. "and nagging about a one-click fix is the bug's other half")
+check(not r.ok, "an auto-cast buff that is missing is not a quiet state")
+
+r = model.evaluate(snapshot({ hasPet = true,
+  buffs = { armor({ auto = true, missing = false, expiring = true, minutes = 2 }) } }))
+check(button(r, "buff:armor") ~= nil,
+  "an EXPIRING auto-cast buff offers the button too")
+
+r = model.evaluate(snapshot({ hasPet = true, buffs = {} }))
+check(#r.buttons == 0 and #r.notes == 0 and r.ok,
+  "a healthy buff never reaches the model, so the quiet state is untouched")
 
 r = model.evaluate(snapshot({ hasPet = true,
   buffs = { armor({ auto = true, spell = false }) } }))
 check(r.notes[1].text == "armor: auto (untrained)", "auto note is honest about untrained spells")
+check(#r.buttons == 0, "an untrained auto buff has no rank to cast, so no button")
+
+r = model.evaluate(snapshot({ hasPet = true, dead = true,
+  buffs = { armor({ auto = true }) } }))
+check(#r.buttons == 0 and r.notes[1].text == "armor: auto (Demon Skin)",
+  "a dead player gets the auto note and no button, exactly as before")
+
+r = model.evaluate(snapshot({ hasPet = true, buffs = { armor() } }))
+check(button(r, "buff:armor").auto == false,
+  "a hand-managed buff's button is flagged not-auto (no tooltip line)")
 
 r = model.evaluate(snapshot({ hasPet = true, buffs = { armor({ spell = false }) } }))
 check(#r.buttons == 0, "an untrained buff offers no button")

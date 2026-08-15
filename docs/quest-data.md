@@ -42,6 +42,7 @@ followed by `/reload` in-game picks up new data without restarting the client
 ShadowArmyQuestData = {
   ["Rude Awakening"] = {
     id = 363, level = 1, minLevel = 1, zone = 85,
+    races = 178, classes = 256,   -- omitted when the quest gates nobody
     objectives = {
       { label = "Mindless Zombie", kind = "mob", count = 8,
         spots = { {zone = 85, x = 43.2, y = 61.7}, ... } },
@@ -60,6 +61,14 @@ ShadowArmyQuestData = {
 - `zone` is an `AreaTable` zone id; `x`/`y` are zone-normalized percent — the
   same space `GetPlayerMapPosition` returns, multiplied by 100.
 - `kind` is `"mob"`, `"object"` or `"item"`.
+- `races` / `classes` are `quest_template.RequiredRaces` /
+  `RequiredClasses` — bitmasks of `1 << (id - 1)`, tabulated in
+  `docs/world-db-queries.md`. **Both are omitted when the DB stores 0**
+  ("anyone"), so a reader must treat a missing field as "no gate" and never as
+  "matches nothing". They ride on the primary entry *and* on every `alts`
+  variant, because their whole reason for existing is telling variants apart
+  (see title collisions below). 1221 of 4394 emitted variants carry at least
+  one; the other 3173 are open to everybody.
 - `from` names who to hunt for an item objective — the densest in-zone
   sources (up to 4, selected by spawn-point count, NOT drop rate), emitted
   alphabetically for a stable file; do not read `from[1]` as "best".
@@ -191,6 +200,47 @@ filters on it, and templates with several patch rows resolve to the highest
   the log does not show, so a delivery sequel with no tracked objectives beats
   a gather part 1 once the log stops showing gather lines. Ties keep the
   primary.
+
+  Labels alone are not enough, which is what the `races`/`classes` masks are
+  for (ticket 0045). Measured over the whole file with the audit method from
+  `wow-coworld/quest-alts-ambiguity-report.md`: 590 titles carry alts and
+  **503 of them are ambiguous** to a label-only resolver — 336 because every
+  variant has zero objectives (the score is always 0, so the primary wins
+  forever) and 167 because two variants share the same nonempty label set.
+  240 of the 503 have a colliding group holding **two or more different
+  turn-in NPCs**, i.e. a wrong pick puts the marker on the wrong person.
+
+  Filtering variants by player identity before scoring labels cuts that
+  substantially. For an undead warlock (`races` bit 16, `classes` bit 256):
+
+  | | label-only | + identity filter |
+  |---|---|---|
+  | variants offered | 1934 | 1418 |
+  | titles that vanish entirely | 0 | 113 |
+  | titles resolved outright (one survivor) | 0 | 46 |
+  | ambiguous titles | 503 | **350** |
+  | … with differing turn-ins | 240 | **188** |
+  | zero-objective alts whose turn-in differs from the primary | 470 | 335 |
+
+  What it does **not** fix is the headline offenders. The eight-city cloth
+  donations (*A Donation of Wool/Silk/Mageweave/Runecloth*), both commendation
+  signet families and *The Missing Diplomat* all store `RequiredRaces = 0` and
+  `RequiredClasses = 0`: the game gates those by **reputation with the city
+  faction**, not by identity, so no mask can separate them and they stay at
+  the top of the remaining list. They need the turn-in-zone tiebreak (step 3
+  of ticket 0045). The groups that do collapse are the ones actually keyed to
+  identity — Deliana/Mokvar (`races` 77 vs 178 plus a class bit), race-specific
+  class chains, Alliance/Horde mirrors.
+
+  This file only **emits** the masks. Choosing a variant with them is
+  `QuestModel.resolve`'s job in the addon.
+- **Same entry emitted twice.** `quest_template` is patch-ranged like every
+  other template table, and unlike `item_template` the quest read does not
+  collapse a quest's rows to the highest `patch <= 10` — it takes them all. So
+  a quest with two patch rows appears twice in its own `alts` list (visible as
+  the duplicated `id@Llevel` pairs in the ambiguity audit). Harmless to the
+  label resolver, since duplicates agree on everything, but it inflates the
+  variant counts above and it is the obvious next cleanup.
 - **Items with no locatable source** (~1103 objectives): crafted, vendor-bought,
   handed out by scripts/spells, or produced by quest-object interactions that
   do not go through a loot template.
@@ -200,9 +250,11 @@ filters on it, and templates with several patch rows resolve to the highest
   the escort walks lives in `creature_movement` / scripts and is not modelled.
 - **"Explore area" objectives** (`ReqSpellCast` / area triggers with no
   creature) have no spawn to point at.
-- **Class and race-gated quests** are emitted like any other; the file carries
-  no `RequiredRaces` / `RequiredClasses`, so the addon shows whatever the player
-  actually has in their log — harmless, since the log is the filter.
+- **Class and race gates are data, not a filter.** Every quest is emitted
+  whoever it is for; `races`/`classes` ride along so a *reader* can filter.
+  For drawing a quest the player already holds this changes nothing (the log
+  is the filter); it matters only when several quests share a title and the
+  file has to say which one this player is holding.
 - **One zone per objective.** A mob spread evenly across two zones is reduced
   to the denser one. The per-spot `zone` field is still emitted, so relaxing
   this later needs no contract change.
