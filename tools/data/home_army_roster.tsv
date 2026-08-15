@@ -1,0 +1,33 @@
+# Scale-out home seats — roster table (read by tools/home_army_scale.sh and
+# `make army-scale-status`). The ORIGINAL FOUR seats (Shadowfel, Igris, Tusk,
+# Beru) are deliberately NOT here: they keep their own hand-written Makefile
+# targets and lifecycle. The quest-QA seat (Kaisel / shadow9) is not here
+# either — different runtime root, different lifecycle.
+#
+# Columns: character<TAB>account<TAB>class
+#   character  solo-leveling shadow-soldier name (AGENTS.md naming rule),
+#              single capitalized word, <= 12 chars (client name rule).
+#   account    realmd account; password is the same string (shadowN/shadowN
+#              convention shared with shadow1..shadow4). shadow9 is SKIPPED —
+#              it belongs to the quest-QA seat.
+#   class      undead-legal class: warrior | rogue | priest | mage | warlock.
+#              Race is always undead; the client rolls the character on first
+#              login (docs/warlock-seat.md), so this column IS the class
+#              selector via VANILLA_WOW_PLAYER_CHARACTER_CLASS.
+#
+# Classes were rolled at random over the undead-legal five (3 of each).
+Bellion	shadow5	mage
+Baruka	shadow6	warrior
+Kargalgan	shadow7	warlock
+Greed	shadow8	warrior
+Iron	shadow10	warrior
+Tank	shadow11	priest
+Jima	shadow12	rogue
+Fang	shadow13	mage
+Metus	shadow14	priest
+Kamish	shadow15	rogue
+Vulcan	shadow16	warlock
+Ashborn	shadow17	priest
+Baran	shadow18	rogue
+Rakan	shadow19	mage
+Legia	shadow20	warlock

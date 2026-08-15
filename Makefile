@@ -152,6 +152,35 @@ define start_home_seat
 	fi
 endef
 
+# Stop a seat living under an arbitrary runtime root: (1) root, (2) seat name.
+# stop_home_seat is this with the home-army root baked in; the quest-QA seat
+# passes its own root so it can never signal a home seat by name collision.
+define stop_home_seat_dir
+	@set -e; \
+	seat_dir="$(1)/$(2)"; \
+	pid_file="$$seat_dir/launcher.pid"; \
+	admin_pid="$$seat_dir/lua-debug-admin.pid"; \
+	if [ -s "$$admin_pid" ]; then \
+		apid=$$(cat "$$admin_pid"); \
+		if kill -0 "$$apid" 2>/dev/null; then \
+			kill -TERM -- "-$$apid" 2>/dev/null || kill -TERM "$$apid" 2>/dev/null || true; \
+			echo "stopped $(2) debug admin (pid $$apid)"; \
+		fi; \
+		rm -f "$$admin_pid"; \
+	fi; \
+	if [ ! -s "$$pid_file" ]; then echo "$(2) is stopped"; exit 0; fi; \
+	pid=$$(cat "$$pid_file"); \
+	if ! kill -0 "$$pid" 2>/dev/null; then \
+		rm -f "$$pid_file"; echo "$(2) is stopped (removed stale pid)"; exit 0; \
+	fi; \
+	kill -TERM -- "-$$pid" 2>/dev/null || kill -TERM "$$pid"; \
+	i=0; while kill -0 "$$pid" 2>/dev/null && [ $$i -lt 30 ]; do sleep 0.5; i=$$((i + 1)); done; \
+	if kill -0 "$$pid" 2>/dev/null; then \
+		echo "error: $(2) did not stop after 15 seconds (pid $$pid)" >&2; exit 1; \
+	fi; \
+	rm -f "$$pid_file"; echo "stopped $(2)"
+endef
+
 define stop_home_seat
 	@set -e; \
 	seat_dir="$(HOME_ARMY_DIR)/$(1)"; \
@@ -222,8 +251,20 @@ NIM_CHECK_FILES = system/system_server.nim \
 	tools/lua_debug_admin.nim \
 	src/conductor.nim
 
-.PHONY: test-smoke test-smoke-lua test-smoke-nim test-smoke-nim-soft
-test-smoke: test-smoke-lua test-smoke-nim-soft
+.PHONY: test-smoke test-smoke-lua test-smoke-nim test-smoke-nim-soft test-smoke-sh
+test-smoke: test-smoke-lua test-smoke-nim-soft test-smoke-sh
+
+# Cheap parse-only gate for the operator shell scripts (same doctrine as
+# test-smoke-lua: a compile-check is a legitimate leg for code with no unit
+# suite). `bash -n` never executes a line.
+SH_CHECK_FILES = tools/home_army_scale.sh tools/soap.sh tools/realm_op.sh
+test-smoke-sh:
+	@rc=0; for f in $(SH_CHECK_FILES); do \
+		[ -f "$$f" ] || continue; \
+		bash -n "$$f" || { echo "PARSE FAIL: $$f"; rc=1; }; \
+	done; \
+	if [ $$rc -eq 0 ]; then echo "test-smoke-sh: all shell parses clean"; fi; \
+	exit $$rc
 
 # Parse-only check of every non-test Lua file (addon files are Lua 5.0-style
 # but 5.3 luac still catches syntax errors; the addon itself is never run by
@@ -1089,6 +1130,310 @@ home-army-status:
 
 # Compatibility name retained for operators and The System.
 party-army: home-army-start
+
+# ---------------------------------------------------------------------------
+# Scale-out home seats — PARAMETERIZED, roster-driven.
+#
+# The original four (Shadowfel/Igris/Tusk/Beru) keep their hand-written
+# targets above and are never touched by anything in this block. Extra seats
+# are one generic target family instead of N copy-pasted pairs:
+#
+#   make seat-account SEAT=Bellion SEAT_USER=shadow5
+#   make seat-start   SEAT=Bellion SEAT_USER=shadow5 SEAT_CLASS=mage
+#   make seat-status  SEAT=Bellion
+#   make seat-stop    SEAT=Bellion
+#
+# The roster table (tools/data/home_army_roster.tsv) plus the STAGGERED
+# rollout live in tools/home_army_scale.sh — one seat at a time with a gap,
+# because all seats share one nginx asset server on 127.0.0.1:25608
+# (docs/postmortems/2026-08-15-asset-server-connection-drops.md).
+#
+#   make army-scale-start    # staggered launch of the whole roster
+#   make army-scale-status   # roster + status.json freshness
+#   make army-scale-stop
+#
+# CHARACTER CREATION is the ordinary client flow, not a DB insert: with
+# VANILLA_WOW_PLAYER_CHARACTER_CREATION=1 a character name absent from
+# SMSG_CHAR_ENUM is rolled via CMSG_CHAR_CREATE, and the appearance tuple
+# comes from VANILLA_WOW_PLAYER_CHARACTER_{RACE,CLASS,GENDER} — that env var
+# IS the class picker (docs/warlock-seat.md "Why no seed script"). Defaults
+# are troll/shaman/male, so all three are always set.
+#
+# WS bridge: these seats reuse the proven slot=0/token-0 pair the original
+# four share. /tcp/realmd and /tcp/world are raw byte proxies that keep a SET
+# of tasks per slot (no one-owner rule, no connection counter) and carry each
+# seat's own account credentials over the wire, so one slot serves all of
+# them. Realm PlayerLimit is 100.
+#
+# NO DEBUG PORT by default: 7788..7791 belong to the original four and 7800
+# to the quest-QA seat. Opt a single seat in with SEAT_DEBUG_PORT=7801+.
+#
+# OFF-DISPLAY BY DEFAULT — this is what makes scaling past five seats legal.
+# The launcher's machine-local `seat` lease has a hard capacity of FIVE shared
+# lanes (agents/agent_lease.py SHARED_CAPACITIES in the fork), and it exists to
+# ration the HOST GPU/X display: requiresSeatLease() is
+# `rendered and (not headless or hostDisplayAvailable)`. A headless seat that
+# can see DISPLAY grabs a real GLX context on monofuel's desktop — five of
+# those is the cap, and the original four plus the traverse lane already fill
+# it. Launch with DISPLAY/XAUTHORITY cleared and nativeDisplayAvailable() is
+# false, so the launcher takes its own documented branch: xvfb-run + software
+# GL, and requiresSeatLease() returns false. No lease, no lane contention with
+# the human's desktop or with sibling lanes — the launcher's design, not a
+# workaround. Cost is CPU (software rasterizer), which is why the rollout is
+# staggered and guarded. Set SEAT_HOST_DISPLAY=1 to put a seat back on the
+# host display (it will then queue for one of the five lanes).
+SEAT_HOST_DISPLAY ?=
+# llvmpipe spawns a rasterizer thread per core by default — N software seats
+# times 32 threads is self-inflicted thrash. Bots render pixels nobody sees;
+# cap them hard.
+SEAT_LP_THREADS ?= 4
+SEAT ?=
+SEAT_USER ?=
+SEAT_PASS ?= $(SEAT_USER)
+SEAT_RACE ?= undead
+SEAT_CLASS ?= warrior
+SEAT_GENDER ?= male
+SEAT_ENTRY ?= $(HOME_ENTRY)
+SEAT_SLOT ?= $(HOME_SLOT)
+SEAT_TOKEN ?= $(HOME_TOKEN)
+SEAT_DEBUG_PORT ?=
+ARMY_ROSTER ?= $(CURDIR)/tools/data/home_army_roster.tsv
+ARMY_SCALE := $(CURDIR)/tools/home_army_scale.sh
+
+# Every parameterized recipe re-exports its inputs to the detached child.
+SEAT_ARGS = SEAT="$(SEAT)" SEAT_USER="$(SEAT_USER)" SEAT_PASS="$(SEAT_PASS)" \
+	SEAT_RACE="$(SEAT_RACE)" SEAT_CLASS="$(SEAT_CLASS)" \
+	SEAT_GENDER="$(SEAT_GENDER)" SEAT_ENTRY="$(SEAT_ENTRY)" \
+	SEAT_SLOT="$(SEAT_SLOT)" SEAT_TOKEN="$(SEAT_TOKEN)" \
+	SEAT_DEBUG_PORT="$(SEAT_DEBUG_PORT)"
+
+.PHONY: seat-guard seat-account seat-character seat-provision seat-bot \
+	seat-start seat-stop seat-status \
+	army-scale-start army-scale-stop army-scale-status army-scale-provision
+
+seat-guard:
+	@if [ -z "$(SEAT)" ]; then \
+		echo "error: SEAT=<Name> is required (e.g. make seat-start SEAT=Bellion SEAT_USER=shadow5 SEAT_CLASS=mage)" >&2; \
+		exit 1; \
+	fi; \
+	case " Shadowfel Igris Tusk Beru Kaisel " in *" $(SEAT) "*) \
+		echo "error: $(SEAT) is a protected seat — use its dedicated targets" >&2; \
+		exit 1;; \
+	esac
+
+# Idempotent, same SOAP path as qa-account (the upstream provisioning script
+# the older *-account targets call is gone from the upstream checkout).
+seat-account: seat-guard
+	@if [ -z "$(SEAT_USER)" ]; then echo "error: SEAT_USER=<account> is required" >&2; exit 1; fi; \
+	$(CURDIR)/tools/soap.sh account create $(SEAT_USER) $(SEAT_PASS) || true; \
+	echo "account ready: $(SEAT_USER) / $(SEAT_PASS)"
+
+# Roll the seat's level-1 character through the ORDINARY client protocol.
+#
+# This step is separate because the rendered client CANNOT do it: its world
+# entry resolves the name through requireExistingCharacter (select-only), so a
+# name absent from SMSG_CHAR_ENUM is a hard error, not a create.
+# VANILLA_WOW_PLAYER_CHARACTER_CREATION is only read by the Reference Player
+# and hosted coworld-session routes, neither of which serves a local
+# direct-WebSocket lua-bot seat — the quest-QA seat hit exactly this wall on
+# 2026-08-15 (local_data/qa-seat/Kaisel/launcher.log.*).
+#
+# tools/roll_seat_character.nim in the fork sends real CMSG_CHAR_CREATE over
+# the realm's published ports: server-validated race/class, fresh level 1, no
+# DB write and no GM command. Idempotent — an existing name is skipped.
+# SEAT_CLASS is the class selector.
+SEAT_REALM_HOST ?= 127.0.0.1
+SEAT_REALM_PORT ?= 3724
+SEAT_WORLD_PORT ?= 8085
+seat-character: seat-guard
+	@set -e; \
+	if [ -z "$(SEAT_USER)" ]; then echo "error: SEAT_USER=<account> is required" >&2; exit 1; fi; \
+	cd "$(FORK_CLIENT)"; \
+	nix develop --command nim r --hints:off --warnings:off \
+		tools/roll_seat_character.nim -- \
+		--host="$(SEAT_REALM_HOST)" --port="$(SEAT_REALM_PORT)" \
+		--world-port="$(SEAT_WORLD_PORT)" \
+		--username="$(SEAT_USER)" --password="$(SEAT_PASS)" \
+		--name="$(SEAT)" --race="$(SEAT_RACE)" --class="$(SEAT_CLASS)" \
+		--gender="$(SEAT_GENDER)"
+
+seat-provision: seat-account seat-character
+
+# Foreground seat, same runtime root as the original four so The System's
+# roster control-plane column and the home-army-status pattern both find it.
+seat-bot: seat-guard
+	@set -e; \
+	if [ -z "$(SEAT_USER)" ]; then echo "error: SEAT_USER=<account> is required" >&2; exit 1; fi; \
+	seat_dir="$(HOME_ARMY_DIR)/$(SEAT)"; \
+	mkdir -p "$$seat_dir/status" "$$seat_dir/observer"; \
+	debug_dir=""; \
+	if [ -n "$(SEAT_DEBUG_PORT)" ]; then \
+		debug_dir="$$seat_dir/control"; mkdir -p "$$debug_dir/acks"; \
+	fi; \
+	if [ -z "$(SEAT_HOST_DISPLAY)" ]; then \
+		unset DISPLAY XAUTHORITY WAYLAND_DISPLAY; \
+		export LP_NUM_THREADS="$(SEAT_LP_THREADS)"; \
+	fi; \
+	cd "$(FORK_CLIENT)"; \
+	VANILLA_WOW_LOGIN_WS_URL="$(HOME_WS)/tcp/realmd?slot=$(SEAT_SLOT)&token=$(SEAT_TOKEN)" \
+	VANILLA_WOW_GAME_WS_URL="$(HOME_WS)/tcp/world?slot=$(SEAT_SLOT)&token=$(SEAT_TOKEN)" \
+	VANILLA_WOW_LUA_DEBUG_DIR="$$debug_dir" \
+	VANILLA_WOW_PLAYER_CHARACTER_CREATION=1 \
+	VANILLA_WOW_PLAYER_CHARACTER_RACE="$(SEAT_RACE)" \
+	VANILLA_WOW_PLAYER_CHARACTER_CLASS="$(SEAT_CLASS)" \
+	VANILLA_WOW_PLAYER_CHARACTER_GENDER="$(SEAT_GENDER)" \
+	COWORLD_PLAYER_OBSERVER_DIR="$$seat_dir/observer" \
+	nix develop --command nim r tools/launch_nim_player.nim -- \
+		--controller=embedded --presentation=headless --bot=lua-bot \
+		--owner=home-$(SEAT) \
+		--lua-repo="$(CURDIR)" --lua-entry="$(SEAT_ENTRY)" \
+		--lua-status-dir="$$seat_dir/status" \
+		--username="$(SEAT_USER)" --password="$(SEAT_PASS)" \
+		--character-name="$(SEAT)" \
+		--skip-cinematic
+
+# Reuses the original detach/pid/log-rotate machinery. HOME_DEBUG_PORT_BASE is
+# NOT consulted here (index 0 is passed only to satisfy the macro arity); this
+# lane opts in per seat via SEAT_DEBUG_PORT instead.
+seat-start: seat-guard
+	$(call start_home_seat,$(SEAT),seat-bot $(SEAT_ARGS),0)
+
+seat-stop: seat-guard
+	$(call stop_home_seat,$(SEAT))
+
+seat-status: seat-guard
+	@seat_dir="$(HOME_ARMY_DIR)/$(SEAT)"; \
+	if [ -s "$$seat_dir/status/status.json" ]; then \
+		jq -c '{intent_kind,intent_reason,summary,bot}' "$$seat_dir/status/status.json"; \
+	else echo "no status yet"; fi
+
+army-scale-provision:
+	@$(ARMY_SCALE) provision
+army-scale-start:
+	@$(ARMY_SCALE) start
+army-scale-stop:
+	@$(ARMY_SCALE) stop
+army-scale-status:
+	@$(ARMY_SCALE) status
+
+# ---------------------------------------------------------------------------
+# Kaisel — DISPOSABLE quest-QA scenario seat (ticket 0057,
+# docs/quest-qa-2026-08-15.md).
+#
+# Not a home seat: its own account, its own runtime tree under
+# local_data/qa-seat/, its own debug port (7800 by default, clear of the
+# 7788..7791 home block), and it is never started by home-army-start. Agents
+# own it end to end — start it, /lua/reload it while iterating on the
+# soft-quest path, stop it when the run is done. The four home seats are never
+# reloaded from this loop.
+QA_ACCOUNT := shadow9
+QA_PASS := shadow9
+QA_CHARACTER := Kaisel
+QA_RACE := undead
+QA_CLASS := warlock
+QA_GENDER := male
+QA_SEAT_DIR := $(CURDIR)/local_data/qa-seat
+QA_DEBUG_PORT ?= 7800
+QA_ENTRY ?= home
+
+.PHONY: qa-account qa-character qa-character-check qa-bot qa-seat-start qa-seat-stop qa-seat-status
+# Idempotent: the GM console reports "Account already exists" on a re-run.
+# Uses SOAP rather than the upstream provisioning script the older *-account
+# targets call — that script is gone from the current upstream checkout
+# (docs/quest-qa-2026-08-15.md).
+qa-account:
+	@$(CURDIR)/tools/soap.sh account create $(QA_ACCOUNT) $(QA_PASS) || true; \
+	echo "account ready: $(QA_ACCOUNT) / $(QA_PASS)"
+
+# One-time character roll through the ordinary client flow — no
+# characters-table insert. The CLI world-entry route
+# (player/runtime/glue_connect.nim startConnect) requires the character to
+# already exist; only the GlueXML managed-character route creates one, and it
+# is selected by OMITTING --character-name (that missing field is what turns
+# the front door on) while supplying the --create-character-* prefill. Runs
+# until the seat is in world; interrupt it once `make qa-character-check`
+# shows the row.
+qa-character:
+	@set -e; \
+	seat_dir="$(QA_SEAT_DIR)/$(QA_CHARACTER)"; \
+	mkdir -p "$$seat_dir/status" "$$seat_dir/observer"; \
+	cd "$(FORK_CLIENT)"; \
+	VANILLA_WOW_LOGIN_WS_URL="$(HOME_WS)/tcp/realmd?slot=$(HOME_SLOT)&token=$(HOME_TOKEN)" \
+	VANILLA_WOW_GAME_WS_URL="$(HOME_WS)/tcp/world?slot=$(HOME_SLOT)&token=$(HOME_TOKEN)" \
+	COWORLD_PLAYER_OBSERVER_DIR="$$seat_dir/observer" \
+	nix develop --command nim r tools/launch_nim_player.nim -- \
+		--controller=embedded --presentation=headless --bot=lua-bot \
+		--owner=qa-$(QA_CHARACTER)-create \
+		--lua-repo="$(CURDIR)" --lua-entry="$(QA_ENTRY)" \
+		--lua-status-dir="$$seat_dir/status" \
+		--username="$(QA_ACCOUNT)" --password="$(QA_PASS)" \
+		--create-character-name="$(QA_CHARACTER)" \
+		--create-character-race="$(QA_RACE)" \
+		--create-character-class="$(QA_CLASS)" \
+		--create-character-gender="$(QA_GENDER)" \
+		--skip-cinematic
+
+qa-character-check:
+	@docker exec coworld-vmangos-coworld-game-1 mariadb -umangos -pmangos \
+		characters -e "SELECT guid,name,race,class,level,map,zone FROM characters WHERE name='$(QA_CHARACTER)';"
+
+# Foreground seat — identical launch shape to launch_home_seat so the QA seat
+# exercises the same path the home seats do, only with its own dirs and port.
+qa-bot:
+	@set -e; \
+	seat_dir="$(QA_SEAT_DIR)/$(QA_CHARACTER)"; \
+	mkdir -p "$$seat_dir/status" "$$seat_dir/observer" "$$seat_dir/control/acks"; \
+	cd "$(FORK_CLIENT)"; \
+	VANILLA_WOW_LOGIN_WS_URL="$(HOME_WS)/tcp/realmd?slot=$(HOME_SLOT)&token=$(HOME_TOKEN)" \
+	VANILLA_WOW_GAME_WS_URL="$(HOME_WS)/tcp/world?slot=$(HOME_SLOT)&token=$(HOME_TOKEN)" \
+	VANILLA_WOW_LUA_DEBUG_DIR="$$seat_dir/control" \
+	COWORLD_PLAYER_OBSERVER_DIR="$$seat_dir/observer" \
+	nix develop --command nim r tools/launch_nim_player.nim -- \
+		--controller=embedded --presentation=headless --bot=lua-bot \
+		--owner=qa-$(QA_CHARACTER) \
+		--lua-repo="$(CURDIR)" --lua-entry="$(QA_ENTRY)" \
+		--lua-status-dir="$$seat_dir/status" \
+		--username="$(QA_ACCOUNT)" --password="$(QA_PASS)" \
+		--character-name="$(QA_CHARACTER)" \
+		--skip-cinematic
+
+qa-seat-start:
+	@set -e; \
+	seat_dir="$(QA_SEAT_DIR)/$(QA_CHARACTER)"; \
+	pid_file="$$seat_dir/launcher.pid"; \
+	mkdir -p "$$seat_dir/control/acks" "$$seat_dir/status"; \
+	if [ -s "$$pid_file" ] && kill -0 "$$(cat $$pid_file)" 2>/dev/null; then \
+		echo "$(QA_CHARACTER) already running (pid $$(cat $$pid_file))"; exit 0; \
+	fi; \
+	rm -f "$$pid_file" "$$seat_dir/status/status.json" "$$seat_dir/control/request.json"; \
+	if [ -s "$$seat_dir/launcher.log" ]; then \
+		mv "$$seat_dir/launcher.log" "$$seat_dir/launcher.log.$$(date -u +%Y%m%dT%H%M%SZ)"; \
+	fi; \
+	setsid $(MAKE) --no-print-directory qa-bot >"$$seat_dir/launcher.log" 2>&1 < /dev/null & \
+	pid=$$!; echo "$$pid" > "$$pid_file"; \
+	echo "starting $(QA_CHARACTER) (pid $$pid; log $$seat_dir/launcher.log)"; \
+	admin_pid="$$seat_dir/lua-debug-admin.pid"; \
+	if [ -s "$$admin_pid" ] && kill -0 "$$(cat $$admin_pid)" 2>/dev/null; then \
+		echo "  debug admin already running (pid $$(cat $$admin_pid))"; \
+	else \
+		setsid nix develop --command nim r tools/lua_debug_admin.nim -- \
+			--seat="$(QA_CHARACTER)" --port="$(QA_DEBUG_PORT)" \
+			--control-dir="$$seat_dir/control" \
+			--status-dir="$$seat_dir/status" \
+			>"$$seat_dir/lua-debug-admin.log" 2>&1 < /dev/null & \
+		echo "$$!" > "$$admin_pid"; \
+		echo "  debug port http://127.0.0.1:$(QA_DEBUG_PORT)"; \
+	fi
+
+qa-seat-stop:
+	$(call stop_home_seat_dir,$(QA_SEAT_DIR),$(QA_CHARACTER))
+
+qa-seat-status:
+	@seat_dir="$(QA_SEAT_DIR)/$(QA_CHARACTER)"; \
+	if [ -s "$$seat_dir/status/status.json" ]; then \
+		jq -c '{intent_kind,intent_reason,nav_progress,summary,bot}' \
+			"$$seat_dir/status/status.json"; \
+	else echo "no status yet"; fi
 
 # ---------------------------------------------------------------------------
 # Our fork of coworld-vanilla-wow (docs/coworld-fork.md): thin rebase layer
