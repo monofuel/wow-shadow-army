@@ -82,13 +82,30 @@ HOME_ENTRY ?= home
 HOME_ARMY_DIR := $(CURDIR)/local_data/home-army
 HOME_STATUS_MAX_AGE ?= 30
 
+# Live Lua debug port for home seats (docs/lua-debug-port.md, ticket 0053).
+# EMPTY = OFF, and off means the seat env carries no control dir and no admin
+# process exists — the feature is absent, not idle. HOME LANE ONLY: league,
+# traverse, and every hosted policy image must never set this.
+#
+#   make home-army-start HOME_DEBUG_PORT_BASE=7788
+#
+# Ports are base + seat index: shadowfel 7788, igris 7789, tusk 7790,
+# beru 7791. A seat reads its control dir from the environment AT LAUNCH, so a
+# already-running seat gains nothing until its next restart.
+HOME_DEBUG_PORT_BASE ?=
+
 define launch_home_seat
 	@set -e; \
 	seat_dir="$(HOME_ARMY_DIR)/$(1)"; \
 	mkdir -p "$$seat_dir/status" "$$seat_dir/observer"; \
+	debug_dir=""; \
+	if [ -n "$(HOME_DEBUG_PORT_BASE)" ]; then \
+		debug_dir="$$seat_dir/control"; mkdir -p "$$debug_dir/acks"; \
+	fi; \
 	cd "$(FORK_CLIENT)"; \
 	VANILLA_WOW_LOGIN_WS_URL="$(HOME_WS)/tcp/realmd?slot=$(HOME_SLOT)&token=$(HOME_TOKEN)" \
 	VANILLA_WOW_GAME_WS_URL="$(HOME_WS)/tcp/world?slot=$(HOME_SLOT)&token=$(HOME_TOKEN)" \
+	VANILLA_WOW_LUA_DEBUG_DIR="$$debug_dir" \
 	COWORLD_PLAYER_OBSERVER_DIR="$$seat_dir/observer" \
 	nix develop --command nim r tools/launch_nim_player.nim -- \
 		--controller=embedded --presentation=headless --bot=lua-bot \
@@ -110,19 +127,44 @@ define start_home_seat
 			echo "$(1) already running (pid $$pid)"; exit 0; \
 		fi; \
 	fi; \
-	rm -f "$$pid_file" "$$seat_dir/status/status.json"; \
+	rm -f "$$pid_file" "$$seat_dir/status/status.json" "$$seat_dir/control/request.json"; \
 	if [ -s "$$seat_dir/launcher.log" ]; then \
 		mv "$$seat_dir/launcher.log" "$$seat_dir/launcher.log.$$(date -u +%Y%m%dT%H%M%SZ)"; \
 	fi; \
 	setsid $(MAKE) --no-print-directory $(2) >"$$seat_dir/launcher.log" 2>&1 < /dev/null & \
 	pid=$$!; echo "$$pid" > "$$pid_file"; \
-	echo "starting $(1) (pid $$pid; log $$seat_dir/launcher.log)"
+	echo "starting $(1) (pid $$pid; log $$seat_dir/launcher.log)"; \
+	if [ -n "$(HOME_DEBUG_PORT_BASE)" ]; then \
+		port=$$(($(HOME_DEBUG_PORT_BASE) + $(3))); \
+		admin_pid="$$seat_dir/lua-debug-admin.pid"; \
+		mkdir -p "$$seat_dir/control/acks"; \
+		if [ -s "$$admin_pid" ] && kill -0 "$$(cat $$admin_pid)" 2>/dev/null; then \
+			echo "  debug admin already running (pid $$(cat $$admin_pid))"; \
+		else \
+			setsid nix develop --command nim r tools/lua_debug_admin.nim -- \
+				--seat="$(1)" --port="$$port" \
+				--control-dir="$$seat_dir/control" \
+				--status-dir="$$seat_dir/status" \
+				>"$$seat_dir/lua-debug-admin.log" 2>&1 < /dev/null & \
+			echo "$$!" > "$$admin_pid"; \
+			echo "  debug port http://127.0.0.1:$$port (log $$seat_dir/lua-debug-admin.log)"; \
+		fi; \
+	fi
 endef
 
 define stop_home_seat
 	@set -e; \
 	seat_dir="$(HOME_ARMY_DIR)/$(1)"; \
 	pid_file="$$seat_dir/launcher.pid"; \
+	admin_pid="$$seat_dir/lua-debug-admin.pid"; \
+	if [ -s "$$admin_pid" ]; then \
+		apid=$$(cat "$$admin_pid"); \
+		if kill -0 "$$apid" 2>/dev/null; then \
+			kill -TERM -- "-$$apid" 2>/dev/null || kill -TERM "$$apid" 2>/dev/null || true; \
+			echo "stopped $(1) debug admin (pid $$apid)"; \
+		fi; \
+		rm -f "$$admin_pid"; \
+	fi; \
 	if [ ! -s "$$pid_file" ]; then echo "$(1) is stopped"; exit 0; fi; \
 	pid=$$(cat "$$pid_file"); \
 	if ! kill -0 "$$pid" 2>/dev/null; then \
@@ -177,6 +219,7 @@ traverse-lint:
 # even where no unit suite imports it yet.
 NIM_CHECK_FILES = system/system_server.nim \
 	tools/fair_play_audit.nim tools/party_promote.nim \
+	tools/lua_debug_admin.nim \
 	src/conductor.nim
 
 .PHONY: test-smoke test-smoke-lua test-smoke-nim test-smoke-nim-soft
@@ -1000,13 +1043,13 @@ beru-bot:
 # Explicit bot lifecycle. These targets do not start or stop the persistent
 # realm and do not create accounts; character/server state stays untouched.
 shadowfel-start:
-	$(call start_home_seat,$(WARLOCK_CHARACTER),warlock-bot)
+	$(call start_home_seat,$(WARLOCK_CHARACTER),warlock-bot,0)
 igris-start:
-	$(call start_home_seat,$(IGRIS_CHARACTER),igris-bot)
+	$(call start_home_seat,$(IGRIS_CHARACTER),igris-bot,1)
 tusk-start:
-	$(call start_home_seat,$(TUSK_CHARACTER),tusk-bot)
+	$(call start_home_seat,$(TUSK_CHARACTER),tusk-bot,2)
 beru-start:
-	$(call start_home_seat,$(BERU_CHARACTER),beru-bot)
+	$(call start_home_seat,$(BERU_CHARACTER),beru-bot,3)
 
 shadowfel-stop:
 	$(call stop_home_seat,$(WARLOCK_CHARACTER))
