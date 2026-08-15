@@ -90,3 +90,31 @@ the way home does is UNKNOWN and worth answering first when comparing.
   0055 (seat babysitter — detection/recovery for wedges of any cause).
 - Prod reports: monofuel's unreproducible hosted asset-loading failures
   (no local ticket; his report is the motivating symptom).
+
+## 2026-08-15 update — H1 CONFIRMED against prod, fixed at the source
+
+The traverse-lane agent closed the loop the same night:
+
+- **Prod confirmation:** the exact error string appears in hosted episode
+  logs for policy versions v10-v13; drop counts scaled with fetch
+  concurrency (0 in v7-v9 before the residency pump raised concurrency,
+  8 in v13, including a vmap collision model) — the H1 request-budget
+  signature.
+- **Why prod stalls instead of wedging:** the traverse fork's collision/
+  terrain/navmesh consumers treat transient fetch failure as keep-waiting
+  with a 1s transport retry, so drops cost ~1s stalls. The home wedge is
+  therefore most plausibly H3 in the RENDERER's world-stream manifest
+  path — a different consumer. H3 remains the open question (ticket 0056,
+  rescoped).
+- **Correction to this doc:** the generated conf's template is
+  FORK-owned — `tools/nginx_assets.conf` in monofuel-vanilla-wow — not
+  upstream launcher tooling as hypothesized above. The fix
+  (`keepalive_requests 100000;`) landed on fork master a8835801f,
+  cross-referencing this postmortem, and rides the next daemon build to
+  hosted (v14). The pod-side platform asset server (job-*-game:8080) is
+  not ours to tune; client retries absorb it.
+- **Home rollout:** our fork checkout rebased onto that master
+  (debug-port branch ad48d2f78 now carries the fix); the next
+  home-army-restart launches seats with the fixed conf. Expected local
+  result: fetch-failure counts drop to ~0. If a seat still wedges after
+  that, H3 is isolated by elimination.
