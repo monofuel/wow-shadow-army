@@ -118,3 +118,33 @@ The traverse-lane agent closed the loop the same night:
   home-army-restart launches seats with the fixed conf. Expected local
   result: fetch-failure counts drop to ~0. If a seat still wedges after
   that, H3 is isolated by elimination.
+
+## 2026-08-15 update 2 — H3 RETIRED by fork audit; H4 is the wedge suspect
+
+Full audit on branch monofuel/h3-manifest-retry (no changes needed):
+- **H3 retired.** Transient manifest failures map to AssetWaiting and are
+  re-fetched at 1 Hz forever (httpassets.nim:1698-1706, 1958-1972, retry
+  requeue :1471-1479); 404 walks a bounded ladder to a clean terminal
+  skip; NOTHING gates on manifest state — worst case is slower serial
+  discovery, never a freeze. Falsifiable: injecting .assets.txt failures
+  should NOT wedge a seat; if it does, H3 revives.
+- **H4 (new prime suspect): native fetch-pool exhaustion with no
+  effective timeout.** Under -d:noGui (bot seats): MaxConcurrentFetches
+  == NativeHttpFetchWorkerCount == 16 (no spare workers);
+  cancelExpiredFetches is a native no-op; the 30s deadline is evaluated
+  only on a legacy blocking path runtime polling never enters; the
+  worker HttpClient timeout is per socket READ, not per transfer — a
+  half-closed keepalive or dribbling response holds a worker
+  indefinitely. 16 such sockets = every fetch worker stuck = pending
+  grows with a STABLE blocker URL and no "World stream settled" — the
+  exact pre-freeze Tusk telemetry. Secondary: warm lane starves while
+  the demand lane has any backlog (:1291-1308).
+- **Repro rig:** fault proxy before :25608 holding 16 concurrent
+  requests open (partial headers, no data, no FIN); expect climbing
+  pending=, no settle, frozen status.json.
+- **Instrumentation gap:** the "HTTP assets delayed" line logs neither
+  inflight count nor oldest-fetch age; adding both makes H4 diagnosable
+  from seat logs alone (would have settled Tusk from the attachments).
+- Minor non-freeze defect logged: the manifest 3-attempt retry ladder is
+  reachable only by definite 404s (which retries can't help); transients
+  never reach it. Cosmetic, left alone for rebase friction.
