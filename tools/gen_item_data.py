@@ -1,0 +1,206 @@
+#!/usr/bin/env python3
+"""Generate addons/ShadowArmy/ItemData.lua from the VMaNGOS world DB.
+
+The same "we own the realm" advantage as tools/gen_quest_data.py, pointed at
+bags instead of quests: the 1.12 client exposes **no vendor sell price at all**
+(there is no GetItemSellPrice / GetSellValue API), and GetItemInfo returns nil
+for anything the client has not cached this session. An addon that wants to
+decide "sell this / equip this / keep this for a quest" therefore cannot ask
+the client what an item is worth or even what it is. The world DB knows both.
+
+Reads (read-only, never writes):
+  * world DB via `docker exec <container> mariadb ...` (same shell-out path as
+    tools/gen_quest_data.py and system/system_server.nim)
+
+Emits a pure data file (no logic, Lua 5.0 loadable) keyed by **item id**,
+because every bag slot yields an item link and every link carries `item:ID`
+(GetContainerItemLink -> "|cff...|Hitem:2589:0:0:0|h[Linen Cloth]|h|r"), so the
+addon never needs a name to look a row up. Names are deliberately NOT emitted:
+they would roughly triple the file for a key nothing resolves by, and the
+client already has the localized name in the link it just parsed.
+
+Deterministic: sorted by item id, no timestamps, so a re-run against an
+unchanged DB produces a byte-identical file.
+
+  python3 tools/gen_item_data.py
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import subprocess
+import sys
+from typing import Dict, List, Optional, Sequence, Tuple
+
+# ---------------------------------------------------------------------------
+# Coupling isolation: everything version/deployment specific lives here.
+# ---------------------------------------------------------------------------
+
+DEFAULT_CONTAINER = os.environ.get(
+    "SYSTEM_MYSQL_CONTAINER", "coworld-vmangos-coworld-game-1"
+)
+DB_USER = "mangos"
+DB_PASS = "mangos"
+DB_NAME = "mangos"
+
+# mangosd.conf `WowPatch = 10` == 1.12. VMaNGOS is a progression core: item
+# rows carry a patch column and an item may have several, so the query filters
+# and the highest `patch <= 10` row wins (same rule as gen_quest_data.py's
+# load_template).
+WOW_PATCH = 10
+
+_REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DEFAULT_OUT = os.path.join(_REPO, "addons", "ShadowArmy", "ItemData.lua")
+
+# Emitted key -> (column, default). Order here is the emit order, and any field
+# equal to its default is dropped from the line: with ~17.7k items that is the
+# difference between a small data file and a fat one. The addon reads every
+# field as `row.sell or 0` etc., so an absent field is exactly the default.
+FIELDS: Sequence[Tuple[str, str, int]] = (
+    ("sell", "sell_price", 0),       # vendor sell value in copper
+    ("q", "quality", 0),             # 0 poor .. 5 legendary
+    ("lvl", "item_level", 0),
+    ("req", "required_level", 0),
+    ("slot", "inventory_type", 0),   # numeric InventoryType id, not a string
+    ("class", "class", 0),
+    ("sub", "subclass", 0),
+)
+
+
+# ---------------------------------------------------------------------------
+# DB access (docker exec mariadb -N -B, TSV out)
+# ---------------------------------------------------------------------------
+
+
+_UNESCAPE = {"0": "\0", "b": "\b", "n": "\n", "r": "\r", "t": "\t",
+             "Z": "\x1a", "\\": "\\"}
+
+
+def _unescape(text: str) -> str:
+    if "\\" not in text:
+        return text
+    out: List[str] = []
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if ch == "\\" and i + 1 < len(text):
+            out.append(_UNESCAPE.get(text[i + 1], text[i + 1]))
+            i += 2
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out)
+
+
+class World:
+    def __init__(self, container: str) -> None:
+        self.container = container
+
+    def query(self, sql: str) -> List[List[str]]:
+        cmd = ["docker", "exec", self.container, "mariadb",
+               "-u" + DB_USER, "-p" + DB_PASS, DB_NAME, "-N", "-B", "-e", sql]
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        if proc.returncode != 0:
+            raise RuntimeError("query failed: %s\n%s" % (sql[:120], proc.stderr.strip()))
+        rows = []
+        for line in proc.stdout.split("\n"):
+            if not line:
+                continue
+            rows.append([_unescape(c) for c in line.split("\t")])
+        return rows
+
+
+def _i(text: str) -> int:
+    return 0 if text in ("", "NULL") else int(float(text))
+
+
+# ---------------------------------------------------------------------------
+# Lua emit
+# ---------------------------------------------------------------------------
+
+
+# NOTE: no lua_string() escaper here on purpose — every emitted value is an
+# integer. If a future rev ever emits names, lift gen_quest_data.py's
+# lua_string() verbatim rather than writing a second one.
+
+
+def emit(items: List[Tuple[int, Dict[str, int]]], header: List[str]) -> str:
+    lines = ["-- generated by tools/gen_item_data.py; do not edit by hand"]
+    lines += ["-- " + line for line in header]
+    lines.append("")
+    lines.append("ShadowArmyItemData = {")
+    for entry, row in items:
+        parts = ["%s = %d" % (key, row[key])
+                 for key, _, default in FIELDS if row[key] != default]
+        if parts:
+            lines.append("[%d] = { %s }," % (entry, ", ".join(parts)))
+        else:
+            lines.append("[%d] = {}," % entry)
+    lines.append("}")
+    lines.append("")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--container", default=DEFAULT_CONTAINER)
+    ap.add_argument("--out", default=DEFAULT_OUT)
+    args = ap.parse_args(argv)
+
+    db = World(args.container)
+
+    columns = ["entry"] + [col for _, col, _ in FIELDS]
+    # ORDER BY entry,patch so the highest patch <= 10 row overwrites the lower
+    # ones — an item's stats can change between content patches.
+    rows = db.query(
+        "SELECT %s FROM item_template WHERE patch<=%d ORDER BY entry,patch"
+        % (",".join(columns), WOW_PATCH)
+    )
+
+    by_entry: Dict[int, Dict[str, int]] = {}
+    for r in rows:
+        if len(r) < len(columns):
+            continue
+        entry = _i(r[0])
+        if entry <= 0:
+            continue
+        by_entry[entry] = {key: _i(cell)
+                           for (key, _, _), cell in zip(FIELDS, r[1:])}
+
+    items = sorted(by_entry.items())
+
+    sellable = sum(1 for _, row in items if row["sell"] > 0)
+    header = [
+        "source: VMaNGOS world DB (%s) item_template, WowPatch %d" % (DB_NAME, WOW_PATCH),
+        "scope: whole game — %d item_template rows, %d items emitted" % (len(rows), len(items)),
+        "keyed by item id; item links carry item:ID, so no names are stored",
+        "fields (omitted when equal to the default, read as `row.sell or 0`):",
+        "  sell  = vendor sell price in copper   default 0 (0 = vendor buys it for nothing)",
+        "  q     = quality 0 poor .. 5 legendary default 0",
+        "  lvl   = item level                    default 0",
+        "  req   = required character level      default 0",
+        "  slot  = InventoryType numeric id      default 0 (not equippable)",
+        "  class = item class id                 default 0 (consumable)",
+        "  sub   = item subclass id              default 0",
+        "%d of %d items have a nonzero sell price" % (sellable, len(items)),
+        "regenerate: make item-data   (see docs/item-data.md)",
+    ]
+
+    text = emit(items, header)
+    with open(args.out, "w") as fh:
+        fh.write(text)
+
+    print("wrote %s" % args.out)
+    print("  item_template rows  : %d" % len(rows))
+    print("  emitted (unique)    : %d" % len(items))
+    print("  with sell price     : %d" % sellable)
+    print("  size                : %.2f MiB" % (len(text) / 1048576.0))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

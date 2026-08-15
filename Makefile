@@ -136,7 +136,7 @@ define stop_home_seat
 	rm -f "$$pid_file"; echo "stopped $(1)"
 endef
 
-.PHONY: test test-lua test-nim system pin-check start-server stop-server server-logging logs account soap-account play play-classic play-classic-netlog play-xr traverse traverse-field traverse-replay traverse-pack-replay traverse-headed traverse-pol traverse-desert traverse-wet traverse-checkpoints traverse-lint traverse-lint-soft lift-tele quest-data warlock-account warlock-bot botwarrior-bot tusk-account tusk-bot beru-account beru-bot party-army home-army-start home-army-stop home-army-restart home-army-status shadowfel-start shadowfel-stop igris-start igris-stop tusk-start tusk-stop beru-start beru-stop navmesh-helper navmesh-status map-browser map-browser-once map-browser-debug map-browser-probe
+.PHONY: test test-lua test-nim system pin-check start-server stop-server server-logging logs account soap-account play play-classic play-classic-netlog play-xr traverse traverse-field traverse-replay traverse-pack-replay traverse-headed traverse-pol traverse-desert traverse-wet traverse-checkpoints traverse-lint traverse-lint-soft lift-tele quest-data item-data warlock-account warlock-bot botwarrior-bot tusk-account tusk-bot beru-account beru-bot party-army home-army-start home-army-stop home-army-restart home-army-status shadowfel-start shadowfel-stop igris-start igris-stop tusk-start tusk-stop beru-start beru-stop navmesh-helper navmesh-status map-browser map-browser-once map-browser-debug map-browser-probe
 
 # Unit tier: Lua tools + Nim host/system tests only (v2 DoD: no Python required
 # for bot correctness). If nim is missing, test-nim-soft skips rather than
@@ -396,6 +396,13 @@ QUEST_DATA_ARGS ?=
 quest-data:
 	@python3 tools/gen_quest_data.py \
 		--dbc-dir "$(VANILLA_WOW_EXTRACTED_DATA_DIR)/dbc" $(QUEST_DATA_ARGS)
+
+# Regenerate addons/ShadowArmy/ItemData.lua from the world DB (docs/item-data.md).
+# Read-only DB access; requires the realm up. Deterministic, so a no-op rerun
+# leaves the file byte-identical. Whole game, no DBCs needed.
+ITEM_DATA_ARGS ?=
+item-data:
+	@python3 tools/gen_item_data.py $(ITEM_DATA_ARGS)
 
 .PHONY: backup-server
 backup-server:
