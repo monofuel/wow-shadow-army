@@ -450,6 +450,13 @@ function M.decide(view)
   end
 
   local murist_member = party_member(view, "Murist")
+  -- A home-seat group without Murist is always wrong (the escort exists FOR
+  -- him), and a grouped client auto-declines his invites. Leave so he can
+  -- invite; accept_party above re-forms the party the intended way.
+  if party.in_group and not murist_member then
+    return finish({ kind = "leave_party", reason = "no_murist_in_group" },
+      view, "party_forming", role)
+  end
   if party.in_group and murist_member and
       guid_equal(party.leader_guid, view.player_guid) then
     if not last_promote_at or now - last_promote_at >= PROMOTE_RETRY_SECONDS then
