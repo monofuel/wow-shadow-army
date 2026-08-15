@@ -35,41 +35,10 @@ NEIGH8 = tuple(
     for dj in (-1, 0, 1)
     if not (di == 0 and dj == 0)
 )
-# Zones whose painted ADT signature is useless: route least-cost paths
-# between known anchors over minimap local brightness + walkability.
-# Constants are session-calibrated; do not "improve" them.
-MINIMAP_ROUTE_ZONES = {
-    "kalimdor": [
-        {
-            "name": "thousand_needles",
-            # bbox ALIGNED to STEP multiples (lattice keys are global
-            # integer indices; a misaligned bbox once caused
-            # banker's-rounding key collisions in a prototype)
-            "bbox": (-7000.0, -4400.0, -4200.0, -600.0),
-            "z_band": (-120.0, 100.0),
-            "max_grade_wall": 1.8,
-            "slope_penalty": 2.0,
-            "contrast_c0": 25.0,
-            "contrast_k": 22.0,
-            "block_yd": 64.0,
-            "max_water_depth": 0.5,
-            "legs": [
-                ["feralas_junction", (-4280.0, -776.0),      "lift_lower",      (-4677.066, -1853.667), {"z_corridor": (-120.0, -20.0, 10.0)}],
-                ["lift_lower",       (-4677.066, -1853.667), "freewind_base",   (-5320.0, -2170.0),     {"z_corridor": (-120.0, -20.0, 10.0)}],
-                ["freewind_base",    (-5320.0, -2170.0),     "canyon_se",       (-5560.0, -2050.0),     {"z_corridor": (-120.0, -20.0, 10.0)}],
-                # canyon -> basin descent through the verified low-grade gap (seed (-5700,-3130) heading SSW,
-                # measured max grade 1.01, z stays within [-55,-20]); corridor hi -10 gives lip margin
-                ["canyon_se",        (-5560.0, -2050.0),     "basin_entry",     (-5848.0, -3424.0),     {"z_corridor": (-120.0, -10.0, 10.0)}],
-                ["basin_entry",      (-5848.0, -3424.0),     "racetrack_north", (-6100.0, -3500.0),     {"z_corridor": (-120.0, -20.0, 10.0)}],
-                ["racetrack_north",  (-6100.0, -3500.0),     "racetrack_mid",   (-6230.0, -3700.0),     {"z_corridor": (-120.0, -20.0, 10.0)}],
-                ["racetrack_mid",    (-6230.0, -3700.0),     "racetrack_south", (-6350.0, -3900.0),     {"z_corridor": (-120.0, -20.0, 10.0)}],
-                # basin -> Tanaris shelf: measured ramp pinch grade 1.78-1.79 sits AT the 1.8 global wall,
-                # so this leg gets its own wall with margin; climbs lawfully to z~86 -> no z corridor
-                ["racetrack_south",  (-6350.0, -3900.0),     "tanaris_road",    (-6720.0, -3456.0),     {"max_grade_wall": 2.2}],
-            ],
-        },
-    ],
-}
+# Thousand Needles is intentionally absent here. Its old hand-anchored
+# brightness router selected mesa rims. The Nim minimap-ribbon detector owns
+# that zone and composes its source-honest segments after this painted bake.
+MINIMAP_ROUTE_ZONES: dict[str, list[dict]] = {}
 
 # Frozen clockwise Zhang-Suen ring P2..P9. Orientation-agnostic; do not
 # "fix" for world-axis direction.

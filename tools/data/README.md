@@ -37,6 +37,9 @@ byte-deterministic). Remaining lines are segments:
 
 ```
 {"id": "b0001", "source": "baked", "pts": [[x, y, z], ...]}
+{"id": "v0001", "source": "minimap_ribbon", "network_role": "trunk", "confidence": 1.0, "pts": [[x, y, z], ...]}
+{"id": "v0002", "source": "terrain_medial", "network_role": "trunk", "confidence": 0.55, "pts": [[x, y, z], ...]}
+{"id": "v0003", "source": "visual_gap_bridge", "network_role": "great_lift_spur", "confidence": 0.0, "pts": [[x, y, z], ...]}
 {"id": "h_something", "source": "hand", "note": "...", "pts": [[x, y, z], ...]}
 ```
 
@@ -45,21 +48,19 @@ are assigned after a stable sort and **renumber every re-bake**.
 
 ### Regeneration
 
-From the repo root, with Kalimdor / Azeroth ADTs available
-(`VANILLA_WOW_ADT_DIR` or the default flat dump). Kalimdor's bake
-runs the Thousand Needles minimap-route pass and needs Pillow;
-Azeroth has no `MINIMAP_ROUTE_ZONES` entry and does not:
+The generic ADT paint bake remains the first pass. The agent-owned
+`road-ribbons` target then replaces Thousand Needles/Shimmering Flats with the
+visual detector output:
 
 ```sh
-nix-shell -p python3Packages.pillow --run \
-  'python3 tools/bake_road_waypoints.py --map kalimdor'
+python3 tools/bake_road_waypoints.py --map kalimdor --no-minimap
+make road-ribbons
 python3 tools/bake_road_waypoints.py --map azeroth
 ```
 
-`--no-minimap` skips the route pass (Kalimdor then needs no Pillow).
 Defaults write `tools/data/road_waypoints_<map>.jsonl`. A second run of
 the same command must leave `git diff --stat tools/data/` empty.
-Current artifacts: kalimdor **179** segments, azeroth **236**.
+Current artifacts: kalimdor **176** segments, azeroth **236**.
 
 Bake knobs (see `tools/bake_road_waypoints.py`):
 
@@ -88,52 +89,24 @@ Bake knobs (see `tools/bake_road_waypoints.py`):
   whole components whose total centerline arclength is under the
   threshold. Meta field: `min_component_length_yd`. Bake stats include
   `dropped_short`. Network-scale guard — isolated paint scraps die.
-- Meta also records `markers` (copy of `ROAD_TEXTURE_MARKERS`),
-  `overlay_only_markers` (copy of `OVERLAY_ONLY_MARKERS`), and
-  `minimap_route_zones` (copy of the zones actually run; empty under
-  `--no-minimap`).
-- `--no-minimap` skips `MINIMAP_ROUTE_ZONES`. Without it, a Kalimdor
-  bake with no Pillow exits 2 (`nix-shell -p python3Packages.pillow`).
+- Meta also records `markers` (copy of `ROAD_TEXTURE_MARKERS`) and
+  `overlay_only_markers` (copy of `OVERLAY_ONLY_MARKERS`).
 
-`MINIMAP_ROUTE_ZONES` (Kalimdor only today: zone `thousand_needles`)
-is a per-zone dict, not a CLI flag. Fields:
-
-- `bbox` — world box, **STEP-aligned** (lattice keys are global
-  integer indices).
-- `z_band` — search bound only; cells outside are dropped, not costed.
-- `max_grade_wall` (1.8) — hard skip. Mesa tops sit behind cliff-grade
-  rings, so they are unreachable from the floor.
-- `slope_penalty` (2.0) — extra cost on grade above 0.5:
-  `penalty * (grade - 0.5)`.
-- `contrast_c0` (25) / `contrast_k` (22) / `block_yd` (64) — contrast
-  term is `max(0, c0 - (G - 64yd-block-median-G)) / k`. `G` is the
-  minimap green channel.
-- `max_water_depth` (0.5) — hard skip, same meaning as the paint gate.
-- `legs` — `[name_a, (x, y), name_b, (x, y), options?]`. Each leg
-  emits one decimated `"source": "baked"` segment. No path (or a
-  1-point decimation) aborts with `minimap route FAILED`. Per-leg
-  options (round-6):
-  - `z_corridor: (lo, hi, penalty_per_yd)` — cost penalty (not a
-    wall) added while the cell's z is outside `[lo, hi]`. Floor legs
-    use `(-120, -20, 10.0)`: the Thousand Needles road never leaves
-    the canyon bottom, and +10/yd makes any rim detour unaffordable.
-  - `max_grade_wall` — per-leg override of the zone wall. Only the
-    basin→Tanaris ramp uses it (2.2; the measured ramp pinch is
-    1.78–1.79, right at the 1.8 zone wall). Cells between the zone
-    wall and a leg override never feed the block-median contrast
-    baseline, so one leg's wall cannot drift another leg's path.
-  - The bake hard-fails if a corridor leg spends >5% of its length
-    outside its corridor (per-leg stderr shows `pct_outside` and the
-    max contiguous run) or if any anchor snaps >20 yd — the two
-    failure modes that shipped round-5's rim-walking leg.
-
-Dijkstra is deterministic: heap keyed `(cost, cell)`. Shipped legs:
-`feralas_junction` → `lift_lower` → `freewind_base` → `canyon_se` →
-`basin_entry` → `racetrack_north` → `racetrack_mid` →
-`racetrack_south` → `tanaris_road`. The chain descends the measured
-low-grade scarp cut into the Shimmering Flats basin, crosses the
-salt past the racetrack (three waypoints keep the line off the drag
-strip), and climbs the southwest ramp to the painted Tanaris road.
+Thousand Needles and the Shimmering Flats are composed by the Nim visual
+ribbon detector (`src/tools/detect_road_ribbons.nim`) after the generic ADT
+paint bake. It reads the full-resolution minimap atlas, discovers the three
+terminals: the Feralas and Great Lift crossings from minimap evidence, plus a
+broad Gadgetzan destination region localized from canonical in-game town-guard
+spawns. It writes `minimap_ribbon`, `terrain_medial`, and separately labelled
+`visual_gap_bridge` segments. It has no interior route anchors. The detector
+requires a broad bilateral ribbon response across several widths, rejects
+mesa-top and terrain-discontinuity strata, recognizes the darker track polarity
+on pale salt, and follows maximum walkable-floor clearance where the painted
+ribbon loses contrast. It extracts one Feralas-to-Gadgetzan trunk before
+attaching the Great Lift as a short spur; it never computes a second route
+across the canyon. Any unsupported run over 24 yards hard-fails the bake.
+Diagnostics under `local_data/` show accepted evidence, the final red route,
+and an evaluation-only blue-reference overlay when the detector test runs.
 
 `ROAD_TEXTURE_MARKERS` (substring match, lowercased): `road`,
 `elwynncobblestone`, `duskwoodcobblestone`, `tanarisdirtfootprint`.
@@ -147,8 +120,8 @@ added as overlay-only; looked like the light-brown trail. (3) hl02
 removed (round-3's mistake): it paints mesa TOPS at alpha-255
 overlay (overlay-only semantics cannot save it; flat tops pass
 `--max-grade`) and its canyon-floor footprint is one ~180yd patch.
-The floor road has no texture signature; 1kN roads come from the
-minimap routing pass.
+The floor road has no ADT layer signature; its visible minimap ribbon is the
+authoritative signal.
 
 Dev subset (does not replace the checked-in artifact):
 
@@ -176,10 +149,9 @@ with a newline.
 - **Tanaris paint is thin.** The extra marker is `tanarisdirtfootprint`
   (a footprint tileset, not a `*road*` tileset); coverage is sparse.
   Overlay-only.
-- **Thousand Needles floor is routed, not painted.** `MINIMAP_ROUTE_ZONES`
-  legs are re-derived every bake as `"source": "baked"` segments.
-  Tune the zone config, do not hand-edit those lines — the next bake
-  replaces them. Hand lines still survive **byte-identical**.
+- **Thousand Needles uses visual detection.** The Nim ribbon detector replaces
+  every old zone segment; tune its generic visual/terrain gates, never add
+  interior route points. Hand lines remain unrelated legacy data.
 - **Isolated scraps under 150 yd never bake.** `--min-component-length`
   drops whole components below that arclength. Roads matter as a
   network — add a `"source": "hand"` line for anything genuinely
