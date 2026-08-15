@@ -652,9 +652,7 @@ def emit(entries: List[Tuple[str, Dict[str, object]]], header: List[str],
         lines.append("[%d] = %s," % (zone, lua_string(zone_names[zone])))
     lines.append("}")
     lines.append("")
-    lines.append("ShadowArmyQuestData = {")
-    for title, q in entries:
-        lines.append("[%s] = {" % lua_string(title))
+    def quest_body(q: Dict[str, object]) -> None:
         lines.append("id = %d, level = %d, minLevel = %d, zone = %d,"
                      % (q["id"], q["level"], q["minLevel"], q["zone"]))
         objectives = q["objectives"]
@@ -674,6 +672,18 @@ def emit(entries: List[Tuple[str, Dict[str, object]]], header: List[str],
                 lines.append("%s = { label = %s, zone = %d, x = %s, y = %s },"
                              % (key, lua_string(spot["label"]), spot["zone"],
                                 fmt(spot["x"]), fmt(spot["y"])))
+    lines.append("ShadowArmyQuestData = {")
+    for title, q in entries:
+        lines.append("[%s] = {" % lua_string(title))
+        quest_body(q)
+        alts = q.get("alts")
+        if alts:
+            lines.append("alts = {")
+            for alt in alts:
+                lines.append("{")
+                quest_body(alt)
+                lines.append("},")
+            lines.append("},")
         lines.append("},")
     lines.append("}")
     lines.append("")
@@ -716,7 +726,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     gen = Generator(db, areas, args.max_spots)
 
-    built: Dict[str, Tuple[Tuple[int, int, int], Dict[str, object]]] = {}
+    built: Dict[str, List[Tuple[Tuple[int, int, int], Dict[str, object]]]] = {}
     total = len(quests)
     kept_scope = 0
     usable = 0
@@ -732,17 +742,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             continue
         usable += 1
         title = q["Title"]
-        # 1.12's quest log gives titles, not ids: on a title collision keep the
-        # lower-level quest (the one a fresh character meets first).
+        # 1.12's quest log gives titles, not ids: on a title collision the
+        # lower-level quest (the one a fresh character meets first) is the
+        # primary entry and every other variant rides along in `alts`, so the
+        # addon can pick by live objective labels (chains like Fields of
+        # Grief reuse one title for consecutive quests at the same level).
         rank = (q["QuestLevel"] if q["QuestLevel"] > 0 else 999,
                 q["MinLevel"], q["entry"])
         if title in built:
             collisions += 1
-            if rank >= built[title][0]:
-                continue
-        built[title] = (rank, data)
+        built.setdefault(title, []).append((rank, data))
 
-    entries = sorted(((t, d) for t, (_, d) in built.items()), key=lambda kv: kv[0])
+    entries = []
+    for title, variants in built.items():
+        variants.sort(key=lambda rd: rd[0])
+        primary = variants[0][1]
+        if len(variants) > 1:
+            primary["alts"] = [d for _, d in variants[1:]]
+        entries.append((title, primary))
+    entries.sort(key=lambda kv: kv[0])
 
     scope = "whole game"
     if zone_filter or args.max_level:
@@ -758,7 +776,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "scope: %s" % scope,
         "quest_template rows %d, in scope %d, locatable %d, emitted %d"
         % (total, kept_scope, usable, len(entries)),
-        "title collisions resolved by keeping the lower-level quest: %d" % collisions,
+        "title collisions: %d (lower-level quest primary, other variants in alts)"
+        % collisions,
         "coords are zone-normalized percent (GetPlayerMapPosition * 100)",
         "regenerate: make quest-data   (see docs/quest-data.md)",
     ]

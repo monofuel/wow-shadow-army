@@ -140,4 +140,59 @@ check(#live == 2 and live[1].title == "The Hunt Begins",
   "collapsed header quests are included")
 check(not expanded and selected == 1, "collapsed state and selection are restored")
 
+-- Title collision chains: "Fields of Grief" is quest 365 (gather Tirisfal
+-- Pumpkins, turn in to Johaan) AND quest 407 (deliver the Laced Pumpkin to
+-- the Captured Scarlet Zealot). The generated entry carries 407 in alts;
+-- the live leaderboard labels must pick the right variant.
+local griefData = {
+  ["Fields of Grief"] = {
+    id = 365, level = 7, minLevel = 4, zone = 85,
+    objectives = {
+      { label = "Tirisfal Pumpkin", kind = "object", count = 10,
+        spots = { { zone = 85, x = 32, y = 47 } } },
+    },
+    turnIn = { label = "Apothecary Johaan", zone = 85, x = 59.4, y = 52.4 },
+    alts = {
+      {
+        id = 407, level = 7, minLevel = 4, zone = 85,
+        turnIn = { label = "Captured Scarlet Zealot", zone = 85, x = 61.6, y = 51.5 },
+      },
+    },
+  },
+}
+local griefZones = { [85] = "Tirisfal Glades" }
+
+check(model.resolve(griefData["Fields of Grief"],
+    { { text = "Tirisfal Pumpkin: 3/10" } }).id == 365,
+  "part-1 boards resolve to the primary variant")
+check(model.resolve(griefData["Fields of Grief"],
+    { { text = "Laced Pumpkin: 1/1" } }).id == 407,
+  "part-2 boards resolve to the alt variant")
+check(model.resolve(griefData["The Missing"], {}) == nil,
+  "resolve passes a missing entry through")
+check(model.resolve(griefData["Fields of Grief"], nil).id == 407,
+  "an empty log favors the variant with no tracked objectives")
+
+r = model.build({
+  quests = {
+    { title = "Fields of Grief", header = "Tirisfal Glades", complete = true,
+      objectives = { { text = "Laced Pumpkin: 1/1", have = 1, need = 1, done = true } } },
+  },
+  data = griefData, zoneNames = griefZones, currentZone = "Tirisfal Glades",
+  pos = { x = 60, y = 52 },
+})
+check(r.list[1].objs[1].text == "Turn in: Captured Scarlet Zealot",
+  "part-2 turn-in points at the Zealot, not part 1's Johaan")
+
+r = model.build({
+  quests = {
+    { title = "Fields of Grief", header = "Tirisfal Glades", complete = true,
+      objectives = { { text = "Tirisfal Pumpkin: 10/10", have = 10, need = 10, done = true } } },
+  },
+  data = griefData, zoneNames = griefZones, currentZone = "Tirisfal Glades",
+  pos = { x = 60, y = 52 },
+})
+check(r.list[1].objs[1].text == "Turn in: Apothecary Johaan",
+  "part-1 turn-in still points at Johaan")
+
 print("test_advisor_quest_model: " .. passed .. " checks passed")

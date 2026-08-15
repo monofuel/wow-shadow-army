@@ -163,6 +163,55 @@ function QuestModel.readLog(api)
   return live, sig
 end
 
+-- Vanilla reuses quest TITLES across chain steps ("Fields of Grief" is both
+-- the pumpkin gathering and the tavern delivery that follows it), and 1.12
+-- never exposes quest ids to addons — so the generated data carries every
+-- same-title variant (primary + alts) and the live leaderboard labels decide
+-- which variant a log entry actually is. A variant earns points for each of
+-- its objective labels found in the live board text and loses one for each
+-- label the log does not show; boards keep their labels after completion, so
+-- a ready-to-turn-in part 2 still resolves away from part 1's turn-in NPC.
+local function questVariantScore(v, boards, nb)
+  local objs = v.objectives or {}
+  local nObj = questGetn(objs)
+  local score = 0
+  local oi = 1
+  while oi <= nObj do
+    local label = objs[oi].label
+    local hit = false
+    if label then
+      local want = string.lower(label)
+      local bi = 1
+      while bi <= nb do
+        if string.find(string.lower(boards[bi].text or ""), want, 1, true) then
+          hit = true
+          break
+        end
+        bi = bi + 1
+      end
+    end
+    if hit then score = score + 2 else score = score - 1 end
+    oi = oi + 1
+  end
+  return score
+end
+
+function QuestModel.resolve(q, boards)
+  if not q or not q.alts then return q end
+  boards = boards or {}
+  local nb = questGetn(boards)
+  local best = q
+  local bestScore = questVariantScore(q, boards, nb)
+  local nAlts = questGetn(q.alts)
+  local ai = 1
+  while ai <= nAlts do
+    local score = questVariantScore(q.alts[ai], boards, nb)
+    if score > bestScore then best, bestScore = q.alts[ai], score end
+    ai = ai + 1
+  end
+  return best
+end
+
 function QuestModel.build(opts)
   opts = opts or {}
   local live = opts.quests or {}
@@ -189,7 +238,7 @@ function QuestModel.build(opts)
       logOrder = qi, r = color[1], g = color[2], b = color[3],
       minDist = 1e9, objs = {},
     }
-    local q = data[entry.title]
+    local q = QuestModel.resolve(data[entry.title], lq.objectives)
 
     if entry.complete then
       local obj = {
@@ -554,7 +603,7 @@ local F = {}
 
 -- Bump on every edit. The System watches Chat.log for "<SA> loaded rev=..."
 -- after sending a reload — a new rev proves the edit actually loaded.
-local REV = "r40"
+local REV = "r41"
 
 -- Log window (r16): every F.say()/F.emit() line also lands here with a
 -- timestamp, so errors survive chat scroll-off and can be reviewed in-game.

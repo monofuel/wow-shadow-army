@@ -5,6 +5,6 @@
 
 # Core UI first so a QuestData load failure cannot kill /sa / panel.
 ShadowArmy.lua
-# Optional pure-data file (~1.1MB). If it fails to load (size/parse), the
+# Optional pure-data file (~1.5MB). If it fails to load (size/parse), the
 # quest helper degrades; the advisor panel still works.
 QuestData.lua

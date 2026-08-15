@@ -387,6 +387,16 @@ persistent:
 persistent-headed:
 	@cd $(FORK_CLIENT) && $(PERSISTENT_LAUNCH) --presentation=headed
 
+# Regenerate addons/ShadowArmy/QuestData.lua from the world DB + WorldMapArea.dbc
+# (docs/quest-data.md). Read-only DB access; requires the realm up. Deterministic,
+# so a no-op rerun leaves the file byte-identical. Scope with:
+#   make quest-data QUEST_DATA_ARGS="--max-level 20"
+#   make quest-data QUEST_DATA_ARGS="--zones 85,130,12"
+QUEST_DATA_ARGS ?=
+quest-data:
+	@python3 tools/gen_quest_data.py \
+		--dbc-dir "$(VANILLA_WOW_EXTRACTED_DATA_DIR)/dbc" $(QUEST_DATA_ARGS)
+
 .PHONY: backup-server
 backup-server:
 	@tools/backup_server.sh $(LABEL)
