@@ -267,4 +267,134 @@ check(ft({"Extremely Long Mob Name Of Doom"}, 2, 12, "") == "Extremely L+",
 check(string.len(ft({"Cracked Skull Soldier", "Rattlecage Soldier", "C", "D", "E"}, 2, 24, "")) <= 24,
   "the panel hint never exceeds its character budget")
 
+--------------------------------------------------------------------------
+-- Identity filtering (ticket 0045). The audit found 336 alt groups where
+-- EVERY variant has zero objectives: the label score is a tie for all of
+-- them, so the primary always won and the turn-in marker pointed at the
+-- other faction's city half the time. The game gates those on race/class,
+-- so the player's own identity is the discriminator labels never had.
+--------------------------------------------------------------------------
+
+-- Mask arithmetic first: bit = 1 << (id - 1), docs/world-db-queries.md.
+check(model.maskBit(1) == 1 and model.maskBit(6) == 32 and model.maskBit(9) == 256,
+  "mask bit is 1 << (id - 1)")
+check(model.maskBit(nil) == nil and model.maskBit(0) == nil,
+  "no id is no bit")
+check(model.maskAllows(nil, 32) and model.maskAllows(0, 32),
+  "an absent or zero mask is 'anyone' — the generator omits 0 columns")
+check(model.maskAllows(-1, 32), "AllowableClass -1 is everyone")
+check(model.maskAllows(178, nil),
+  "an unknown player bit never excludes a variant")
+check(model.maskAllows(178, 32) and not model.maskAllows(178, 1),
+  "a Horde race mask admits Tauren and refuses Human")
+check(model.maskAllows(1024, 1024) and not model.maskAllows(1024, 512),
+  "the high class bits (druid 1024) test cleanly without bitwise ops")
+
+-- Tokens -> bits. UnitRace answers the localized name on this 1.12 build and
+-- the CamelCase token on later ones; both have to land on the same id.
+local ident = model.identity("Tauren", "WARLOCK")
+check(ident.race == 32 and ident.class == 256, "Tauren warlock maps to its bits")
+check(model.identity("Night Elf").race == 8 and model.identity("NightElf").race == 8,
+  "spaced and squashed race names agree")
+check(model.identity("Undead").race == 16 and model.identity("Scourge").race == 16,
+  "Undead and Scourge are the same race id")
+check(model.identity(nil, "Warlock").class == 256,
+  "the class token is matched case-insensitively")
+check(model.identity("Murloc", nil) == nil,
+  "nothing recognized means no identity, and resolve filters nothing")
+
+-- The faction-mirror shape: one title, two variants, NO objectives on either,
+-- different turn-in NPCs, opposing race masks. Alliance = human+dwarf+
+-- nightelf+gnome (1+4+8+64), Horde = orc+undead+tauren+troll (2+16+32+128).
+local mirror = {
+  id = 8, races = 77,
+  turnIn = { label = "Stormwind Quartermaster", zone = 1519, x = 60, y = 70 },
+  alts = {
+    { id = 9, races = 178,
+      turnIn = { label = "Orgrimmar Quartermaster", zone = 1637, x = 40, y = 30 } },
+  },
+}
+
+check(model.resolve(mirror, {}).id == 8,
+  "with no identity the mirror still falls back to the primary (old behavior)")
+check(model.resolve(mirror, {}, model.identity("Tauren")).id == 9,
+  "a Tauren resolves the faction mirror by identity alone, labels never used")
+check(model.resolve(mirror, {}, model.identity("Human")).id == 8,
+  "a Human resolves the same mirror to the Alliance variant")
+check(model.resolve(mirror, { { text = "anything at all" } },
+    model.identity("Troll", "WARLOCK")).id == 9,
+  "board text cannot outvote identity when only one variant survives")
+
+-- Class gating works the same way (warlock 256 vs mage 128).
+local classMirror = {
+  id = 20, classes = 256, turnIn = { label = "Demon Trainer" },
+  alts = { { id = 21, classes = 128, turnIn = { label = "Portal Trainer" } } },
+}
+check(model.resolve(classMirror, {}, model.identity("Human", "MAGE")).id == 21,
+  "a mage takes the mage variant of a class-gated pair")
+check(model.resolve(classMirror, {}, model.identity("Human", "WARLOCK")).id == 20,
+  "a warlock takes the warlock variant")
+
+-- Data that excludes everybody is a generator bug, not an answer: fall back
+-- to the label path rather than returning something arbitrary.
+check(model.resolve(classMirror, {}, model.identity("Human", "DRUID")).id == 20,
+  "masks that exclude every variant fall back to label scoring")
+
+-- Identity and labels compose: the filter narrows, the labels decide.
+local composed = {
+  id = 30, races = 77,
+  objectives = { { label = "Silverpine Cloth" } },
+  alts = {
+    { id = 31, races = 178, objectives = { { label = "Silverpine Cloth" } } },
+    { id = 32, races = 178, objectives = { { label = "Laced Pumpkin" } } },
+  },
+}
+check(model.resolve(composed, { { text = "Laced Pumpkin: 1/1" } },
+    model.identity("Orc")).id == 32,
+  "identity narrows to the Horde pair, labels pick which of the two")
+check(model.resolve(composed, { { text = "Silverpine Cloth: 2/6" } },
+    model.identity("Orc")).id == 31,
+  "the other board text picks the other Horde variant")
+check(model.resolve(composed, { { text = "Laced Pumpkin: 1/1" } },
+    model.identity("Gnome")).id == 30,
+  "an Alliance player never reaches the Horde variants the labels prefer")
+
+-- Maskless data must behave EXACTLY as it did before identity existed.
+local taurenIdent = model.identity("Tauren", "WARLOCK")
+check(model.resolve(griefData["Fields of Grief"],
+    { { text = "Tirisfal Pumpkin: 3/10" } }, taurenIdent).id == 365,
+  "maskless variants ignore identity: part-1 boards still resolve to 365")
+check(model.resolve(griefData["Fields of Grief"],
+    { { text = "Laced Pumpkin: 1/1" } }, taurenIdent).id == 407,
+  "maskless variants ignore identity: part-2 boards still resolve to 407")
+check(model.resolve(griefData["Fields of Grief"], nil, taurenIdent).id == 407,
+  "maskless variants ignore identity: an empty log scores the same as ever")
+check(model.resolve(griefData["The Missing"], {}, taurenIdent) == nil,
+  "a missing entry still passes through with an identity in hand")
+
+-- End to end through build(): the turn-in marker follows identity.
+r = model.build({
+  quests = {
+    { title = "Quartermaster's Due", header = "Orgrimmar", complete = true,
+      objectives = {} },
+  },
+  data = { ["Quartermaster's Due"] = mirror },
+  zoneNames = { [1637] = "Orgrimmar" }, currentZone = "Orgrimmar",
+  identity = model.identity("Tauren", "WARRIOR"),
+})
+check(r.list[1].objs[1].text == "Turn in: Orgrimmar Quartermaster",
+  "build() sends a Tauren to the Horde turn-in of a faction mirror")
+
+r = model.build({
+  quests = {
+    { title = "Quartermaster's Due", header = "Stormwind City", complete = true,
+      objectives = {} },
+  },
+  data = { ["Quartermaster's Due"] = mirror },
+  zoneNames = { [1519] = "Stormwind City" }, currentZone = "Stormwind City",
+  identity = model.identity("Gnome", "MAGE"),
+})
+check(r.list[1].objs[1].text == "Turn in: Stormwind Quartermaster",
+  "and a Gnome to the Alliance one")
+
 print("test_advisor_quest_model: " .. passed .. " checks passed")

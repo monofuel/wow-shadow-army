@@ -38,6 +38,20 @@ filter is ambiguous.
   `1 << (classId - 1)`: warrior 1, paladin 2, hunter 4, rogue 8,
   priest 16, shaman 64, mage 128, warlock 256, druid 1024.
   `AllowableClass = -1` means everyone.
+- **Race masks:** `RequiredRaces` / `AllowableRace` are bitmasks of
+  `1 << (raceId - 1)`: human 1, orc 2, dwarf 4, night elf 8, undead 16,
+  tauren 32, gnome 64, troll 128. The two combinations worth recognising on
+  sight are **77 = Alliance** (1+4+8+64) and **178 = Horde** (2+16+32+128);
+  255 is everyone spelled out. `UnitRace()`/`UnitClass()` in the addon give a
+  localized *name*, not an id, so a consumer needs its own name→bit table.
+- **`0` means "no gate", not "nobody".** `RequiredRaces = 0` /
+  `RequiredClasses = 0` is the DB's "anyone may take this", and it is the
+  common case (3408 of 4727 quest rows have both zero). Treating 0 as a mask
+  and `AND`-ing it fails every quest in the game. Note also that a quest with
+  no race gate can still be faction-gated in practice: the eight capital-city
+  cloth donations are `0/0` and separated only by reputation with the city,
+  which is why identity masks cannot tell them apart
+  (`docs/quest-data.md`, title collisions).
 - **Item class/subclass:** weapons class 2 (sub: 10 staff, 15 dagger,
   19 wand), armor class 4 (sub 0 misc, 1 cloth), quest items class 12.
   `inventory_type` is the equip slot family.

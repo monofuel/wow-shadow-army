@@ -196,18 +196,129 @@ local function questVariantScore(v, boards, nb)
   return score
 end
 
-function QuestModel.resolve(q, boards)
+-- Identity gating (ticket 0045). Labels cannot separate the big alt groups:
+-- L60 faction/city mirrors (donation quests x8 cities, commendation signets,
+-- Deliana/Mokvar pairs) share a title AND an empty objective set, so the
+-- label score is a tie and the primary wins by default — which is how a
+-- turn-in marker ends up pointing at the other faction's city. The game
+-- itself gates those on race/class, so the player's own identity is the
+-- discriminator the labels never had.
+--
+-- The generator emits per-variant `races` / `classes` bitmasks from
+-- quest_template RequiredRaces / RequiredClasses (bit = 1 << (id - 1),
+-- documented in docs/world-db-queries.md) and OMITS the field when the
+-- column is 0 = "anyone". So an absent mask is not "no data", it is "no
+-- gate": a maskless variant always survives the filter.
+--
+-- Lua 5.0 has no bitwise operators and no `%` operator, and 5.3 dropped
+-- math.mod, so every mask test below is plain float arithmetic both hosts
+-- agree on.
+QuestModel.CLASS_ID = {
+  WARRIOR = 1, PALADIN = 2, HUNTER = 3, ROGUE = 4, PRIEST = 5,
+  SHAMAN = 7, MAGE = 8, WARLOCK = 9, DRUID = 11,
+}
+
+-- 1.12 UnitRace gives the localized name on this build; the CamelCase token
+-- (2.0+) is accepted too so the same table serves both. "Undead" and
+-- "Scourge" are the same race id.
+QuestModel.RACE_ID = {
+  Human = 1, Orc = 2, Dwarf = 3, NightElf = 4, Scourge = 5,
+  Tauren = 6, Gnome = 7, Troll = 8, Undead = 5,
+}
+
+-- These three hang off QuestModel rather than being file locals on purpose:
+-- the main chunk's register peak is the scarce resource in this file (see the
+-- 200-locals note further down), and none of them is on a per-frame path.
+function QuestModel.maskBit(id)
+  if not id or id < 1 then return nil end
+  local bit, i = 1, 1
+  while i < id do
+    bit = bit * 2
+    i = i + 1
+  end
+  return bit
+end
+
+-- Does this gate let the player through? An absent / 0 / -1 mask is
+-- "anyone"; an UNKNOWN player bit also passes, because a filter that cannot
+-- see the player must not throw variants away.
+function QuestModel.maskAllows(mask, bit)
+  if not mask or mask <= 0 then return true end
+  if not bit then return true end
+  local shifted = math.floor(mask / bit)
+  return math.floor(shifted / 2) * 2 ~= shifted
+end
+
+function QuestModel.variantAllowed(v, ident)
+  if not v then return false end
+  if not ident then return true end
+  return QuestModel.maskAllows(v.races, ident.race)
+    and QuestModel.maskAllows(v.classes, ident.class)
+end
+
+-- Tokens in, mask bits out. UnitRace/UnitClass are read in the UI half and
+-- the result is passed into the model, so resolve stays pure and lua/tests
+-- can drive any identity it likes. nil when neither token is recognized —
+-- which makes resolve behave exactly as it did before identity existed.
+function QuestModel.identity(raceToken, classToken)
+  local rid, cid = nil, nil
+  if raceToken then
+    rid = QuestModel.RACE_ID[raceToken]
+    if not rid then
+      local squashed = string.gsub(raceToken, " ", "")
+      rid = QuestModel.RACE_ID[squashed]
+    end
+  end
+  if classToken then
+    cid = QuestModel.CLASS_ID[string.upper(classToken)]
+  end
+  if not rid and not cid then return nil end
+  return { race = QuestModel.maskBit(rid), class = QuestModel.maskBit(cid) }
+end
+
+-- identity = { race = <player race bit>, class = <player class bit> } or nil.
+-- Order: identity filter -> lone survivor wins outright -> label score over
+-- the survivors -> tie keeps the primary (the survivor list preserves
+-- primary-first order and only a STRICTLY better score displaces it).
+function QuestModel.resolve(q, boards, identity)
   if not q or not q.alts then return q end
   boards = boards or {}
   local nb = questGetn(boards)
-  local best = q
-  local bestScore = questVariantScore(q, boards, nb)
+  local variants, n = { q }, 1
   local nAlts = questGetn(q.alts)
   local ai = 1
   while ai <= nAlts do
-    local score = questVariantScore(q.alts[ai], boards, nb)
-    if score > bestScore then best, bestScore = q.alts[ai], score end
+    n = n + 1
+    variants[n] = q.alts[ai]
     ai = ai + 1
+  end
+
+  if identity then
+    local kept, nk = {}, 0
+    local i = 1
+    while i <= n do
+      if QuestModel.variantAllowed(variants[i], identity) then
+        nk = nk + 1
+        kept[nk] = variants[i]
+      end
+      i = i + 1
+    end
+    -- Masks that exclude EVERY variant mean the data is wrong about this
+    -- player, not that the quest is unanswerable: keep the unfiltered list
+    -- and let the labels decide, same as before identity existed.
+    if nk > 0 then
+      variants, n = kept, nk
+      if n == 1 then return variants[1] end
+    end
+  end
+
+  local best = variants[1]
+  local bestScore = questVariantScore(best, boards, nb)
+  local vi = 2
+  while vi <= n do
+    local score = questVariantScore(variants[vi], boards, nb)
+    if score > bestScore then best, bestScore = variants[vi], score end
+    vi = vi + 1
   end
   return best
 end
@@ -222,6 +333,8 @@ function QuestModel.build(opts)
   local yardsX = opts.yardsX or 3500
   local yardsY = opts.yardsY or 2333
   local palette = opts.colors or QuestModel.colors
+  -- { race = bit, class = bit } from QuestModel.identity; nil = no filtering.
+  local identity = opts.identity
   local nColors = questGetn(palette)
   local list, candidates = {}, {}
   local seq = 0
@@ -238,7 +351,7 @@ function QuestModel.build(opts)
       logOrder = qi, r = color[1], g = color[2], b = color[3],
       minDist = 1e9, objs = {},
     }
-    local q = QuestModel.resolve(data[entry.title], lq.objectives)
+    local q = QuestModel.resolve(data[entry.title], lq.objectives, identity)
 
     if entry.complete then
       local obj = {
@@ -1142,8 +1255,20 @@ ShadowArmy.combatModel = CombatModel
 --------------------------------------------------------------------------
 -- Pure passive-upkeep model (r42): given the watched self-buffs, the pet
 -- state and the class, decide which one-click buttons the panel shows and
--- which lines stay plain text. Buttons are for upkeep the human still owns;
--- anything the advisor already auto-casts stays a note.
+-- which lines stay plain text.
+--
+-- r49 (ticket 0058, monofuel live report): the original rule was "anything
+-- the advisor auto-casts stays a note, never a button" — which produced
+-- "armor: auto (Demon Skin)" in green next to a buff that was MISSING, with
+-- no way to fix it by hand. AUTOCAST ARMED IS NOT AUTOCAST FIRED: the armor
+-- watch has verify windows, GCD/cast-failure gates and a texture capture
+-- that can still be in progress (docs/vanilla-addons/client-quirks.md:
+-- buff textures must be captured, never guessed), so `auto` says a machine
+-- is trying, not that the buff is up. A missing/expiring TRAINED buff now
+-- always yields the button; the auto state degrades to secondary info (the
+-- same green note as before, plus a tooltip line on the button itself).
+-- Double-casting is already impossible — F.passiveClick returns early while
+-- auto.casting is set — so no new guard belongs here.
 --------------------------------------------------------------------------
 
 local PassiveModel = {}
@@ -1167,18 +1292,34 @@ function PassiveModel.evaluate(snapshot)
   while i <= passiveGetn(buffs) do
     local buff = buffs[i]
     if buff.missing or buff.expiring then
-      if buff.auto then
+      if buff.spell and not snapshot.dead then
+        -- The button comes FIRST now, autocast or not (ticket 0058).
+        nb = nb + 1
+        result.buttons[nb] = {
+          id = "buff:" .. (buff.id or buff.label),
+          label = buff.spell, spell = buff.spell, selfCast = true,
+          auto = buff.auto and true or false,
+        }
+        if buff.auto then
+          -- Secondary, and deliberately still tone "ok": the panel nags in
+          -- chat for every note that is NOT ok, and nagging about something
+          -- the human can now fix with one click is the regression this
+          -- ticket is the other half of.
+          nn = nn + 1
+          result.notes[nn] = {
+            tone = "ok",
+            text = string.format("%s: auto (%s)",
+              buff.autoLabel or buff.label, buff.spell),
+          }
+        end
+      elseif buff.auto then
+        -- No castable rank (or dead): there is no button to offer, so the
+        -- auto note is all there is — unchanged from r42.
         nn = nn + 1
         result.notes[nn] = {
           tone = "ok",
           text = string.format("%s: auto (%s)",
             buff.autoLabel or buff.label, buff.spell or "untrained"),
-        }
-      elseif buff.spell and not snapshot.dead then
-        nb = nb + 1
-        result.buttons[nb] = {
-          id = "buff:" .. (buff.id or buff.label),
-          label = buff.spell, spell = buff.spell, selfCast = true,
         }
       elseif buff.missing then
         nn = nn + 1
@@ -1600,6 +1741,180 @@ end
 
 ShadowArmy.bagModel = BagModel
 
+--------------------------------------------------------------------------
+-- Pure inventory-over-chat encoder (r49, ticket 0052). The realm DB only
+-- learns about bags on its save interval — the staleness that killed the old
+-- breadcrumbs poller — but the addon already owns a live outbound channel:
+-- F.emit -> SendChatMessage(SAY) -> Chat.log -> The System's tail. So the
+-- bags go out as plain ASCII over that same bus. No base64: a human reading
+-- Chat.log has to be able to see what happened.
+--
+-- WIRE FORMAT (the System side parses exactly this):
+--   <SA> inv  <seq>/<total> <id>:<count>,<id>:<count>,...   full snapshot
+--   <SA> invd <seq>/<total> +<id>:<count>,-<id>,...          delta
+-- `inv` REPLACES the known inventory once all <total> lines of a set are in
+-- hand; a set with a missing line is incomplete and must not be applied
+-- (these lines are DROPPABLE — see F.emit — so under queue pressure they are
+-- exactly what gets thrown away, and never an err/loaded line).
+-- `invd` PATCHES it: `+id:count` sets that id's new TOTAL count (not a
+-- difference — an absolute set is idempotent and self-heals a lost line),
+-- `-id` removes the id entirely. Counts are summed across bags 0-4, so one
+-- id appears once per line-set however many stacks it occupies.
+--
+-- Pure: no WoW API, no frames, no globals — lua/tests drives it on host Lua,
+-- and the bots inherit the same encoder for free.
+--------------------------------------------------------------------------
+
+local InvModel = {}
+
+-- 1.12 chat accepts 255; 240 leaves room for the server's own decoration in
+-- Chat.log and for a "99/99" header on a very full set.
+InvModel.LINE_MAX = 240
+InvModel.KIND_FULL = "inv"
+InvModel.KIND_DELTA = "invd"
+InvModel.HEADER_MAX = 6        -- "99/99 " — the widest header we can produce
+
+-- The exact string F.emit puts on the wire, so tests measure the real thing.
+function InvModel.chatLine(kind, text)
+  return "<SA> " .. kind .. " " .. text
+end
+
+-- How many payload chars a single line of `kind` may carry.
+function InvModel.budget(kind, lineMax)
+  lineMax = lineMax or InvModel.LINE_MAX
+  return lineMax - string.len(InvModel.chatLine(kind, "")) - InvModel.HEADER_MAX
+end
+
+-- rows = { { id = <item id>, count = <stack size> }, ... }, one per occupied
+-- bag slot -> { [id] = total count }. A row with no id (a link we could not
+-- parse) is dropped rather than reported as item nil.
+function InvModel.aggregate(rows)
+  local out = {}
+  local i = 1
+  while rows and rows[i] ~= nil do
+    local r = rows[i]
+    if r.id then
+      out[r.id] = (out[r.id] or 0) + (r.count or 1)
+    end
+    i = i + 1
+  end
+  return out
+end
+
+-- Ids ascending keeps every line deterministic, which is what makes the 30s
+-- identical-message dedupe in F.emit a feature (an unchanged bag re-encodes
+-- to the same bytes) instead of a coin flip.
+-- (On InvModel, not a file local: main-chunk registers are the scarce
+-- resource here — same reason as QuestModel's mask helpers above.)
+function InvModel.sortedIds(a, b)
+  local ids, n = {}, 0
+  for id in pairs(a or {}) do
+    n = n + 1
+    ids[n] = id
+  end
+  if b then
+    for id in pairs(b) do
+      if (a or {})[id] == nil then
+        n = n + 1
+        ids[n] = id
+      end
+    end
+  end
+  if n > 1 then table.sort(ids) end
+  return ids, n
+end
+
+function InvModel.snapshotTokens(state)
+  local ids, n = InvModel.sortedIds(state)
+  local tokens = {}
+  local i = 1
+  while i <= n do
+    tokens[i] = ids[i] .. ":" .. state[ids[i]]
+    i = i + 1
+  end
+  return tokens, n
+end
+
+-- prev/cur are aggregate maps. Unchanged ids produce nothing at all, so an
+-- idle player costs zero chat lines.
+function InvModel.deltaTokens(prev, cur)
+  prev = prev or {}
+  cur = cur or {}
+  local ids, n = InvModel.sortedIds(cur, prev)
+  local tokens, nt = {}, 0
+  local i = 1
+  while i <= n do
+    local id = ids[i]
+    local now, was = cur[id], prev[id]
+    if now == nil then
+      nt = nt + 1
+      tokens[nt] = "-" .. id
+    elseif now ~= was then
+      nt = nt + 1
+      tokens[nt] = "+" .. id .. ":" .. now
+    end
+    i = i + 1
+  end
+  return tokens, nt
+end
+
+-- Greedy pack: tokens joined with "," until the next one would overflow.
+function InvModel.pack(tokens, n, budget)
+  local parts, np, cur = {}, 0, nil
+  local i = 1
+  while i <= n do
+    local t = tokens[i]
+    if cur == nil then
+      cur = t
+    elseif string.len(cur) + 1 + string.len(t) <= budget then
+      cur = cur .. "," .. t
+    else
+      np = np + 1
+      parts[np] = cur
+      cur = t
+    end
+    i = i + 1
+  end
+  if cur ~= nil then
+    np = np + 1
+    parts[np] = cur
+  end
+  return parts, np
+end
+
+-- tokens -> the `text` arguments for F.emit(kind, text), numbered. The header
+-- is sized for the WORST case (HEADER_MAX) before the packing runs, so the
+-- count of lines can never invalidate the budget the packing used.
+function InvModel.lines(kind, tokens, n, lineMax)
+  local parts, np = InvModel.pack(tokens, n, InvModel.budget(kind, lineMax))
+  if np == 0 then
+    -- Empty bags are a fact, not a non-event: "1/1" with no payload tells
+    -- The System the inventory is empty instead of leaving stale items up.
+    return { "1/1" }, 1
+  end
+  local out = {}
+  local i = 1
+  while i <= np do
+    out[i] = string.format("%d/%d ", i, np) .. parts[i]
+    i = i + 1
+  end
+  return out, np
+end
+
+function InvModel.snapshotLines(state, lineMax)
+  local tokens, n = InvModel.snapshotTokens(state)
+  return InvModel.lines(InvModel.KIND_FULL, tokens, n, lineMax)
+end
+
+-- Nothing changed -> no lines at all (n == 0), NOT an empty-set line.
+function InvModel.deltaLines(prev, cur, lineMax)
+  local tokens, n = InvModel.deltaTokens(prev, cur)
+  if n == 0 then return {}, 0 end
+  return InvModel.lines(InvModel.KIND_DELTA, tokens, n, lineMax)
+end
+
+ShadowArmy.invModel = InvModel
+
 -- Unit tests load this file without the WoW UI and stop after the pure model.
 if not CreateFrame then return end
 
@@ -1608,7 +1923,7 @@ local F = {}
 
 -- Bump on every edit. The System watches Chat.log for "<SA> loaded rev=..."
 -- after sending a reload — a new rev proves the edit actually loaded.
-local REV = "r48"
+local REV = "r49"
 
 -- Log window (r16): every F.say()/F.emit() line also lands here with a
 -- timestamp, so errors survive chat scroll-off and can be reviewed in-game.
@@ -1632,7 +1947,10 @@ end
 -- actually reads (loaded / reloading / reload-click / err / pong / status).
 local EMIT_GAP = 2.0        -- seconds between ANY two sends
 local EMIT_QUEUE_MAX = 5
-local DROPPABLE = { trace = true }
+-- r49: inventory lines (ticket 0052) join traces as droppable chatter. A
+-- snapshot is re-sent every 5 minutes anyway, so losing one to queue pressure
+-- costs nothing — crowding out an `err` would cost a debugging session.
+local DROPPABLE = { trace = true, inv = true, invd = true }
 
 local emitQueue = {}        -- FIFO of { msg = string, drop = bool }
 local lastSendAt = 0
@@ -1847,6 +2165,12 @@ while _pbi <= PASSIVE_MAX_BUTTONS do
     GameTooltip:SetOwner(this, "ANCHOR_LEFT")
     GameTooltip:SetText(this.passiveLabel or this.passiveSpell)
     if this.passiveRank then GameTooltip:AddLine(this.passiveRank, 0.8, 0.8, 0.8) end
+    -- r49 (ticket 0058): the button shows even when the advisor is already
+    -- trying to cast this itself, so the tooltip says why there are two
+    -- things working on the same buff.
+    if this.passiveAuto then
+      GameTooltip:AddLine("autocast armed - click to force", 0.55, 0.75, 1.0)
+    end
     GameTooltip:Show()
   end)
   b:SetScript("OnLeave", function() GameTooltip:Hide() end)
@@ -2988,10 +3312,12 @@ function F.passiveLine()
       btn.passiveSelf = want.selfCast and 1 or nil
       btn.passiveLabel = want.label
       btn.passiveRank = book and book.rank or nil
+      btn.passiveAuto = want.auto and true or nil
       btn.icon:SetTexture((book and book.texture) or PASSIVE_ICON_FALLBACK)
       btn:Show()
     else
       btn.passiveSpell = nil
+      btn.passiveAuto = nil
       btn:Hide()
     end
     i = i + 1
@@ -4695,6 +5021,112 @@ do
 end
 
 --------------------------------------------------------------------------
+-- Inventory over the chat bus (r49, ticket 0052). Fully automatic: no
+-- button, no slash command, nothing for monofuel to remember. The System
+-- gets Murist's bags within ~10s of a loot event and joins the ids against
+-- the world DB on its side (names/prices are ITS job, not ours — sending
+-- names would blow the 240-char line budget for no gain).
+--
+-- Encoding lives in InvModel (pure, host-tested). This half is only: walk
+-- the bags, hand the model an aggregate, hand the model's lines to F.emit.
+--
+-- Cadence: full snapshot 5s after PLAYER_ENTERING_WORLD (bags read empty at
+-- the instant the event fires) and every 5 minutes after; deltas 5s after
+-- the last BAG_UPDATE, since looting fires that event in bursts.
+--------------------------------------------------------------------------
+do
+  local inv = {
+    fullEvery = 300,   -- seconds between unprompted full snapshots
+    debounce = 5,      -- quiet seconds after the last BAG_UPDATE
+    settle = 5,        -- grace after a loading screen before the first read
+    armed = false,     -- nothing goes out before PLAYER_ENTERING_WORLD
+    nextFull = 0,
+    dirtyAt = 0,       -- 0 = no pending delta
+    state = nil,       -- last aggregate we told The System about
+  }
+
+  -- bags 0-4 -> { [id] = total count }. Same link/id parse the bag window
+  -- uses (F.bagTagLinkId); 1.12 GetContainerItemInfo answers
+  -- texture, count, locked, quality, readable.
+  function F.invScan()
+    local rows, n = {}, 0
+    local bag = 0
+    while bag <= 4 do
+      local slots = GetContainerNumSlots(bag)
+      if slots and slots > 0 then
+        local slot = 1
+        while slot <= slots do
+          local link = GetContainerItemLink(bag, slot)
+          if link then
+            local _, count = GetContainerItemInfo(bag, slot)
+            n = n + 1
+            rows[n] = { id = F.bagTagLinkId(link), count = count or 1 }
+          end
+          slot = slot + 1
+        end
+      end
+      bag = bag + 1
+    end
+    return InvModel.aggregate(rows)
+  end
+
+  function F.invSend(kind, lines, n)
+    local i = 1
+    while i <= n do
+      F.emit(kind, lines[i])
+      i = i + 1
+    end
+  end
+
+  function F.invSendFull()
+    local state = F.invScan()
+    local lines, n = InvModel.snapshotLines(state)
+    inv.state = state
+    inv.nextFull = GetTime() + inv.fullEvery
+    inv.dirtyAt = 0
+    F.invSend(InvModel.KIND_FULL, lines, n)
+  end
+
+  function F.invSendDelta()
+    local state = F.invScan()
+    local lines, n = InvModel.deltaLines(inv.state, state)
+    inv.state = state
+    inv.dirtyAt = 0
+    if n > 0 then F.invSend(InvModel.KIND_DELTA, lines, n) end
+  end
+
+  -- Driven from the driver's OnUpdate; both paths are time-gated, so this is
+  -- a pair of number compares on the frames where nothing is due.
+  function F.invTick()
+    if not inv.armed then return end
+    local now = GetTime()
+    if now >= inv.nextFull then
+      F.invSendFull()
+      return
+    end
+    if inv.dirtyAt > 0 and now >= inv.dirtyAt then
+      F.invSendDelta()
+    end
+  end
+
+  local invEvents = CreateFrame("Frame", "ShadowArmyInvEvents", UIParent)
+  invEvents:RegisterEvent("BAG_UPDATE")
+  invEvents:RegisterEvent("PLAYER_ENTERING_WORLD")
+  invEvents:SetScript("OnEvent", function()
+    if event == "PLAYER_ENTERING_WORLD" then
+      -- A loading screen can also mean "the client dropped item data": the
+      -- next line-set is a FULL snapshot, never a delta against a stale map.
+      inv.armed = true
+      inv.state = nil
+      inv.nextFull = GetTime() + inv.settle
+      inv.dirtyAt = 0
+    else
+      inv.dirtyAt = GetTime() + inv.debounce
+    end
+  end)
+end
+
+--------------------------------------------------------------------------
 -- QUEST HELPER (r18, r32 checklist): "where do I go next" — quest-identity
 -- checklist in the advisor panel, color-matched dots on minimap + world map.
 -- Everything here is driven by QuestData.lua (global ShadowArmyQuestData,
@@ -4765,6 +5197,7 @@ local quest = {
   status = nil,         -- idle/error reason string when list is empty
   zoneName = "",
   px = 0, py = 0, posOK = false,
+  identity = nil,       -- lazily filled by F.questIdentity (false = no match)
 }
 
 local questBtn -- created below; opens the complete quest checklist window
@@ -5322,6 +5755,21 @@ function F.questReadLiveLog()
   })
 end
 
+-- Race/class of the seat, as mask bits for the variant filter (ticket 0045).
+-- Cached on the quest table: identity cannot change inside a session, and
+-- questScan runs on the driver. Cached as `false` when the tokens are
+-- unrecognized so a miss is not re-probed every tick.
+function F.questIdentity()
+  if quest.identity == nil then
+    local model = ShadowArmy and ShadowArmy.questModel
+    local race = UnitRace and UnitRace("player") or nil
+    local _, classToken = UnitClass("player")
+    quest.identity = (model and model.identity(race, classToken)) or false
+  end
+  if quest.identity == false then return nil end
+  return quest.identity
+end
+
 -- r33 scanner: accepted quests and their live objectives always make the
 -- checklist. Optional QuestData only contributes trusted, current-zone
 -- waypoints to that model.
@@ -5351,6 +5799,7 @@ function F.questScan()
     pos = pos,
     yardsX = QUEST_ZONE_YARDS_X,
     yardsY = QUEST_ZONE_YARDS_Y,
+    identity = F.questIdentity(),
   })
 
   local cand = {}
@@ -6453,6 +6902,9 @@ driver:SetScript("OnUpdate", function()
   -- r47: bag disposition list, 1s debounce, only while the window is open.
   local btok, bterr = pcall(F.bagTagTick)
   if not btok then F.emit("err", "bagTagTick: " .. tostring(bterr)) end
+  -- r49: inventory snapshot/delta out to The System (ticket 0052).
+  local ivok, iverr = pcall(F.invTick)
+  if not ivok then F.emit("err", "invTick: " .. tostring(iverr)) end
   -- r33: the quest checklist is always live; markers have their own toggle.
   local qok, qerr = pcall(F.questTick)
   if not qok then F.emit("err", "questTick: " .. tostring(qerr)) end
@@ -6674,6 +7126,13 @@ frame:SetScript("OnEvent", function()
       F.emit("status", string.format("lvl=%d hp=%d/%d zone=%s xph=%d",
         UnitLevel("player"), UnitHealth("player"), UnitHealthMax("player"),
         GetZoneText(), xph))
+    elseif verb == "inv" or verb == "inv?" then
+      -- ticket 0052: The System wants a fresh full snapshot right now (a
+      -- dashboard tab just opened, or it decided its copy is stale). Both
+      -- spellings accepted — the ticket writes `<SYS> inv?` and the verb
+      -- parse keeps the "?" attached.
+      local iok, ierr = pcall(F.invSendFull)
+      if not iok then F.emit("err", "inv: " .. tostring(ierr)) end
     elseif verb == "say" then
       F.say(rest)
     elseif verb == "admin" then

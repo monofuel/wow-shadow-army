@@ -7,6 +7,7 @@ import std/[json, options, os, sequtils, sets, strutils]
 import ../../src/conductor/cfg
 import ../../src/conductor/evalgate
 import ../../src/conductor/ledger
+import ../../src/conductor/masterhealth
 import ../../src/conductor/shiplib
 
 var passed = 0
@@ -204,6 +205,72 @@ check(bumpVersionTag("petrel:v99", "petrel") == "petrel:v100",
   "multi-digit bump")
 check(bumpVersionTag("", "petrel") == "", "empty label underivable")
 check(bumpVersionTag("ibis:v4", "petrel") == "", "foreign policy refused")
+
+# --- static-test leg: the gate runs the FULL unit tier (ticket 0044) ---
+# `make test-lua` left the Nim tier and the Python road tests outside the
+# gate; 3def984 broke exactly those and rode to master. Pin the command so
+# a narrowing regression is a red test, not another red master.
+check(staticTestArgs() == @["test"], "gate static leg is `make test`")
+check(staticTestCmd() == "make test", "static command string")
+check(staticTestArgs() != @["test-lua"], "static leg is not lua-only")
+check(StaticTestTimeoutMs >= 600_000, "static leg keeps a >=10min timeout")
+
+# --- master-health state file (the dashboard light reads this) ---
+let mhRepo = tmp / "mh-repo"
+createDir(mhRepo)
+check(masterHealthPath(mhRepo) == mhRepo / ".conductor" / "master-health.json",
+  "health file sits with the other .conductor runtime state")
+
+# never checked -> unknown, and unknown always wants a check
+var health = loadMasterHealth(mhRepo)
+check(health.status == mhUnknown, "missing file reads as unknown")
+check(health.sha == "" and health.checkedAt == "", "unknown carries no verdict")
+check(needsCheck(health, "abc123def"), "unknown sha needs a check")
+check(not needsCheck(health, ""), "no sha -> nothing to check")
+
+# roundtrip: every field the dashboard needs survives save/load
+saveMasterHealth(mhRepo, MasterHealth(branch: "master", sha: "abc123def",
+  status: mhGreen, checkedAt: "2026-08-15T06:41:12Z", durationS: 31.4,
+  command: staticTestCmd(), detail: ""))
+health = loadMasterHealth(mhRepo)
+check(health.branch == "master", "branch roundtrips")
+check(health.sha == "abc123def", "sha roundtrips")
+check(health.status == mhGreen, "status roundtrips")
+check(health.checkedAt == "2026-08-15T06:41:12Z", "timestamp roundtrips")
+check(abs(health.durationS - 31.4) < 0.001, "duration roundtrips")
+check(health.command == "make test", "command recorded for the tooltip")
+
+# a green verdict pins to its sha: same sha skips, a new sha rechecks
+check(not needsCheck(health, "abc123def"), "same sha reuses the verdict")
+check(needsCheck(health, "fff999aaa"), "moved HEAD triggers a recheck")
+
+# red carries the failure tail; an error verdict is never trusted
+saveMasterHealth(mhRepo, MasterHealth(branch: "master", sha: "bad00bad0",
+  status: mhRed, checkedAt: "2026-08-15T07:00:00Z", durationS: 12.0,
+  command: staticTestCmd(), detail: "rc=2: test_conductor_gate FAILED"))
+health = loadMasterHealth(mhRepo)
+check(health.status == mhRed, "red roundtrips")
+check(health.detail.contains("FAILED"), "red keeps the failure tail")
+check(not needsCheck(health, "bad00bad0"), "a red verdict also pins to its sha")
+check(needsCheck(MasterHealth(status: mhError, sha: "abc123def"), "abc123def"),
+  "error verdict is retried even at the same sha")
+
+# on-disk shape: exactly the keys the dashboard reads, status as a string
+let mhRaw = parseJson(readFile(masterHealthPath(mhRepo)))
+for key in ["branch", "sha", "status", "checkedAt", "durationS", "command",
+    "detail"]:
+  check(mhRaw.hasKey(key), "state file has " & key)
+check(mhRaw.len == 7, "state file has no extra keys")
+check(mhRaw["status"].kind == JString and mhRaw["status"].getStr() == "red",
+  "status serializes as a string")
+check(masterHealthJson(health)["status"].getStr() == "red",
+  "dashboard json mirrors the file")
+
+# corrupt file must not wedge the watchdog — it re-checks instead
+writeFile(masterHealthPath(mhRepo), "{\"status\": ")
+health = loadMasterHealth(mhRepo)
+check(health.status == mhUnknown, "corrupt state file reads as unknown")
+check(needsCheck(health, "abc123def"), "corrupt state file forces a check")
 
 removeDir(tmp)
 echo "test_conductor_gate: ", passed, " ok"

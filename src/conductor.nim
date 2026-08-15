@@ -15,6 +15,7 @@ import
   conductor/cfg,
   conductor/evalgate,
   conductor/ledger,
+  conductor/masterhealth,
   conductor/shiplib,
   conductor/state,
   conductor/tick
@@ -28,6 +29,9 @@ proc usage() =
   echo "  once      run a single tick (ticket -> agent -> gate -> merge)"
   echo "  run       daemon loop (single instance, pause via .conductor/pause)"
   echo "  gate      re-run the gate for the current in-flight candidate"
+  echo "  master-health [--force]  run the gate's static tests against this"
+  echo "            checkout's HEAD (skipped when the sha already has a"
+  echo "            verdict) and write .conductor/master-health.json"
   echo "  ship [guard-uuid]  manual ship of the champion (guard required"
   echo "            for the first ship, taken from the ledger afterwards)"
   quit 1
@@ -87,6 +91,13 @@ proc cmdStatus(cfgAll: ConductorConfig, leagueName, repo, root: string) =
   echo "  tick phase:    ", $st.phase,
     (if st.ticketId.len > 0: " (ticket " & st.ticketId & ")" else: "")
   echo "  paused:        ", isPaused(repo)
+  let health = loadMasterHealth(repo)
+  echo "  master health: ", $health.status,
+    (if health.sha.len > 0: " @ " & health.sha else: ""),
+    (if health.branch.len > 0: " (" & health.branch & ")" else: ""),
+    (if health.checkedAt.len > 0: " " & health.checkedAt else: "")
+  if health.status == mhRed:
+    echo "    RED: ", health.detail.strip().splitLines()[^1]
   if fileExists(needsHumanPath(repo)):
     echo "  NEEDS-HUMAN:"
     for line in readFile(needsHumanPath(repo)).strip().splitLines():
@@ -225,6 +236,14 @@ proc cmdRun(leagueName, repo, root: string) =
           sleep(60_000)
           continue
         pausedLogged = false
+        # Master-health watchdog (ticket 0044): the gate only sees what
+        # the loop itself built, so a hand commit straight to master rides
+        # free. Re-runs the gate's static command only when this
+        # checkout's HEAD moved, so a quiet master costs one rev-parse.
+        try:
+          discard checkMasterHealth(repo, repo)
+        except CatchableError as e:
+          echo "conductor: WARN master-health: ", e.msg
         discard recoverCrashedTick(cfgAll, leagueName, repo, root)
         let res = runTick(cfgAll, leagueName, repo, root)
         echo "conductor: tick — ", $res.outcome,
@@ -314,6 +333,13 @@ proc main() =
       echo "  - ", reason
   of "run":
     cmdRun(leagueName, repo, root)
+  of "master-health":
+    let force = paramCount() >= 3 and paramStr(3) == "--force"
+    let health = checkMasterHealth(repo, repo, force)
+    echo "conductor: master-health — ", $health.status, " @ ", health.sha,
+      " (", masterHealthPath(repo), ")"
+    if health.status == mhRed:
+      quit 1
   of "gate-branch":
     if paramCount() < 4:
       quit "usage: conductor <league> gate-branch <branch> <ticketId>" &

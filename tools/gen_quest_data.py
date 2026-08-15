@@ -111,8 +111,17 @@ WMA_ID, WMA_MAP, WMA_AREA, WMA_NAME = 0, 1, 2, 3
 WMA_LEFT, WMA_RIGHT, WMA_TOP, WMA_BOTTOM = 4, 5, 6, 7
 
 # AreaTable.dbc, 25 fields / 100-byte records:
-#   0 id  1 mapId  2 parentAreaId  ... 11 areaName(str, enUS)
-AT_ID, AT_MAP, AT_PARENT, AT_NAME = 0, 1, 2, 11
+#   0 id  1 mapId  2 parentAreaId  3 exploreFlag  4 flags  ...
+#   11 areaName(str, enUS)
+AT_ID, AT_MAP, AT_PARENT, AT_FLAGS, AT_NAME = 0, 1, 2, 4, 11
+
+# AreaTable flag bit that marks a capital city. In this build it partitions the
+# 49 zone maps exactly: every outdoor zone is 0x40/0x41, the battlegrounds are
+# 0x0, and only Undercity/Stormwind/Ironforge/Orgrimmar/Thunder Bluff/Darnassus
+# carry 0x138 (0x100 | 0x20 | 0x10 | 0x8). That makes "is this box a capital?"
+# a DBC lookup rather than a hardcoded id list -- see gen_road_data.py, which
+# uses it to keep surface roads out of the city boxes that overlay them.
+AREA_FLAG_CAPITAL = 0x100
 
 
 class MapAreas:
@@ -133,10 +142,12 @@ class MapAreas:
 
         self.area_name: Dict[int, str] = {}
         self.area_parent: Dict[int, int] = {}
+        self.area_flags: Dict[int, int] = {}
         for i in range(at.count):
             v = at.ints(i)
             self.area_name[v[AT_ID]] = at.string(v[AT_NAME])
             self.area_parent[v[AT_ID]] = v[AT_PARENT]
+            self.area_flags[v[AT_ID]] = v[AT_FLAGS]
 
         # per continent map id -> list of zone boxes, smallest first so the
         # first containing box wins (city maps nest inside their zone's box).
@@ -161,6 +172,55 @@ class MapAreas:
         for boxes in self.by_map.values():
             boxes.sort(key=lambda b: (b[0], b[1]))
 
+        # The zone maps that are capital cities. Their boxes nest inside an
+        # outdoor zone's box and overlay open ground, so the smallest-box rule
+        # hands them roads that belong to the zone above/around them.
+        self.capital_zones: Set[int] = set(
+            z for z in self.zone_ids
+            if self.area_flags.get(z, 0) & AREA_FLAG_CAPITAL
+        )
+
+        # The outdoor zone a capital sits in: the smallest non-capital box that
+        # FULLY contains the capital's box. Full containment, not "contains the
+        # point", is what makes this the zone a player walks out of the gates
+        # into -- a neighbouring zone whose box merely clips the city corner
+        # (Silverpine and Western Plaguelands both clip Undercity's) would win
+        # a smallest-box contest over half the city's ground and cut the
+        # surface road in three. Orgrimmar has no such parent: its box runs
+        # north past Durotar's, so it falls back to the plain box rule.
+        self.box: Dict[int, Tuple[float, float, float, float]] = {}
+        self.capital_parent: Dict[int, int] = {}
+        for boxes in self.by_map.values():
+            for size, area, left, right, top, bottom in boxes:
+                self.box[area] = (left, right, top, bottom)
+        for boxes in self.by_map.values():
+            for size, area, left, right, top, bottom in boxes:
+                if area not in self.capital_zones:
+                    continue
+                lo_y, hi_y = min(left, right), max(left, right)
+                lo_x, hi_x = min(top, bottom), max(top, bottom)
+                for osize, oarea, oleft, oright, otop, obottom in boxes:
+                    if oarea == area or oarea in self.capital_zones:
+                        continue
+                    if (min(oleft, oright) <= lo_y and hi_y <= max(oleft, oright)
+                            and min(otop, obottom) <= lo_x
+                            and hi_x <= max(otop, obottom)):
+                        self.capital_parent[area] = oarea  # boxes are size-sorted
+                        break
+
+    def project(self, area: int, wx: float, wy: float
+                ) -> Optional[Tuple[float, float]]:
+        """world -> this zone map's percent, or None if the box misses it."""
+        box = self.box.get(area)
+        if box is None:
+            return None
+        left, right, top, bottom = box
+        mx = (left - wy) / (left - right) * 100.0
+        my = (top - wx) / (top - bottom) * 100.0
+        if 0.0 <= mx <= 100.0 and 0.0 <= my <= 100.0:
+            return mx, my
+        return None
+
     def zone_of_sort(self, zone_or_sort: int) -> int:
         """quest_template.ZoneOrSort -> a zone that has a world map.
 
@@ -179,7 +239,13 @@ class MapAreas:
         return 0
 
     def locate(self, map_id: int, wx: float, wy: float,
-               prefer_zone: int = 0) -> Optional[Tuple[int, float, float]]:
+               prefer_zone: int = 0,
+               exclude: Optional[Set[int]] = None
+               ) -> Optional[Tuple[int, float, float]]:
+        """Smallest containing box wins. `exclude` drops boxes from the search
+        entirely, which is how gen_road_data re-files a surface road out of the
+        capital box that overlays it and into the outdoor zone underneath.
+        """
         boxes = self.by_map.get(map_id)
         if not boxes:
             return None  # instanced maps have no WorldMapArea row in 1.12
@@ -192,6 +258,8 @@ class MapAreas:
 
         hit = None
         for box in boxes:
+            if exclude and box[1] in exclude:
+                continue
             area, mx, my = norm(box)
             if 0.0 <= mx <= 100.0 and 0.0 <= my <= 100.0:
                 # The bbox test cannot tell the Ruins of Lordaeron (surface,
@@ -488,7 +556,8 @@ def single_spot(points: Sequence[Point], prefer_zone: int) -> Optional[Point]:
 # ---------------------------------------------------------------------------
 
 QUEST_COLUMNS = (
-    ["entry", "Title", "QuestLevel", "MinLevel", "ZoneOrSort", "SrcItemId"]
+    ["entry", "Title", "QuestLevel", "MinLevel", "ZoneOrSort", "SrcItemId",
+     "RequiredRaces", "RequiredClasses"]
     + ["ReqCreatureOrGOId%d" % i for i in (1, 2, 3, 4)]
     + ["ReqCreatureOrGOCount%d" % i for i in (1, 2, 3, 4)]
     + ["ReqItemId%d" % i for i in (1, 2, 3, 4)]
@@ -635,8 +704,15 @@ class Generator:
                     break
             if not zone and objectives:
                 zone = int(objectives[0]["spots"][0][0])
+        # Who the game will even let hold this quest. The title is all the 1.12
+        # quest log exposes, so a resolver that only reads objective labels
+        # cannot tell eight identical capital-city donation quests apart -- but
+        # the game already picked one for the player, and these two masks say
+        # which (ticket 0045). 0 means "anyone" in the DB and is omitted rather
+        # than emitted as a mask that matches nothing.
         return {"id": entry, "level": q["QuestLevel"], "minLevel": q["MinLevel"],
                 "zone": zone, "objectives": objectives,
+                "races": q["RequiredRaces"], "classes": q["RequiredClasses"],
                 "turnIn": turn_in, "startedBy": started_by}
 
 
@@ -685,6 +761,11 @@ def emit(entries: List[Tuple[str, Dict[str, object]]], header: List[str],
     def quest_body(q: Dict[str, object]) -> None:
         lines.append("id = %d, level = %d, minLevel = %d, zone = %d,"
                      % (q["id"], q["level"], q["minLevel"], q["zone"]))
+        # Identity gates, omitted when the quest has none (the common case).
+        gates = ["%s = %d" % (key, q.get(key) or 0)
+                 for key in ("races", "classes") if q.get(key)]
+        if gates:
+            lines.append(", ".join(gates) + ",")
         objectives = q["objectives"]
         if objectives:
             lines.append("objectives = {")

@@ -13,6 +13,8 @@ Management server for the wow-shadow-army: one Nim binary, many interfaces.
 | Stop local traverse | `POST /traverse/pol/stop` | kill process tree + traverse containers |
 
 
+| Seat watch partial | `GET /seats` | htmx fragment (seat babysitter panel) |
+| Bags partial | `GET /murist/inventory` | htmx fragment (Murist inventory panel) |
 | Roster partial | `GET /roster` | htmx fragment (roster table rows) |
 | Events partial | `GET /events` | htmx fragment (addon event rows) |
 | Server partial | `GET /server` | htmx fragment (realm status + Start/Stop buttons) |
@@ -43,6 +45,9 @@ MCP tools (same dispatch procs as the dashboard):
 | `stop_server` | `stopServer()` | queue operator `down`; characters/accounts persist |
 | `start_bot` | `startBotSeat(name)` | launch a bot seat; ready when `control_up` flips |
 | `stop_bot` | `stopBotSeat(name)` | stop a bot seat (client logs out) |
+| `seat_watch` | `seatWatchStatus()` | babysitter view (wedged seats, restarts, alerts) |
+| `character_inventory` | `characterInventory(name)` | latest-known bags from the chat bus + item join |
+| `request_inventory` | `requestInventorySnapshot(name)` | announce `<SYS> inv?` for a fresh snapshot |
 
 Design source: `coworld-playbook/games/solo-leveling.md` → **The System (management server)**.
 
@@ -80,6 +85,9 @@ Optional env:
 | `SYSTEM_SOAP_URL` | `http://<game-bridge-ip>:7878/` (via `docker inspect`) | gsoap endpoint |
 | `SYSTEM_SOAP_USER` | `system` | SOAP Basic auth user |
 | `SYSTEM_SOAP_PASS` | `shadowsoap` | SOAP Basic auth password |
+| `SYSTEM_SEAT_BABYSITTER` | `1` | `0`/`off` makes the seat watch observe-only (no auto-restart) |
+| `SYSTEM_SEAT_STALE_SEC` | `90` | wedge threshold for a seat's `status.json` |
+| `SYSTEM_HTTP_PORT` | `7777` | listen port; only for an isolated test instance beside the live one |
 
 ## Dashboard
 
@@ -88,9 +96,71 @@ Open http://127.0.0.1:7777/ (aliases `/army`).
 Tabs in the header: **Army** | **Murist** | **Advisor** | **Admin**.
 
 - **Army** (`GET /army`) — roster only (hides foundation `Bot*` / Nightsun / Cowcam). Order: Murist → Shadowfel → Igris → Tusk → Beru, then others. Columns: name · level · XP · **HP/MP** · class · **zone** · **pos** · gold · **life** · **seat** · **bot** Start/Stop. Panel head shows army strip (`N online · alive/ghost/dead · ctrl k/n`). Polls `GET /roster` every few seconds via htmx. MCP `list_characters` still accepts `include_foundation=true` for the full realm.
-- **Murist** (`GET /murist`) — human seat snapshot (level, class, race, gold, zone, pos, XP, vitals, life/online) + **quest log** (unrewarded: complete/active/failed + objective progress) + Murist-only addon events. Polls `GET /murist/status`, `GET /murist/quests`, `GET /murist/events`.
+- **Army → Seat watch** — babysitter row per home seat: light (green live / amber starting / grey stopped / **red wedged**), heartbeat age, auto-restarts this hour, last action, wedge evidence file. Polls `GET /seats`; a seat that burned its restart budget shows a persistent red alert banner. See "Seat babysitter" below.
+- **Murist** (`GET /murist`) — human seat snapshot (level, class, race, gold, zone, pos, XP, vitals, life/online) + **quest log** (unrewarded: complete/active/failed + objective progress) + **bags** (chat-bus inventory: item, id, qty, vendor sell/value, data age) + Murist-only addon events. Polls `GET /murist/status`, `GET /murist/quests`, `GET /murist/inventory`, `GET /murist/events`.
 - **Advisor** (`GET /advisor`) — live ring of parsed `<SA>` / `<ShadowArmy>` lines from Chat.log. Table body polls `GET /events`. **Reload addon** posts to `POST /reload`.
 - **Admin** (`GET /admin`) — **Realm** panel (start/stop) + ops buttons (respawn army, tele party to Murist). Local ops only; not fair-play recovery. Realm start/stop runs as a **detached user unit** (`wow-realm-op` via `systemd-run --user`), not as a child of `wow-system`, so restarting the dashboard does not kill a multi-minute image build. Progress is mirrored in `local_data/realm-op.json` + `local_data/realm-op.log`.
+
+## Seat babysitter (ticket 0055)
+
+A home seat can wedge with its launcher PID alive and its Lua heartbeat frozen
+(2026-08-15: Tusk hung on a world-asset stream mid-fight; the realm showed him
+offline and nothing noticed until a human read the roster). A background thread
+samples every seat in `SeatMakeTargets` every 10s:
+
+| Seat state | Rule |
+|---|---|
+| `stopped` | no live `launcher.pid` |
+| `starting` | PID alive, no `status/status.json` yet (a cold `nim r` build is slow — never restarted for it) |
+| `running` | PID alive, heartbeat younger than the threshold |
+| `wedged` | PID alive, heartbeat **older than 90s** (`SYSTEM_SEAT_STALE_SEC`) |
+
+Recovery for a wedged seat, in order:
+
+1. **Evidence first** — the last 50 `launcher.log` lines land in
+   `local_data/home-army/<Seat>/wedge-<UTC>.log` **before** anything restarts
+   (the start target rotates `launcher.log`, so the postmortem has to be taken
+   first).
+2. **Event line** — `<SYS> wedge …` goes into the same ring the addon feeds, so
+   it shows up in the Advisor tail and `addon_events`.
+3. **Auto-restart** — the seat's own Makefile stop + start targets (identical to
+   the roster Bot buttons), then a 3-minute cooldown before the next attempt.
+4. **Bounded** — max 3 restarts per seat per hour (`local_data/seat-watch.json`
+   keeps the window across dashboard restarts). Past the budget the seat stops
+   being restarted and shows a persistent red alert instead of crash-looping.
+
+Alerts clear themselves when the seat's heartbeat comes back. `SYSTEM_SEAT_BABYSITTER=0`
+downgrades the whole thing to observe-only (detection + red light, no restarts).
+A 60s grace after The System boots means our own restart never counts against a seat.
+
+## Inventory over the chat bus (ticket 0052)
+
+The realm DB only learns about bags on its save interval, so inventory comes over
+the addon's existing outbound channel (`F.emit` → SAY → Chat.log → the tailer).
+Wire format is the addon's `ShadowArmy.invModel`:
+
+```
+<SA> inv  <seq>/<total> <id>:<count>,<id>:<count>,…    full snapshot (REPLACE)
+<SA> invd <seq>/<total> +<id>:<count>,-<id>,…          delta (PATCH, absolute)
+<SA> inv  1/1                                          bags are empty (a fact)
+```
+
+System-side rules:
+
+- A **snapshot is applied only when every line of the set has arrived** — inv
+  lines are droppable under the addon's emit queue, and a set with a hole would
+  under-report bags. Parts may arrive in any order inside 20s; an abandoned set
+  leaves the previous known bags (and their age) on screen untouched.
+- A **delta patches absolute totals** (`+id:count` sets the new total, `-id`
+  removes), so replaying one is idempotent. A delta that lands between snapshot
+  parts is applied to the in-flight set too, so the commit cannot lose it.
+- Item names / vendor prices join `mangos.item_template` (highest `patch <= 10`
+  wins), cached in-process — unknown ids still render, just unnamed.
+- The Murist tab shows the data **age**; before any line has ever arrived the
+  panel stays quiet rather than implying empty bags.
+- `request_inventory` (MCP) announces `<SYS> inv?` for an on-demand snapshot;
+  the addon suppresses an identical repeat for 30s, so unchanged bags may answer
+  with silence.
 
 ## Reload loop
 
@@ -153,6 +223,8 @@ listCharacters()       ──►  htmx roster     / MCP list_characters
 recentEvents()         ──►  htmx events     / MCP addon_events
 reloadAddon()          ──►  htmx POST /reload / MCP reload_addon
 announceInGame()       ──►  MCP send_announce (and reloadAddon internals)
+seatWatchStatus()      ──►  htmx GET /seats  / MCP seat_watch
+characterInventory()   ──►  htmx GET /murist/inventory / MCP character_inventory
 respawnShadowArmy()    ──►  htmx Admin tab / MCP / Murist admin chat
 telePartyToMurist()    ──►  htmx Admin tab / MCP / Murist admin chat
 reloadAddon()          ──►  htmx Reload / MCP / Murist admin chat

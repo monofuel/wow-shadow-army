@@ -39,7 +39,7 @@
 import
   std/[
     algorithm, base64, httpclient, json, locks, net, options, os, osproc,
-    streams, strformat, strutils, times, uri
+    streams, strformat, strutils, tables, times, uri
   ],
   mummy, mummy/routers,
   webby/httpheaders as mummyheaders,
@@ -198,6 +198,34 @@ ORDER BY FIELD(cq.status, 1, 3, 5), qt.QuestLevel, cq.quest"""
   SaPrefix = "<SA> "
   ## Older addon banner still seen in the wild.
   LegacyPrefix = "<ShadowArmy> "
+  ## Seat babysitter (ticket 0055). A home seat whose Lua status heartbeat is
+  ## older than this while its launcher PID is still alive is WEDGED: the
+  ## client process exists but the policy has stopped ticking.
+  SeatWedgeStaleSec* = 90.0
+  ## How often the babysitter samples every seat's status file.
+  SeatWatchPollMs = 10_000
+  ## Recovery budget: no more than this many auto-restarts per seat per window
+  ## before the dashboard escalates to a persistent alert instead of looping.
+  SeatRestartBudget* = 3
+  SeatRestartWindowSec* = 3600.0
+  ## Ignore staleness for this long after The System boots (`nim r` recompiles
+  ## on restart; seats must not be blamed for the dashboard's own downtime).
+  SeatWatchStartupGraceSec = 60.0
+  ## Minimum spacing between two recovery attempts on the same seat — a restart
+  ## needs longer than one poll to bring a heartbeat back.
+  SeatRecoveryCooldownSec = 180.0
+  ## Launcher.log lines captured into the wedge evidence file before recovery.
+  SeatWedgeEvidenceLines* = 50
+  ## Bytes of launcher.log read to find those lines (tail only; logs get big).
+  SeatWedgeEvidenceBytes = 256 * 1024
+  ## Durable babysitter state (restart budget survives a dashboard restart).
+  SeatWatchStateRel = "local_data/seat-watch.json"
+  ## Inventory over the chat bus (ticket 0052): parts of one snapshot arriving
+  ## inside this window belong to the same snapshot; a later `full` line starts
+  ## a new one.
+  InvSnapshotWindowSec* = 20.0
+  ## Inventory rows rendered on a seat panel (highest vendor value first).
+  InvPanelRows = 40
   ## How long reloadAddon waits for a fresh <SA> loaded event. The human
   ## path is announce → panel button lights up → click, so this needs to
   ## cover human reaction time, not just a programmatic reload.
@@ -1346,6 +1374,371 @@ proc eventsToJson*(events: seq[AddonEvent]): JsonNode =
   for e in events:
     result.add(eventToJson(e))
 
+proc pushSystemEvent*(name, kind, payload: string) {.gcsafe.} =
+  ## Append a System-generated line to the same ring the addon feeds, so
+  ## babysitter actions show up in the dashboard event tail / MCP addon_events.
+  let ev = AddonEvent(
+    time: now().format("yyyy-MM-dd HH:mm:ss"),
+    name: name,
+    kind: kind,
+    payload: payload,
+    raw: &"<SYS> {kind} {name} {payload}"
+  )
+  {.gcsafe.}:
+    withLock gEventLock:
+      discard appendAddonEvent(gEvents, gNextEventId, ev)
+
+# ---------------------------------------------------------------------------
+# Inventory over the chat bus (ticket 0052)
+#
+# The addon emits compact ASCII over /say, VMaNGOS writes it to Chat.log, and
+# the tailer above already delivers it here. Wire format (addon-side encoder:
+# `ShadowArmy.invModel`, addons/ShadowArmy/ShadowArmy.lua):
+#
+#   <SA> inv  <seq>/<total> <id>:<count>,<id>:<count>,…   full snapshot
+#   <SA> invd <seq>/<total> +<id>:<count>,-<id>,…         delta
+#
+# `inv` REPLACES the known bags, but only once every line of the set is in
+# hand — inv lines are droppable under emit-queue pressure, so a set with a
+# hole must never be applied as if it were the whole inventory (that would
+# silently under-report bags, which is worse than showing older data). Parts
+# are assembled in any order inside InvSnapshotWindowSec.
+# `invd` PATCHES it: `+id:count` is the item's new TOTAL count (absolute, so
+# it is idempotent and self-heals a dropped line) and `-id` removes the id.
+# Counts are summed across bags, so an id appears once per line set.
+#
+# The parser is deliberately loose: unknown tokens are ignored, `id:count`
+# without a sign works, separators may be spaces or commas, and the optional
+# `seq=<n>` guard drops a delta that lost a race for one item id.
+# ---------------------------------------------------------------------------
+
+type
+  InvPair* = tuple[itemId, count: int]
+
+  InvLine* = object
+    ## One parsed `<SA> inv|invd …` payload (pure; no state).
+    isFull*: bool
+    part*: int ## 0 when the emitter sent no `<seq>/<total>` header
+    parts*: int
+    seqNo*: int ## 0 when the emitter sent no sequence
+    bag*: int
+    hasBag*: bool
+    pairs*: seq[InvPair] ## count 0 = remove this id
+
+  InventoryItem* = object
+    ## Latest known total count of one item id for one character.
+    itemId*: int
+    count*: int
+    seqNo*: int
+    updatedAt*: float ## epoch seconds when this line was applied
+
+  CharacterInventory* = object
+    ## Latest-known bags for one character, assembled from chat-bus lines.
+    name*: string
+    items*: Table[int, InventoryItem] ## committed view (what the panel shows)
+    pending*: Table[int, InventoryItem] ## snapshot still assembling
+    updatedAt*: float ## epoch the committed view last CHANGED (0 = never)
+    lastLineAt*: float ## epoch of the newest inv line, applied or not
+    snapshotAt*: float ## epoch the in-flight snapshot started (0 = none)
+    partsTotal*: int ## `<total>` of the in-flight snapshot
+    partsSeen*: seq[int]
+    lines*: int ## inv lines seen since boot
+    lastKind*: string ## "full" | "delta"
+    complete*: bool ## a whole snapshot has been committed at least once
+
+  ItemInfo* = object
+    ## World DB facts for one item id (names / vendor price join).
+    itemId*: int
+    name*: string
+    sellPrice*: int ## copper, vendor sell
+    quality*: int
+
+var
+  gInvLock: Lock
+  gInventories: Table[string, CharacterInventory]
+  gItemInfoLock: Lock
+  gItemInfoCache: Table[int, ItemInfo]
+
+initLock(gInvLock)
+initLock(gItemInfoLock)
+
+proc isAllDigits(s: string): bool =
+  if s.len == 0:
+    return false
+  for c in s:
+    if c notin {'0' .. '9'}:
+      return false
+  result = true
+
+proc parseIntOr(s: string, fallback = 0): int =
+  try:
+    result = parseInt(s)
+  except ValueError:
+    result = fallback
+
+proc isInvFullKind*(kind: string): bool =
+  ## `inv` is the full-snapshot channel; `invd` carries deltas.
+  kind == "inv"
+
+proc isInvKind*(kind: string): bool =
+  kind == "inv" or kind == "invd"
+
+proc parseInvPayload*(payload: string, isFull = false): InvLine =
+  ## Tolerant parse of one inventory payload. Never raises; unknown tokens are
+  ## ignored so the emitter can grow fields without breaking The System.
+  result = InvLine(isFull: isFull, pairs: @[])
+  let flat = payload.multiReplace([(",", " "), (";", " ")])
+  for rawTok in flat.splitWhitespace():
+    if rawTok.len == 0:
+      continue
+    let lower = rawTok.toLowerAscii()
+    case lower
+    of "full", "snap", "snapshot", "all":
+      result.isFull = true
+      continue
+    of "delta", "upd", "update", "diff":
+      result.isFull = false
+      continue
+    else:
+      discard
+    if lower.startsWith("seq="):
+      result.seqNo = parseIntOr(lower[4 .. ^1])
+      continue
+    if lower.startsWith("bag="):
+      result.bag = parseIntOr(lower[4 .. ^1])
+      result.hasBag = true
+      continue
+    # `-<id>` removes an id outright (delta form).
+    if rawTok.len > 1 and rawTok[0] == '-' and isAllDigits(rawTok[1 .. ^1]):
+      result.pairs.add((itemId: parseIntOr(rawTok[1 .. ^1]), count: 0))
+      continue
+    # `+<id>:<count>` / `<id>:<count>` — the count is an absolute total.
+    var tok = rawTok
+    if tok.len > 1 and tok[0] == '+':
+      tok = tok[1 .. ^1]
+    let colon = tok.find(':')
+    if colon > 0:
+      let idPart = tok[0 ..< colon]
+      var countPart = tok[colon + 1 .. ^1]
+      let neg = countPart.startsWith("-")
+      if neg:
+        countPart = countPart[1 .. ^1]
+      if isAllDigits(idPart) and isAllDigits(countPart):
+        let count = if neg: 0 else: parseIntOr(countPart)
+        result.pairs.add((itemId: parseIntOr(idPart), count: count))
+      continue
+    let slash = tok.find('/')
+    if slash > 0:
+      let a = tok[0 ..< slash]
+      let b = tok[slash + 1 .. ^1]
+      if isAllDigits(a) and isAllDigits(b):
+        result.part = parseIntOr(a)
+        result.parts = parseIntOr(b)
+      continue
+    if lower.len > 1 and lower[0] == 's' and isAllDigits(lower[1 .. ^1]):
+      result.seqNo = parseIntOr(lower[1 .. ^1])
+      continue
+    if lower.len > 1 and lower[0] == 'b' and isAllDigits(lower[1 .. ^1]):
+      result.bag = parseIntOr(lower[1 .. ^1])
+      result.hasBag = true
+      continue
+
+proc newCharacterInventory*(name: string): CharacterInventory =
+  ## Empty inventory record for one character.
+  CharacterInventory(
+    name: name,
+    items: initTable[int, InventoryItem](),
+    pending: initTable[int, InventoryItem](),
+    partsSeen: @[]
+  )
+
+proc applyInvPairs(
+    dest: var Table[int, InventoryItem], line: InvLine, now: float,
+    guardSeq: bool
+) =
+  ## Fold `id:count` pairs into one map. count 0 removes the id.
+  for p in line.pairs:
+    if p.itemId <= 0:
+      continue
+    if guardSeq and line.seqNo > 0 and dest.hasKey(p.itemId) and
+        dest[p.itemId].seqNo > line.seqNo:
+      continue # a newer delta already moved this id
+    if p.count <= 0:
+      dest.del(p.itemId)
+    else:
+      dest[p.itemId] = InventoryItem(
+        itemId: p.itemId, count: p.count, seqNo: line.seqNo, updatedAt: now)
+
+proc invAssembling*(inv: CharacterInventory): bool =
+  ## True while a multi-line snapshot is still missing parts.
+  inv.snapshotAt > 0.0
+
+proc applyInvLine*(inv: var CharacterInventory, line: InvLine, now: float) =
+  ## Fold one parsed line into the latest-known inventory.
+  ## Full lines assemble into `pending` and only replace `items` when the whole
+  ## set has landed; delta lines patch `items` (and any in-flight snapshot) now.
+  inc inv.lines
+  inv.lastLineAt = now
+  if line.isFull:
+    inv.lastKind = "full"
+    let sameBatch =
+      inv.snapshotAt > 0.0 and
+      (now - inv.snapshotAt) <= InvSnapshotWindowSec and
+      line.parts == inv.partsTotal
+    if not sameBatch:
+      inv.pending.clear()
+      inv.partsSeen = @[]
+      inv.partsTotal = line.parts
+      inv.snapshotAt = now
+    applyInvPairs(inv.pending, line, now, guardSeq = false)
+    let partIdx = if line.part > 0: line.part else: inv.partsSeen.len + 1
+    if partIdx notin inv.partsSeen:
+      inv.partsSeen.add(partIdx)
+    if inv.partsTotal <= 0 or inv.partsSeen.len >= inv.partsTotal:
+      # Whole set in hand: this is now the truth about the bags.
+      inv.items = inv.pending
+      inv.pending = initTable[int, InventoryItem]()
+      inv.partsSeen = @[]
+      inv.snapshotAt = 0.0
+      inv.complete = true
+      inv.updatedAt = now
+  else:
+    if line.pairs.len == 0:
+      return
+    inv.lastKind = "delta"
+    applyInvPairs(inv.items, line, now, guardSeq = true)
+    if invAssembling(inv):
+      # Keep an in-flight snapshot honest: the delta is newer than its parts.
+      applyInvPairs(inv.pending, line, now, guardSeq = true)
+    inv.updatedAt = now
+
+proc recordInventoryEvent*(e: AddonEvent) {.gcsafe.} =
+  ## Chat.log hook: fold one `<SA> inv|invd …` event into the per-character store.
+  if not isInvKind(e.kind) or e.name.len == 0:
+    return
+  let line = parseInvPayload(e.payload, isFull = isInvFullKind(e.kind))
+  let nowSec = epochTime()
+  {.gcsafe.}:
+    withLock gInvLock:
+      var inv =
+        if gInventories.hasKey(e.name): gInventories[e.name]
+        else: newCharacterInventory(e.name)
+      applyInvLine(inv, line, nowSec)
+      gInventories[e.name] = inv
+
+proc characterInventory*(name: string): Option[CharacterInventory] =
+  ## Latest-known inventory for one character — single dispatch (HTTP + MCP).
+  withLock gInvLock:
+    if gInventories.hasKey(name):
+      result = some(gInventories[name])
+    else:
+      result = none(CharacterInventory)
+
+proc inventoryCharacters*(): seq[string] =
+  ## Names that have ever reported inventory over the chat bus.
+  result = @[]
+  withLock gInvLock:
+    for name in gInventories.keys:
+      result.add(name)
+  result.sort()
+
+proc liveInventoryItems*(inv: CharacterInventory): seq[InventoryItem] =
+  ## Committed stacks (the panel/MCP view); ordering is the caller's business.
+  result = @[]
+  for _, item in inv.items:
+    if item.count > 0:
+      result.add(item)
+
+proc itemInfoSql*(ids: seq[int]): string =
+  ## World DB join for item names / vendor prices. `patch` is multi-row per
+  ## item, so ORDER BY entry,patch lets the highest patch win on ingest.
+  var idList = ""
+  for i, id in ids:
+    if i > 0:
+      idList.add(",")
+    idList.add($id)
+  result = "SELECT entry, name, sell_price, quality FROM mangos.item_template " &
+    &"WHERE patch <= 10 AND entry IN ({idList}) ORDER BY entry, patch"
+
+proc parseItemInfoTsv*(tsv: string): seq[ItemInfo] =
+  ## Parse the item join TSV (entry, name, sell_price, quality).
+  result = @[]
+  for rawLine in tsv.splitLines():
+    let line = rawLine.strip(leading = false)
+    if line.len == 0:
+      continue
+    let cols = line.split('\t')
+    if cols.len < 4:
+      continue
+    let entry = parseIntOr(cols[0].strip())
+    if entry <= 0:
+      continue
+    result.add(ItemInfo(
+      itemId: entry,
+      name: cols[1].strip(),
+      sellPrice: parseIntOr(cols[2].strip()),
+      quality: parseIntOr(cols[3].strip())
+    ))
+
+proc lookupItemInfo*(ids: seq[int]): Table[int, ItemInfo] =
+  ## Cached world-DB lookup: item facts never change under a running realm, so
+  ## a poll only pays for ids it has not seen before (and stays useful when the
+  ## realm is down — unknown ids simply render as their id).
+  result = initTable[int, ItemInfo]()
+  var missing: seq[int] = @[]
+  withLock gItemInfoLock:
+    for id in ids:
+      if gItemInfoCache.hasKey(id):
+        result[id] = gItemInfoCache[id]
+      else:
+        missing.add(id)
+  if missing.len == 0:
+    return
+  var rows: seq[ItemInfo] = @[]
+  try:
+    rows = parseItemInfoTsv(dockerMariadbSelect(itemInfoSql(missing)))
+  except CatchableError:
+    return # realm down / DB busy: ids stay unnamed, panel still renders
+  var found = initTable[int, ItemInfo]()
+  for row in rows:
+    found[row.itemId] = row
+  withLock gItemInfoLock:
+    for id in missing:
+      let info =
+        if found.hasKey(id): found[id]
+        else: ItemInfo(itemId: id, name: "", sellPrice: 0, quality: 0)
+      gItemInfoCache[id] = info
+      result[id] = info
+
+proc inventoryToJson*(inv: CharacterInventory, info: Table[int, ItemInfo]): JsonNode =
+  ## Serialize one character's latest-known inventory (MCP + JSON APIs).
+  var items = %*[]
+  var totalSell = 0
+  for item in liveInventoryItems(inv):
+    let known = info.hasKey(item.itemId)
+    let sell = if known: info[item.itemId].sellPrice else: 0
+    totalSell += sell * item.count
+    items.add(%*{
+      "item_id": item.itemId,
+      "count": item.count,
+      "name": if known: info[item.itemId].name else: "",
+      "sell_price": sell,
+      "quality": if known: info[item.itemId].quality else: 0
+    })
+  result = %*{
+    "name": inv.name,
+    "items": items,
+    "item_count": items.len,
+    "total_sell_copper": totalSell,
+    "age_sec": (if inv.updatedAt > 0: epochTime() - inv.updatedAt else: -1.0),
+    "lines": inv.lines,
+    "last_kind": inv.lastKind,
+    "assembling": invAssembling(inv),
+    "parts_seen": inv.partsSeen.len,
+    "parts_total": inv.partsTotal,
+    "complete": inv.complete
+  }
+
 proc isAdminRequester*(name: string): bool =
   ## True when `name` may trigger System admin actions from the addon chat bus.
   result = name == AdminRequesterName
@@ -1417,6 +1810,7 @@ proc pushParsedLine(line: string) {.gcsafe.} =
   {.gcsafe.}:
     withLock gEventLock:
       discard appendAddonEvent(gEvents, gNextEventId, ev)
+    recordInventoryEvent(ev)
     queueAdminFromAddon(ev)
 
 proc processTailChunk(chunk: string, partial: var string) {.gcsafe.} =
@@ -3307,6 +3701,338 @@ proc reloadAddon*(): JsonNode =
     "hint": "no <SA> loaded seen in 25s — client logged out, on a loading screen, or the panel button is still unclicked (check addon_events for reload-click)"
   }
 
+proc requestInventorySnapshot*(name = AdminRequesterName): JsonNode =
+  ## Announce `<SYS> inv?` so logged-in addons re-emit a full `<SA> inv` set.
+  ## Push is the normal path (login snapshot + BAG_UPDATE deltas); this is the
+  ## on-demand poke. The addon drops identical outbound lines for 30s, so
+  ## unchanged bags may answer with silence — the panel age stays the truth.
+  let before = characterInventory(name)
+  let detail = announceInGame("<SYS> inv?")
+  result = %*{
+    "ok": true,
+    "name": name,
+    "announce": detail,
+    "age_sec_before": (
+      if before.isSome and before.get.updatedAt > 0:
+        epochTime() - before.get.updatedAt
+      else: -1.0)
+  }
+
+# ---------------------------------------------------------------------------
+# Seat babysitter (ticket 0055): watch → evidence → bounded auto-restart
+#
+# A home seat can wedge with its launcher PID alive and its Lua status file
+# frozen (2026-08-15: Tusk hung on a world-asset stream mid-fight and nobody
+# noticed until a human read the roster). The truth already exists on disk —
+# status.json mtime — so The System owns the watch: sample every seat, capture
+# the launcher.log evidence BEFORE recovery clobbers it, then restart through
+# the same Makefile targets the roster buttons use. Bounded to
+# SeatRestartBudget per SeatRestartWindowSec so a genuinely broken build turns
+# into one persistent red alert instead of a restart loop.
+# ---------------------------------------------------------------------------
+
+type
+  SeatWatch* = object
+    ## One seat's liveness as the babysitter sees it (dashboard + MCP view).
+    name*: string
+    ## "running" | "starting" | "stopped" | "wedged"
+    state*: string
+    pidAlive*: bool
+    hasStatus*: bool
+    statusAgeSec*: float ## -1 when no status file exists yet
+    restarts*: int ## auto-restarts inside the trailing window
+    alerting*: bool ## budget spent — recovery paused, needs a human
+    wedges*: int ## wedges observed since boot
+    lastAction*: string ## last babysitter action line ("" when idle)
+    lastActionAgeSec*: float ## -1 when nothing has happened yet
+    evidence*: string ## basename of the last wedge evidence file
+
+  SeatWatchRec = object
+    ## Internal record: public view + the restart timestamps behind the budget.
+    watch: SeatWatch
+    stamps: seq[float]
+    lastActionAt: float
+
+var
+  gSeatWatchLock: Lock
+  gSeatWatch: seq[SeatWatchRec]
+  gSeatWatchThread: Thread[void]
+  gSystemBootAt: float
+
+initLock(gSeatWatchLock)
+
+proc seatBabysitterEnabled*(): bool =
+  ## On by default; SYSTEM_SEAT_BABYSITTER=0 makes the watch observe-only.
+  let env = getEnv("SYSTEM_SEAT_BABYSITTER", "1").strip().toLowerAscii()
+  result = env notin ["0", "false", "off", "no"]
+
+proc seatWedgeStaleSec*(): float =
+  ## Staleness threshold; SYSTEM_SEAT_STALE_SEC overrides (test rigs).
+  let env = getEnv("SYSTEM_SEAT_STALE_SEC", "").strip()
+  if env.len > 0:
+    try:
+      let v = parseFloat(env)
+      if v > 0:
+        return v
+    except ValueError:
+      discard
+  result = SeatWedgeStaleSec
+
+proc classifySeat*(
+    pidAlive, hasStatus: bool,
+    statusAgeSec: float,
+    staleSec = SeatWedgeStaleSec
+): string =
+  ## Pure liveness rule. A seat only counts as WEDGED when its launcher is
+  ## alive AND a status file exists AND that file has stopped moving: a seat
+  ## with no status file yet is still booting (a cold `nim r` build is slow),
+  ## and must never be restarted for it.
+  if not pidAlive:
+    return "stopped"
+  if not hasStatus:
+    return "starting"
+  if statusAgeSec < -2.0:
+    return "starting" # clock skew / file written in the future
+  if statusAgeSec > staleSec:
+    return "wedged"
+  result = "running"
+
+proc pruneRestartStamps*(
+    stamps: seq[float], now: float, windowSec = SeatRestartWindowSec
+): seq[float] =
+  ## Drop restart timestamps that fell out of the rate-limit window.
+  result = @[]
+  for t in stamps:
+    if now - t <= windowSec:
+      result.add(t)
+
+proc restartAllowed*(
+    stamps: seq[float], now: float,
+    budget = SeatRestartBudget, windowSec = SeatRestartWindowSec
+): bool =
+  ## True while the seat still has recovery budget in the trailing window.
+  result = pruneRestartStamps(stamps, now, windowSec).len < budget
+
+proc seatWatchStatePath*(): string =
+  armyRoot() / SeatWatchStateRel
+
+proc tailLogLines*(path: string, maxLines: int): seq[string] =
+  ## Last maxLines lines of a (possibly large) log file. Empty when missing.
+  result = @[]
+  let chunk = readFileTail(path, SeatWedgeEvidenceBytes)
+  if chunk.len == 0:
+    return
+  let lines = chunk.strip(leading = false).splitLines()
+  let n = min(maxLines, lines.len)
+  if n <= 0:
+    return
+  result = lines[lines.len - n .. ^1]
+
+proc wedgeEvidenceName*(stamp: Time): string =
+  ## wedge-<UTC timestamp>.log — sorts chronologically next to launcher.log.
+  "wedge-" & stamp.utc().format("yyyyMMdd'T'HHmmss'Z'") & ".log"
+
+proc captureWedgeEvidence*(
+    name: string, statusAgeSec: float, stamp = getTime()
+): string =
+  ## Write the launcher.log tail into the seat dir BEFORE recovery rotates it.
+  ## Returns the file basename, or "" when nothing could be written.
+  try:
+    let dir = seatRuntimeDir(name)
+    if not dirExists(dir):
+      return ""
+    let fileName = wedgeEvidenceName(stamp)
+    var body = &"# wedge evidence: {name}\n"
+    body.add(&"# captured: {stamp.utc().format(\"yyyy-MM-dd HH:mm:ss\")}Z\n")
+    body.add(&"# status.json age: {statusAgeSec.int}s (threshold {seatWedgeStaleSec().int}s)\n")
+    body.add(&"# launcher pid alive: yes\n")
+    body.add(&"# last {SeatWedgeEvidenceLines} launcher.log lines:\n")
+    for line in tailLogLines(dir / "launcher.log", SeatWedgeEvidenceLines):
+      body.add(line & "\n")
+    writeFile(dir / fileName, body)
+    result = fileName
+  except CatchableError:
+    result = ""
+
+proc loadSeatWatchState() =
+  ## Restore restart stamps so a dashboard restart cannot refill the budget.
+  var node: JsonNode = nil
+  try:
+    if fileExists(seatWatchStatePath()):
+      node = parseJson(readFile(seatWatchStatePath()))
+  except CatchableError:
+    node = nil
+  withLock gSeatWatchLock:
+    gSeatWatch = @[]
+    for seat in SeatMakeTargets:
+      var rec = SeatWatchRec(
+        watch: SeatWatch(
+          name: seat.name, state: "stopped", statusAgeSec: -1.0,
+          lastActionAgeSec: -1.0),
+        stamps: @[]
+      )
+      if node != nil and node.kind == JObject and node.hasKey("seats") and
+          node["seats"].hasKey(seat.name):
+        let s = node["seats"][seat.name]
+        if s.hasKey("restarts") and s["restarts"].kind == JArray:
+          for t in s["restarts"]:
+            rec.stamps.add(t.getFloat(0.0))
+        if s.hasKey("alerting"):
+          rec.watch.alerting = s["alerting"].getBool(false)
+      gSeatWatch.add(rec)
+
+proc saveSeatWatchState() =
+  ## Persist the rate-limit window (best effort; never fails a recovery).
+  try:
+    var seats = newJObject()
+    withLock gSeatWatchLock:
+      for rec in gSeatWatch:
+        var stamps = %*[]
+        for t in rec.stamps:
+          stamps.add(%t)
+        seats[rec.watch.name] = %*{
+          "restarts": stamps,
+          "alerting": rec.watch.alerting
+        }
+    let path = seatWatchStatePath()
+    createDir(path.parentDir)
+    writeFile(path, pretty(%*{"seats": seats}))
+  except CatchableError:
+    discard
+
+proc seatWatchStatus*(): seq[SeatWatch] =
+  ## Current babysitter view — single dispatch for the dashboard + MCP.
+  let nowSec = epochTime()
+  result = @[]
+  withLock gSeatWatchLock:
+    for rec in gSeatWatch:
+      var w = rec.watch
+      w.restarts = pruneRestartStamps(rec.stamps, nowSec).len
+      w.lastActionAgeSec =
+        if rec.lastActionAt > 0: nowSec - rec.lastActionAt else: -1.0
+      result.add(w)
+
+proc seatWatchToJson*(seats: seq[SeatWatch]): JsonNode =
+  ## Serialize the babysitter view for MCP / JSON APIs.
+  result = %*[]
+  for w in seats:
+    result.add(%*{
+      "name": w.name,
+      "state": w.state,
+      "pid_alive": w.pidAlive,
+      "has_status": w.hasStatus,
+      "status_age_sec": w.statusAgeSec,
+      "restarts_last_hour": w.restarts,
+      "alerting": w.alerting,
+      "wedges": w.wedges,
+      "last_action": w.lastAction,
+      "last_action_age_sec": w.lastActionAgeSec,
+      "evidence": w.evidence
+    })
+
+proc recoverWedgedSeat(idx: int, name: string, statusAgeSec: float) =
+  ## Evidence first, then a bounded stop+start through the Makefile targets.
+  let nowSec = epochTime()
+  let evidence = captureWedgeEvidence(name, statusAgeSec)
+  var allowed = false
+  var used = 0
+  withLock gSeatWatchLock:
+    inc gSeatWatch[idx].watch.wedges
+    gSeatWatch[idx].watch.evidence = evidence
+    gSeatWatch[idx].stamps = pruneRestartStamps(gSeatWatch[idx].stamps, nowSec)
+    allowed = gSeatWatch[idx].stamps.len < SeatRestartBudget
+    used = gSeatWatch[idx].stamps.len
+  pushSystemEvent(name, "wedge",
+    &"status stale {statusAgeSec.int}s with launcher alive; evidence {evidence}")
+  if not allowed:
+    withLock gSeatWatchLock:
+      gSeatWatch[idx].watch.alerting = true
+      gSeatWatch[idx].lastActionAt = nowSec
+      gSeatWatch[idx].watch.lastAction =
+        &"auto-restart paused after {used} restarts in the last hour"
+    pushSystemEvent(name, "alert",
+      &"wedged again after {used} auto-restarts in the last hour — recovery paused")
+    saveSeatWatchState()
+    return
+  withLock gSeatWatchLock:
+    gSeatWatch[idx].stamps.add(nowSec)
+    gSeatWatch[idx].lastActionAt = nowSec
+    gSeatWatch[idx].watch.lastAction = "restarting (wedged)"
+  saveSeatWatchState()
+  var detail = ""
+  try:
+    let stopped = stopBotSeat(name)
+    detail = stopped{"detail"}.getStr("")
+    let started = startBotSeat(name)
+    detail.add(" · " & started{"detail"}.getStr(""))
+  except CatchableError as e:
+    detail = "restart failed: " & e.msg
+  withLock gSeatWatchLock:
+    gSeatWatch[idx].watch.lastAction = "auto-restart: " & tailForDisplay(detail, 160)
+  pushSystemEvent(name, "restart", &"auto-restart {used + 1}/{SeatRestartBudget} this hour: {detail}")
+
+proc babysitSeatsOnce*() =
+  ## One sampling pass over every home seat: classify, then recover if wedged.
+  ## Safe to call from a test — it only ever touches SeatMakeTargets seats
+  ## under armyRoot().
+  let nowSec = epochTime()
+  let staleSec = seatWedgeStaleSec()
+  var initialized = false
+  withLock gSeatWatchLock:
+    initialized = gSeatWatch.len == SeatMakeTargets.len
+  if not initialized:
+    loadSeatWatchState()
+  for idx, seat in SeatMakeTargets:
+    let name = seat.name
+    let pidAlive = seatPidAlive(name)
+    let statusPath = seatStatusPath(name)
+    let hasStatus = fileExists(statusPath)
+    var age = -1.0
+    if hasStatus:
+      try:
+        age = nowSec - getLastModificationTime(statusPath).toUnixFloat()
+      except CatchableError:
+        age = -1.0
+    let state = classifySeat(pidAlive, hasStatus, age, staleSec)
+    var lastActionAt = 0.0
+    withLock gSeatWatchLock:
+      gSeatWatch[idx].watch.name = name
+      gSeatWatch[idx].watch.state = state
+      gSeatWatch[idx].watch.pidAlive = pidAlive
+      gSeatWatch[idx].watch.hasStatus = hasStatus
+      gSeatWatch[idx].watch.statusAgeSec = age
+      lastActionAt = gSeatWatch[idx].lastActionAt
+      if state == "running" and gSeatWatch[idx].watch.alerting:
+        # Healthy again: clear the alert, keep the restart history honest.
+        gSeatWatch[idx].watch.alerting = false
+        gSeatWatch[idx].watch.lastAction = "recovered"
+        gSeatWatch[idx].lastActionAt = nowSec
+    if state != "wedged":
+      continue
+    if not seatBabysitterEnabled():
+      continue
+    if nowSec - gSystemBootAt < SeatWatchStartupGraceSec:
+      continue # our own restart, not the seat's fault
+    if lastActionAt > 0 and nowSec - lastActionAt < SeatRecoveryCooldownSec:
+      continue # a restart is still landing
+    recoverWedgedSeat(idx, name, age)
+
+proc seatWatchLoop() {.thread.} =
+  ## Babysitter thread: sample every SeatWatchPollMs, forever.
+  while true:
+    sleep(SeatWatchPollMs)
+    try:
+      {.cast(gcsafe).}:
+        babysitSeatsOnce()
+    except Exception:
+      discard
+
+proc startSeatWatch() =
+  ## Spawn the seat babysitter (call once from main before serve).
+  gSystemBootAt = epochTime()
+  loadSeatWatchState()
+  createThread(gSeatWatchThread, seatWatchLoop)
+
 # ---------------------------------------------------------------------------
 # HTML rendering
 # ---------------------------------------------------------------------------
@@ -3566,6 +4292,203 @@ proc renderRosterRows*(characters: seq[Character]): string =
       </tr>
 """)
 
+proc formatAgeSec*(sec: float): string =
+  ## Compact "how old is this" label ("4s", "3m", "1h12m", "—").
+  if sec < 0:
+    return "—"
+  if sec < 90:
+    return &"{sec.int}s"
+  if sec < 3600:
+    return &"{(sec / 60).int}m"
+  let hours = (sec / 3600).int
+  let mins = ((sec - hours.float * 3600.0) / 60).int
+  result = &"{hours}h{mins}m"
+
+proc seatStateDotClass*(w: SeatWatch): string =
+  ## Seat light: red for wedged/alerting, green running, amber starting, grey off.
+  if w.alerting or w.state == "wedged":
+    return "dot bad"
+  case w.state
+  of "running": "dot on"
+  of "starting": "dot warn"
+  else: "dot off"
+
+proc renderSeatWatchRows*(seats: seq[SeatWatch]): string =
+  ## Babysitter table body: one line per home seat, red when wedged.
+  if seats.len == 0:
+    return """<tr><td colspan="6" class="empty">No home seats configured.</td></tr>"""
+  result = ""
+  for w in seats:
+    let stateText = if w.alerting: "ALERT" else: w.state
+    let stateCls =
+      if w.alerting or w.state == "wedged": "status dead"
+      elif w.state == "running": "status alive"
+      elif w.state == "starting": "status warn"
+      else: "status offline"
+    let rowCls = if w.alerting or w.state == "wedged": " class=\"row-dead\"" else: ""
+    let age = if w.hasStatus: formatAgeSec(w.statusAgeSec) else: "—"
+    let restarts =
+      if w.restarts > 0: &"{w.restarts}/{SeatRestartBudget}"
+      else: "0"
+    var last = w.lastAction
+    if last.len > 0 and w.lastActionAgeSec >= 0:
+      last = &"{last} · {formatAgeSec(w.lastActionAgeSec)} ago"
+    if last.len == 0:
+      last = "—"
+    let evidence = if w.evidence.len > 0: escapeHtml(w.evidence) else: "—"
+    result.add(&"""
+      <tr{rowCls}>
+        <td class="name"><span class="{seatStateDotClass(w)}"></span> {escapeHtml(w.name)}</td>
+        <td><span class="{stateCls}">{escapeHtml(stateText)}</span></td>
+        <td class="conn">{age}</td>
+        <td class="conn">{restarts}</td>
+        <td class="payload">{escapeHtml(last)}</td>
+        <td class="payload">{evidence}</td>
+      </tr>
+""")
+
+proc seatWatchSummary*(seats: seq[SeatWatch]): string =
+  ## One-line babysitter strip for the panel head.
+  var running, wedged, alerting, stopped = 0
+  for w in seats:
+    if w.alerting: inc alerting
+    case w.state
+    of "running": inc running
+    of "wedged": inc wedged
+    of "stopped": inc stopped
+    else: discard
+  result = &"{running}/{seats.len} live · {wedged} wedged"
+  if alerting > 0:
+    result.add(&" · {alerting} alert")
+
+proc renderSeatWatchPanelBody*(seats: seq[SeatWatch]): string =
+  ## Full babysitter panel body (summary + table) — one htmx swap target.
+  let alerts = block:
+    var names: seq[string] = @[]
+    for w in seats:
+      if w.alerting:
+        names.add(w.name)
+    names
+  var banner = ""
+  if alerts.len > 0:
+    banner = &"""
+      <p class="seat-alert">Auto-restart paused: {escapeHtml(alerts.join(", "))}
+        ({SeatRestartBudget} restarts/hour spent)</p>"""
+  result = &"""
+      <div class="panel-actions" style="margin-bottom:0.6rem">
+        <span class="army-summary">{escapeHtml(seatWatchSummary(seats))}</span>
+        <span class="meta">wedge = status stale &gt; {seatWedgeStaleSec().int}s with launcher alive</span>
+      </div>
+{banner}
+      <div class="table-scroll">
+      <table>
+        <thead>
+          <tr>
+            <th>Seat</th>
+            <th>Watch</th>
+            <th>Heartbeat</th>
+            <th>Restarts/h</th>
+            <th>Last action</th>
+            <th>Evidence</th>
+          </tr>
+        </thead>
+        <tbody>
+{renderSeatWatchRows(seats)}
+        </tbody>
+      </table>
+      </div>"""
+
+proc renderInventoryPanelBody*(
+    inv: Option[CharacterInventory], info: Table[int, ItemInfo]
+): string =
+  ## Compact bags panel body: value-sorted stacks + data age (one htmx swap).
+  if inv.isNone or inv.get.lines == 0:
+    return """
+      <p class="empty">No inventory on the bus yet.</p>"""
+  let c = inv.get
+  if c.updatedAt <= 0:
+    # Lines are arriving but no whole snapshot has landed yet: say so rather
+    # than render a set we know is missing parts.
+    return &"""
+      <p class="empty">Inventory snapshot assembling ({c.partsSeen.len}/{c.partsTotal})…</p>"""
+  var items = liveInventoryItems(c)
+  proc sellOf(id: int): int =
+    if info.hasKey(id): info[id].sellPrice else: 0
+  items.sort(proc (a, b: InventoryItem): int =
+    let va = sellOf(a.itemId) * a.count
+    let vb = sellOf(b.itemId) * b.count
+    if va != vb:
+      return cmp(vb, va)
+    return cmp(a.itemId, b.itemId)
+  )
+  var totalSell = 0
+  for it in items:
+    totalSell += sellOf(it.itemId) * it.count
+  let age = if c.updatedAt > 0: epochTime() - c.updatedAt else: -1.0
+  let ageCls = if age >= 0 and age <= 60: "army-summary" else: "army-summary stale"
+  var partsNote = ""
+  if invAssembling(c):
+    partsNote = &"""<span class="badge warn">new snapshot {c.partsSeen.len}/{c.partsTotal}</span>"""
+  var rows = ""
+  var shown = 0
+  for it in items:
+    if shown >= InvPanelRows:
+      break
+    inc shown
+    let known = info.hasKey(it.itemId)
+    let name = if known and info[it.itemId].name.len > 0: info[it.itemId].name else: "—"
+    let sell = sellOf(it.itemId)
+    let value = sell * it.count
+    rows.add(&"""
+        <tr>
+          <td class="conn">{it.itemId}</td>
+          <td class="name">{escapeHtml(name)}</td>
+          <td class="lvl">{it.count}</td>
+          <td class="gold">{escapeHtml(formatGold(sell))}</td>
+          <td class="gold">{escapeHtml(formatGold(value))}</td>
+        </tr>
+""")
+  if rows.len == 0:
+    # `<SA> inv 1/1` with no payload is a positive "bags are empty", which is
+    # not the same as never having heard from this character.
+    rows = """<tr><td colspan="5" class="empty">Bags empty.</td></tr>"""
+  var more = ""
+  if items.len > shown:
+    more = &"""<span class="meta">+{items.len - shown} more</span>"""
+  result = &"""
+      <div class="panel-actions" style="margin-bottom:0.6rem">
+        <span class="{ageCls}">updated {formatAgeSec(age)} ago</span>
+        <span class="army-summary">{items.len} stacks · {escapeHtml(formatGold(totalSell))} vendor</span>
+        {partsNote}
+        {more}
+      </div>
+      <div class="table-scroll">
+      <table>
+        <thead>
+          <tr>
+            <th>Id</th>
+            <th>Item</th>
+            <th>Qty</th>
+            <th>Sell</th>
+            <th>Value</th>
+          </tr>
+        </thead>
+        <tbody>
+{rows}
+        </tbody>
+      </table>
+      </div>"""
+
+proc inventoryPanelFor*(name: string): string =
+  ## Single dispatch for the bags panel: latest-known inventory + world-DB join.
+  let inv = characterInventory(name)
+  if inv.isNone:
+    return renderInventoryPanelBody(inv, initTable[int, ItemInfo]())
+  var ids: seq[int] = @[]
+  for item in liveInventoryItems(inv.get):
+    ids.add(item.itemId)
+  result = renderInventoryPanelBody(inv, lookupItemInfo(ids))
+
 proc renderRosterOfflineRow*(): string =
   ## Roster body when the realm is down: friendly nudge, not a red error.
   result = """<tr><td colspan="11" class="empty">Realm offline — <a href="/admin">Admin</a> to start.</td></tr>"""
@@ -3769,8 +4692,17 @@ const DashboardCss = """
       border: 1px solid var(--border); background: var(--panel);
     }
     .dot {
+      display: inline-block;
       width: 8px; height: 8px; border-radius: 50%;
       background: var(--bad); box-shadow: 0 0 0 transparent; flex-shrink: 0;
+    }
+    .dot.bad { background: var(--bad); box-shadow: 0 0 10px var(--bad); }
+    .army-summary.stale { color: var(--warn); border-color: rgba(240,193,75,0.45); }
+    .seat-alert {
+      margin: 0 0 0.6rem; padding: 0.5rem 0.75rem; border-radius: 10px;
+      font-size: 0.85rem; font-weight: 600; color: var(--bad);
+      border: 1px solid rgba(255,107,107,0.45);
+      background: linear-gradient(180deg, #2a1414 0%, var(--ink) 100%);
     }
     .dot.on { background: var(--good); box-shadow: 0 0 10px var(--good); }
     .dot.warn { background: var(--warn); box-shadow: 0 0 8px var(--warn); }
@@ -3883,10 +4815,15 @@ proc renderDashboard*(title, active, body: string): string =
 </html>
 """
 
-proc renderArmyPage*(characters: seq[Character], rosterOffline = false): string =
-  ## Army tab: roster only. Foundation seats always hidden.
+proc renderArmyPage*(
+    characters: seq[Character],
+    seats: seq[SeatWatch] = @[],
+    rosterOffline = false
+): string =
+  ## Army tab: roster + seat babysitter. Foundation seats always hidden.
   let rows = if rosterOffline: renderRosterOfflineRow() else: renderRosterRows(characters)
   let summary = armySummary(characters)
+  let seatBody = renderSeatWatchPanelBody(seats)
   let body = &"""
     <section class="panel">
       <div class="panel-head">
@@ -3919,6 +4856,18 @@ proc renderArmyPage*(characters: seq[Character], rosterOffline = false): string 
 {rows}
         </tbody>
       </table>
+      </div>
+    </section>
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Seat watch</h2>
+      </div>
+      <div class="panel-body"
+           id="seat-watch"
+           hx-get="/seats"
+           hx-trigger="every {PollSeconds}s"
+           hx-swap="innerHTML settle:0s swap:0s">
+{seatBody}
       </div>
     </section>"""
   result = renderDashboard("Army", "army", body)
@@ -4001,12 +4950,16 @@ proc renderMuristPage*(
     murist: Option[Character],
     events: seq[AddonEvent],
     quests: seq[QuestLogEntry] = @[],
-    realmOffline = false
+    realmOffline = false,
+    inventoryBody = ""
 ): string =
-  ## Murist tab: human seat snapshot + quest log + addon events.
+  ## Murist tab: human seat snapshot + quest log + bags + addon events.
   let statusBody = renderMuristStatus(murist, realmOffline = realmOffline)
   let questRows = renderQuestRows(quests, realmOffline = realmOffline)
   let eventRows = renderMuristEventRows(events)
+  let invBody =
+    if inventoryBody.len > 0: inventoryBody
+    else: renderInventoryPanelBody(none(CharacterInventory), initTable[int, ItemInfo]())
   let questSummary =
     if realmOffline: ""
     else: &"""<span class="army-summary">{quests.len} open</span>"""
@@ -4049,6 +5002,18 @@ proc renderMuristPage*(
 {questRows}
         </tbody>
       </table>
+      </div>
+    </section>
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Bags</h2>
+      </div>
+      <div class="panel-body"
+           id="murist-inventory"
+           hx-get="/murist/inventory"
+           hx-trigger="every {PollSeconds}s"
+           hx-swap="innerHTML settle:0s swap:0s">
+{invBody}
       </div>
     </section>
     <section class="panel">
@@ -4492,8 +5457,11 @@ proc armyPageHandler(request: Request) {.gcsafe.} =
           rosterOffline = true
       else:
         rosterOffline = true
+    var seats: seq[SeatWatch] = @[]
+    {.gcsafe.}:
+      seats = seatWatchStatus()
     request.respond(200, htmlHeaders(),
-      renderArmyPage(characters, rosterOffline = rosterOffline))
+      renderArmyPage(characters, seats, rosterOffline = rosterOffline))
   except Exception as e:
     request.respond(500, htmlHeaders(),
       &"<!DOCTYPE html><html><body><h1>Army error</h1><pre>{escapeHtml(e.msg)}</pre></body></html>")
@@ -4527,8 +5495,12 @@ proc muristPageHandler(request: Request) {.gcsafe.} =
       else:
         realmOffline = true
       events = recentEvents(limit = 40)
+    var invBody = ""
+    {.gcsafe.}:
+      invBody = inventoryPanelFor(AdminRequesterName)
     request.respond(200, htmlHeaders(),
-      renderMuristPage(murist, events, quests, realmOffline = realmOffline))
+      renderMuristPage(murist, events, quests, realmOffline = realmOffline,
+                       inventoryBody = invBody))
   except Exception as e:
     request.respond(500, htmlHeaders(),
       &"<!DOCTYPE html><html><body><h1>Murist error</h1><pre>{escapeHtml(e.msg)}</pre></body></html>")
@@ -4583,6 +5555,28 @@ proc muristEventsHandler(request: Request) {.gcsafe.} =
   except Exception as e:
     request.respond(500, htmlHeaders(),
       &"""<tr><td colspan="4" class="empty">error: {escapeHtml(e.msg)}</td></tr>""")
+
+proc muristInventoryHandler(request: Request) {.gcsafe.} =
+  ## GET /murist/inventory — htmx fragment: Murist's latest-known bags.
+  try:
+    var body = ""
+    {.gcsafe.}:
+      body = inventoryPanelFor(AdminRequesterName)
+    request.respond(200, htmlHeaders(), body)
+  except Exception as e:
+    request.respond(500, htmlHeaders(),
+      &"""<p class="empty">error: {escapeHtml(e.msg)}</p>""")
+
+proc seatsPartialHandler(request: Request) {.gcsafe.} =
+  ## GET /seats — htmx fragment: seat babysitter panel body.
+  try:
+    var seats: seq[SeatWatch]
+    {.gcsafe.}:
+      seats = seatWatchStatus()
+    request.respond(200, htmlHeaders(), renderSeatWatchPanelBody(seats))
+  except Exception as e:
+    request.respond(500, htmlHeaders(),
+      &"""<p class="empty">error: {escapeHtml(e.msg)}</p>""")
 
 proc traversePageHandler(request: Request) {.gcsafe.} =
   ## GET /traverse — Traverse tab (telemetry + PoL / observer + replays).
@@ -5217,6 +6211,111 @@ proc registerMcpTools(server: McpServer) =
       isError: not payload{"ok"}.getBool(false)
     )
 
+  let seatWatchTool = McpTool(
+    name: "seat_watch",
+    description: "Seat babysitter view: per home seat liveness (running/starting/stopped/wedged), status heartbeat age, auto-restarts in the last hour, persistent alert flag, and the last wedge evidence file.",
+    inputSchema: %*{
+      "type": "object",
+      "properties": newJObject(),
+      "additionalProperties": false,
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    }
+  )
+
+  proc seatWatchMcpHandler(arguments: JsonNode): ToolResult {.gcsafe.} =
+    ## Same dispatch as the Army tab Seat watch panel.
+    discard arguments
+    var seats: seq[SeatWatch]
+    {.gcsafe.}:
+      seats = seatWatchStatus()
+    let payload = %*{
+      "seats": seatWatchToJson(seats),
+      "stale_threshold_sec": seatWedgeStaleSec(),
+      "restart_budget_per_hour": SeatRestartBudget,
+      "enabled": seatBabysitterEnabled()
+    }
+    result = ToolResult(
+      content: @[textContent($payload)],
+      structuredContent: some(payload),
+      isError: false
+    )
+
+  let inventoryTool = McpTool(
+    name: "character_inventory",
+    description: "Latest-known bags for one character, assembled from `<SA> inv` chat-bus lines (item id, count, world-DB name / vendor sell price) plus the age of the data. Empty until that character has emitted inventory.",
+    inputSchema: %*{
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Character name (default Murist)"
+        }
+      },
+      "additionalProperties": false,
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    }
+  )
+
+  proc characterInventoryMcpHandler(arguments: JsonNode): ToolResult {.gcsafe.} =
+    ## Same dispatch as the Murist tab Bags panel.
+    var name = AdminRequesterName
+    if arguments != nil and arguments{"name"}.getStr("").len > 0:
+      name = arguments{"name"}.getStr("")
+    var payload: JsonNode
+    {.gcsafe.}:
+      let inv = characterInventory(name)
+      if inv.isNone:
+        payload = %*{
+          "name": name,
+          "items": [],
+          "item_count": 0,
+          "age_sec": -1.0,
+          "lines": 0,
+          "known": false,
+          "reported": inventoryCharacters()
+        }
+      else:
+        var ids: seq[int] = @[]
+        for item in liveInventoryItems(inv.get):
+          ids.add(item.itemId)
+        payload = inventoryToJson(inv.get, lookupItemInfo(ids))
+        payload["known"] = %true
+    result = ToolResult(
+      content: @[textContent($payload)],
+      structuredContent: some(payload),
+      isError: false
+    )
+
+  let requestInventoryTool = McpTool(
+    name: "request_inventory",
+    description: "Announce `<SYS> inv?` so logged-in clients re-emit a full `<SA> inv` snapshot over the chat bus. Push is the normal path (login + BAG_UPDATE deltas); the addon suppresses an identical repeat for 30s, so unchanged bags may answer with silence.",
+    inputSchema: %*{
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Character whose inventory age is reported back (default Murist)"
+        }
+      },
+      "additionalProperties": false,
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    }
+  )
+
+  proc requestInventoryMcpHandler(arguments: JsonNode): ToolResult {.gcsafe.} =
+    ## Same announce path as reload_addon, different verb.
+    var name = AdminRequesterName
+    if arguments != nil and arguments{"name"}.getStr("").len > 0:
+      name = arguments{"name"}.getStr("")
+    var payload: JsonNode
+    {.gcsafe.}:
+      payload = requestInventorySnapshot(name)
+    result = ToolResult(
+      content: @[textContent($payload)],
+      structuredContent: some(payload),
+      isError: not payload{"ok"}.getBool(false)
+    )
+
   # registerRichTool: plain registerTool only surfaces getStr() on JsonNode
   # (arrays become empty text). Monky uses the rich path for the same reason.
   server.registerRichTool(listTool, listCharactersHandler)
@@ -5228,8 +6327,22 @@ proc registerMcpTools(server: McpServer) =
   server.registerRichTool(serverStatusTool, serverStatusMcpHandler)
   server.registerRichTool(startServerTool, startServerMcpHandler)
   server.registerRichTool(stopServerTool, stopServerMcpHandler)
+  server.registerRichTool(seatWatchTool, seatWatchMcpHandler)
+  server.registerRichTool(inventoryTool, characterInventoryMcpHandler)
+  server.registerRichTool(requestInventoryTool, requestInventoryMcpHandler)
   server.registerRichTool(startBotTool, startBotMcpHandler)
   server.registerRichTool(stopBotTool, stopBotMcpHandler)
+
+proc httpPort*(): int =
+  ## Listen port. SYSTEM_HTTP_PORT exists so an isolated instance (fake
+  ## SYSTEM_ARMY_DIR / SYSTEM_CHAT_LOG) can be exercised beside the live
+  ## dashboard without taking 7777 or touching real seats.
+  let env = getEnv("SYSTEM_HTTP_PORT", "").strip()
+  if env.len > 0:
+    let p = parseIntOr(env, 0)
+    if p > 0 and p < 65536:
+      return p
+  result = HttpPort
 
 proc main() =
   ## Boot The System: Chat.log tailer + one mummy server (dashboard + MCP).
@@ -5238,6 +6351,7 @@ proc main() =
   startChatLogTailer()
   startAdminWorker()
   startServerOpWorker()
+  startSeatWatch()
 
   var router: Router
   router.get("/", armyPageHandler)
@@ -5246,6 +6360,8 @@ proc main() =
   router.get("/murist/status", muristStatusHandler)
   router.get("/murist/quests", muristQuestsHandler)
   router.get("/murist/events", muristEventsHandler)
+  router.get("/murist/inventory", muristInventoryHandler)
+  router.get("/seats", seatsPartialHandler)
   router.get("/advisor", advisorPageHandler)
   router.get("/traverse", traversePageHandler)
   router.get("/traverse/status", traverseStatusHandler)
@@ -5271,28 +6387,31 @@ proc main() =
   router.get("/server-info", serverInfoHandler)
   router.post("/mcp", mcpHandler)
 
+  let port = httpPort()
   let server = newServer(router)
-  echo &"{ServerName} v{Version} listening on http://127.0.0.1:{HttpPort}"
-  echo &"  Army:        GET  http://127.0.0.1:{HttpPort}/army"
-  echo &"  Murist:      GET  http://127.0.0.1:{HttpPort}/murist"
-  echo &"  Advisor:     GET  http://127.0.0.1:{HttpPort}/advisor"
-  echo &"  Traverse:    GET  http://127.0.0.1:{HttpPort}/traverse"
+  echo &"{ServerName} v{Version} listening on http://127.0.0.1:{port}"
+  echo &"  Army:        GET  http://127.0.0.1:{port}/army"
+  echo &"  Murist:      GET  http://127.0.0.1:{port}/murist"
+  echo &"  Advisor:     GET  http://127.0.0.1:{port}/advisor"
+  echo &"  Traverse:    GET  http://127.0.0.1:{port}/traverse"
   echo &"  Traverse ops POST /traverse/pol/start|/stop  /traverse/watch/start|/stop"
-  echo &"  Admin:       GET  http://127.0.0.1:{HttpPort}/admin"
-  echo &"  Events:      GET  http://127.0.0.1:{HttpPort}/events"
-  echo &"  Server:      GET  http://127.0.0.1:{HttpPort}/server (POST /server/start /server/stop)"
-  echo &"  Reload:      POST http://127.0.0.1:{HttpPort}/reload"
-  echo &"  Respawn:     POST http://127.0.0.1:{HttpPort}/admin/respawn-shadow-army"
-  echo &"  Tele party:  POST http://127.0.0.1:{HttpPort}/admin/tele-party-to-murist"
-  echo &"  MCP:         POST http://127.0.0.1:{HttpPort}/mcp"
+  echo &"  Admin:       GET  http://127.0.0.1:{port}/admin"
+  echo &"  Events:      GET  http://127.0.0.1:{port}/events"
+  echo &"  Server:      GET  http://127.0.0.1:{port}/server (POST /server/start /server/stop)"
+  echo &"  Reload:      POST http://127.0.0.1:{port}/reload"
+  echo &"  Respawn:     POST http://127.0.0.1:{port}/admin/respawn-shadow-army"
+  echo &"  Tele party:  POST http://127.0.0.1:{port}/admin/tele-party-to-murist"
+  echo &"  MCP:         POST http://127.0.0.1:{port}/mcp"
   echo &"  container:   {gameContainer()} (SYSTEM_MYSQL_CONTAINER to override)"
   echo &"  traverse:    {resolveTraverseContainer()} (SYSTEM_TRAVERSE_CONTAINER to override)"
   echo &"  Chat.log:    {chatLogPath()} (SYSTEM_CHAT_LOG to override)"
   echo &"  upstream:    {upstreamDir()} (SYSTEM_UPSTREAM_DIR to override)"
+  echo &"  seat watch:  babysitter {(if seatBabysitterEnabled(): \"on\" else: \"observe-only\")}" &
+    &" · wedge > {seatWedgeStaleSec().int}s · {SeatRestartBudget} restarts/h/seat"
   echo "  DB access:   docker exec + mariadb SELECT (read-only)"
   echo "  SOAP write:  announce + admin revive/tele (SYSTEM_SOAP_* )"
   echo "  lifecycle:   operator up/down via uv (async worker; Server panel)"
-  server.serve(Port(HttpPort), "127.0.0.1")
+  server.serve(Port(port), "127.0.0.1")
 
 when isMainModule:
   main()
