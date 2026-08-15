@@ -107,6 +107,15 @@ Our tools need to be fast and robust. we only have a week for each coworld compe
   tier has no network, no docker, no sleeps (testing doctrine:
   racha_notes `Programming/testing.md`). Integration tier may use the
   local realm. Prefer Lua tool tests; do not add Python unit suites.
+- **"Champion" means OUR active policy, not tournament rank.**
+  `is_champion: true` (and any "champion slot" / "champion policy"
+  language) means that policy is our account's currently-active entry in
+  the league — nothing more. It says NOTHING about leaderboard standing.
+  Check the leaderboard (`docs/leagues/`) before claiming any rank; as of
+  2026-08-15 we are ranked #2, and this lexicon trap has now caused at
+  least two premature celebrations (once at #4, once tonight at #2).
+  When reporting results, say "our champion policy" and state the actual
+  rank separately.
 - **Naming.** Repo-internal personas use shadow-soldier names (igris,
   beru, tusk, kaisel, ...). One file per persona, one thesis per persona,
   each a pinned hypothesis (see solo-leveling.md persona section).
