@@ -63,6 +63,8 @@ SPOT_BIN_MAX_STEPS = 24
 # Guard against pathological loot items dropped by half the game.
 MAX_SPAWNS_PER_OBJECTIVE = 4000
 MAX_MEDOID_SAMPLE = 256
+# "who drops this" names on an item objective: the dominant droppers only.
+MAX_SOURCE_NAMES = 4
 
 
 # ---------------------------------------------------------------------------
@@ -569,21 +571,49 @@ class Generator:
             sources = self.item_sources.get(item, [])
             if not sources:
                 continue
-            spawns: List[Spawn] = []
+            all_pts: List[Point] = []
+            source_pts: Dict[str, List[Point]] = {}
             kinds: Set[str] = set()
             for kind, entry in sources:
                 got = self.spawns_of(kind, entry)
-                if got:
-                    kinds.add(kind)
-                    spawns.extend(got)
-            pts = dominant_zone(to_points(spawns, self.areas, zone), zone)
+                if not got:
+                    continue
+                kinds.add(kind)
+                got_pts = to_points(got, self.areas, zone)
+                all_pts.extend(got_pts)
+                name = self.name_of(kind, entry)
+                if name and got_pts:
+                    source_pts.setdefault(name, []).extend(got_pts)
+            pts = dominant_zone(all_pts, zone)
             spots = pick_spots(pts, self.max_spots)
             if spots:
-                out.append({"label": self.item_names.get(item, "#%d" % item),
-                            "kind": "object" if kinds == {"object"} else "item",
-                            "count": q["ReqItemCount%d" % i] or 1,
-                            "spots": spots})
+                label = self.item_names.get(item, "#%d" % item)
+                obj: Dict[str, object] = {
+                    "label": label,
+                    "kind": "object" if kinds == {"object"} else "item",
+                    "count": q["ReqItemCount%d" % i] or 1,
+                    "spots": spots,
+                }
+                names = self.source_names(source_pts, pts[0][0])
+                # the label already names the source when there is only one;
+                # no point repeating "Darkhound Blood" as its own hunting hint.
+                if names and names != [label]:
+                    obj["from"] = names
+                out.append(obj)
         return out
+
+    @staticmethod
+    def source_names(source_pts: Dict[str, List[Point]], kept_zone: int) -> List[str]:
+        """Who to hunt for an item objective: the templates that actually put
+        spawns in the zone the spots came from, dominant droppers first, capped
+        so a HUD line stays readable. Emitted alphabetically for a stable file."""
+        counts: Dict[str, int] = {}
+        for name, points in source_pts.items():
+            hits = sum(1 for p in points if p[0] == kept_zone)
+            if hits:
+                counts[name] = hits
+        top = sorted(counts, key=lambda n: (-counts[n], n))[:MAX_SOURCE_NAMES]
+        return sorted(top)
 
     def build(self, q: Dict[str, int]) -> Optional[Dict[str, object]]:
         zone = self.areas.zone_of_sort(q["ZoneOrSort"])
@@ -662,9 +692,16 @@ def emit(entries: List[Tuple[str, Dict[str, object]]], header: List[str],
                 spots = ", ".join(
                     "{zone = %d, x = %s, y = %s}" % (z, fmt(x), fmt(y))
                     for z, x, y in obj["spots"])
-                lines.append("{ label = %s, kind = %s, count = %d, spots = { %s } },"
-                             % (lua_string(obj["label"]), lua_string(obj["kind"]),
-                                obj["count"], spots))
+                # `from` is not a Lua keyword, so it is a safe table key.
+                sources = obj.get("from")
+                origin = ""
+                if sources:
+                    origin = "from = { %s }, " % ", ".join(
+                        lua_string(name) for name in sources)
+                lines.append(
+                    "{ label = %s, kind = %s, count = %d, %sspots = { %s } },"
+                    % (lua_string(obj["label"]), lua_string(obj["kind"]),
+                       obj["count"], origin, spots))
             lines.append("},")
         for key in ("turnIn", "startedBy"):
             spot = q[key]

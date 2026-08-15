@@ -45,6 +45,9 @@ ShadowArmyQuestData = {
     objectives = {
       { label = "Mindless Zombie", kind = "mob", count = 8,
         spots = { {zone = 85, x = 43.2, y = 61.7}, ... } },
+      { label = "Darkhound Blood", kind = "item", count = 5,
+        from = { "Cursed Darkhound", "Decrepit Darkhound" },
+        spots = { {zone = 85, x = 62.8, y = 38.1}, ... } },
     },
     turnIn    = { label = "Shadow Priest Sarvis", zone = 85, x = 30.8, y = 66.2 },
     startedBy = { label = "Undertaker Mordo",     zone = 85, x = 30.2, y = 71.7 },
@@ -57,6 +60,11 @@ ShadowArmyQuestData = {
 - `zone` is an `AreaTable` zone id; `x`/`y` are zone-normalized percent — the
   same space `GetPlayerMapPosition` returns, multiplied by 100.
 - `kind` is `"mob"`, `"object"` or `"item"`.
+- `from` names who to hunt for an item objective — the densest in-zone
+  sources (up to 4, selected by spawn-point count, NOT drop rate), emitted
+  alphabetically for a stable file; do not read `from[1]` as "best".
+  Omitted when it would add nothing: mob-kill objectives never carry it (their
+  `label` *is* the enemy), nor does an item whose only source shares its name.
 - Quests with nothing locatable are omitted entirely rather than emitted empty.
 - Same-title quests carry their other variants in an `alts` list on the
   primary entry (same shape, nested once) — see title collisions below.
