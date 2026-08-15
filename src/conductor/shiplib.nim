@@ -52,6 +52,19 @@ proc parseVersionTag(output, policy: string): string =
       return output[idx ..< stop]
     inc idx
 
+proc bumpVersionTag*(lastLabel, policy: string): string =
+  ## "petrel:v9" -> "petrel:v10"; "" when underivable. The upload CLI's
+  ## stdout has never contained a parseable tag (4/4 ships needed manual
+  ## submits), but the version sequence is deterministic from the last
+  ## shipped label.
+  let prefix = policy & ":v"
+  if lastLabel.startsWith(prefix):
+    try:
+      return prefix & $(parseInt(lastLabel[prefix.len .. ^1]) + 1)
+    except ValueError:
+      discard
+  ""
+
 proc parseUuid(output: string): string =
   ## First 8-4-4-4-12 hex UUID in the text; "" when absent.
   const hex = {'0'..'9', 'a'..'f', 'A'..'F'}
@@ -154,14 +167,23 @@ proc executeShip*(root: string, lc: LeagueConfig, repo, laneDirPath: string,
     discard uvRun(forkDir, @["coworld", "player", "unset"])
     return ShipOutcome(detail: "upload-policy failed: " &
       outUp[max(0, outUp.len - 300) .. ^1])
-  let versionTag = parseVersionTag(outUp, lc.ship.policy)
-  let versionId = parseUuid(outUp)
-  if versionTag.len == 0 or versionId.len == 0:
-    flagNeedsHuman(repo, "ship stopped after upload: could not parse " &
-      "version tag/id from upload-policy output — submit by hand " &
+  var versionTag = parseVersionTag(outUp, lc.ship.policy)
+  var versionId = parseUuid(outUp)
+  if versionTag.len == 0:
+    versionTag = bumpVersionTag(
+      lastShipped(ledgerPath(laneDirPath, lc.ticketLane)){
+        "ship", "label"}.getStr(),
+      lc.ship.policy)
+    if versionTag.len > 0:
+      echo "conductor: upload output unparseable (known CLI behavior) — ",
+        "derived ", versionTag, " from the last shipped label; the ",
+        "submit readback supplies the immutable id"
+  if versionTag.len == 0:
+    flagNeedsHuman(repo, "ship stopped after upload: could not parse OR " &
+      "derive the version tag — submit by hand " &
       "(one submit per frozen version!)")
     discard uvRun(forkDir, @["coworld", "player", "unset"])
-    return ShipOutcome(detail: "uploaded but version tag/id unparsed — " &
+    return ShipOutcome(detail: "uploaded but version tag underivable — " &
       "NEEDS-HUMAN (do not re-upload)")
 
   # Submit behind the champion guard.
@@ -183,6 +205,13 @@ proc executeShip*(root: string, lc: LeagueConfig, repo, laneDirPath: string,
   var submissionId = ""
   if rcSub == 0:
     submissionId = parseUuid(outSub)
+    if versionId.len == 0:
+      # The submit readback's status URL carries the immutable id
+      # ("...policy-version:<uuid>") — harvest it when the upload output
+      # gave nothing.
+      let marker = outSub.find("policy-version:")
+      if marker >= 0:
+        versionId = parseUuid(outSub[marker + len("policy-version:") .. ^1])
   else:
     flagNeedsHuman(repo, "submit failed for " & versionTag &
       " (guard " & guard & ") — inspect before any retry: " &

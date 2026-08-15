@@ -197,5 +197,13 @@ lcShip.ship.minNorthing = 0.0
 ratchet = shipRatchet(shipRoot, lcShip, shipLane, candidate9k)
 check(not ratchet.ok, "legacy mode still gates vs last-shipped floor")
 
+# --- ship version-tag derivation (upload output unparseable 4/4 ships) ---
+check(bumpVersionTag("petrel:v9", "petrel") == "petrel:v10",
+  "bumps the last shipped label")
+check(bumpVersionTag("petrel:v99", "petrel") == "petrel:v100",
+  "multi-digit bump")
+check(bumpVersionTag("", "petrel") == "", "empty label underivable")
+check(bumpVersionTag("ibis:v4", "petrel") == "", "foreign policy refused")
+
 removeDir(tmp)
 echo "test_conductor_gate: ", passed, " ok"
