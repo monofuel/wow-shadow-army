@@ -96,6 +96,21 @@ r = model.evaluate(snapshot({ buffs = { armor() } }))
 check(r.buttons[1].id == "buff:armor" and r.buttons[2].id == "summon",
   "buff upkeep is offered before the summon")
 
+r = model.evaluate(snapshot({ hasPet = true, buffs = {
+  armor({ missing = false, expiring = true, minutes = 4, spell = "Demon Armor" }) } }))
+check(button(r, "buff:armor") ~= nil, "an expiring trained buff becomes a cast button")
+check(button(r, "buff:armor").label == "Demon Armor",
+  "the expiring-buff button is labelled with the trained rank")
+check(#r.notes == 0, "an expiring buff with a button raises no note")
+
+r = model.evaluate(snapshot({ buffs = {
+  armor(),
+  armor({ id = "ward", label = "Shadow Ward", spell = "Shadow Ward" }) } }))
+check(#r.buttons == 3, "two missing buffs plus the summon make three buttons")
+check(r.buttons[1].id == "buff:armor" and r.buttons[2].id == "buff:ward",
+  "both missing buffs get their own button, in snapshot order")
+check(r.buttons[3].id == "summon", "the summon stays last behind both buffs")
+
 r = model.evaluate(snapshot({ hasPet = true, dead = true, buffs = { armor() } }))
 check(#r.buttons == 0, "a dead player gets no buff button")
 check(r.notes[1].text == "Demon Skin MISSING", "a dead player still sees the warning")

@@ -277,6 +277,12 @@ function QuestModel.build(opts)
           have = board.have, need = board.need,
           done = board.done and true or false, turnIn = false,
         }
+        -- Who drops this item. QuestData emits `from` alphabetically (picked
+        -- by spawn density, not drop rate) — never rank it. A finished
+        -- objective needs no hunt hint.
+        if generated and generated.from and not obj.done then
+          obj.from = generated.from
+        end
         local spots = generated and generated.spots
         if spots and questGetn(spots) > 0 then
           local first = spots[1]
@@ -662,6 +668,192 @@ end
 
 ShadowArmy.passiveModel = PassiveModel
 
+-- Buff watch: warn when a tracked self-buff is missing or expiring.
+-- 1.12 API quirk: GetPlayerBuff/GetPlayerBuffTimeLeft give remaining time,
+-- but buff NAMES aren't exposed directly — identify by texture instead
+-- (stable across ranks). Demon Skin and Demon Armor share the watch slot:
+-- either one counts as "armored".
+-- Lives above the UI guard (r44) so unit tests bind the REAL table: the bar
+-- model's managed set is derived from it, and a rename here must break tests
+-- rather than silently un-manage a spell.
+local ARMOR_WATCH = {
+  id = "armor",
+  label = "Demon Skin",
+  autoLabel = "armor",
+  -- Preference order; Demon Armor supersedes Demon Skin at 20+.
+  spells = { "Demon Armor", "Demon Skin" },
+  textures = {
+    "Interface\\Icons\\Spell_Shadow_RagingScream",  -- Demon Skin
+    "Interface\\Icons\\Spell_Shadow_SpectralSight", -- Demon Armor (lvl 20+)
+  },
+  warnBelow = 300, -- seconds; warn under 5 minutes
+  autoCast = true, -- r12: the advisor keeps this one up itself (see F.armorTick)
+}
+
+local WATCHED_BUFFS = { ARMOR_WATCH }
+
+ShadowArmy.watchedBuffs = WATCHED_BUFFS
+
+--------------------------------------------------------------------------
+-- Pure action-bar sweep model (r43): the advisor owns its managed abilities
+-- (combat-coach spells, passive-upkeep buffs, the class summon) and casts
+-- them itself, so a bar copy is dead weight the human can mis-click.
+-- monofuel authorized clobbering the bar. This half only decides WHICH
+-- slots go; the UI half reads slot names and does the removal.
+--
+-- r44 telemetry shelf: the combat coach reads EXACT usability and range off
+-- an action slot that holds the spell (F.combatActionState). Sweeping every
+-- copy would pin it to usable=true plus a CheckInteractDistance guess for the
+-- rest of the session, so the sweep now keeps one copy per managed spell in
+-- the last bonus bank — a bank no key can reach on a stance-less class.
+--------------------------------------------------------------------------
+
+local BarModel = {}
+
+local function barGetn(t)
+  local n = 0
+  while t and t[n + 1] ~= nil do n = n + 1 end
+  return n
+end
+
+BarModel.maxSlot = 120 -- 1.12: 10 pages x 12 buttons, no more
+-- 1-72 are the six pressable pages — the only slots a human can mis-click.
+-- 73-120 are the stance/bonus banks (a druid's form bars live there), so the
+-- sweep stops at 72 and form bars survive untouched.
+BarModel.sweepMax = 72
+-- The last bonus bank is the telemetry shelf. Assumes a stance-less class:
+-- bonus offset 4 (druid Travel Form) renders these very slots as the live
+-- bar, so the shelf must move before the sweep ships for druids.
+BarModel.shelfFirst = 109
+BarModel.shelfLast = 120
+
+-- Managed names in shelf priority order, lowercase: 1.12 tooltips carry the
+-- client's capitalisation, not ours. Coach spells come first because they are
+-- the ones that consume exact slot telemetry; `watches` is the passive
+-- buff-watch list, whose every RANK counts (Demon Skin and Demon Armor share
+-- one watch); the class summon trails.
+function BarModel.managedOrder(classToken, watches)
+  local out, n, seen = {}, 0, {}
+  local function add(name)
+    if not name then return end
+    local key = string.lower(name)
+    if seen[key] then return end
+    seen[key] = true
+    n = n + 1
+    out[n] = key
+  end
+  local defs = CombatModel.actions[classToken or ""] or {}
+  local i = 1
+  while i <= barGetn(defs) do
+    add(defs[i].spell)
+    i = i + 1
+  end
+  local wi = 1
+  while wi <= barGetn(watches) do
+    local spells = watches[wi].spells or {}
+    local si = 1
+    while si <= barGetn(spells) do
+      add(spells[si])
+      si = si + 1
+    end
+    wi = wi + 1
+  end
+  add(PassiveModel.summons[classToken or ""])
+  return out
+end
+
+-- Set form of the same list, for O(1) slot matching.
+function BarModel.managedNames(classToken, watches)
+  local names = {}
+  local order = BarModel.managedOrder(classToken, watches)
+  local i = 1
+  while i <= barGetn(order) do
+    names[order[i]] = true
+    i = i + 1
+  end
+  return names
+end
+
+-- slotNames is { [slot] = tooltip line 1 } and is sparse (empty slots are
+-- absent), so walk the slot range rather than the table.
+function BarModel.sweep(slotNames, managed, maxSlot)
+  local out, n = {}, 0
+  slotNames = slotNames or {}
+  managed = managed or {}
+  local slot = 1
+  local last = maxSlot or BarModel.maxSlot
+  while slot <= last do
+    local name = slotNames[slot]
+    if name and managed[string.lower(name)] then
+      n = n + 1
+      out[n] = slot
+    end
+    slot = slot + 1
+  end
+  return out
+end
+
+-- The whole decision, so the UI half only executes. Returns
+--   { remove = { slot, ... },                    -- pressable slots to clear
+--     place  = { { name = <lowercase>, slot = n }, ... }, -- shelf refills
+--     shelfFull = bool }                         -- some spell got no shelf
+-- opts:
+--   order      ordered managed names (BarModel.managedOrder); no order, no
+--              placement — a hash set has no stable order to fill a shelf in
+--   trained    set/map keyed lowercase of spells the player actually knows
+--              (auto.spells works directly); nil means "all of them"
+--   occupied   set of slots holding SOMETHING, macros and slots whose tooltip
+--              would not read included — those are never overwritten
+--   sweepMax / shelfFirst / shelfLast / maxSlot   range overrides
+function BarModel.plan(slotNames, managed, opts)
+  slotNames, managed, opts = slotNames or {}, managed or {}, opts or {}
+  local sweepMax = opts.sweepMax or BarModel.sweepMax
+  local shelfFirst = opts.shelfFirst or BarModel.shelfFirst
+  local shelfLast = opts.shelfLast or BarModel.shelfLast
+  local maxSlot = opts.maxSlot or BarModel.maxSlot
+  local occupied = opts.occupied or {}
+  local out = { remove = BarModel.sweep(slotNames, managed, sweepMax),
+    place = {}, shelfFull = false }
+  -- Anything already parked in the untouched banks still feeds the coach, so
+  -- it needs no shelf copy.
+  local kept = {}
+  local slot = sweepMax + 1
+  while slot <= maxSlot do
+    local name = slotNames[slot]
+    if name then kept[string.lower(name)] = true end
+    slot = slot + 1
+  end
+  local free, fn = {}, 0
+  slot = shelfFirst
+  while slot <= shelfLast do
+    if not occupied[slot] and not slotNames[slot] then
+      fn = fn + 1
+      free[fn] = slot
+    end
+    slot = slot + 1
+  end
+  local order, trained = opts.order or {}, opts.trained
+  local pn, i = 0, 1
+  while i <= barGetn(order) do
+    local name = string.lower(order[i])
+    if not kept[name] and (not trained or trained[name]) then
+      kept[name] = true
+      if pn < fn then
+        pn = pn + 1
+        out.place[pn] = { name = name, slot = free[pn] }
+      else
+        -- Shelf is out of room: the coach falls back to approximate range
+        -- and usable=true for whatever is left over.
+        out.shelfFull = true
+      end
+    end
+    i = i + 1
+  end
+  return out
+end
+
+ShadowArmy.barModel = BarModel
+
 -- Unit tests load this file without the WoW UI and stop after the pure model.
 if not CreateFrame then return end
 
@@ -670,7 +862,7 @@ local F = {}
 
 -- Bump on every edit. The System watches Chat.log for "<SA> loaded rev=..."
 -- after sending a reload — a new rev proves the edit actually loaded.
-local REV = "r42"
+local REV = "r44"
 
 -- Log window (r16): every F.say()/F.emit() line also lands here with a
 -- timestamp, so errors survive chat scroll-off and can be reviewed in-game.
@@ -801,10 +993,15 @@ end
 --------------------------------------------------------------------------
 
 local PANEL_BASE_HEIGHT = 300 -- r32: room for quest checklist under grind lines
+-- r43: anchored by TOPRIGHT so the passive row growing the panel pushes only
+-- downward. A RIGHT anchor grows from the center and shifts every line above
+-- it too. Y keeps the top edge exactly where the old RIGHT/-40/60 anchor put
+-- it at base height (60 + half the panel).
+local PANEL_TOP_Y = 60 + PANEL_BASE_HEIGHT / 2
 local panel = CreateFrame("Frame", "ShadowArmyPanel", UIParent)
 panel:SetWidth(210)
 panel:SetHeight(PANEL_BASE_HEIGHT)
-panel:SetPoint("RIGHT", UIParent, "RIGHT", -40, 60)
+panel:SetPoint("TOPRIGHT", UIParent, "RIGHT", -40, PANEL_TOP_Y)
 panel:SetFrameStrata("HIGH")
 panel:SetBackdrop({
   bgFile = "Interface\\Tooltips\\UI-Tooltip-Background",
@@ -825,7 +1022,7 @@ panel:Show()
 function F.panelShowReset()
   -- Recover from off-screen drag or a hide that left no way back.
   panel:ClearAllPoints()
-  panel:SetPoint("RIGHT", UIParent, "RIGHT", -40, 60)
+  panel:SetPoint("TOPRIGHT", UIParent, "RIGHT", -40, PANEL_TOP_Y)
   panel:Show()
 end
 
@@ -851,9 +1048,11 @@ local line4 = F.makeLine(line3)
 local line5 = F.makeLine(line4, -6) -- buff watch / warnings
 
 -- r42: long-term passive upkeep buttons (missing self-buff, missing minion).
--- Frames are built once here and only shown/hidden on refresh. The row keeps
--- zero height while nothing is pending, so the quest checklist below never
--- moves in the common case.
+-- Frames are built once here and only shown/hidden on refresh. An idle row
+-- still costs 5px (1px minimum height + its 4px gap), so the checklist below
+-- sits 5px lower than it did in r41; from there it only moves when a button
+-- actually appears, and r43's TOPRIGHT panel anchor keeps that growth
+-- downward.
 local PASSIVE_MAX_BUTTONS = 4
 local PASSIVE_BTN_STEP = 20
 local passiveRow = CreateFrame("Frame", "ShadowArmyPassiveRow", panel)
@@ -1432,27 +1631,6 @@ reloadBtn:SetScript("OnClick", function()
   ReloadUI()
 end)
 
--- One-click loot vacuum (r14): 'loot gated' proved LootSlot is a no-op
--- outside hardware-event context on this client (while sort's
--- PickupContainerItem works from OnUpdate — the gate is per-function).
--- So ride the player's first click on ANY loot item: from inside that
--- click's context, loot every other slot too. One click per corpse.
-if LootButton_OnClick then
-  local origLootButtonClick = LootButton_OnClick
-  LootButton_OnClick = function(button)
-    local clicked = this and this:GetID() or 0
-    local i = GetNumLootItems()
-    while i >= 1 do
-      if i ~= clicked then
-        LootSlot(i)
-        pcall(ConfirmLootSlot, i)
-      end
-      i = i - 1
-    end
-    origLootButtonClick(button)
-  end
-end
-
 -- Auto-reload (r14): when a reload is pending, piggyback the player's own
 -- next action-bar press — that keypress IS a hardware event, so ReloadUI is
 -- legal inside the hook. Out-of-combat only (a surprise 2s UI freeze
@@ -1570,27 +1748,6 @@ end)
 -- clock-ish lines. Range bucket via CheckInteractDistance (1.12 addons
 -- get no world coordinates for other units — buckets are what we have).
 --------------------------------------------------------------------------
-
--- Buff watch: warn when a tracked self-buff is missing or expiring.
--- 1.12 API quirk: GetPlayerBuff/GetPlayerBuffTimeLeft give remaining time,
--- but buff NAMES aren't exposed directly — identify by texture instead
--- (stable across ranks). Demon Skin and Demon Armor share the watch slot:
--- either one counts as "armored".
-local ARMOR_WATCH = {
-  id = "armor",
-  label = "Demon Skin",
-  autoLabel = "armor",
-  -- Preference order; Demon Armor supersedes Demon Skin at 20+.
-  spells = { "Demon Armor", "Demon Skin" },
-  textures = {
-    "Interface\\Icons\\Spell_Shadow_RagingScream",  -- Demon Skin
-    "Interface\\Icons\\Spell_Shadow_SpectralSight", -- Demon Armor (lvl 20+)
-  },
-  warnBelow = 300, -- seconds; warn under 5 minutes
-  autoCast = true, -- r12: the advisor keeps this one up itself (see F.armorTick)
-}
-
-local WATCHED_BUFFS = { ARMOR_WATCH }
 
 function F.buffTimeLeftByTexture(textures)
   local i = 0
@@ -1762,7 +1919,11 @@ function F.passiveLine()
     end
   end
 
+  -- Clamp BEFORE the height math: the model may propose more upkeep than
+  -- there are frames, and an unclamped count would inflate the panel by rows
+  -- that can never be drawn.
   local shown = table.getn(result.buttons)
+  if shown > PASSIVE_MAX_BUTTONS then shown = PASSIVE_MAX_BUTTONS end
   local i = 1
   while i <= PASSIVE_MAX_BUTTONS do
     local btn = passiveBtns[i]
@@ -1790,6 +1951,159 @@ function F.passiveLine()
   if text then return text end
   if shown > 0 then return "" end
   return "|cFF44FF44buffs OK|r"
+end
+
+--------------------------------------------------------------------------
+-- r43: advisor-managed spells come OFF the action bar (monofuel's call).
+-- The advisor casts the coach rotation and the passive layer itself, so a
+-- bar copy only invites a mis-click on an ability we already drive.
+--
+-- r44 narrows that to the PRESSABLE pages (1-72) and parks one copy of each
+-- managed spell on the telemetry shelf (109-120, the last bonus bank — no key
+-- reaches it on a stance-less class). F.combatActionState reads exact
+-- usability/range off a slot; without the shelf the coach would be stuck on
+-- usable=true and CheckInteractDistance guesses forever.
+--
+-- 1.12 has NO GetActionInfo: the only way to name a slot's contents is a
+-- tooltip scan. One hidden GameTooltip is built here (never per tick) and
+-- read through its name region's first line, which in 1.12 carries the base
+-- spell name with no rank suffix — so an exact, case-insensitive match
+-- against the managed set is safe.
+--
+-- Removal is PickupAction + ClearCursor: picking an action up leaves the
+-- slot empty and dropping it on nothing discards it. Refilling the r44
+-- telemetry shelf is PickupSpell + PlaceAction, the same pair the spellbook
+-- drag uses.
+--------------------------------------------------------------------------
+
+local barTip = CreateFrame("GameTooltip", "ShadowArmyBarTip", UIParent,
+  "GameTooltipTemplate")
+barTip:SetOwner(UIParent, "ANCHOR_NONE")
+
+local BAR_SWEEP_SETTLE = 2 -- seconds a trigger waits (login bars fill late)
+local BAR_SWEEP_GAP = 5    -- seconds; SPELLS_CHANGED arrives in bursts
+-- r44: seconds of no human bar edits before we are allowed to touch the bar.
+-- A macro drag is invisible to CursorHasItem/CursorHasSpell, so this quiet
+-- period is what keeps a mid-rearrange drag safe.
+local BAR_SWEEP_QUIET = 5
+-- Grace window in which an ACTIONBAR_SLOT_CHANGED is assumed to be OUR own
+-- mutation echoing back, so the sweep cannot defer itself forever.
+local BAR_SWEEP_OWN = 1
+local barSweep = { pending = false, nextAt = 0, changedAt = 0, ownAt = 0 }
+
+-- Tooltip line 1 of an action slot, or nil when the slot is empty, a macro,
+-- or unreadable. Callers treat nil as "leave this slot alone".
+function F.barSlotName(slot)
+  if not HasAction(slot) then return nil end
+  -- Macros are out of scope: a macro slot's tooltip carries the MACRO name,
+  -- never the spell it wraps, so a managed spell inside one is invisible and
+  -- an unrelated macro named "Shadow Bolt" would be a false positive.
+  if GetActionText and GetActionText(slot) then return nil end
+  barTip:SetOwner(UIParent, "ANCHOR_NONE")
+  barTip:ClearLines()
+  -- SetAction returns truthy only when it actually populated the tooltip —
+  -- stock ActionButton_SetTooltip branches on the same result. Without it a
+  -- STALE tooltip from the previous slot would name this one.
+  local ok, filled = pcall(barTip.SetAction, barTip, slot)
+  if not (ok and filled) then return nil end
+  if barTip:NumLines() <= 0 then return nil end
+  local fs = getglobal("ShadowArmyBarTipTextLeft1")
+  local text = fs and fs:GetText()
+  if not text or text == "" then return nil end
+  return text
+end
+
+-- Debounced request. Never sweeps inline: the caller may be an event handler
+-- firing mid-login burst or mid-combat.
+function F.barSweepRequest()
+  barSweep.pending = true
+  local at = GetTime() + BAR_SWEEP_SETTLE
+  if at > barSweep.nextAt then barSweep.nextAt = at end
+end
+
+function F.barSweepRun()
+  -- Stamped before AND after the mutations: every ACTIONBAR_SLOT_CHANGED this
+  -- run causes is ours, and must not arm the quiet period against us.
+  barSweep.ownAt = GetTime()
+  local names, occupied = {}, {}
+  local slot = 1
+  while slot <= BarModel.maxSlot do
+    -- HasAction is the occupancy truth: a macro or an unreadable slot names
+    -- nothing yet must never be treated as free shelf space.
+    if HasAction(slot) then occupied[slot] = true end
+    names[slot] = F.barSlotName(slot)
+    slot = slot + 1
+  end
+  barTip:Hide()
+  local plan = BarModel.plan(names,
+    BarModel.managedNames(auto.classToken, WATCHED_BUFFS),
+    { order = BarModel.managedOrder(auto.classToken, WATCHED_BUFFS),
+      -- auto.spells is keyed lowercase and holds the HIGHEST rank's book
+      -- index (F.scanSpellbook overwrites as it walks ranks upward).
+      trained = auto.spells, occupied = occupied })
+  local n = table.getn(plan.remove)
+  local i = 1
+  while i <= n do
+    pcall(PickupAction, plan.remove[i])
+    pcall(ClearCursor) -- an action left on the cursor would ride the next click
+    i = i + 1
+  end
+  -- Refill the telemetry shelf so the coach keeps exact IsUsableAction /
+  -- IsActionInRange on every managed spell it can.
+  local placed, pn = 0, table.getn(plan.place)
+  i = 1
+  while i <= pn do
+    local entry = plan.place[i]
+    local book = auto.spells[entry.name]
+    local ok = false
+    if book and book.index then
+      if pcall(PickupSpell, book.index, "spell") then
+        ok = pcall(PlaceAction, entry.slot)
+      end
+    end
+    pcall(ClearCursor) -- covers a failed pickup AND a rejected placement
+    if ok then placed = placed + 1 end
+    i = i + 1
+  end
+  if plan.shelfFull then F.emit("bar", "shelf full") end
+  if n > 0 or placed > 0 then
+    F.emit("bar", "swept removed=" .. n .. " shelved=" .. placed)
+    F.scanCombatActions() -- the coach's exact-slot map just went stale
+  end
+  -- Echoes land after this returns, so re-stamp: the sweep never defers
+  -- itself into a loop.
+  barSweep.ownAt = GetTime()
+end
+
+function F.barSweepTick()
+  if not barSweep.pending then return end
+  local now = GetTime()
+  if now < barSweep.nextAt then return end
+  -- Combat / dead / casting: hold the request; PLAYER_REGEN_ENABLED re-arms
+  -- it and this tick retries once the window is clear.
+  if UnitAffectingCombat("player") or UnitIsDeadOrGhost("player") then return end
+  if auto.casting then return end
+  -- r44 drag safety. Never yank an action onto a loaded cursor, and stay off
+  -- the bar entirely while the human is mid-rearrange — a macro drag shows up
+  -- in neither cursor query, only in the ACTIONBAR_SLOT_CHANGED quiet period.
+  -- Checked once, HERE, at sweep start: F.barSweepRun's own mutations are
+  -- stamped ownAt and never move changedAt.
+  if (CursorHasItem and CursorHasItem())
+    or (CursorHasSpell and CursorHasSpell())
+    or (now - barSweep.changedAt) < BAR_SWEEP_QUIET then
+    F.barSweepRequest() -- re-arm; retry once the bar settles
+    return
+  end
+  barSweep.pending = false
+  barSweep.nextAt = now + BAR_SWEEP_GAP
+  F.barSweepRun()
+end
+
+-- ACTIONBAR_SLOT_CHANGED bookkeeping: only HUMAN edits arm the quiet period.
+function F.barSweepNoteChange()
+  local now = GetTime()
+  if (now - barSweep.ownAt) <= BAR_SWEEP_OWN then return end
+  barSweep.changedAt = now
 end
 
 --------------------------------------------------------------------------
@@ -1894,7 +2208,7 @@ function F.probeRefreshStatus()
 end
 
 function F.probeRun(kind, ctx)
-  -- kind: status | buffs | cast | loot | pickup | reload
+  -- kind: status | buffs | cast | pickup | reload
   if kind == "status" then
     F.probeEmitVerdict("status ctx=" .. ctx .. " " .. F.probeStatusDump())
     return
@@ -1928,31 +2242,6 @@ function F.probeRun(kind, ctx)
       mana0 = mana0,
       buff0 = left0 and true or false,
     }
-    return
-  end
-  if kind == "loot" then
-    local n, left0 = F.probeCountLootItems()
-    if n == 0 then
-      F.probeEmitVerdict("loot ctx=" .. ctx .. " FAIL no loot window (open a corpse first)")
-      return
-    end
-    local i = n
-    while i >= 1 do
-      pcall(LootSlot, i)
-      pcall(ConfirmLootSlot, i)
-      i = i - 1
-    end
-    local _, left1 = F.probeCountLootItems()
-    local verdict
-    if left1 < left0 then
-      verdict = "OK"
-    elseif left0 == 0 then
-      verdict = "EMPTY"
-    else
-      verdict = "GATED" -- calls returned, items still there
-    end
-    F.probeEmitVerdict(string.format(
-      "loot ctx=%s %s slots=%d items %d->%d", ctx, verdict, n, left0, left1))
     return
   end
   if kind == "pickup" then
@@ -2138,7 +2427,6 @@ F.makeProbeBtn("Help", 356, modeY, 48, function()
   F.probeLog("  Frame: runs on next driver OnUpdate (software).")
   F.probeLog("  Delay: runs after 0.5s timer (software).")
   F.probeLog("Cast: Demon Skin/Armor + 1.2s follow-up (mana/buff).")
-  F.probeLog("Loot: needs open loot window; OK if item count drops.")
   F.probeLog("Pickup: bag item on/off cursor; OK if cursor takes item.")
   F.probeLog("Reload: WILL reload UI if ungated — use last.")
   F.probeLog("Compare same probe under Click vs Frame vs Delay.")
@@ -2147,13 +2435,12 @@ end)
 -- Action row
 local actY = -70
 F.makeProbeBtn("Cast armor", 10, actY, 80, function() F.probeSchedule("cast") end)
-F.makeProbeBtn("Loot all", 94, actY, 70, function() F.probeSchedule("loot") end)
-F.makeProbeBtn("Pickup", 168, actY, 60, function() F.probeSchedule("pickup") end)
-F.makeProbeBtn("|cFFFF6644ReloadUI|r", 232, actY, 80, function() F.probeSchedule("reload") end)
-F.makeProbeBtn("Clear", 316, actY, 48, function()
+F.makeProbeBtn("Pickup", 94, actY, 60, function() F.probeSchedule("pickup") end)
+F.makeProbeBtn("|cFFFF6644ReloadUI|r", 158, actY, 80, function() F.probeSchedule("reload") end)
+F.makeProbeBtn("Clear", 242, actY, 48, function()
   if probeLogMsg then probeLogMsg:Clear() end
 end)
-F.makeProbeBtn("Rec", 368, actY, 36, function()
+F.makeProbeBtn("Rec", 294, actY, 36, function()
   probe.recording = not probe.recording
   F.probeLog("event recording " .. (probe.recording and "ON" or "OFF"))
 end)
@@ -3984,6 +4271,24 @@ function F.questWindowLine(i)
   return line
 end
 
+-- "who do I hunt for this item" hint. The names arrive alphabetical, so the
+-- first two are not the best two — the cap is line width, nothing more.
+local QUEST_FROM_MAX = 2
+function F.questFromText(from)
+  local n = table.getn(from)
+  local out = nil
+  local i = 1
+  while i <= n and i <= QUEST_FROM_MAX do
+    out = out and (out .. ", " .. from[i]) or from[i]
+    i = i + 1
+  end
+  if not out then return nil end
+  if n > QUEST_FROM_MAX then
+    out = out .. " +" .. (n - QUEST_FROM_MAX) .. " more"
+  end
+  return out
+end
+
 function F.questWindowRows()
   local rows = {}
   if quest.status then
@@ -4011,8 +4316,13 @@ function F.questWindowRows()
       elseif obj.zoneName and obj.zoneName ~= quest.zoneName then
         suffix = "  |cFF888888" .. obj.zoneName .. "|r"
       end
+      local hunt = ""
+      if obj.from and not obj.done then
+        local names = F.questFromText(obj.from)
+        if names then hunt = " |cFF888888(" .. names .. ")|r" end
+      end
       rows[table.getn(rows) + 1] = string.format(
-        "|c%s  %s %s|r%s", hex, prefix, text, suffix)
+        "|c%s  %s %s|r%s%s", hex, prefix, text, hunt, suffix)
       oi = oi + 1
     end
     if table.getn(entry.objs) == 0 then
@@ -4357,83 +4667,12 @@ end)
 -- programmatic UI reload on hardware-event context (the slash path starts
 -- from a keypress). So: try the free paths, then light up the panel's
 -- Reload! button — a mouse click IS a hardware event, so its OnClick works.
+--
+-- r43: auto-loot deleted. r11-r14 measured it end to end — LootSlot is a
+-- no-op outside hardware-event context here, so the retry ladder only ever
+-- produced `loot gated` / `loot result took=0` noise. Looting is the human's
+-- click; do not rebuild this.
 --------------------------------------------------------------------------
--- Auto-loot (r11): single-shot LootSlot() at LOOT_OPENED provably did not
--- empty the window (live: `trace loot opened slots=N`, items still there).
--- Three candidate causes, and this code is built to tell them apart:
---   (a) the client gates LootSlot the way it gates ReloadUI -> retries can
---       never work, and `loot gated` says so out loud;
---   (b) the first call races the server's loot packet -> retries fix it;
---   (c) BoP/quest items want ConfirmLootSlot -> the confirm pass fixes it.
--- GetNumLootItems() counts SLOTS, which do not disappear as they are
--- looted, so "how much is left" is measured by how many slots still carry
--- an item (GetLootSlotInfo returns nil texture for a cleared slot).
---------------------------------------------------------------------------
-
-local LOOT_RETRY_EVERY = 0.25
-local LOOT_RETRY_FOR = 2.0
-
-local loot = {
-  active = false,
-  openedAt = 0,
-  startSlots = 0,   -- item-bearing slots when the window opened
-  lastSeen = 0,     -- item-bearing slots at the most recent observation
-  nextTryAt = 0,
-  gatedReported = false, -- one `loot gated` per session is the whole signal
-}
-
-function F.lootSlotsLeft()
-  local n = GetNumLootItems()
-  if not n then return 0 end
-  local left = 0
-  local i = 1
-  while i <= n do
-    if GetLootSlotInfo(i) then -- first return is the texture; nil = cleared
-      left = left + 1
-    end
-    i = i + 1
-  end
-  return left
-end
-
-function F.lootSweep()
-  local n = GetNumLootItems()
-  if not n then return end
-  -- Backwards: LootSlot removes entries, so forward indexing skips slots.
-  local i = n
-  while i >= 1 do
-    LootSlot(i)
-    -- BoP/quest items raise a confirmation prompt; on clients with nothing
-    -- pending this call errors, and an unguarded error here would kill the
-    -- rest of the sweep silently (scriptErrors is off).
-    pcall(ConfirmLootSlot, i)
-    i = i - 1
-  end
-  loot.lastSeen = F.lootSlotsLeft()
-end
-
-function F.lootTick()
-  local now = GetTime()
-  if now < loot.nextTryAt then return end
-  loot.nextTryAt = now + LOOT_RETRY_EVERY
-  loot.lastSeen = F.lootSlotsLeft()
-  if loot.lastSeen <= 0 then
-    loot.active = false -- window is empty; summary lands on LOOT_CLOSED
-    return
-  end
-  if (now - loot.openedAt) > LOOT_RETRY_FOR then
-    loot.active = false -- retry budget spent
-    if loot.lastSeen >= loot.startSlots and not loot.gatedReported then
-      -- Two seconds of retries moved exactly nothing: these calls are being
-      -- ignored, not raced. More retries are wasted; the next rev needs a
-      -- hardware-event piggyback (same shape as the reload button).
-      loot.gatedReported = true
-      F.emit("loot", "gated")
-    end
-    return
-  end
-  F.lootSweep()
-end
 
 local pendingReload = 0 -- countdown of escalation steps; 0 = idle
 -- r11: every request gets a number so the ladder is traceable end to end, and
@@ -4453,6 +4692,9 @@ driver:SetScript("OnUpdate", function()
   -- legacy path). pcall so a failure cannot kill the rest of OnUpdate.
   local aok, aerr = pcall(F.armorTick)
   if not aok then F.emit("err", "armorTick: " .. tostring(aerr)) end
+  -- r43: debounced action-bar sweep of advisor-managed spells.
+  local sbok, sberr = pcall(F.barSweepTick)
+  if not sbok then F.emit("err", "barSweepTick: " .. tostring(sberr)) end
   -- r13: bag autosort (one swap in flight).
   if sort.active then
     local sok, serr = pcall(F.sortTick)
@@ -4469,7 +4711,6 @@ driver:SetScript("OnUpdate", function()
     local cok, cerr = pcall(F.crewTick)
     if not cok then F.emit("err", "crewTick: " .. tostring(cerr)) end
   end
-  if loot.active then F.lootTick() end
   -- r35: combat coach panel refresh (~4 Hz when open). Display only.
   if combatFrame:IsShown() then
     combatAcc = combatAcc + (arg1 or 0)
@@ -4548,6 +4789,10 @@ end
 local frame = CreateFrame("Frame", "ShadowArmyFrame", UIParent)
 frame:RegisterEvent("PLAYER_ENTERING_WORLD")
 frame:RegisterEvent("LEARNED_SPELL_IN_TAB")
+-- r43: managed-spell bar sweep triggers (debounced in F.barSweepRequest);
+-- PLAYER_REGEN_ENABLED is where a combat-deferred sweep lands.
+frame:RegisterEvent("SPELLS_CHANGED")
+frame:RegisterEvent("PLAYER_REGEN_ENABLED")
 frame:RegisterEvent("ACTIONBAR_SLOT_CHANGED")
 frame:RegisterEvent("ACTIONBAR_PAGE_CHANGED")
 frame:RegisterEvent("PLAYER_AURAS_CHANGED")
@@ -4566,12 +4811,6 @@ frame:RegisterEvent("PLAYER_ENTER_COMBAT")
 frame:RegisterEvent("PLAYER_LEAVE_COMBAT")
 -- The System inbound: GM announce arrives as CHAT_MSG_SYSTEM
 frame:RegisterEvent("CHAT_MSG_SYSTEM")
--- auto-loot: vanilla has no always-auto-loot option (that's a TBC setting),
--- and LootSlot isn't protected in 1.12 — vacuum the window on open, then
--- retry from the driver (r11) and report the result on close
-frame:RegisterEvent("LOOT_OPENED")
-frame:RegisterEvent("LOOT_SLOT_CLEARED")
-frame:RegisterEvent("LOOT_CLOSED")
 
 frame:SetScript("OnEvent", function()
   if event == "PLAYER_ENTERING_WORLD" then
@@ -4587,6 +4826,7 @@ frame:SetScript("OnEvent", function()
     -- fanfare mute didn't take (music still played), so this is the next
     -- single-variable test. Re-enable only after turn-ins are proven safe.
     F.panelShowReset()
+    F.barSweepRequest()
     F.say("ARISE. Advisor online for " .. UnitName("player") .. " — /sa help (rev=" .. REV .. ")")
     F.emit("loaded", "rev=" .. REV)
     if not ShadowArmyQuestData then
@@ -4594,7 +4834,20 @@ frame:SetScript("OnEvent", function()
     end
   elseif event == "LEARNED_SPELL_IN_TAB" then
     F.scanSpellbook()
-  elseif event == "ACTIONBAR_SLOT_CHANGED" or event == "ACTIONBAR_PAGE_CHANGED" then
+  elseif event == "SPELLS_CHANGED" then
+    -- Respecs fire SPELLS_CHANGED without LEARNED_SPELL_IN_TAB; the sweep's
+    -- PickupSpell indices come from auto.spells, so rescan before sweeping.
+    F.scanSpellbook()
+    F.barSweepRequest()
+  elseif event == "PLAYER_REGEN_ENABLED" then
+    -- Only re-arms a sweep the combat check already deferred.
+    if barSweep.pending then F.barSweepRequest() end
+  elseif event == "ACTIONBAR_SLOT_CHANGED" then
+    -- r44: a slot edit is the only signal a macro drag leaves, so it arms the
+    -- sweep's quiet period (F.barSweepNoteChange ignores our own mutations).
+    F.barSweepNoteChange()
+    F.scanCombatActions()
+  elseif event == "ACTIONBAR_PAGE_CHANGED" then
     F.scanCombatActions()
   elseif event == "PLAYER_AURAS_CHANGED" then
     -- Druid forms page a different action-bar bank. Re-scan so exact range
@@ -4625,27 +4878,6 @@ frame:SetScript("OnEvent", function()
     auto.melee = true
   elseif event == "PLAYER_LEAVE_COMBAT" then
     auto.melee = false
-  elseif event == "LOOT_OPENED" then
-    loot.active = true
-    loot.openedAt = GetTime()
-    loot.startSlots = F.lootSlotsLeft()
-    loot.lastSeen = loot.startSlots
-    loot.nextTryAt = GetTime() + LOOT_RETRY_EVERY
-    F.dtrace("loot opened slots=" .. tostring(GetNumLootItems())
-      .. " items=" .. loot.startSlots)
-    F.lootSweep() -- first attempt now; the driver retries for ~2s after this
-  elseif event == "LOOT_SLOT_CLEARED" then
-    -- Keeps lastSeen honest when the window empties and auto-closes inside
-    -- a single retry interval.
-    loot.lastSeen = F.lootSlotsLeft()
-  elseif event == "LOOT_CLOSED" then
-    loot.active = false
-    if loot.startSlots > 0 then
-      -- The one line that settles "do these calls do anything at all".
-      F.emit("loot", "result took=" .. (loot.startSlots - loot.lastSeen)
-        .. " left=" .. loot.lastSeen)
-      loot.startSlots = 0
-    end
   elseif event == "CHAT_MSG_SYSTEM" then
     -- The System speaks via GM `announce`, which arrives as CHAT_MSG_SYSTEM:
     -- "|cffff0000[System Message]: <SYS> reload|r". Strip color codes, look for

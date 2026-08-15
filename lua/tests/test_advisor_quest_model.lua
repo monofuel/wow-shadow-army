@@ -195,4 +195,56 @@ r = model.build({
 check(r.list[1].objs[1].text == "Turn in: Apothecary Johaan",
   "part-1 turn-in still points at Johaan")
 
+-- `from` = who drops an item objective (QuestData, alphabetical, unranked).
+local plagueZones = { [85] = "Tirisfal Glades" }
+local plagueData = {
+  ["A New Plague"] = {
+    zone = 85,
+    objectives = {
+      {
+        label = "Darkhound Blood", kind = "item", count = 5,
+        from = { "Cursed Darkhound", "Decrepit Darkhound", "Ravenous Darkhound" },
+        spots = { { zone = 85, x = 62.8, y = 38.1 } },
+      },
+    },
+    turnIn = { label = "Apothecary Johaan", zone = 85, x = 59.4, y = 52.4 },
+  },
+}
+
+r = model.build({
+  quests = {
+    { title = "A New Plague", header = "Tirisfal Glades", objectives = {
+      { text = "Darkhound Blood: 2/5", have = 2, need = 5 },
+    } },
+  },
+  data = plagueData, zoneNames = plagueZones, currentZone = "Tirisfal Glades",
+  pos = { x = 60, y = 52 },
+})
+check(r.list[1].objs[1].from ~= nil, "item objective carries its hunt list")
+check(#r.list[1].objs[1].from == 3 and r.list[1].objs[1].from[1] == "Cursed Darkhound",
+  "hunt list passes through in QuestData order")
+
+r = model.build({
+  quests = {
+    { title = "A New Plague", header = "Tirisfal Glades", objectives = {
+      { text = "Darkhound Blood: 5/5", have = 5, need = 5, done = true },
+    } },
+  },
+  data = plagueData, zoneNames = plagueZones, currentZone = "Tirisfal Glades",
+  pos = { x = 60, y = 52 },
+})
+check(r.list[1].objs[1].done and r.list[1].objs[1].from == nil,
+  "a done objective drops the hunt list")
+
+r = model.build({
+  quests = {
+    { title = "The Hunt Begins", header = "Red Cloud Mesa", objectives = {
+      { text = "Plainstrider Feather: 2/7", have = 2, need = 7 },
+    } },
+  },
+  data = taurenData, zoneNames = zones, currentZone = "Mulgore",
+  pos = { x = 45, y = 70 },
+})
+check(r.list[1].objs[1].from == nil, "an objective with no source list stays bare")
+
 print("test_advisor_quest_model: " .. passed .. " checks passed")
