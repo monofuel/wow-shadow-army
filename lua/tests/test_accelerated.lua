@@ -278,9 +278,277 @@ local stuckGiver = view({
 })
 local firstTry = grind.decide(stuckGiver)
 check(firstTry.kind == "interact", "approaches a questgiver when idle at level 3")
-clock = clock + 50.0
+clock = clock + 80.0
 local afterPatience = grind.decide(stuckGiver)
 check(afterPatience.kind ~= "interact" or afterPatience.guid ~= 903,
   "gives up on a questgiver after patience")
+
+-- Reward panels that offer a choice: a bare /questreward is rejected by the
+-- client ("Choose a quest reward first"), so the choice button is pressed
+-- first and the plain verb only runs once a choice is selected.
+local function rewardView(frame, nodes)
+  return view({}, {
+    level = 3,
+    quest_frame = frame,
+    accepted_quests = { 1 }, quest_objectives = {}, completed_quest_ids = {},
+    ui_nodes = nodes or {},
+    action_buttons = {
+      { slot = 1, spell_id = 5176, usable = true, usable_known = true },
+    },
+  })
+end
+
+local rewardChoiceNodes = {
+  { source_name = "QuestRewardItem1", reference_id = "quest-reward:1",
+    enabled = true, hit_testable = true },
+  { source_name = "QuestRewardItem2", reference_id = "quest-reward:2",
+    enabled = true, hit_testable = true },
+}
+local chooseReward = grind.decide(rewardView({
+  open = true, panel = "reward", selected_choice = 0,
+  choice_items = { { item_id = 3270, count = 1 }, { item_id = 3273, count = 1 } },
+}, rewardChoiceNodes))
+check(chooseReward.kind == "ui_press" and
+  chooseReward.reference == "quest-reward:1",
+  "selects a reward choice before turning in")
+
+local takeReward = grind.decide(rewardView({
+  open = true, panel = "reward", selected_choice = 1,
+  choice_items = { { item_id = 3270, count = 1 }, { item_id = 3273, count = 1 } },
+}, rewardChoiceNodes))
+check(takeReward.kind == "quest_cmd" and takeReward.command == "/questreward",
+  "turns in once a choice is selected")
+
+local noChoiceReward = grind.decide(rewardView({
+  open = true, panel = "reward", selected_choice = 0, choice_items = {},
+}))
+check(noChoiceReward.kind == "quest_cmd" and
+  noChoiceReward.command == "/questreward",
+  "turns in directly when the quest offers no choice")
+
+-- Banking a turn-in outranks the next pull. Every Deathknell giver has mobs
+-- inside the hunt radius, so a shared gate stranded finished quests forever.
+local turnInWithHunt = view({
+  unit(910, 8.0, 3),
+  giver(911, 12.0, "TurnIn"),
+}, {
+  level = 3,
+  quest_markers = { { questgiver_guid = 911, status = 6 } },
+  quest_frame = { open = false },
+  accepted_quests = { 1 }, quest_objectives = {}, completed_quest_ids = {},
+  ui_nodes = {},
+  action_buttons = {
+    { slot = 1, spell_id = 5176, usable = true, usable_known = true },
+  },
+})
+local banking = grind.decide(turnInWithHunt)
+check(banking.kind == "interact" and banking.guid == 911,
+  "walks to a turn-in even with a huntable mob nearby")
+
+local acceptWithHunt = view({
+  unit(912, 8.0, 3),
+  giver(913, 12.0, "Offer"),
+}, {
+  level = 3,
+  quest_markers = { { questgiver_guid = 913, status = 5 } },
+  quest_frame = { open = false },
+  accepted_quests = {}, quest_objectives = {}, completed_quest_ids = {},
+  ui_nodes = {},
+  action_buttons = {
+    { slot = 1, spell_id = 5176, usable = true, usable_known = true },
+  },
+})
+check(grind.decide(acceptWithHunt).kind == "attack",
+  "still yields a new accept to a nearby pull")
+
+-- Questgiver memory: standing next to a giver records where it was, so a seat
+-- that grinds its way out of sight can walk back to hand work in.
+local hubGiver = giver(940, 10.0, "Hub")
+hubGiver.location = { map_id = 1, position = { x = 1845.0, y = 1620.0, z = 97.0, o = 0 } }
+grind.decide(view({ hubGiver }, {
+  level = 3,
+  quest_markers = { { questgiver_guid = 940, status = 5 } },
+  quest_frame = { open = false },
+  accepted_quests = {}, quest_objectives = {}, completed_quest_ids = {},
+  ui_nodes = {},
+  action_buttons = {
+    { slot = 1, spell_id = 5176, usable = true, usable_known = true },
+  },
+}))
+
+-- Out of sight, with a finished objective to bank: walk back to it.
+local farAwayWithWork = view({}, {
+  level = 3,
+  quest_markers = {},
+  quest_frame = { open = false },
+  accepted_quests = { 1 },
+  quest_objectives = { { quest_id = 1, complete = true, entry = 0 } },
+  completed_quest_ids = {},
+  ui_nodes = {},
+  location = { map_id = 1, position = { x = 1990.0, y = 1700.0, z = 85.0, o = 0 } },
+  action_buttons = {
+    { slot = 1, spell_id = 5176, usable = true, usable_known = true },
+  },
+})
+clock = clock + 5.0
+local walkBack = grind.decide(farAwayWithWork)
+check(walkBack.reason == "quest_hub" and math.abs(walkBack.x - 1845.0) < 1.0,
+  "walks back to a remembered questgiver to bank a finished objective")
+
+-- Nothing to hand in and a full-enough log: no reason to walk back.
+local farAwayIdle = view({}, {
+  level = 3,
+  quest_markers = {},
+  quest_frame = { open = false },
+  accepted_quests = { 1 },
+  quest_objectives = { { quest_id = 1, complete = false, entry = 0 } },
+  completed_quest_ids = {},
+  ui_nodes = {},
+  location = { map_id = 1, position = { x = 1990.0, y = 1700.0, z = 85.0, o = 0 } },
+  action_buttons = {
+    { slot = 1, spell_id = 5176, usable = true, usable_known = true },
+  },
+})
+check(grind.decide(farAwayIdle).reason ~= "quest_hub",
+  "does not walk back with unfinished work in the log")
+
+-- Loot: item objectives are only satisfied by taking the drop.
+local corpse = unit(920, 2.0, 2, { is_dead = true, health = 0 })
+local function lootView(nodes, extra)
+  local v = view({ corpse }, {
+    level = 3,
+    quest_markers = {},
+    quest_frame = { open = false },
+    accepted_quests = { 1 }, quest_objectives = {}, completed_quest_ids = {},
+    ui_nodes = nodes or {},
+    action_buttons = {
+      { slot = 1, spell_id = 5176, usable = true, usable_known = true },
+    },
+  })
+  for k, v2 in pairs(extra or {}) do v[k] = v2 end
+  return v
+end
+
+-- The kill itself arms the loot attempt, off the kill feed (by the time the
+-- event lands the engaged unit is usually already filtered out as dead).
+local killView = lootView({}, {
+  player_guid = 77,
+  units = { unit(920, 2.0, 2) },
+  auto_attack_guid = 920,
+  combat_kill_events = { { source_guid = 77, target_guid = 920 } },
+})
+check(grind.decide(killView).reason == "target_died", "notices the kill")
+
+grind.decide(lootView({}))  -- kill_settling holds
+grind.decide(lootView({}))
+
+local openLoot = grind.decide(lootView({}))
+check(openLoot.kind == "interact" and openLoot.guid == 920 and
+  openLoot.reason == "loot_corpse",
+  "interacts with the corpse to open the loot window")
+
+local takeSlot = grind.decide(lootView({
+  { source_name = "LootButton1", reference_id = "loot-slot:1234:0",
+    enabled = true, hit_testable = true },
+}))
+check(takeSlot.kind == "ui_press" and takeSlot.reference == "loot-slot:1234:0",
+  "presses the loot slot the client presented")
+
+-- A single empty frame is a pending take, not an empty corpse.
+check(grind.decide(lootView({})).reason == "loot_settling",
+  "waits out a pending take")
+for _ = 1, 10 do grind.decide(lootView({})) end
+local afterLoot = grind.decide(lootView({}))
+check(afterLoot.reason ~= "loot_settling" and afterLoot.reason ~= "loot_corpse",
+  "gives the corpse up once the window stays empty")
+
+-- Someone else's kill is not ours to loot. (Runs with no settling holds
+-- pending, so the kill feed really is what decides.)
+local ignored = grind.decide(view({ unit(930, 2.0, 2, { is_dead = true }) }, {
+  level = 3,
+  player_guid = 77,
+  quest_markers = {},
+  quest_frame = { open = false },
+  accepted_quests = { 1 }, quest_objectives = {}, completed_quest_ids = {},
+  ui_nodes = {},
+  combat_kill_events = { { source_guid = 99, target_guid = 930 } },
+  action_buttons = {
+    { slot = 1, spell_id = 5176, usable = true, usable_known = true },
+  },
+}))
+check(ignored.reason ~= "loot_corpse",
+  "ignores a corpse someone else killed")
+
+-- A stranded chat edit box eats every movement key. It is only stranded once
+-- it has been open for seconds: an in-flight command must not be cancelled.
+local function chatView()
+  return view({}, {
+    level = 3,
+    chat_input_visible = true,
+    chat_input_text = "",
+    quest_markers = {},
+    quest_frame = { open = false },
+    accepted_quests = {}, quest_objectives = {}, completed_quest_ids = {},
+    ui_nodes = {},
+    action_buttons = {
+      { slot = 1, spell_id = 5176, usable = true, usable_known = true },
+    },
+  })
+end
+
+clock = clock + 60.0
+check(grind.decide(chatView()).reason ~= "close_chat_box",
+  "does not cancel a chat command that is still in flight")
+clock = clock + 5.0
+check(grind.decide(chatView()).reason == "close_chat_box",
+  "flushes a chat box that stayed open")
+
+-- Wedge watchdog: a seat that stops displacing out of combat escapes by
+-- bearing, but only on sustained evidence — never on one slow frame.
+local function wedgedView()
+  return view({}, {
+    level = 3,
+    quest_markers = {},
+    quest_frame = { open = false },
+    accepted_quests = {}, quest_objectives = {}, completed_quest_ids = {},
+    ui_nodes = {},
+    location = { map_id = 1, position = { x = 1837.7, y = 1630.1, z = 96.9, o = 0 } },
+    action_buttons = {
+      { slot = 1, spell_id = 5176, usable = true, usable_known = true },
+    },
+  })
+end
+
+clock = clock + 60.0
+local firstStill = grind.decide(wedgedView())
+check(firstStill.reason ~= "unstick", "does not call one still frame a wedge")
+clock = clock + 30.0
+check(grind.decide(wedgedView()).reason ~= "unstick",
+  "wall clock alone is not evidence of a wedge")
+local escape = nil
+for _ = 1, 60 do
+  clock = clock + 0.1
+  escape = grind.decide(wedgedView())
+end
+check(escape.reason == "unstick", "escapes after sustained zero displacement")
+check(escape.navigation_mode == "local_steer" and escape.allow_jump == true,
+  "escape uses the bearing-only reflex that owns walls")
+check(math.abs(escape.x - 1837.7) < 25.0 and math.abs(escape.y - 1630.1) < 25.0,
+  "escape leg is short")
+
+-- Displacement clears it.
+local moved = view({}, {
+  level = 3,
+  quest_markers = {},
+  quest_frame = { open = false },
+  accepted_quests = {}, quest_objectives = {}, completed_quest_ids = {},
+  ui_nodes = {},
+  location = { map_id = 1, position = { x = 1857.7, y = 1650.1, z = 96.9, o = 0 } },
+  action_buttons = {
+    { slot = 1, spell_id = 5176, usable = true, usable_known = true },
+  },
+})
+clock = clock + 10.0
+check(grind.decide(moved).reason ~= "unstick", "a moving seat is never unstuck")
 
 print("test_accelerated: " .. passed .. " ok")

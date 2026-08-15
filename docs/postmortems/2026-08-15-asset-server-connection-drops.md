@@ -164,3 +164,30 @@ at pool exhaustion whose symptom emerges between streams. Evidence in
 the rotated launcher.log.<timestamp> files per seat. The three seats
 were restarted onto the INSTRUMENTED build (inflight=/oldest= now in
 their logs) — the next wedge is self-diagnosing.
+
+## 2026-08-15 update 4 — load-scaling evidence from the army ramp
+
+Ramp to 10 total software-rendered seats (llvmpipe, ~+3.4 load each;
+peak ~58, steady 38-52 on 32 cores) produced:
+- **H2 confirmed in the wild:** asset fetch failures returned (Tank 13,
+  Baruka 9, Greed 9) with keepalive_requests 100000 LIVE — CPU-starved
+  clients idling past keepalive_timeout 30 is the surviving drop
+  mechanism, exactly as predicted. Retries absorbed all of it.
+- **A third, distinct failure mode:** Bellion was dropped by the WS
+  bridge at peak load ("WebSocket peer closed the connection" ->
+  "World reconnect exhausted", failed=0 assets) — transport-layer, not
+  asset-layer; recovered on restart once load fell.
+- The original four seats stayed fresh through the whole ramp, and the
+  new babysitter performed its first live recoveries (Igris/Tusk/Beru
+  re-pidded) without human involvement.
+
+## 2026-08-15 update 5 — QA-seat freezes with H1 live (independent corroboration)
+
+The quest-QA scenario seat (Kaisel) froze twice in the exact wedge
+shape: status.json stops advancing, process alive ~50% CPU / 2.5GB
+RSS, DEBUG PORT STOPS ACKING (new signal — the control-file poll on
+the decide thread dies with it, placing the freeze at or above the
+decide loop, not just the renderer), manifest fetch failures in the
+tail — all with keepalive_requests 100000 confirmed live. Keepalive
+exhaustion (H1) is definitively not the whole story; H2/H4 remain.
+Details: docs/quest-qa-2026-08-15.md "Environment issue" section.
