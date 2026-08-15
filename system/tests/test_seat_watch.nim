@@ -68,6 +68,23 @@ suite "evidence + display":
     check "dot bad" in rows
     check "dot on" in rows
 
+  test "a stalled watch thread is called out, not papered over":
+    # The sampler runs recoveries inline, so one hung child stops the whole
+    # watch. Silence there is what produced a panel full of confident green
+    # rows while nothing was being restarted.
+    let seats = @[
+      SeatWatch(name: "Beru", state: "running", pidAlive: true, hasStatus: true,
+                statusAgeSec: 0.0, lastActionAgeSec: -1.0)
+    ]
+    check "STALLED" notin seatWatchSummary(seats)
+    check "STALLED" notin seatWatchSummary(seats, passAgeSec = 12.0)
+    let stalled = seatWatchSummary(seats, passAgeSec = SeatWatchStallSec + 600.0)
+    check "STALLED" in stalled
+    let body = renderSeatWatchPanelBody(seats, SeatWatchStallSec + 600.0)
+    check "Seat watch STALLED" in body
+    check "seat-alert" in body
+    check "Seat watch STALLED" notin renderSeatWatchPanelBody(seats)
+
   test "budget exhaustion shows a persistent alert banner":
     let body = renderSeatWatchPanelBody(@[
       SeatWatch(name: "Tusk", state: "wedged", alerting: true, pidAlive: true,
@@ -396,3 +413,189 @@ suite "roster seats (throwaway army root)":
     check saved["seats"]["Freshx"]["restarts"].len == 1
     check saved["seats"]["Freshx"]["last_action_at"].getFloat(0.0) > 0
     check saved["seats"]["Spentx"]["alerting"].getBool(false)
+
+# ---------------------------------------------------------------------------
+# Field defect (0055 v2, first night): the panel showed seats "running 0s"
+# while their status.json mtime was minutes stale — dedicated AND scaled, a
+# scattered subset — so classifySeat never said wedged and nothing recovered.
+# Cause: the babysitter samples on a background thread and the panel served
+# whatever that thread last stored. When the thread stalled (a detached
+# `make seat-start` held the capture pipe open, so runShell never returned),
+# every stored age froze at its last-good value and the panel reported healthy
+# forever. These tests pin the two invariants that make that unrepresentable.
+# ---------------------------------------------------------------------------
+
+proc restampSeat(root, seat: string, ageSec: int) =
+  ## Re-date a seat's status.json to look `ageSec` old; nothing else changes.
+  let statusPath =
+    root / "local_data" / "home-army" / seat / "status" / "status.json"
+  setLastModificationTime(
+    statusPath, getTime() - initDuration(seconds = ageSec))
+
+suite "heartbeat age is read live, never served from a stale snapshot":
+  test "a seat that goes stale AFTER the last pass still reads wedged":
+    # This is the field defect exactly: no further sampling pass runs (the
+    # watch thread is hung), yet the panel must report what is on disk NOW.
+    let root = getTempDir() / "sa-seat-watch-live-" & $getCurrentProcessId()
+    removeDir(root)
+    createDir(root)
+    defer: removeDir(root)
+    writeScaledRoot(root,
+      "Livealphax\tshadow31\tmage\nLivebravox\tshadow32\trogue\n" &
+      "Livecharlx\tshadow33\tpriest\n")
+    for seat in ["Livealphax", "Livebravox", "Livecharlx"]:
+      writeWedgedSeat(root, seat, 0) # live pid, FRESH status.json
+    putEnv("SYSTEM_ARMY_DIR", root)
+    putEnv("SYSTEM_SEAT_STALE_SEC", "60")
+    putEnv("SYSTEM_SEAT_BABYSITTER", "0") # observe only: no restarts to race
+    defer:
+      delEnv("SYSTEM_ARMY_DIR")
+      delEnv("SYSTEM_SEAT_STALE_SEC")
+      delEnv("SYSTEM_SEAT_BABYSITTER")
+
+    babysitSeatsOnce()
+    for seat in ["Livealphax", "Livebravox", "Livecharlx"]:
+      check seatNamed(seatWatchStatus(), seat).state == "running"
+
+    # The MIDDLE seat's client wedges. No sampling pass follows — the watch
+    # thread is stuck — so the only thing that can save us is reading the
+    # file at render time.
+    restampSeat(root, "Livebravox", 600)
+
+    let seats = seatWatchStatus()
+    let bravo = seatNamed(seats, "Livebravox")
+    check bravo.state == "wedged"
+    check bravo.statusAgeSec > 60.0
+    check bravo.hasStatus
+    # Its neighbours are untouched: the stale read is attributed to one seat.
+    check seatNamed(seats, "Livealphax").state == "running"
+    check seatNamed(seats, "Livealphax").statusAgeSec < 60.0
+    check seatNamed(seats, "Livecharlx").state == "running"
+    check seatNamed(seats, "Livecharlx").statusAgeSec < 60.0
+
+    # And the panel the human reads says so, in the row and in the summary.
+    let body = renderSeatWatchPanelBody(seats)
+    check "row-dead" in body
+    check "1 wedged" in body
+
+  test "seatHeartbeatAge reports the seat named, missing files included":
+    let root = getTempDir() / "sa-seat-watch-hb-" & $getCurrentProcessId()
+    removeDir(root)
+    createDir(root)
+    defer: removeDir(root)
+    writeScaledRoot(root, "Hbonex\tshadow34\tmage\n")
+    writeWedgedSeat(root, "Hbonex", 300)
+    putEnv("SYSTEM_ARMY_DIR", root)
+    defer: delEnv("SYSTEM_ARMY_DIR")
+
+    let hit = seatHeartbeatAge("Hbonex")
+    check hit.hasStatus
+    check hit.ageSec > 290.0
+    check hit.ageSec < 400.0
+    let miss = seatHeartbeatAge("Nobodyx")
+    check not miss.hasStatus
+    check miss.ageSec == -1.0
+
+suite "roster reload never shifts age attribution":
+  test "a seat inserted at the FRONT does not move the stale read":
+    # Every seat's index changes; the wedged seat must stay the wedged seat.
+    # An index-keyed age would blame its neighbour instead — the "scattered,
+    # intermittent" misread the field notes describe.
+    let root = getTempDir() / "sa-seat-watch-shift-" & $getCurrentProcessId()
+    removeDir(root)
+    createDir(root)
+    defer: removeDir(root)
+    let rosterPath = root / "tools" / "data" / "home_army_roster.tsv"
+    writeScaledRoot(root,
+      "Shiftalphax\tshadow41\tmage\nShiftbravox\tshadow42\trogue\n" &
+      "Shiftcharlx\tshadow43\tpriest\n")
+    for seat in ["Shiftalphax", "Shiftbravox", "Shiftcharlx"]:
+      writeWedgedSeat(root, seat, 0)
+    restampSeat(root, "Shiftbravox", 600) # the middle seat is the wedged one
+    putEnv("SYSTEM_ARMY_DIR", root)
+    putEnv("SYSTEM_SEAT_STALE_SEC", "60")
+    putEnv("SYSTEM_SEAT_BABYSITTER", "0")
+    defer:
+      delEnv("SYSTEM_ARMY_DIR")
+      delEnv("SYSTEM_SEAT_STALE_SEC")
+      delEnv("SYSTEM_SEAT_BABYSITTER")
+
+    babysitSeatsOnce()
+    var seats = seatWatchStatus()
+    check seatNamed(seats, "Shiftalphax").state == "running"
+    check seatNamed(seats, "Shiftbravox").state == "wedged"
+    check seatNamed(seats, "Shiftcharlx").state == "running"
+
+    # The roster is rewritten with a new seat FIRST — every later index moves.
+    writeFile(rosterPath,
+      "Shiftzerox\tshadow40\twarrior\nShiftalphax\tshadow41\tmage\n" &
+      "Shiftbravox\tshadow42\trogue\nShiftcharlx\tshadow43\tpriest\n")
+    setLastModificationTime(rosterPath, getTime() + initDuration(seconds = 5))
+    writeWedgedSeat(root, "Shiftzerox", 0)
+
+    babysitSeatsOnce()
+    seats = seatWatchStatus()
+    check seats.len == 8 # four dedicated + four roster seats
+    check seatNamed(seats, "Shiftzerox").state == "running"
+    check seatNamed(seats, "Shiftalphax").state == "running"
+    check seatNamed(seats, "Shiftbravox").state == "wedged"
+    check seatNamed(seats, "Shiftcharlx").state == "running"
+    # Exactly one seat is wedged — no neighbour inherited the stale age.
+    var wedged: seq[string] = @[]
+    for w in seats:
+      if w.state == "wedged":
+        wedged.add(w.name)
+    check wedged == @["Shiftbravox"]
+
+suite "runShell survives a child that detaches and keeps stdout":
+  test "a backgrounded grandchild holding stdout does not block the caller":
+    # The exact hang that froze the babysitter: `make seat-start` detaches a
+    # long-lived launcher which inherits the capture handle. Reading a PIPE
+    # that child still holds never sees EOF, so runShell blocked until the
+    # SEAT exited. Capturing through a file makes the wait bounded by the
+    # direct child only. A sleeping grandchild outlives this call by design.
+    let root = getTempDir() / "sa-seat-watch-detach-" & $getCurrentProcessId()
+    removeDir(root)
+    createDir(root)
+    defer: removeDir(root)
+    writeScaledRoot(root, "Detachx\tshadow44\tmage\n")
+    # seat-start that behaves like the real one: it leaves a detached child
+    # running long past the make invocation, and that child INHERITS the
+    # capture handle (no redirection) exactly as the real launcher does.
+    writeFile(root / "Makefile", """
+seat-start:
+	@echo "$(SEAT) $(SEAT_USER) $(SEAT_CLASS)" >> $(CURDIR)/seat-start-called
+	@sleep 45 &
+
+seat-stop:
+	@echo "$(SEAT)" >> $(CURDIR)/seat-stop-called
+	@rm -f $(CURDIR)/local_data/home-army/$(SEAT)/launcher.pid
+""")
+    writeWedgedSeat(root, "Detachx", 600)
+    putEnv("SYSTEM_ARMY_DIR", root)
+    putEnv("SYSTEM_SEAT_STALE_SEC", "60")
+    putEnv("SYSTEM_SEAT_BABYSITTER", "1")
+    defer:
+      delEnv("SYSTEM_ARMY_DIR")
+      delEnv("SYSTEM_SEAT_STALE_SEC")
+      delEnv("SYSTEM_SEAT_BABYSITTER")
+
+    if findExe("make").len == 0:
+      skip()
+    else:
+      let began = epochTime()
+      babysitSeatsOnce()
+      let elapsed = epochTime() - began
+      # Before the fix this waited on the detached `sleep 45` (readAll on a
+      # pipe the grandchild still held); now it returns when `make` exits.
+      check elapsed < 20.0
+      # The recovery really ran both halves — it did not just time out.
+      check calledLines(root / "seat-stop-called") == @["Detachx"]
+      check calledLines(root / "seat-start-called") == @["Detachx shadow44 mage"]
+      let seat = seatNamed(seatWatchStatus(), "Detachx")
+      check seat.restarts == 1
+      check "auto-restart" in seat.lastAction
+
+      # And a completed pass is stamped, so the panel knows the watch is alive.
+      check seatWatchPassAgeSec() >= 0.0
+      check seatWatchPassAgeSec() < SeatWatchStallSec

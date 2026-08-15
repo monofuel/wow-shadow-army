@@ -204,6 +204,10 @@ ORDER BY FIELD(cq.status, 1, 3, 5), qt.QuestLevel, cq.quest"""
   SeatWedgeStaleSec* = 90.0
   ## How often the babysitter samples every seat's status file.
   SeatWatchPollMs = 10_000
+  ## A sampling pass this far overdue means the watch thread is not sampling
+  ## any more (it runs recoveries inline, so one hung child stops everything).
+  ## The panel says so out loud instead of quietly serving its last snapshot.
+  SeatWatchStallSec* = 60.0
   ## Recovery budget: no more than this many auto-restarts per seat per window
   ## before the dashboard escalates to a persistent alert instead of looping.
   SeatRestartBudget* = 3
@@ -2529,14 +2533,55 @@ proc seatRuntimeUp*(name: string): bool =
 
 proc runShell(cmd: string): tuple[ok: bool, detail: string] =
   ## Run one shell line, capture combined output (short admin ops only).
+  ##
+  ## Output is captured through a temp FILE, never through an inherited pipe.
+  ## Seat lifecycle targets (`make seat-start`) detach a long-lived launcher
+  ## that keeps whatever it was handed as stdout open; `outputStream.readAll()`
+  ## on such a pipe never sees EOF, so it blocks until the SEAT exits — not
+  ## until `make` exits. That hang froze the babysitter thread on its first
+  ## successful auto-restart, after which the Seat watch panel served a stale
+  ## snapshot forever (seats "running 0s" while their status.json had been
+  ## frozen for minutes) and no seat was ever recovered again. `exec` moves the
+  ## redirection onto the shell itself, so every descendant inherits the FILE.
+  let capture = getTempDir() /
+    ("system-runshell-" & $getCurrentProcessId() & "-" &
+     $int(epochTime() * 1_000_000.0) & ".log")
   try:
     let process = startProcess(
-      "sh", args = ["-c", cmd], options = {poUsePath, poStdErrToStdOut})
-    let output = process.outputStream.readAll()
+      "sh",
+      args = ["-c", "exec >" & quoteShell(capture) & " 2>&1\n" & cmd],
+      options = {poUsePath})
+    # Nothing may be left holding our pipes: close them before waiting.
+    try:
+      process.inputStream.close()
+    except CatchableError:
+      discard
+    try:
+      process.outputStream.close()
+    except CatchableError:
+      discard
+    try:
+      process.errorStream.close()
+    except CatchableError:
+      discard
     let exitCode = process.waitForExit()
     process.close()
+    var output = ""
+    try:
+      if fileExists(capture):
+        output = readFile(capture)
+    except CatchableError:
+      discard
+    try:
+      removeFile(capture)
+    except CatchableError:
+      discard
     result = (ok: exitCode == 0, detail: tailForDisplay(output, 200))
   except CatchableError as e:
+    try:
+      removeFile(capture)
+    except CatchableError:
+      discard
     result = (ok: false, detail: e.msg)
 
 proc runShellDetached(cmd: string): tuple[ok: bool, detail: string] =
@@ -3972,6 +4017,9 @@ var
   gSeatWatch: seq[SeatWatchRec]
   gSeatWatchThread: Thread[void]
   gSystemBootAt: float
+  ## epochTime() of the last COMPLETED sampling pass (0 before the first one).
+  ## Guarded by gSeatWatchLock.
+  gSeatWatchLastPassAt: float
 
 initLock(gSeatWatchLock)
 
@@ -4157,17 +4205,55 @@ proc saveSeatWatchState() =
   except CatchableError:
     discard
 
+proc seatHeartbeatAge*(name: string): tuple[hasStatus: bool, ageSec: float] =
+  ## The one heartbeat-age reader: mtime of the seat's status.json against now.
+  ## Both the sampler and the panel go through this, so the value the human
+  ## reads and the value classifySeat() judges can never come from different
+  ## sources.
+  let statusPath = seatStatusPath(name)
+  if not fileExists(statusPath):
+    return (hasStatus: false, ageSec: -1.0)
+  try:
+    result = (hasStatus: true,
+              ageSec: epochTime() - getLastModificationTime(statusPath).toUnixFloat())
+  except CatchableError:
+    result = (hasStatus: false, ageSec: -1.0)
+
+proc seatWatchPassAgeSec*(): float =
+  ## Seconds since the babysitter last COMPLETED a sampling pass; -1 before the
+  ## first pass. Recoveries run inline on the watch thread, so one hung child
+  ## stops the whole watch — this is how that becomes visible instead of silent.
+  withLock gSeatWatchLock:
+    result =
+      if gSeatWatchLastPassAt > 0: epochTime() - gSeatWatchLastPassAt
+      else: -1.0
+
 proc seatWatchStatus*(): seq[SeatWatch] =
   ## Current babysitter view — single dispatch for the dashboard + MCP.
+  ##
+  ## The heartbeat age is re-read from status.json HERE, at read time, instead
+  ## of being served from whatever the sampler last stored. The sampler is a
+  ## background thread; if it stalls, its stored ages freeze — and a frozen
+  ## "running 0s" on a seat whose file stopped moving minutes ago is exactly
+  ## the false confidence that let wedged seats sit unnoticed. `pidAlive` stays
+  ## as sampled (it is the sampler's job to own process liveness); the age, and
+  ## therefore the wedged/running verdict, is always current.
   let nowSec = epochTime()
-  result = @[]
+  let staleSec = seatWedgeStaleSec()
+  var recs: seq[SeatWatchRec] = @[]
   withLock gSeatWatchLock:
-    for rec in gSeatWatch:
-      var w = rec.watch
-      w.restarts = pruneRestartStamps(rec.stamps, nowSec).len
-      w.lastActionAgeSec =
-        if rec.lastActionAt > 0: nowSec - rec.lastActionAt else: -1.0
-      result.add(w)
+    recs = gSeatWatch
+  result = @[]
+  for rec in recs:
+    var w = rec.watch
+    let hb = seatHeartbeatAge(w.name)
+    w.hasStatus = hb.hasStatus
+    w.statusAgeSec = hb.ageSec
+    w.state = classifySeat(w.pidAlive, w.hasStatus, w.statusAgeSec, staleSec)
+    w.restarts = pruneRestartStamps(rec.stamps, nowSec).len
+    w.lastActionAgeSec =
+      if rec.lastActionAt > 0: nowSec - rec.lastActionAt else: -1.0
+    result.add(w)
 
 proc seatWatchToJson*(seats: seq[SeatWatch]): JsonNode =
   ## Serialize the babysitter view for MCP / JSON APIs.
@@ -4239,20 +4325,20 @@ proc babysitSeatsOnce*() =
   let nowSec = epochTime()
   let staleSec = seatWedgeStaleSec()
   var recoveredThisPass = 0
+  # Stamp the pass as completed however we leave this proc: the dashboard uses
+  # the gap to tell "everything is fine" apart from "nobody is looking".
+  defer:
+    withLock gSeatWatchLock:
+      gSeatWatchLastPassAt = epochTime()
   refreshSeatRoster() # roster grows; pick it up without a dashboard restart
   let targets = seatTargets()
   syncSeatWatch(targets)
   for idx, target in targets:
     let name = target.name
     let pidAlive = seatPidAlive(name)
-    let statusPath = seatStatusPath(name)
-    let hasStatus = fileExists(statusPath)
-    var age = -1.0
-    if hasStatus:
-      try:
-        age = nowSec - getLastModificationTime(statusPath).toUnixFloat()
-      except CatchableError:
-        age = -1.0
+    let hb = seatHeartbeatAge(name)
+    let hasStatus = hb.hasStatus
+    let age = hb.ageSec
     let state = classifySeat(pidAlive, hasStatus, age, staleSec)
     var lastActionAt = 0.0
     var tracked = false
@@ -4619,8 +4705,10 @@ proc renderSeatWatchRows*(seats: seq[SeatWatch]): string =
       </tr>
 """)
 
-proc seatWatchSummary*(seats: seq[SeatWatch]): string =
-  ## One-line babysitter strip for the panel head.
+proc seatWatchSummary*(seats: seq[SeatWatch], passAgeSec = -1.0): string =
+  ## One-line babysitter strip for the panel head. `passAgeSec` is the age of
+  ## the last completed sampling pass; when it runs away the strip says the
+  ## watch is not running rather than implying these numbers are being checked.
   var running, wedged, alerting, stopped = 0
   for w in seats:
     if w.alerting: inc alerting
@@ -4632,8 +4720,12 @@ proc seatWatchSummary*(seats: seq[SeatWatch]): string =
   result = &"{running}/{seats.len} live · {wedged} wedged"
   if alerting > 0:
     result.add(&" · {alerting} alert")
+  if passAgeSec > SeatWatchStallSec:
+    result.add(&" · WATCH STALLED {formatAgeSec(passAgeSec)} — no auto-restarts")
 
-proc renderSeatWatchPanelBody*(seats: seq[SeatWatch]): string =
+proc renderSeatWatchPanelBody*(
+    seats: seq[SeatWatch], passAgeSec = -1.0
+): string =
   ## Full babysitter panel body (summary + table) — one htmx swap target.
   let alerts = block:
     var names: seq[string] = @[]
@@ -4646,9 +4738,14 @@ proc renderSeatWatchPanelBody*(seats: seq[SeatWatch]): string =
     banner = &"""
       <p class="seat-alert">Auto-restart paused: {escapeHtml(alerts.join(", "))}
         ({SeatRestartBudget} restarts/hour spent)</p>"""
+  if passAgeSec > SeatWatchStallSec:
+    banner.add(&"""
+      <p class="seat-alert">Seat watch STALLED: last sampling pass
+        {formatAgeSec(passAgeSec)} ago. Nothing is being auto-restarted —
+        restart The System.</p>""")
   result = &"""
       <div class="panel-actions" style="margin-bottom:0.6rem">
-        <span class="army-summary">{escapeHtml(seatWatchSummary(seats))}</span>
+        <span class="army-summary">{escapeHtml(seatWatchSummary(seats, passAgeSec))}</span>
         <span class="meta">wedge = status stale &gt; {seatWedgeStaleSec().int}s with launcher alive</span>
       </div>
 {banner}
@@ -5090,12 +5187,13 @@ proc renderDashboard*(title, active, body: string): string =
 proc renderArmyPage*(
     characters: seq[Character],
     seats: seq[SeatWatch] = @[],
-    rosterOffline = false
+    rosterOffline = false,
+    seatPassAgeSec = -1.0
 ): string =
   ## Army tab: roster + seat babysitter. Foundation seats always hidden.
   let rows = if rosterOffline: renderRosterOfflineRow() else: renderRosterRows(characters)
   let summary = armySummary(characters)
-  let seatBody = renderSeatWatchPanelBody(seats)
+  let seatBody = renderSeatWatchPanelBody(seats, seatPassAgeSec)
   let body = &"""
     <section class="panel">
       <div class="panel-head">
@@ -5730,10 +5828,13 @@ proc armyPageHandler(request: Request) {.gcsafe.} =
       else:
         rosterOffline = true
     var seats: seq[SeatWatch] = @[]
+    var passAge = -1.0
     {.gcsafe.}:
       seats = seatWatchStatus()
+      passAge = seatWatchPassAgeSec()
     request.respond(200, htmlHeaders(),
-      renderArmyPage(characters, seats, rosterOffline = rosterOffline))
+      renderArmyPage(characters, seats, rosterOffline = rosterOffline,
+                     seatPassAgeSec = passAge))
   except Exception as e:
     request.respond(500, htmlHeaders(),
       &"<!DOCTYPE html><html><body><h1>Army error</h1><pre>{escapeHtml(e.msg)}</pre></body></html>")
@@ -5843,9 +5944,11 @@ proc seatsPartialHandler(request: Request) {.gcsafe.} =
   ## GET /seats — htmx fragment: seat babysitter panel body.
   try:
     var seats: seq[SeatWatch]
+    var passAge = -1.0
     {.gcsafe.}:
       seats = seatWatchStatus()
-    request.respond(200, htmlHeaders(), renderSeatWatchPanelBody(seats))
+      passAge = seatWatchPassAgeSec()
+    request.respond(200, htmlHeaders(), renderSeatWatchPanelBody(seats, passAge))
   except Exception as e:
     request.respond(500, htmlHeaders(),
       &"""<p class="empty">error: {escapeHtml(e.msg)}</p>""")
@@ -6498,13 +6601,20 @@ proc registerMcpTools(server: McpServer) =
     ## Same dispatch as the Army tab Seat watch panel.
     discard arguments
     var seats: seq[SeatWatch]
+    var passAge = -1.0
     {.gcsafe.}:
       seats = seatWatchStatus()
+      passAge = seatWatchPassAgeSec()
     let payload = %*{
       "seats": seatWatchToJson(seats),
       "stale_threshold_sec": seatWedgeStaleSec(),
       "restart_budget_per_hour": SeatRestartBudget,
-      "enabled": seatBabysitterEnabled()
+      "enabled": seatBabysitterEnabled(),
+      # Age of the last completed sampling pass. Well past the poll interval
+      # means the watch thread is not sampling: the seat rows are still true
+      # (ages are read live) but nothing is being auto-restarted.
+      "watch_pass_age_sec": passAge,
+      "watch_stalled": passAge > SeatWatchStallSec
     }
     result = ToolResult(
       content: @[textContent($payload)],
