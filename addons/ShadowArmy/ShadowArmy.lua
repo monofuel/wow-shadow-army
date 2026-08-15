@@ -163,6 +163,55 @@ function QuestModel.readLog(api)
   return live, sig
 end
 
+-- Vanilla reuses quest TITLES across chain steps ("Fields of Grief" is both
+-- the pumpkin gathering and the tavern delivery that follows it), and 1.12
+-- never exposes quest ids to addons — so the generated data carries every
+-- same-title variant (primary + alts) and the live leaderboard labels decide
+-- which variant a log entry actually is. A variant earns points for each of
+-- its objective labels found in the live board text and loses one for each
+-- label the log does not show; boards keep their labels after completion, so
+-- a ready-to-turn-in part 2 still resolves away from part 1's turn-in NPC.
+local function questVariantScore(v, boards, nb)
+  local objs = v.objectives or {}
+  local nObj = questGetn(objs)
+  local score = 0
+  local oi = 1
+  while oi <= nObj do
+    local label = objs[oi].label
+    local hit = false
+    if label then
+      local want = string.lower(label)
+      local bi = 1
+      while bi <= nb do
+        if string.find(string.lower(boards[bi].text or ""), want, 1, true) then
+          hit = true
+          break
+        end
+        bi = bi + 1
+      end
+    end
+    if hit then score = score + 2 else score = score - 1 end
+    oi = oi + 1
+  end
+  return score
+end
+
+function QuestModel.resolve(q, boards)
+  if not q or not q.alts then return q end
+  boards = boards or {}
+  local nb = questGetn(boards)
+  local best = q
+  local bestScore = questVariantScore(q, boards, nb)
+  local nAlts = questGetn(q.alts)
+  local ai = 1
+  while ai <= nAlts do
+    local score = questVariantScore(q.alts[ai], boards, nb)
+    if score > bestScore then best, bestScore = q.alts[ai], score end
+    ai = ai + 1
+  end
+  return best
+end
+
 function QuestModel.build(opts)
   opts = opts or {}
   local live = opts.quests or {}
@@ -189,7 +238,7 @@ function QuestModel.build(opts)
       logOrder = qi, r = color[1], g = color[2], b = color[3],
       minDist = 1e9, objs = {},
     }
-    local q = data[entry.title]
+    local q = QuestModel.resolve(data[entry.title], lq.objectives)
 
     if entry.complete then
       local obj = {
@@ -228,6 +277,12 @@ function QuestModel.build(opts)
           have = board.have, need = board.need,
           done = board.done and true or false, turnIn = false,
         }
+        -- Who drops this item. QuestData emits `from` alphabetically (picked
+        -- by spawn density, not drop rate) — never rank it. A finished
+        -- objective needs no hunt hint.
+        if generated and generated.from and not obj.done then
+          obj.from = generated.from
+        end
         local spots = generated and generated.spots
         if spots and questGetn(spots) > 0 then
           local first = spots[1]
@@ -293,7 +348,469 @@ function QuestModel.build(opts)
   return { list = list, candidates = kept }
 end
 
+-- "who do I hunt for this item" hint (ticket 0047). The window has room to
+-- spell two names out; the 210px advisor PANEL does not, and monofuel reads
+-- objectives on the panel — "Notched Rib 0/5" with no mention of Cracked
+-- Skull Soldier is the bug. So the join lives here, in the pure model, with
+-- an optional character budget: names are dropped (never wrapped, never
+-- clipped mid-word) until the rendered string fits.
+--
+-- Names arrive alphabetical, so the first is not the "best" one — the cap is
+-- line width, nothing more, which is why the dropped ones still show as +N.
+QuestModel.fromMaxNames = 2
+
+local function questFromJoin(from, k, n, more)
+  local out, i = nil, 1
+  while i <= k do
+    out = out and (out .. ", " .. from[i]) or from[i]
+    i = i + 1
+  end
+  if not out then return nil end
+  if n > k then out = out .. " +" .. (n - k) .. (more or "") end
+  return out
+end
+
+-- from      array of source names ({} / nil -> nil, "say nothing")
+-- maxNames  how many get spelled out at most (default 2)
+-- maxChars  optional hard budget for the WHOLE string
+-- more      suffix after the "+N" count (" more" for the window, "" for the panel)
+function QuestModel.fromText(from, maxNames, maxChars, more)
+  -- questGetn indexes its argument unguarded (every other caller feeds it a
+  -- built list); this one is reached straight off a live objective, where the
+  -- field is simply absent on anything that is not an item objective.
+  if not from then return nil end
+  local n = questGetn(from)
+  if n == 0 then return nil end
+  maxNames = maxNames or QuestModel.fromMaxNames
+  if maxNames > n then maxNames = n end
+  if maxNames < 1 then maxNames = 1 end
+  local k = maxNames
+  local s = questFromJoin(from, k, n, more)
+  while maxChars and k > 1 and string.len(s) > maxChars do
+    k = k - 1
+    s = questFromJoin(from, k, n, more)
+  end
+  if maxChars and string.len(s) > maxChars then
+    -- One name alone still overflows: hard-clip with the trailing "+" the
+    -- rest of the panel uses for a shortened string (see F.questShort).
+    if maxChars < 2 then return nil end
+    s = string.sub(s, 1, maxChars - 1) .. "+"
+  end
+  return s
+end
+
 ShadowArmy.questModel = QuestModel
+
+--------------------------------------------------------------------------
+-- Pure route model (r45): google-maps pathing over the generated road
+-- polylines (RoadData.lua, tools/gen_road_data.py). Roads are freeways —
+-- fewer patrols, fewer adds, fewer corpse runs — so a road yard is CHEAPER
+-- than an off-road yard and the search happily walks extra distance to use
+-- one. Everything here is percent-space arithmetic over plain tables: no WoW
+-- API, no frames, no globals, so lua/tests exercises it on host Lua and the
+-- bots can reuse the same primitive for quest pathing later.
+--
+-- Coordinates are zone-normalized percent, the space GetPlayerMapPosition
+-- and QuestData already speak. Distances are therefore percent-space
+-- euclidean, not yards: a vanilla zone is wider than it is tall (~3:2), so a
+-- percent of x is more yards than a percent of y. Every comparison in here is
+-- between two numbers in that same space, so the anisotropy cancels out of
+-- the decisions and only shows up as a mild preference for north-south road
+-- legs — cheap to live with, and it keeps the model unit-free.
+--------------------------------------------------------------------------
+
+-- Scoped so its private helpers release their slots at `end`: Lua 5.0 caps a
+-- function (the addon file itself counts) at 200 live locals, and this file
+-- is a long way down that budget already.
+do
+  local RouteModel = {}
+
+  -- Same Lua 5.0/5.3 dance as questGetn.
+  local function routeGetn(t)
+    local n = 0
+    while t[n + 1] ~= nil do n = n + 1 end
+    return n
+  end
+
+  -- Points from DIFFERENT polylines closer than this are the same junction. The
+  -- bake cuts a road wherever the mask breaks (bridges, crossings, zone borders),
+  -- so without this the network is a pile of disconnected sticks.
+  RouteModel.junctionDist = 1.5
+  -- Off-road yards cost this much more than road yards. 1.0 would make roads
+  -- irrelevant; the higher it goes the more detour the router accepts to reach
+  -- one.
+  RouteModel.offRoadPenalty = 1.6
+  -- Dijkstra settle cap. A zone graph is a few hundred nodes, so hitting this
+  -- means something is wrong with the data, and a stuck advisor is worse than a
+  -- straight line.
+  RouteModel.nodeBudget = 3000
+  -- "The road is further away than the thing I want" — skip routing entirely.
+  RouteModel.shortHopFactor = 1.25
+  -- Lookahead for the "go" bearing: the first route point this far ahead.
+  RouteModel.leadPct = 1.0
+  -- Two waypoints closer than this are one waypoint.
+  RouteModel.epsilon = 0.05
+
+  local function routeDist(ax, ay, bx, by)
+    local dx, dy = ax - bx, ay - by
+    return math.sqrt(dx * dx + dy * dy)
+  end
+
+  local function routeKey(cx, cy)
+    return cx .. ":" .. cy
+  end
+
+  local function routeEdge(graph, a, b)
+    local w = routeDist(graph.nodes[a].x, graph.nodes[a].y,
+                        graph.nodes[b].x, graph.nodes[b].y)
+    local la = graph.adj[a]
+    la[routeGetn(la) + 1] = { to = b, w = w }
+    local lb = graph.adj[b]
+    lb[routeGetn(lb) + 1] = { to = a, w = w }
+  end
+
+  -- zoneSegments is one zone's entry from ShadowArmyRoadData: an array of flat
+  -- {x1,y1,x2,y2,...} polylines. The result is a plain adjacency graph; build it
+  -- once per zone and cache it, because this is the only expensive call here.
+  function RouteModel.build(zoneSegments, opts)
+    opts = opts or {}
+    local join = opts.junctionDist or RouteModel.junctionDist
+    local graph = { nodes = {}, adj = {}, n = 0, cell = join, grid = {} }
+    if not zoneSegments then return graph end
+
+    local nodes, adj, grid = graph.nodes, graph.adj, graph.grid
+    local nn = 0
+    local si = 1
+    local nSeg = routeGetn(zoneSegments)
+    while si <= nSeg do
+      local flat = zoneSegments[si]
+      local nf = routeGetn(flat)
+      local prev = nil
+      local fi = 1
+      while fi + 1 <= nf do
+        local x, y = flat[fi], flat[fi + 1]
+        nn = nn + 1
+        nodes[nn] = { x = x, y = y, seg = si }
+        adj[nn] = {}
+        local key = routeKey(math.floor(x / join), math.floor(y / join))
+        local bucket = grid[key]
+        if not bucket then bucket = {}; grid[key] = bucket end
+        bucket[routeGetn(bucket) + 1] = nn
+        graph.n = nn
+        if prev then routeEdge(graph, prev, nn) end
+        prev = nn
+        fi = fi + 2
+      end
+      si = si + 1
+    end
+
+    -- Junction pass. The spatial hash keeps this linear-ish: only the 3x3 cell
+    -- neighbourhood can hold a point within `join`, so a dense zone does not
+    -- turn a zone change into a visible hitch.
+    local i = 1
+    while i <= nn do
+      local a = nodes[i]
+      local cx = math.floor(a.x / join)
+      local cy = math.floor(a.y / join)
+      local ox = -1
+      while ox <= 1 do
+        local oy = -1
+        while oy <= 1 do
+          local bucket = grid[routeKey(cx + ox, cy + oy)]
+          if bucket then
+            local bi = 1
+            local nb = routeGetn(bucket)
+            while bi <= nb do
+              local j = bucket[bi]
+              -- j > i emits each pair once; different seg only, because points
+              -- inside one polyline are already chained.
+              if j > i and nodes[j].seg ~= a.seg
+                  and routeDist(a.x, a.y, nodes[j].x, nodes[j].y) <= join then
+                routeEdge(graph, i, j)
+              end
+              bi = bi + 1
+            end
+          end
+          oy = oy + 1
+        end
+        ox = ox + 1
+      end
+      i = i + 1
+    end
+    return graph
+  end
+
+  -- Nearest graph node to a point. A zone tops out around 300 nodes, so the
+  -- straight scan is both faster and more predictable than a ring search, and it
+  -- always returns the lowest index on a tie (determinism).
+  local function routeNearest(graph, x, y)
+    local best, bestD = nil, nil
+    local i = 1
+    while i <= graph.n do
+      local nd = graph.nodes[i]
+      local d = routeDist(x, y, nd.x, nd.y)
+      if bestD == nil or d < bestD then best, bestD = i, d end
+      i = i + 1
+    end
+    return best, bestD
+  end
+
+  -- Binary min-heap over node indices. Ties break on the lower node index so two
+  -- equal-cost paths always resolve the same way.
+  local function routeHeapLess(h, a, b)
+    if h.cost[a] ~= h.cost[b] then return h.cost[a] < h.cost[b] end
+    return h.node[a] < h.node[b]
+  end
+
+  local function routeHeapPush(h, node, cost)
+    local n = h.n + 1
+    h.n = n
+    h.node[n] = node
+    h.cost[n] = cost
+    while n > 1 do
+      local p = math.floor(n / 2)
+      if not routeHeapLess(h, n, p) then break end
+      h.node[p], h.node[n] = h.node[n], h.node[p]
+      h.cost[p], h.cost[n] = h.cost[n], h.cost[p]
+      n = p
+    end
+  end
+
+  local function routeHeapPop(h)
+    if h.n == 0 then return nil end
+    local top = h.node[1]
+    h.node[1], h.cost[1] = h.node[h.n], h.cost[h.n]
+    h.node[h.n], h.cost[h.n] = nil, nil
+    h.n = h.n - 1
+    local i = 1
+    local stop = false
+    while not stop do
+      local l, r = i * 2, i * 2 + 1
+      local best = i
+      if l <= h.n and routeHeapLess(h, l, best) then best = l end
+      if r <= h.n and routeHeapLess(h, r, best) then best = r end
+      if best == i then
+        stop = true
+      else
+        h.node[best], h.node[i] = h.node[i], h.node[best]
+        h.cost[best], h.cost[i] = h.cost[i], h.cost[best]
+        i = best
+      end
+    end
+    return top
+  end
+
+  local function routeAppend(pts, x, y, eps)
+    local n = routeGetn(pts)
+    if n > 0 and routeDist(pts[n].x, pts[n].y, x, y) < eps then return end
+    pts[n + 1] = { x = x, y = y }
+  end
+
+  -- route(graph, start, goal) -> waypoints, meta
+  --   waypoints : { {x=,y=}, ... } always at least start and goal
+  --   meta      : { straight = bool, reason = string, cost, length, nodes }
+  -- Never errors and never returns nil: every failure mode (no data, budget
+  -- overflow, disconnected road network, a road that would not actually help)
+  -- degrades to the two-point straight line the advisor drew before roads
+  -- existed.
+  function RouteModel.route(graph, start, goal, opts)
+    opts = opts or {}
+    local penalty = opts.penalty or RouteModel.offRoadPenalty
+    local budget = opts.nodeBudget or RouteModel.nodeBudget
+    local shortHop = opts.shortHopFactor or RouteModel.shortHopFactor
+    local eps = opts.epsilon or RouteModel.epsilon
+    local sx, sy = start.x, start.y
+    local gx, gy = goal.x, goal.y
+    local straightLen = routeDist(sx, sy, gx, gy)
+
+    local function bail(reason)
+      local pts = {}
+      routeAppend(pts, sx, sy, eps)
+      routeAppend(pts, gx, gy, eps)
+      return pts, {
+        straight = true, reason = reason,
+        length = straightLen, cost = straightLen * penalty, nodes = 0,
+      }
+    end
+
+    if not graph or (graph.n or 0) < 2 then return bail("no-roads") end
+    local entry, dEntry = routeNearest(graph, sx, sy)
+    local goalNode, dExit = routeNearest(graph, gx, gy)
+    if not entry or not goalNode then return bail("no-roads") end
+    -- The goal is closer than the nearest tarmac: walking to a road to walk back
+    -- is exactly the detour nobody wants.
+    if straightLen <= dEntry * shortHop then return bail("short-hop") end
+    -- Even a free road cannot beat the straight line once both off-road legs
+    -- already cost more than the whole trip.
+    if straightLen <= dEntry + dExit then return bail("short-hop") end
+
+    local dist, prev, done = {}, {}, {}
+    local h = { n = 0, node = {}, cost = {} }
+    dist[entry] = 0
+    routeHeapPush(h, entry, 0)
+    local settled, reached, overflow = 0, false, false
+    while h.n > 0 and not reached and not overflow do
+      local u = routeHeapPop(h)
+      if not done[u] then
+        done[u] = true
+        settled = settled + 1
+        if settled > budget then
+          overflow = true
+        elseif u == goalNode then
+          reached = true
+        else
+          local es = graph.adj[u]
+          local ei = 1
+          local ne = routeGetn(es)
+          while ei <= ne do
+            local e = es[ei]
+            local nd = dist[u] + e.w
+            if dist[e.to] == nil or nd < dist[e.to] then
+              dist[e.to] = nd
+              prev[e.to] = u
+              routeHeapPush(h, e.to, nd)
+            end
+            ei = ei + 1
+          end
+        end
+      end
+    end
+    if overflow then return bail("budget") end
+    if not reached then return bail("disconnected") end
+
+    local roadCost = dist[goalNode]
+    local total = (dEntry + dExit) * penalty + roadCost
+    if total >= straightLen * penalty then return bail("straight-cheaper") end
+
+    -- Walk prev back to the entry node; the guard is belt-and-braces against a
+    -- malformed graph, since Dijkstra's tree cannot contain a cycle.
+    local back, nb = {}, 0
+    local u = goalNode
+    while u and nb <= graph.n do
+      nb = nb + 1
+      back[nb] = u
+      if u == entry then u = nil else u = prev[u] end
+    end
+    if back[nb] ~= entry then return bail("no-path") end
+
+    local pts = {}
+    routeAppend(pts, sx, sy, eps)
+    local i = nb
+    while i >= 1 do
+      local nd = graph.nodes[back[i]]
+      routeAppend(pts, nd.x, nd.y, eps)
+      i = i - 1
+    end
+    routeAppend(pts, gx, gy, eps)
+
+    local length = 0
+    i = 2
+    local np = routeGetn(pts)
+    while i <= np do
+      length = length + routeDist(pts[i - 1].x, pts[i - 1].y, pts[i].x, pts[i].y)
+      i = i + 1
+    end
+    return pts, {
+      straight = false, reason = "road",
+      length = length, cost = total, nodes = settled,
+    }
+  end
+
+  -- The point to actually face right now: snap to the nearest route point, then
+  -- walk FORWARD along the path until `lead` percent of route is behind us.
+  -- Measuring progress along the route rather than as-the-crow-flies is what
+  -- stops a player standing just past a waypoint from being told to turn around
+  -- and walk back to it.
+  function RouteModel.nextPoint(pts, x, y, lead)
+    if not pts then return nil end
+    local n = routeGetn(pts)
+    if n < 2 then return nil end
+    lead = lead or RouteModel.leadPct
+    local near, nearD = 1, nil
+    local i = 1
+    while i <= n do
+      local d = routeDist(x, y, pts[i].x, pts[i].y)
+      if nearD == nil or d < nearD then near, nearD = i, d end
+      i = i + 1
+    end
+    local acc = 0
+    i = near + 1
+    while i <= n do
+      acc = acc + routeDist(pts[i - 1].x, pts[i - 1].y, pts[i].x, pts[i].y)
+      if acc > lead then return pts[i].x, pts[i].y, i end
+      i = i + 1
+    end
+    return pts[n].x, pts[n].y, n
+  end
+
+  -- Every point of every segment of one zone, thinned to `budget` points for
+  -- the world-map road layer. That layer exists so a human can say "that road
+  -- isn't in the data", so a segment DISAPPEARING is the one unacceptable
+  -- outcome: each segment keeps its two endpoints whenever the budget can seat
+  -- them all, and only the leftover is shared out in proportion to length.
+  -- A zone whose points already fit is drawn whole.
+  -- -> a dense array of { x=, y= }, and its count (percent coordinates, the
+  -- same space build() and route() speak)
+  function RouteModel.sample(zoneSegments, budget)
+    local out, np = {}, 0
+    if not zoneSegments then return out, 0 end
+    budget = budget or 180
+    if budget < 1 then return out, 0 end
+    local nSeg = routeGetn(zoneSegments)
+    local total = 0
+    local si = 1
+    while si <= nSeg do
+      total = total + math.floor(routeGetn(zoneSegments[si]) / 2)
+      si = si + 1
+    end
+    if total < 1 then return out, 0 end
+    -- Endpoint floor per segment, dropped entirely when there are more
+    -- segments than the budget can even give two dots each.
+    local base = 2
+    if nSeg * base > budget then base = 0 end
+    local extra = budget - base * nSeg
+    local spare = total - base * nSeg
+    if spare < 1 then spare = 1 end
+    si = 1
+    while si <= nSeg and np < budget do
+      local flat = zoneSegments[si]
+      local cnt = math.floor(routeGetn(flat) / 2)
+      local take
+      if total <= budget then
+        take = cnt
+      else
+        take = base + math.floor((cnt - base) * extra / spare)
+        if take < 1 then take = 1 end
+        if take > cnt then take = cnt end
+      end
+      if take > budget - np then take = budget - np end
+      if take >= cnt then
+        local fi = 1
+        while fi + 1 <= cnt * 2 do
+          np = np + 1
+          out[np] = { x = flat[fi], y = flat[fi + 1] }
+          fi = fi + 2
+        end
+      elseif take == 1 then
+        np = np + 1
+        out[np] = { x = flat[1], y = flat[2] }
+      elseif take > 1 then
+        -- Evenly spaced along the polyline, both endpoints always included.
+        local k = 0
+        while k < take do
+          local idx = math.floor(k * (cnt - 1) / (take - 1) + 0.5) + 1
+          np = np + 1
+          out[np] = { x = flat[idx * 2 - 1], y = flat[idx * 2] }
+          k = k + 1
+        end
+      end
+      si = si + 1
+    end
+    return out, np
+  end
+
+  ShadowArmy.routeModel = RouteModel
+end
 
 --------------------------------------------------------------------------
 -- Pure combat-coach model. Like QuestModel, this stays above the WoW UI
@@ -404,18 +921,84 @@ local function combatAdd(snapshot, result, id, want, idleReason)
   return row
 end
 
+-- r46 (ticket 0041): resource policy is denominated in CASTS, not percent.
+-- The old percent gates opened a dead band — at 272 max mana, "bolt only above
+-- 35%" is ~95 mana against a 40-mana Shadow Bolt, so 20-35% mana neither bolted
+-- ("save mana") nor tapped ("mana OK") and the coach fell through to melee.
+-- The band widens as max mana grows, so the constants cannot be retuned; the
+-- gates must read actual cost.
+--
+-- CONSTRAINT: these percent numbers are the FALLBACK ONLY. `snapshot.costs` is
+-- built from spellbook tooltips (F.spellCost), which can legitimately come back
+-- empty — a tooltip that will not populate, a spell the sweep has not seen yet.
+-- When a cost (or `snapshot.power`) is missing, the affected gate degrades to
+-- exactly the pre-r46 percent behavior below. It must never degrade to
+-- "always recommend": suggesting an unaffordable cast every tick is a worse
+-- failure than the dead band this ticket closes.
+CombatModel.percentGates = {
+  shadowbolt = 35,
+  immolate = 45,
+  lifetap = 20,
+  wrath = 30,
+}
+
+-- Mana cost of an action id, or nil when cost data is unavailable.
+local function combatCost(snapshot, id)
+  local costs = snapshot.costs
+  local cost = costs and costs[id] or nil
+  if type(cost) ~= "number" then return nil end
+  return cost
+end
+
+-- true/false when castability is known, nil when it is not (caller falls back).
+local function combatCanAfford(snapshot, id)
+  local cost = combatCost(snapshot, id)
+  if cost == nil then return nil end
+  if type(snapshot.power) ~= "number" then return nil end
+  return snapshot.power >= cost
+end
+
 local function combatWarlock(snapshot, result)
   local hp = snapshot.hpPct or 100
   local mana = snapshot.powerPct or 100
   local targetHp = snapshot.targetHpPct or 100
   local actions = snapshot.actions or {}
+  local gates = CombatModel.percentGates
+
+  -- Shadow Bolt is the unit of account: it is the filler, so "can I still
+  -- bolt?" is what decides both the nuke gate and when tapping starts.
+  local boltOK = combatCanAfford(snapshot, "shadowbolt")
+  local boltWant, boltReason
+  if boltOK ~= nil then
+    boltWant = boltOK
+    if boltOK then boltReason = "nuke" else boltReason = "not enough mana" end
+  else
+    boltWant = mana > gates.shadowbolt
+    if boltWant then boltReason = "nuke" else boltReason = "save mana" end
+  end
+
+  -- Immolate keeps one bolt in reserve so a long cast cannot strand the
+  -- rotation with no filler left.
+  local boltCost, immoCost = combatCost(snapshot, "shadowbolt"), combatCost(snapshot, "immolate")
+  local immoAfford, immoBlocked
+  if boltCost and immoCost and type(snapshot.power) == "number" then
+    immoAfford = snapshot.power >= immoCost + boltCost
+    immoBlocked = "bolt reserve"
+  else
+    immoAfford = mana > gates.immolate
+    immoBlocked = "mana reserve"
+  end
+
+  -- Life Tap turns on exactly where bolting turns off: no gap, no overlap.
+  local tapNeeded
+  if boltOK ~= nil then tapNeeded = not boltOK else tapNeeded = mana < gates.lifetap end
 
   combatAdd(snapshot, result, "drainlife", hp <= 45, hp <= 45 and "recover health" or "health OK")
   combatAdd(snapshot, result, "fear", snapshot.danger and hp < 50,
     snapshot.danger and "defensive option" or "defensive")
   combatAdd(snapshot, result, "lifetap",
-    snapshot.hostile and mana < 20 and hp > 65,
-    (hp <= 65 and mana < 20) and "health too low" or "mana OK")
+    snapshot.hostile and tapNeeded and hp > 65,
+    (hp <= 65 and tapNeeded) and "health too low" or "mana OK")
   combatAdd(snapshot, result, "corruption",
     snapshot.hostile and not (actions.corruption and actions.corruption.debuff),
     (actions.corruption and actions.corruption.debuff) and "already up" or "DoT")
@@ -423,11 +1006,11 @@ local function combatWarlock(snapshot, result)
     snapshot.hostile and targetHp > 50 and not (actions.agony and actions.agony.debuff),
     targetHp <= 50 and "target low" or ((actions.agony and actions.agony.debuff) and "already up" or "curse"))
   combatAdd(snapshot, result, "immolate",
-    snapshot.hostile and targetHp > 65 and mana > 45
+    snapshot.hostile and targetHp > 65 and immoAfford
       and not (actions.immolate and actions.immolate.debuff),
-    targetHp <= 65 and "target low" or ((actions.immolate and actions.immolate.debuff) and "already up" or "mana reserve"))
-  combatAdd(snapshot, result, "shadowbolt", snapshot.hostile and mana > 35,
-    mana <= 35 and "save mana" or "nuke")
+    targetHp <= 65 and "target low" or ((actions.immolate and actions.immolate.debuff) and "already up"
+      or (immoAfford and "DoT" or immoBlocked)))
+  combatAdd(snapshot, result, "shadowbolt", snapshot.hostile and boltWant, boltReason)
   combatAdd(snapshot, result, "shoot", snapshot.hostile and snapshot.hasWand,
     snapshot.shooting and "firing" or (snapshot.hasWand and "wand" or "no wand"))
   combatAdd(snapshot, result, "melee", snapshot.hostile,
@@ -449,8 +1032,18 @@ local function combatDruidHumanoid(snapshot, result)
   combatAdd(snapshot, result, "faeriefire",
     snapshot.hostile and snapshot.danger and not (actions.faeriefire and actions.faeriefire.debuff),
     (actions.faeriefire and actions.faeriefire.debuff) and "already up" or "elite armor")
-  combatAdd(snapshot, result, "wrath", snapshot.hostile and mana > 30,
-    mana <= 30 and "save mana" or "nuke")
+  -- Same cast-denominated gate as the Warlock filler (r46, ticket 0041), with
+  -- the same fall back to the old percent constant when cost data is missing.
+  local wrathOK = combatCanAfford(snapshot, "wrath")
+  local wrathWant, wrathReason
+  if wrathOK ~= nil then
+    wrathWant = wrathOK
+    if wrathOK then wrathReason = "nuke" else wrathReason = "not enough mana" end
+  else
+    wrathWant = mana > CombatModel.percentGates.wrath
+    if wrathWant then wrathReason = "nuke" else wrathReason = "save mana" end
+  end
+  combatAdd(snapshot, result, "wrath", snapshot.hostile and wrathWant, wrathReason)
   combatAdd(snapshot, result, "catform", false, "form option")
   combatAdd(snapshot, result, "bearform", false, "form option")
   combatAdd(snapshot, result, "melee", snapshot.hostile, "fallback")
@@ -546,6 +1139,467 @@ end
 
 ShadowArmy.combatModel = CombatModel
 
+--------------------------------------------------------------------------
+-- Pure passive-upkeep model (r42): given the watched self-buffs, the pet
+-- state and the class, decide which one-click buttons the panel shows and
+-- which lines stay plain text. Buttons are for upkeep the human still owns;
+-- anything the advisor already auto-casts stays a note.
+--------------------------------------------------------------------------
+
+local PassiveModel = {}
+
+-- Class summons. A class with no entry simply never gets a summon button.
+PassiveModel.summons = {
+  WARLOCK = "Summon Imp",
+}
+
+local function passiveGetn(t)
+  local n = 0
+  while t and t[n + 1] ~= nil do n = n + 1 end
+  return n
+end
+
+function PassiveModel.evaluate(snapshot)
+  local result = { buttons = {}, notes = {}, ok = true }
+  local nb, nn = 0, 0
+  local buffs = snapshot.buffs or {}
+  local i = 1
+  while i <= passiveGetn(buffs) do
+    local buff = buffs[i]
+    if buff.missing or buff.expiring then
+      if buff.auto then
+        nn = nn + 1
+        result.notes[nn] = {
+          tone = "ok",
+          text = string.format("%s: auto (%s)",
+            buff.autoLabel or buff.label, buff.spell or "untrained"),
+        }
+      elseif buff.spell and not snapshot.dead then
+        nb = nb + 1
+        result.buttons[nb] = {
+          id = "buff:" .. (buff.id or buff.label),
+          label = buff.spell, spell = buff.spell, selfCast = true,
+        }
+      elseif buff.missing then
+        nn = nn + 1
+        result.notes[nn] = { tone = "bad", text = buff.label .. " MISSING" }
+      else
+        nn = nn + 1
+        result.notes[nn] = {
+          tone = "warn",
+          text = string.format("%s %dm left", buff.label, buff.minutes or 0),
+        }
+      end
+    end
+    i = i + 1
+  end
+  local summon = PassiveModel.summons[snapshot.classToken or ""]
+  if summon and not snapshot.hasPet and not snapshot.inCombat
+      and not snapshot.dead
+      and snapshot.known and snapshot.known[string.lower(summon)] then
+    nb = nb + 1
+    result.buttons[nb] = { id = "summon", label = summon, spell = summon }
+  end
+  result.ok = (nb == 0 and nn == 0)
+  return result
+end
+
+ShadowArmy.passiveModel = PassiveModel
+
+-- Buff watch: warn when a tracked self-buff is missing or expiring.
+-- 1.12 API quirk: GetPlayerBuff/GetPlayerBuffTimeLeft give remaining time,
+-- but buff NAMES aren't exposed directly — identify by texture instead
+-- (stable across ranks). Demon Skin and Demon Armor share the watch slot:
+-- either one counts as "armored".
+-- Lives above the UI guard (r44) so unit tests bind the REAL table: the bar
+-- model's managed set is derived from it, and a rename here must break tests
+-- rather than silently un-manage a spell.
+local ARMOR_WATCH = {
+  id = "armor",
+  label = "Demon Skin",
+  autoLabel = "armor",
+  -- Preference order; Demon Armor supersedes Demon Skin at 20+.
+  spells = { "Demon Armor", "Demon Skin" },
+  textures = {
+    "Interface\\Icons\\Spell_Shadow_RagingScream",  -- Demon Skin
+    "Interface\\Icons\\Spell_Shadow_SpectralSight", -- Demon Armor (lvl 20+)
+  },
+  warnBelow = 300, -- seconds; warn under 5 minutes
+  autoCast = true, -- r12: the advisor keeps this one up itself (see F.armorTick)
+}
+
+local WATCHED_BUFFS = { ARMOR_WATCH }
+
+ShadowArmy.watchedBuffs = WATCHED_BUFFS
+
+--------------------------------------------------------------------------
+-- Pure action-bar sweep model (r43): the advisor owns its managed abilities
+-- (combat-coach spells, passive-upkeep buffs, the class summon) and casts
+-- them itself, so a bar copy is dead weight the human can mis-click.
+-- monofuel authorized clobbering the bar. This half only decides WHICH
+-- slots go; the UI half reads slot names and does the removal.
+--
+-- r44 telemetry shelf: the combat coach reads EXACT usability and range off
+-- an action slot that holds the spell (F.combatActionState). Sweeping every
+-- copy would pin it to usable=true plus a CheckInteractDistance guess for the
+-- rest of the session, so the sweep now keeps one copy per managed spell in
+-- the last bonus bank — a bank no key can reach on a stance-less class.
+--------------------------------------------------------------------------
+
+local BarModel = {}
+
+local function barGetn(t)
+  local n = 0
+  while t and t[n + 1] ~= nil do n = n + 1 end
+  return n
+end
+
+BarModel.maxSlot = 120 -- 1.12: 10 pages x 12 buttons, no more
+-- 1-72 are the six pressable pages — the only slots a human can mis-click.
+-- 73-120 are the stance/bonus banks (a druid's form bars live there), so the
+-- sweep stops at 72 and form bars survive untouched.
+BarModel.sweepMax = 72
+-- The last bonus bank is the telemetry shelf. Assumes a stance-less class:
+-- bonus offset 4 (druid Travel Form) renders these very slots as the live
+-- bar, so the shelf must move before the sweep ships for druids.
+BarModel.shelfFirst = 109
+BarModel.shelfLast = 120
+
+-- Managed names in shelf priority order, lowercase: 1.12 tooltips carry the
+-- client's capitalisation, not ours. Coach spells come first because they are
+-- the ones that consume exact slot telemetry; `watches` is the passive
+-- buff-watch list, whose every RANK counts (Demon Skin and Demon Armor share
+-- one watch); the class summon trails.
+function BarModel.managedOrder(classToken, watches)
+  local out, n, seen = {}, 0, {}
+  local function add(name)
+    if not name then return end
+    local key = string.lower(name)
+    if seen[key] then return end
+    seen[key] = true
+    n = n + 1
+    out[n] = key
+  end
+  local defs = CombatModel.actions[classToken or ""] or {}
+  local i = 1
+  while i <= barGetn(defs) do
+    add(defs[i].spell)
+    i = i + 1
+  end
+  local wi = 1
+  while wi <= barGetn(watches) do
+    local spells = watches[wi].spells or {}
+    local si = 1
+    while si <= barGetn(spells) do
+      add(spells[si])
+      si = si + 1
+    end
+    wi = wi + 1
+  end
+  add(PassiveModel.summons[classToken or ""])
+  return out
+end
+
+-- Set form of the same list, for O(1) slot matching.
+function BarModel.managedNames(classToken, watches)
+  local names = {}
+  local order = BarModel.managedOrder(classToken, watches)
+  local i = 1
+  while i <= barGetn(order) do
+    names[order[i]] = true
+    i = i + 1
+  end
+  return names
+end
+
+-- slotNames is { [slot] = tooltip line 1 } and is sparse (empty slots are
+-- absent), so walk the slot range rather than the table.
+function BarModel.sweep(slotNames, managed, maxSlot)
+  local out, n = {}, 0
+  slotNames = slotNames or {}
+  managed = managed or {}
+  local slot = 1
+  local last = maxSlot or BarModel.maxSlot
+  while slot <= last do
+    local name = slotNames[slot]
+    if name and managed[string.lower(name)] then
+      n = n + 1
+      out[n] = slot
+    end
+    slot = slot + 1
+  end
+  return out
+end
+
+-- The whole decision, so the UI half only executes. Returns
+--   { remove = { slot, ... },                    -- pressable slots to clear
+--     place  = { { name = <lowercase>, slot = n }, ... }, -- shelf refills
+--     shelfFull = bool }                         -- some spell got no shelf
+-- opts:
+--   order      ordered managed names (BarModel.managedOrder); no order, no
+--              placement — a hash set has no stable order to fill a shelf in
+--   trained    set/map keyed lowercase of spells the player actually knows
+--              (auto.spells works directly); nil means "all of them"
+--   occupied   set of slots holding SOMETHING, macros and slots whose tooltip
+--              would not read included — those are never overwritten
+--   sweepMax / shelfFirst / shelfLast / maxSlot   range overrides
+function BarModel.plan(slotNames, managed, opts)
+  slotNames, managed, opts = slotNames or {}, managed or {}, opts or {}
+  local sweepMax = opts.sweepMax or BarModel.sweepMax
+  local shelfFirst = opts.shelfFirst or BarModel.shelfFirst
+  local shelfLast = opts.shelfLast or BarModel.shelfLast
+  local maxSlot = opts.maxSlot or BarModel.maxSlot
+  local occupied = opts.occupied or {}
+  local out = { remove = BarModel.sweep(slotNames, managed, sweepMax),
+    place = {}, shelfFull = false }
+  -- Anything already parked in the untouched banks still feeds the coach, so
+  -- it needs no shelf copy. `kept` is a SET, so the duplicate shelf copies a
+  -- broken sweep may have left behind (r44's unreadable-bar bug) collapse to
+  -- one entry: the name is simply never placed again. Nothing removes them —
+  -- removal stops at sweepMax and a spare copy on the shelf is harmless.
+  local kept = {}
+  local slot = sweepMax + 1
+  while slot <= maxSlot do
+    local name = slotNames[slot]
+    if name then kept[string.lower(name)] = true end
+    slot = slot + 1
+  end
+  local free, fn = {}, 0
+  slot = shelfFirst
+  while slot <= shelfLast do
+    if not occupied[slot] and not slotNames[slot] then
+      fn = fn + 1
+      free[fn] = slot
+    end
+    slot = slot + 1
+  end
+  local order, trained = opts.order or {}, opts.trained
+  local pn, i = 0, 1
+  while i <= barGetn(order) do
+    local name = string.lower(order[i])
+    if not kept[name] and (not trained or trained[name]) then
+      kept[name] = true
+      if pn < fn then
+        pn = pn + 1
+        out.place[pn] = { name = name, slot = free[pn] }
+      else
+        -- Shelf is out of room: the coach falls back to approximate range
+        -- and usable=true for whatever is left over.
+        out.shelfFull = true
+      end
+    end
+    i = i + 1
+  end
+  return out
+end
+
+ShadowArmy.barModel = BarModel
+
+--------------------------------------------------------------------------
+-- Pure bag disposition model (r47, ticket 0039 phase 2): "a bot picked up
+-- 12 random items — what should it do with them?" Tags every bag item the
+-- human sees first and the bots consume later.
+--
+-- THE DATA CONTRACT IS THE WHOLE TRAP (docs/item-data.md; the phase-1 review
+-- called this exact footgun out): ItemData OMITS every field that equals its
+-- default, so an absent `class` means 0 = Consumable and an absent `q` means
+-- 0 = Poor. Reading `row.class` raw turns every consumable into "no class"
+-- and every gray into "unknown quality". Every field read here goes through
+-- BagModel.field() and nothing else may read a row directly.
+--
+-- A missing ROW is a different thing entirely: `ShadowArmyItemData[id] == nil`
+-- means this patch's dump never saw the item, and the only honest answer is
+-- HOLD "unknown item". Do not fold that into the defaulting.
+--
+-- Pure: no WoW API, no frames, no globals — lua/tests drives it on host Lua.
+--------------------------------------------------------------------------
+
+local BagModel = {}
+
+local function bagGetn(t)
+  local n = 0
+  while t and t[n + 1] ~= nil do n = n + 1 end
+  return n
+end
+
+BagModel.SELL = "SELL"
+BagModel.EQUIP = "EQUIP"
+BagModel.KEEP_QUEST = "KEEP_QUEST"
+BagModel.HOLD = "HOLD"
+-- Declared so the UI can colour it, NEVER returned by v1. Deciding "drink
+-- this / eat this / this is a bandage" needs `spellid_1` + `flags` out of
+-- item_template, which phase 1 did not emit (ticket 0039 note 2026-08-14).
+-- Consumables land on HOLD with a reason that says so, rather than a guess
+-- that heals nothing.
+BagModel.USE = "USE"
+BagModel.useImplemented = false
+
+BagModel.CLASS_CONSUMABLE = 0
+BagModel.CLASS_WEAPON = 2
+BagModel.CLASS_ARMOR = 4
+BagModel.CLASS_QUEST = 12
+
+BagModel.ARMOR_MISC = 0  -- necks, rings, trinkets, held-in-off-hand
+BagModel.ARMOR_CLOTH = 1
+
+-- `slot` is inventory_type. These are the SINGLE-position slots we are
+-- willing to compare by item level. FINGER (11) and TRINKET (12) have two
+-- positions each, and weapons are not comparable by item level at all (a
+-- wand and a one-hand sword share `lvl` and nothing else) — those punt to
+-- MANUAL_SLOT. ROBE (20) is a chest piece; warlock gear is full of them.
+BagModel.EQUIP_SLOT = {
+  [1] = "head", [2] = "neck", [3] = "shoulder", [5] = "chest",
+  [6] = "waist", [7] = "legs", [8] = "feet", [9] = "wrist",
+  [10] = "hands", [16] = "back", [20] = "chest", [23] = "off-hand",
+}
+
+-- Equippable, but the call is the human's this rev. The reason text names
+-- the slot so the bag window explains itself instead of just saying "hold".
+BagModel.MANUAL_SLOT = {
+  [4] = "shirt", [11] = "ring", [12] = "trinket", [13] = "weapon",
+  [14] = "shield", [15] = "ranged", [17] = "two-hander", [19] = "tabard",
+  [21] = "main hand", [22] = "off hand", [25] = "thrown",
+  [26] = "ranged", [28] = "relic",
+}
+
+-- Cloth casters wear cloth (armor subclass 1) plus the Misc pieces every
+-- class can wear (subclass 0: necks, rings, trinkets, held-in-off-hand).
+BagModel.CLOTH_CLASSES = { WARLOCK = true, MAGE = true, PRIEST = true }
+
+-- THE defaulting accessor. Absent == the column's default, never "unknown".
+function BagModel.field(row, key)
+  if not row then return 0 end
+  local v = row[key]
+  if v == nil then return 0 end
+  return v
+end
+
+-- true / false / nil, where nil is "we have no proficiency rule for this
+-- class yet" and the caller must punt rather than guess.
+function BagModel.canEquip(classToken, class, sub)
+  if class ~= BagModel.CLASS_ARMOR then return nil end
+  if classToken and BagModel.CLOTH_CLASSES[classToken] then
+    return (sub == BagModel.ARMOR_CLOTH or sub == BagModel.ARMOR_MISC)
+  end
+  return nil
+end
+
+-- One item -> { tag, reason, sell, equipSlot? }. ORDER MATTERS; first match
+-- wins. Keep the order comment honest, it is the spec.
+function BagModel.decide(item, level, classToken, equipped)
+  item = item or {}
+  equipped = equipped or {}
+  local row = item.data
+  if not row then
+    return { tag = BagModel.HOLD, reason = "unknown item", sell = 0 }
+  end
+  local f = BagModel.field
+  local class = f(row, "class")
+  local sub = f(row, "sub")
+  local q = f(row, "q")
+  local sell = f(row, "sell")
+  local req = f(row, "req")
+  local ilvl = f(row, "lvl")
+  local slot = f(row, "slot")
+
+  -- 1. Quest items are never sold and never dropped, whatever they are
+  --    worth. This sits FIRST precisely so a high sell price cannot reach
+  --    the gray rule below and vendor away a quest chain.
+  if class == BagModel.CLASS_QUEST then
+    return { tag = BagModel.KEEP_QUEST, reason = "quest item", sell = sell }
+  end
+
+  -- 2. Gray with a vendor price: the reason to walk to a merchant at all.
+  if q == 0 and sell > 0 then
+    return { tag = BagModel.SELL, reason = "gray", sell = sell }
+  end
+
+  -- 3. Equippable upgrade. A miss here does not end the decision — it
+  --    records WHY it missed and falls through to the HOLD rules, so the
+  --    window can say "needs level 20" instead of a bare "hold".
+  local equipHold = nil
+  local slotKey = BagModel.EQUIP_SLOT[slot]
+  if slotKey then
+    local wearable = BagModel.canEquip(classToken, class, sub)
+    if wearable == nil then
+      equipHold = "equippable — no proficiency rule"
+    elseif not wearable then
+      equipHold = "not your armor type"
+    elseif req > level then
+      equipHold = "needs level " .. req
+    else
+      local cur = equipped[slotKey]
+      if not cur then
+        return { tag = BagModel.EQUIP, sell = sell, equipSlot = slotKey,
+          reason = slotKey .. " slot is empty" }
+      end
+      local curLvl = f(cur, "lvl")
+      if ilvl > curLvl then
+        return { tag = BagModel.EQUIP, sell = sell, equipSlot = slotKey,
+          reason = string.format("%s upgrade il%d>%d", slotKey, ilvl, curLvl) }
+      end
+      equipHold = string.format("%s il%d <= worn il%d", slotKey, ilvl, curLvl)
+    end
+  elseif BagModel.MANUAL_SLOT[slot] then
+    equipHold = BagModel.MANUAL_SLOT[slot] .. " — your call"
+  end
+
+  -- 4. Gray with NO vendor price is NOT "sell it for nothing" — there is
+  --    nothing to sell it FOR. It is the drop-when-bags-are-full pile, so it
+  --    holds with a reason that says so and never sends anyone to a vendor.
+  if q == 0 and sell == 0 then
+    return { tag = BagModel.HOLD, reason = equipHold or "no value", sell = 0 }
+  end
+
+  if equipHold then
+    return { tag = BagModel.HOLD, reason = equipHold, sell = sell }
+  end
+
+  -- 5. Everything else holds, with a reason. Consumables get the honest
+  --    "USE is not built yet" instead of being lumped into "keep".
+  if class == BagModel.CLASS_CONSUMABLE then
+    return { tag = BagModel.HOLD, reason = "consumable — USE not implemented",
+      sell = sell }
+  end
+  return { tag = BagModel.HOLD, reason = "keep", sell = sell }
+end
+
+-- snapshot = {
+--   items  = { { id, count, name?, bag?, bagSlot?, data = <ItemData row or nil> } },
+--   player = { level, classToken, equipped = { <slotKey> = <ItemData row> } },
+-- }
+-- `bag`/`bagSlot` are the container coordinates (deliberately NOT called
+-- `slot` — in a row, `slot` is inventory_type, and one name for two numbers
+-- is how a bag-slot index ends up compared against INVTYPE_HEAD).
+-- -> { items = { { id, count, name, bag, bagSlot, tag, reason, sell } },
+--      sellCopper, sellCount, unknown }
+function BagModel.evaluate(snapshot)
+  snapshot = snapshot or {}
+  local player = snapshot.player or {}
+  local level = player.level or 1
+  local classToken = player.classToken
+  local equipped = player.equipped or {}
+  local items = snapshot.items or {}
+  local out = { items = {}, sellCopper = 0, sellCount = 0, unknown = 0 }
+  local i, n = 1, bagGetn(items)
+  while i <= n do
+    local it = items[i] or {}
+    local d = BagModel.decide(it, level, classToken, equipped)
+    d.id, d.name, d.bag, d.bagSlot = it.id, it.name, it.bag, it.bagSlot
+    d.count = it.count or 1
+    if d.tag == BagModel.SELL then
+      out.sellCount = out.sellCount + 1
+      out.sellCopper = out.sellCopper + (d.sell or 0) * d.count
+    end
+    if not it.data then out.unknown = out.unknown + 1 end
+    out.items[i] = d
+    i = i + 1
+  end
+  return out
+end
+
+ShadowArmy.bagModel = BagModel
+
 -- Unit tests load this file without the WoW UI and stop after the pure model.
 if not CreateFrame then return end
 
@@ -554,7 +1608,7 @@ local F = {}
 
 -- Bump on every edit. The System watches Chat.log for "<SA> loaded rev=..."
 -- after sending a reload — a new rev proves the edit actually loaded.
-local REV = "r40"
+local REV = "r48"
 
 -- Log window (r16): every F.say()/F.emit() line also lands here with a
 -- timestamp, so errors survive chat scroll-off and can be reviewed in-game.
@@ -684,10 +1738,20 @@ end
 -- Advisor panel: draggable window with live lines + buttons.
 --------------------------------------------------------------------------
 
+-- r32: room for quest checklist under grind lines.
+-- r47: +24 for a fourth button row (Bags). Buttons anchor to the panel BOTTOM
+-- and the panel anchors by TOPRIGHT, so the extra row grows downward and the
+-- checklist lines above it do not move.
+local PANEL_BASE_HEIGHT = 324
+-- r43: anchored by TOPRIGHT so the passive row growing the panel pushes only
+-- downward. A RIGHT anchor grows from the center and shifts every line above
+-- it too. Y keeps the top edge exactly where the old RIGHT/-40/60 anchor put
+-- it at base height (60 + half the panel).
+local PANEL_TOP_Y = 60 + PANEL_BASE_HEIGHT / 2
 local panel = CreateFrame("Frame", "ShadowArmyPanel", UIParent)
 panel:SetWidth(210)
-panel:SetHeight(300) -- r32: room for quest checklist under grind lines
-panel:SetPoint("RIGHT", UIParent, "RIGHT", -40, 60)
+panel:SetHeight(PANEL_BASE_HEIGHT)
+panel:SetPoint("TOPRIGHT", UIParent, "RIGHT", -40, PANEL_TOP_Y)
 panel:SetFrameStrata("HIGH")
 panel:SetBackdrop({
   bgFile = "Interface\\Tooltips\\UI-Tooltip-Background",
@@ -708,7 +1772,7 @@ panel:Show()
 function F.panelShowReset()
   -- Recover from off-screen drag or a hide that left no way back.
   panel:ClearAllPoints()
-  panel:SetPoint("RIGHT", UIParent, "RIGHT", -40, 60)
+  panel:SetPoint("TOPRIGHT", UIParent, "RIGHT", -40, PANEL_TOP_Y)
   panel:Show()
 end
 
@@ -732,11 +1796,77 @@ local line2 = F.makeLine(line1)
 local line3 = F.makeLine(line2)
 local line4 = F.makeLine(line3)
 local line5 = F.makeLine(line4, -6) -- buff watch / warnings
+
+-- r42: long-term passive upkeep buttons (missing self-buff, missing minion).
+-- Frames are built once here and only shown/hidden on refresh. An idle row
+-- still costs 5px (1px minimum height + its 4px gap), so the checklist below
+-- sits 5px lower than it did in r41; from there it only moves when a button
+-- actually appears, and r43's TOPRIGHT panel anchor keeps that growth
+-- downward.
+--
+-- r46 (ticket 0042): they are ability icons now, not red text slabs — square
+-- spell-texture buttons with a hover tooltip. Still two per row, still four
+-- frames, so the row/panel height math below only needs the new step.
+local PASSIVE_MAX_BUTTONS = 4
+local PASSIVE_BTN_SIZE = 24
+local PASSIVE_BTN_GAP = 4
+local PASSIVE_BTN_STEP = PASSIVE_BTN_SIZE + PASSIVE_BTN_GAP
+-- Used when the spell has no captured texture yet (scan has not run, or the
+-- spell is not in the book). An icon button with no icon reads as broken.
+local PASSIVE_ICON_FALLBACK = "Interface\\Icons\\INV_Misc_QuestionMark"
+local passiveRow = CreateFrame("Frame", "ShadowArmyPassiveRow", panel)
+passiveRow:SetPoint("TOPLEFT", line5, "BOTTOMLEFT", 0, -4)
+passiveRow:SetWidth(194)
+passiveRow:SetHeight(1)
+local passiveBtns = {}
+local _pbi = 1
+while _pbi <= PASSIVE_MAX_BUTTONS do
+  local b = CreateFrame("Button", "ShadowArmyPassiveBtn" .. _pbi, passiveRow)
+  b:SetWidth(PASSIVE_BTN_SIZE)
+  b:SetHeight(PASSIVE_BTN_SIZE)
+  b:SetPoint("TOPLEFT", passiveRow, "TOPLEFT",
+    math.mod(_pbi - 1, 2) * PASSIVE_BTN_STEP,
+    -math.floor((_pbi - 1) / 2) * PASSIVE_BTN_STEP)
+  local icon = b:CreateTexture("ShadowArmyPassiveBtn" .. _pbi .. "Icon", "BACKGROUND")
+  icon:SetAllPoints(b)
+  icon:SetTexture(PASSIVE_ICON_FALLBACK)
+  b.icon = icon
+  b:SetPushedTexture("Interface\\Buttons\\UI-Quickslot-Depress")
+  b:SetHighlightTexture("Interface\\Buttons\\ButtonHilight-Square")
+  -- Additive highlight is the stock icon-button look; the getter is guarded
+  -- because this build's widget surface is not the reference one.
+  if b.GetHighlightTexture then
+    local hl = b:GetHighlightTexture()
+    if hl and hl.SetBlendMode then hl:SetBlendMode("ADD") end
+  end
+  b:SetScript("OnClick", function()
+    F.passiveClick(this.passiveSpell, this.passiveSelf)
+  end)
+  b:SetScript("OnEnter", function()
+    if not this.passiveSpell then return end
+    GameTooltip:SetOwner(this, "ANCHOR_LEFT")
+    GameTooltip:SetText(this.passiveLabel or this.passiveSpell)
+    if this.passiveRank then GameTooltip:AddLine(this.passiveRank, 0.8, 0.8, 0.8) end
+    GameTooltip:Show()
+  end)
+  b:SetScript("OnLeave", function() GameTooltip:Hide() end)
+  b:Hide()
+  passiveBtns[_pbi] = b
+  _pbi = _pbi + 1
+end
+
 -- r32: multi-line quest checklist (quest identity + objectives). line6 is
 -- slot 1 so corpse-run can still steal the first row while ghosting.
 local QUEST_PANEL_LINES = 8
+-- r47: character budget for the hunt-hint sub-line. The panel is 210px wide
+-- with 194px of usable room, GameFontNormalSmall averages ~5.5px/char, so a
+-- row holds roughly 35 characters; the sub-line spends 11 of them on its
+-- "      from " prefix. QuestModel.fromText drops NAMES to fit this rather
+-- than letting a FontString run off the panel edge (1.12 FontStrings with no
+-- width neither wrap nor clip — they just overhang).
+local QUEST_HINT_CHARS = 24
 local questLines = {}
-questLines[1] = F.makeLine(line5, -6)
+questLines[1] = F.makeLine(passiveRow, -6)
 local _qli = 2
 while _qli <= QUEST_PANEL_LINES do
   questLines[_qli] = F.makeLine(questLines[_qli - 1], -2)
@@ -806,6 +1936,57 @@ function F.scanCombatActions()
   end
 end
 
+-- r46 (ticket 0041): the coach needs each spell's REAL mana cost, and 1.12 has
+-- no GetSpellCost — the spellbook tooltip is the only source. One hidden
+-- tooltip, built here at load and never per scan.
+local bookTip = CreateFrame("GameTooltip", "ShadowArmyBookTip", UIParent,
+  "GameTooltipTemplate")
+bookTip:SetOwner(UIParent, "ANCHOR_NONE")
+
+-- Cost lives in the tooltip's header block (line 2 in practice); a few lines of
+-- slack covers reagent/requires lines without reaching the description, where a
+-- sentence could otherwise look like a cost.
+local BOOK_TIP_LINES = 6
+
+-- Mana cost of spellbook entry `index`, or nil for a costless/non-mana spell
+-- and for any read that did not populate.
+--
+-- CONSTRAINT (r46, docs/vanilla-addons/client-quirks.md): tooltip populate
+-- calls on this wine 1.12 build return NO flag, so SetSpell's return value is
+-- never consulted. Every line we are about to read is blanked FIRST, exactly
+-- like F.barSlotName does for SetAction; text read back after SetSpell can then
+-- only have come from this spell. A failed read yields nil, and the model falls
+-- back to its percent gate rather than inventing a cost.
+function F.spellCost(index)
+  bookTip:SetOwner(UIParent, "ANCHOR_NONE")
+  bookTip:ClearLines()
+  local i = 1
+  while i <= BOOK_TIP_LINES do
+    local left = getglobal("ShadowArmyBookTipTextLeft" .. i)
+    local right = getglobal("ShadowArmyBookTipTextRight" .. i)
+    if left then left:SetText(nil) end
+    if right then right:SetText(nil) end
+    i = i + 1
+  end
+  if not pcall(bookTip.SetSpell, bookTip, index, "spell") then return nil end
+  i = 1
+  while i <= BOOK_TIP_LINES do
+    local side = 1
+    while side <= 2 do
+      local name = "ShadowArmyBookTipText" .. (side == 1 and "Left" or "Right") .. i
+      local fs = getglobal(name)
+      local text = fs and fs:GetText()
+      if text and text ~= "" then
+        local _, _, cost = string.find(text, "^(%d+) Mana")
+        if cost then return tonumber(cost) end
+      end
+      side = side + 1
+    end
+    i = i + 1
+  end
+  return nil
+end
+
 function F.scanSpellbook()
   auto.known, auto.spells = {}, {}
   local classLabel, classToken = UnitClass("player")
@@ -819,9 +2000,13 @@ function F.scanSpellbook()
     if not name then break end
     local key = string.lower(name)
     auto.known[key] = true
+    -- Ranks are walked upward and overwrite, so `index` names the highest
+    -- trained rank — `cost` is read from that same index and stays consistent
+    -- with it.
     auto.spells[key] = {
       name = name, rank = rank, index = i,
       texture = GetSpellTexture(i, "spell"),
+      cost = F.spellCost(i),
     }
     i = i + 1
   end
@@ -954,6 +2139,10 @@ function F.combatSnapshot()
     form = F.currentDruidForm(),
     playerDead = UnitIsDeadOrGhost("player") and true or false,
     hpPct = hpMax > 0 and UnitHealth("player") / hpMax * 100 or 0,
+    -- r46: POINTS are what the coach gates on (cost vs. pool). powerPct stays
+    -- for display and for the percent fallback when cost data is missing.
+    power = UnitMana("player") or 0,
+    powerMax = powerMax or 0,
     powerPct = powerMax > 0 and UnitMana("player") / powerMax * 100 or 0,
     resourceName = resourceName, resourceLowReason = resourceName .. " low",
     moving = move.moving, casting = auto.casting,
@@ -966,12 +2155,18 @@ function F.combatSnapshot()
     combo = GetComboPoints() or 0,
     hasWand = GetInventoryItemLink("player", 18) and true or false,
     shooting = auto.shooting, melee = auto.melee,
-    actions = {},
+    actions = {}, costs = {},
   }
   local defs = F.combatDefs()
   local i = 1
   while i <= table.getn(defs) do
-    snapshot.actions[defs[i].id] = F.combatActionState(defs[i], snapshot)
+    local def = defs[i]
+    snapshot.actions[def.id] = F.combatActionState(def, snapshot)
+    -- Missing entry (untrained, non-mana, or an unreadable tooltip) is left
+    -- absent on purpose: the model reads that as "no cost data" and falls back
+    -- to its percent gate.
+    local book = def.spell and auto.spells[string.lower(def.spell)] or nil
+    if book and book.cost then snapshot.costs[def.id] = book.cost end
     i = i + 1
   end
   return snapshot
@@ -1053,34 +2248,90 @@ function ShadowArmy.UseSuggested()
   end
 end
 
+-- r47 (ticket 0049): key 2 is the PASSIVE row, on the same hook as key 1.
+--
+-- The row's order IS the model's order — PassiveModel.evaluate emits the
+-- buff buttons before the summon — so "first active button" is
+-- `result.buttons[1]` and nothing here re-sorts it. The press re-evaluates
+-- instead of reading the last painted row, for the same reason key 1 does:
+-- a minion can die, a buff can drop, between the paint and the keypress.
+local passiveKeySeen = false
+
+-- The button key 2 would cast right now, or nil. No side effects, so the
+-- key hook can ask "do I own this press?" before committing to it.
+function F.passiveEvaluate()
+  return PassiveModel.evaluate(F.passiveSnapshot())
+end
+
+function F.passiveKeyWant()
+  if auto.casting then return nil end
+  -- The SNAPSHOT is inside the pcall too: it reads UnitBuff, the spellbook
+  -- scan and the pet, and this runs on a keypress. An error escaping here
+  -- would take ActionButtonUp with it and the human's key 2 would just die.
+  local ok, result = pcall(F.passiveEvaluate)
+  if not ok or not result then return nil end
+  local want = result.buttons and result.buttons[1] or nil
+  if not want or not want.spell then return nil end
+  return want
+end
+
+function ShadowArmy.UsePassive(want)
+  want = want or F.passiveKeyWant()
+  if not want then return false end
+  if not passiveKeySeen then
+    passiveKeySeen = true
+    F.emit("bindpress", "key=2 passive=" .. tostring(want.id))
+  end
+  -- EXACTLY the path the on-screen button takes, guards included.
+  F.passiveClick(want.spell, want.selfCast and 1 or nil)
+  return true
+end
+
 local stockActionButtonDown = ActionButtonDown
 local stockActionButtonUp = ActionButtonUp
 
+-- Stock ActionButtonDown leaves the button depressed; whoever swallows the
+-- release owes it the reset UseAction would otherwise have done.
+function F.actionButtonClearPushed(id)
+  local button
+  if BonusActionBarFrame and BonusActionBarFrame:IsShown() then
+    button = getglobal("BonusActionButton" .. id)
+  else
+    button = getglobal("ActionButton" .. id)
+  end
+  if button and button.GetButtonState and button:GetButtonState() == "PUSHED" then
+    button:SetButtonState("NORMAL")
+  end
+end
+
 function F.installSuggestedKeyHook()
   if not stockActionButtonDown or not stockActionButtonUp then
-    F.emit("err", "bind ACTIONBUTTON1 hook unavailable")
+    F.emit("err", "bind ACTIONBUTTON1/2 hook unavailable")
     return false
   end
-  -- Down remains stock so the first action button visibly depresses. On key
-  -- release, reset that visual without UseAction(slot 1), then use the coach.
+  -- Down remains stock so the action button visibly depresses. On key
+  -- release, reset that visual without UseAction(slot), then use the coach.
   ActionButtonDown = function(id)
     stockActionButtonDown(id)
   end
   ActionButtonUp = function(id, onSelf)
-    if id ~= 1 then
-      stockActionButtonUp(id, onSelf)
+    if id == 1 then
+      F.actionButtonClearPushed(1)
+      ShadowArmy.UseSuggested()
       return
     end
-    local button
-    if BonusActionBarFrame and BonusActionBarFrame:IsShown() then
-      button = getglobal("BonusActionButton1")
-    else
-      button = getglobal("ActionButton1")
+    if id == 2 and not (HasAction and HasAction(2)) then
+      -- The advisor only OWNS key 2 while slot 2 is empty AND the passive
+      -- row has something to cast. An action the human parked in slot 2
+      -- always wins; a quiet row falls through to stock behaviour.
+      local want = F.passiveKeyWant()
+      if want then
+        F.actionButtonClearPushed(2)
+        ShadowArmy.UsePassive(want)
+        return
+      end
     end
-    if button and button:GetButtonState() == "PUSHED" then
-      button:SetButtonState("NORMAL")
-    end
-    ShadowArmy.UseSuggested()
+    stockActionButtonUp(id, onSelf)
   end
   return true
 end
@@ -1097,6 +2348,24 @@ function F.bindSuggestedKey()
   end
   F.say("1 = suggested ability")
   F.emit("bind", "key=1 action=" .. tostring(GetBindingAction and GetBindingAction("1"))
+    .. " driver=advisor-hook")
+  return true
+end
+
+-- Same binding path as key 1, one key over. ACTIONBUTTON2 is what the hook
+-- above intercepts, so the binding and the interception cannot drift apart.
+function F.bindPassiveKey()
+  local command = "ACTIONBUTTON2"
+  if not SetBinding or not SetBinding("2", command) then
+    F.say("could not bind passive upkeep to 2")
+    F.emit("err", "bind key=2 failed")
+    return false
+  end
+  if SaveBindings and GetCurrentBindingSet then
+    SaveBindings(GetCurrentBindingSet())
+  end
+  F.say("2 = passive upkeep (buff / summon)")
+  F.emit("bind", "key=2 action=" .. tostring(GetBindingAction and GetBindingAction("2"))
     .. " driver=advisor-hook")
   return true
 end
@@ -1270,7 +2539,7 @@ combatClose:SetScript("OnClick", function() combatFrame:Hide() end)
 local combatBtn = CreateFrame("Button", "ShadowArmyCombatBtn", panel, "UIPanelButtonTemplate")
 combatBtn:SetWidth(118)
 combatBtn:SetHeight(20)
-combatBtn:SetPoint("BOTTOMLEFT", panel, "BOTTOMLEFT", 8, 56)
+combatBtn:SetPoint("BOTTOMLEFT", panel, "BOTTOMLEFT", 8, 80)
 combatBtn:SetText("|cFF9482C9Combat|r")
 combatBtn:SetScript("OnClick", function() F.combatToggle() end)
 -- Remote-reload button: hidden until The System requests a reload. It must
@@ -1279,33 +2548,12 @@ combatBtn:SetScript("OnClick", function() F.combatToggle() end)
 local reloadBtn = CreateFrame("Button", "ShadowArmyReloadBtn", panel, "UIPanelButtonTemplate")
 reloadBtn:SetWidth(68) -- 118 + 8 gap + 68 = 194 = panel width minus insets
 reloadBtn:SetHeight(20)
-reloadBtn:SetPoint("BOTTOMRIGHT", panel, "BOTTOMRIGHT", -8, 56) -- top row, beside Combat
+reloadBtn:SetPoint("BOTTOMRIGHT", panel, "BOTTOMRIGHT", -8, 80) -- top row, beside Combat
 reloadBtn:SetText("|cFF44FF44Reload!|r")
 reloadBtn:Hide()
 reloadBtn:SetScript("OnClick", function()
   ReloadUI()
 end)
-
--- One-click loot vacuum (r14): 'loot gated' proved LootSlot is a no-op
--- outside hardware-event context on this client (while sort's
--- PickupContainerItem works from OnUpdate — the gate is per-function).
--- So ride the player's first click on ANY loot item: from inside that
--- click's context, loot every other slot too. One click per corpse.
-if LootButton_OnClick then
-  local origLootButtonClick = LootButton_OnClick
-  LootButton_OnClick = function(button)
-    local clicked = this and this:GetID() or 0
-    local i = GetNumLootItems()
-    while i >= 1 do
-      if i ~= clicked then
-        LootSlot(i)
-        pcall(ConfirmLootSlot, i)
-      end
-      i = i - 1
-    end
-    origLootButtonClick(button)
-  end
-end
 
 -- Auto-reload (r14): when a reload is pending, piggyback the player's own
 -- next action-bar press — that keypress IS a hardware event, so ReloadUI is
@@ -1406,7 +2654,7 @@ local logBtn = CreateFrame("Button", "ShadowArmyLogBtn", panel, "UIPanelButtonTe
 -- r18: half the bottom row; the Quests toggle takes the other half.
 logBtn:SetWidth(93)
 logBtn:SetHeight(20)
-logBtn:SetPoint("BOTTOMLEFT", panel, "BOTTOMLEFT", 8, 32) -- middle row
+logBtn:SetPoint("BOTTOMLEFT", panel, "BOTTOMLEFT", 8, 56) -- second row
 logBtn:SetText("Log")
 logBtn:SetScript("OnClick", function()
   if logFrame:IsVisible() then
@@ -1424,23 +2672,6 @@ end)
 -- clock-ish lines. Range bucket via CheckInteractDistance (1.12 addons
 -- get no world coordinates for other units — buckets are what we have).
 --------------------------------------------------------------------------
-
--- Buff watch: warn when a tracked self-buff is missing or expiring.
--- 1.12 API quirk: GetPlayerBuff/GetPlayerBuffTimeLeft give remaining time,
--- but buff NAMES aren't exposed directly — identify by texture instead
--- (stable across ranks). Demon Skin and Demon Armor share the watch slot:
--- either one counts as "armored".
-local WATCHED_BUFFS = {
-  {
-    label = "Demon Skin",
-    textures = {
-      "Interface\\Icons\\Spell_Shadow_RagingScream",  -- Demon Skin
-      "Interface\\Icons\\Spell_Shadow_SpectralSight", -- Demon Armor (lvl 20+)
-    },
-    warnBelow = 300, -- seconds; warn under 5 minutes
-    autoCast = true, -- r12: the advisor keeps this one up itself (see F.armorTick)
-  },
-}
 
 function F.buffTimeLeftByTexture(textures)
   local i = 0
@@ -1483,35 +2714,150 @@ local ARMOR_CHECK_EVERY = 1    -- buff scan cadence (driver ticks every frame)
 
 local armorNextCheck = 0
 
--- Which spell to use. Demon Armor supersedes Demon Skin at 20+; auto.known
--- is the spellbook scan, so we never CastSpellByName something untrained
--- (that throws "you don't know that spell" red text at the human).
-function F.armorSpell()
-  if auto.known["demon armor"] then return "Demon Armor" end
-  if auto.known["demon skin"] then return "Demon Skin" end
+-- Which spell to use for a watch. auto.known is the spellbook scan, so we
+-- never CastSpellByName something untrained (that throws "you don't know
+-- that spell" red text at the human).
+function F.watchSpell(watch)
+  local names = watch.spells or {}
+  local i = 1
+  while i <= table.getn(names) do
+    if auto.known[string.lower(names[i])] then return names[i] end
+    i = i + 1
+  end
   return nil
 end
 
--- Comma-separated list of the player's current buff icons with the
--- "Interface\Icons\" prefix stripped — the payload of the one diagnostic
--- line. Hard-bounded: 1.12 buff indices are 0..31 and a runaway while-loop
--- here would hang the client, not just the addon.
-function F.playerBuffTextureList(maxN)
-  local out, n, i = nil, 0, 0
-  while n < maxN and i < 32 do
-    local buffIndex = GetPlayerBuff(i, "HELPFUL")
-    if not buffIndex or buffIndex < 0 then break end
-    local tex = GetPlayerBuffTexture(buffIndex)
-    if tex then
-      -- Lua patterns: backslash is NOT special (only % is), so the path
-      -- literal doubles as its own pattern.
-      tex = string.gsub(tex, "Interface\\Icons\\", "")
-      out = out and (out .. "," .. tex) or tex
+function F.armorSpell()
+  return F.watchSpell(ARMOR_WATCH)
+end
+
+--------------------------------------------------------------------------
+-- r47 — TEXTURE CAPTURE, because the guess was wrong exactly as predicted.
+--
+-- Live 2026-08-15: `demon-skin autocast: buff never detected after cast —
+-- texture guess likely wrong; captured=none`. Two separate facts hide in that
+-- one line. The obvious one is the guessed icon path being wrong. The other
+-- is `captured=none`: the diagnostic that was supposed to name the RIGHT
+-- texture came back empty on a player who had just been buffed, because it
+-- enumerated with GetPlayerBuff — so the instrument was blind in precisely
+-- the situation it exists for.
+--
+-- So everything below reads UnitBuff("player", i) instead (the same call
+-- F.unitHasTexture already relies on for target debuffs), and the addon stops
+-- guessing entirely: it snapshots the buff textures immediately BEFORE a cast,
+-- diffs them against the set ~1s after, and the single new texture IS the
+-- buff's real icon. That texture is appended to the watch and used for
+-- detection from then on, and a successful capture clears acDisabled.
+--
+-- Attribution is deliberately strict: exactly ONE new texture, or nothing is
+-- learned. Zero means the cast produced no readable aura and the old
+-- disable-and-report path stays in charge; two or more means something else
+-- landed in the same second and picking one would be the same guess this code
+-- exists to eliminate.
+--
+-- PERSISTENCE is session-only: the addon has no SavedVariables, and adding
+-- one costs a full client restart (the TOC is scanned once per launch), which
+-- is not worth spending mid-session. The capture is cheap — one cast — so it
+-- simply happens again after a reload. Captures are mirrored onto
+-- ShadowArmy.capturedBuffTextures so a live /script can read them out.
+--------------------------------------------------------------------------
+
+local ARMOR_CAPTURE_AFTER = 1.0 -- seconds a cast gets to put its aura up
+
+-- Set of the player's current buff textures. Hard-bounded: a runaway
+-- while-loop here would hang the client, not just the addon.
+function F.playerBuffTextureSet()
+  local set, n, i = {}, 0, 1
+  while i <= 32 do
+    local tex = UnitBuff("player", i)
+    if not tex then break end
+    if not set[tex] then
+      set[tex] = true
       n = n + 1
     end
     i = i + 1
   end
+  return set, n
+end
+
+-- Comma-separated list of the player's current buff icons with the
+-- "Interface\Icons\" prefix stripped — the payload of the one diagnostic line.
+function F.playerBuffTextureList(maxN)
+  local out, n, i = nil, 0, 1
+  while n < maxN and i <= 32 do
+    local tex = UnitBuff("player", i)
+    if not tex then break end
+    -- Lua patterns: backslash is NOT special (only % is), so the path
+    -- literal doubles as its own pattern.
+    tex = string.gsub(tex, "Interface\\Icons\\", "")
+    out = out and (out .. "," .. tex) or tex
+    n = n + 1
+    i = i + 1
+  end
   return out or "none"
+end
+
+function F.watchHasTexture(watch, tex)
+  if not tex then return false end
+  for _, want in ipairs(watch.textures) do
+    if want == tex then return true end
+  end
+  return false
+end
+
+-- Presence without a timer. GetPlayerBuffTimeLeft needs a GetPlayerBuff index
+-- and that enumeration is the suspect, so "is it up at all" gets an
+-- independent answer: an unknown remaining time is not a reason to recast.
+function F.watchBuffPresent(watch)
+  for _, tex in ipairs(watch.textures) do
+    if F.unitHasTexture("player", true, tex) then return true end
+  end
+  return false
+end
+
+function F.armorCaptureDiff(watch)
+  local before = watch.acBefore
+  if not before then return end
+  local after = F.playerBuffTextureSet()
+  local found, extra = nil, 0
+  for tex in pairs(after) do
+    if not before[tex] then
+      extra = extra + 1
+      found = tex
+    end
+  end
+  if extra ~= 1 or not found then
+    F.dtrace("armor capture: " .. extra .. " new buff textures — no attribution")
+    return
+  end
+  if F.watchHasTexture(watch, found) then
+    -- The guess was right after all; nothing to learn, but the cast proved it.
+    watch.acProven = true
+    watch.acVerifyAt = nil
+    return
+  end
+  watch.textures[table.getn(watch.textures) + 1] = found
+  watch.acCaptured = found
+  watch.acProven = true
+  watch.acVerifyAt = nil
+  watch.acDisabled = false
+  ShadowArmy.capturedBuffTextures = ShadowArmy.capturedBuffTextures or {}
+  ShadowArmy.capturedBuffTextures[watch.id] = found
+  F.emit("buff-texture", watch.id .. " captured="
+    .. string.gsub(found, "Interface\\Icons\\", ""))
+end
+
+-- Cast outcome for a capture that is in flight. Instant self-buffs on this
+-- build do not reliably emit SPELLCAST_STOP, so ABSENCE OF A FAILURE is the
+-- confirmation and STOP only records that it arrived; a SPELLCAST_FAILED /
+-- SPELLCAST_INTERRUPTED inside the window throws the sample away, because a
+-- cast that never happened cannot explain a new aura.
+function F.armorNoteCast(ok)
+  for _, watch in ipairs(WATCHED_BUFFS) do
+    if watch.acCaptureAt then
+      if ok then watch.acCastStopped = true else watch.acCastFailed = true end
+    end
+  end
 end
 
 function F.armorTick()
@@ -1519,21 +2865,33 @@ function F.armorTick()
   if now < armorNextCheck then return end
   armorNextCheck = now + ARMOR_CHECK_EVERY
   for _, watch in ipairs(WATCHED_BUFFS) do
+    if watch.autoCast then
+      -- Capture first, and OUTSIDE the acDisabled gate: a successful capture
+      -- is the one thing that can turn the watch back on.
+      if watch.acCaptureAt and now >= watch.acCaptureAt then
+        watch.acCaptureAt = nil
+        if not watch.acCastFailed then F.armorCaptureDiff(watch) end
+        watch.acBefore = nil
+      end
+    end
     if watch.autoCast and not watch.acDisabled then
       local left = F.buffTimeLeftByTexture(watch.textures)
-      if left then
-        -- Texture guess CONFIRMED the first time the buff reads at all. From
-        -- here the safety can never trip: a short timer is not a bad texture,
-        -- and warnBelow refreshes must not look like failed casts.
+      local present = left and true or F.watchBuffPresent(watch)
+      if present then
+        -- Texture CONFIRMED the first time the buff reads at all. From here
+        -- the safety can never trip: a short timer is not a bad texture, and
+        -- warnBelow refreshes must not look like failed casts.
         watch.acProven = true
         watch.acVerifyAt = nil
       elseif watch.acVerifyAt and now >= watch.acVerifyAt then
         watch.acDisabled = true
         F.emit("err", "demon-skin autocast: buff never detected after cast — "
-          .. "texture guess likely wrong; captured=" .. F.playerBuffTextureList(8))
+          .. "capture found nothing; buffs=" .. F.playerBuffTextureList(8))
       end
       -- Cast when the buff is missing entirely OR inside the refresh window.
-      if not watch.acDisabled and (not left or left < watch.warnBelow) then
+      -- `present` without `left` means "up, duration unreadable" — do not
+      -- recast that, it is not a failure.
+      if not watch.acDisabled and (not present or (left and left < watch.warnBelow)) then
         local spell = F.armorSpell()
         if spell and not auto.casting
             and now >= auto.gcdUntil and now >= auto.failUntil
@@ -1546,6 +2904,12 @@ function F.armorTick()
           if not watch.acProven and not watch.acVerifyAt then
             watch.acVerifyAt = now + ARMOR_VERIFY_AFTER
           end
+          -- The before-set is taken RIGHT HERE, one statement before the cast,
+          -- so nothing can slip into the baseline.
+          watch.acBefore = F.playerBuffTextureSet()
+          watch.acCaptureAt = now + ARMOR_CAPTURE_AFTER
+          watch.acCastFailed = false
+          watch.acCastStopped = false
           F.castNow(spell) -- shared GCD bookkeeping + F.dtrace
         end
       end
@@ -1553,39 +2917,260 @@ function F.armorTick()
   end
 end
 
-local lastNag = 0
-function F.buffWatchLine()
-  local warnings = nil
-  local nags = nil
+--------------------------------------------------------------------------
+-- r42: long-term passives are buttons, not nags. A missing self-buff the
+-- advisor does NOT auto-cast, and a missing minion, become one-click panel
+-- buttons; anything already handled (or untrained) stays a status line.
+--------------------------------------------------------------------------
+
+function F.passiveSnapshot()
+  local buffs, n = {}, 0
   for _, watch in ipairs(WATCHED_BUFFS) do
     local left = F.buffTimeLeftByTexture(watch.textures)
-    local warn
-    if not left then
-      warn = string.format("|cFFFF4444%s MISSING|r", watch.label)
-    elseif left < watch.warnBelow then
-      warn = string.format("|cFFFFAA00%s %dm left|r", watch.label, math.ceil(left / 60))
-    end
-    if warn then
-      local nag = warn
-      -- r12: when auto-cast owns this buff there is nothing for the human to
-      -- do — show the auto state and stay out of chat entirely. If the
-      -- texture-guess safety disabled auto-cast, we fall straight back to the
-      -- old warning text AND the old once-a-minute chat nag.
-      if watch.autoCast and not watch.acDisabled then
-        warn = string.format("|cFF44FF44armor: auto (%s)|r", F.armorSpell() or "untrained")
-        nag = nil
-      end
-      warnings = warnings and (warnings .. "  " .. warn) or warn
-      if nag then
-        nags = nags and (nags .. "  " .. nag) or nag
-      end
+    -- r47: same split as F.armorTick — a buff that is UP but whose remaining
+    -- time this build will not hand over must not be painted as missing.
+    local present = left and true or F.watchBuffPresent(watch)
+    if not present or (left and left < watch.warnBelow) then
+      n = n + 1
+      buffs[n] = {
+        id = watch.id, label = watch.label, autoLabel = watch.autoLabel,
+        spell = F.watchSpell(watch),
+        missing = (not present) and true or false,
+        expiring = left and true or false,
+        minutes = left and math.ceil(left / 60) or nil,
+        auto = (watch.autoCast and not watch.acDisabled) and true or false,
+      }
     end
   end
+  return {
+    classToken = auto.classToken,
+    known = auto.known,
+    buffs = buffs,
+    hasPet = UnitExists("pet") and true or false,
+    inCombat = UnitAffectingCombat("player") and true or false,
+    dead = UnitIsDeadOrGhost("player") and true or false,
+  }
+end
+
+function F.passiveClick(spell, onSelf)
+  if not spell or auto.casting then return end
+  F.castNow(spell, onSelf)
+end
+
+local PASSIVE_TONES = { ok = "|cFF44FF44", bad = "|cFFFF4444", warn = "|cFFFFAA00" }
+
+local lastNag = 0
+function F.passiveLine()
+  local result = F.passiveEvaluate()
+  local text, nags = nil, nil
+  for _, note in ipairs(result.notes) do
+    local painted = (PASSIVE_TONES[note.tone] or "|cFFFFAA00") .. note.text .. "|r"
+    text = text and (text .. "  " .. painted) or painted
+    if note.tone ~= "ok" then
+      nags = nags and (nags .. "  " .. note.text) or note.text
+    end
+  end
+
+  -- Clamp BEFORE the height math: the model may propose more upkeep than
+  -- there are frames, and an unclamped count would inflate the panel by rows
+  -- that can never be drawn.
+  local shown = table.getn(result.buttons)
+  if shown > PASSIVE_MAX_BUTTONS then shown = PASSIVE_MAX_BUTTONS end
+  local i = 1
+  while i <= PASSIVE_MAX_BUTTONS do
+    local btn = passiveBtns[i]
+    local want = i <= shown and result.buttons[i] or nil
+    if want then
+      -- r46: the button IS the spell icon. Texture and rank come from the same
+      -- spellbook capture the coach and the bar sweep already use.
+      local book = want.spell and auto.spells[string.lower(want.spell)] or nil
+      btn.passiveSpell = want.spell
+      btn.passiveSelf = want.selfCast and 1 or nil
+      btn.passiveLabel = want.label
+      btn.passiveRank = book and book.rank or nil
+      btn.icon:SetTexture((book and book.texture) or PASSIVE_ICON_FALLBACK)
+      btn:Show()
+    else
+      btn.passiveSpell = nil
+      btn:Hide()
+    end
+    i = i + 1
+  end
+  local rows = math.ceil(shown / 2)
+  passiveRow:SetHeight(rows > 0 and rows * PASSIVE_BTN_STEP or 1)
+  panel:SetHeight(PANEL_BASE_HEIGHT + rows * PASSIVE_BTN_STEP)
+
+  -- Nag only about things the human cannot fix with a click.
   if nags and (GetTime() - lastNag) > 60 then
     lastNag = GetTime()
     F.say("buff watch: " .. nags) -- chat nag at most once a minute
   end
-  return warnings or "|cFF44FF44buffs OK|r"
+  if text then return text end
+  if shown > 0 then return "" end
+  return "|cFF44FF44buffs OK|r"
+end
+
+--------------------------------------------------------------------------
+-- r43: advisor-managed spells come OFF the action bar (monofuel's call).
+-- The advisor casts the coach rotation and the passive layer itself, so a
+-- bar copy only invites a mis-click on an ability we already drive.
+--
+-- r44 narrows that to the PRESSABLE pages (1-72) and parks one copy of each
+-- managed spell on the telemetry shelf (109-120, the last bonus bank — no key
+-- reaches it on a stance-less class). F.combatActionState reads exact
+-- usability/range off a slot; without the shelf the coach would be stuck on
+-- usable=true and CheckInteractDistance guesses forever.
+--
+-- 1.12 has NO GetActionInfo: the only way to name a slot's contents is a
+-- tooltip scan. One hidden GameTooltip is built here (never per tick) and
+-- read through its name region's first line, which in 1.12 carries the base
+-- spell name with no rank suffix — so an exact, case-insensitive match
+-- against the managed set is safe.
+--
+-- Removal is PickupAction + ClearCursor: picking an action up leaves the
+-- slot empty and dropping it on nothing discards it. Refilling the r44
+-- telemetry shelf is PickupSpell + PlaceAction, the same pair the spellbook
+-- drag uses.
+--------------------------------------------------------------------------
+
+local barTip = CreateFrame("GameTooltip", "ShadowArmyBarTip", UIParent,
+  "GameTooltipTemplate")
+barTip:SetOwner(UIParent, "ANCHOR_NONE")
+
+local BAR_SWEEP_SETTLE = 2 -- seconds a trigger waits (login bars fill late)
+local BAR_SWEEP_GAP = 5    -- seconds; SPELLS_CHANGED arrives in bursts
+-- r44: seconds of no human bar edits before we are allowed to touch the bar.
+-- A macro drag is invisible to CursorHasItem/CursorHasSpell, so this quiet
+-- period is what keeps a mid-rearrange drag safe.
+local BAR_SWEEP_QUIET = 5
+-- Grace window in which an ACTIONBAR_SLOT_CHANGED is assumed to be OUR own
+-- mutation echoing back, so the sweep cannot defer itself forever.
+local BAR_SWEEP_OWN = 1
+local barSweep = { pending = false, nextAt = 0, changedAt = 0, ownAt = 0 }
+
+-- Tooltip line 1 of an action slot, or nil when the slot is empty, a macro,
+-- or unreadable. Callers treat nil as "leave this slot alone".
+function F.barSlotName(slot)
+  if not HasAction(slot) then return nil end
+  -- Macros are out of scope: a macro slot's tooltip carries the MACRO name,
+  -- never the spell it wraps, so a managed spell inside one is invisible and
+  -- an unrelated macro named "Shadow Bolt" would be a false positive.
+  if GetActionText and GetActionText(slot) then return nil end
+  barTip:SetOwner(UIParent, "ANCHOR_NONE")
+  barTip:ClearLines()
+  local fs = getglobal("ShadowArmyBarTipTextLeft1")
+  -- CONSTRAINT (r45, live client): this wine 1.12 build's
+  -- GameTooltip:SetAction returns NO populate flag, so blank-then-read is the
+  -- reliable populate proof. r44 required that flag ("if not (ok and filled)")
+  -- and therefore called EVERY slot unreadable: the sweep removed nothing
+  -- (fail-safe, fine) but also could not see its own shelf, so every run
+  -- re-placed the same spells until 109-120 filled up. Live evidence:
+  -- "swept removed=0 shelved=6" followed by "shelf full".
+  --
+  -- ClearLines() alone can leave the FontString's stale text in place, so the
+  -- name line is blanked explicitly first. Any text read back AFTER SetAction
+  -- can then only have come from this slot, which is a strictly stronger
+  -- guarantee than the flag was. NumLines() is deliberately not gated on
+  -- either: another populate signal from the same widget on the same build is
+  -- another way to fail closed for the whole bar.
+  if fs then fs:SetText(nil) end
+  if not pcall(barTip.SetAction, barTip, slot) then return nil end
+  local text = fs and fs:GetText()
+  if not text or text == "" then return nil end
+  return text
+end
+
+-- Debounced request. Never sweeps inline: the caller may be an event handler
+-- firing mid-login burst or mid-combat.
+function F.barSweepRequest()
+  barSweep.pending = true
+  local at = GetTime() + BAR_SWEEP_SETTLE
+  if at > barSweep.nextAt then barSweep.nextAt = at end
+end
+
+function F.barSweepRun()
+  -- Stamped before AND after the mutations: every ACTIONBAR_SLOT_CHANGED this
+  -- run causes is ours, and must not arm the quiet period against us.
+  barSweep.ownAt = GetTime()
+  local names, occupied = {}, {}
+  local slot = 1
+  while slot <= BarModel.maxSlot do
+    -- HasAction is the occupancy truth: a macro or an unreadable slot names
+    -- nothing yet must never be treated as free shelf space.
+    if HasAction(slot) then occupied[slot] = true end
+    names[slot] = F.barSlotName(slot)
+    slot = slot + 1
+  end
+  barTip:Hide()
+  local plan = BarModel.plan(names,
+    BarModel.managedNames(auto.classToken, WATCHED_BUFFS),
+    { order = BarModel.managedOrder(auto.classToken, WATCHED_BUFFS),
+      -- auto.spells is keyed lowercase and holds the HIGHEST rank's book
+      -- index (F.scanSpellbook overwrites as it walks ranks upward).
+      trained = auto.spells, occupied = occupied })
+  local n = table.getn(plan.remove)
+  local i = 1
+  while i <= n do
+    pcall(PickupAction, plan.remove[i])
+    pcall(ClearCursor) -- an action left on the cursor would ride the next click
+    i = i + 1
+  end
+  -- Refill the telemetry shelf so the coach keeps exact IsUsableAction /
+  -- IsActionInRange on every managed spell it can.
+  local placed, pn = 0, table.getn(plan.place)
+  i = 1
+  while i <= pn do
+    local entry = plan.place[i]
+    local book = auto.spells[entry.name]
+    local ok = false
+    if book and book.index then
+      if pcall(PickupSpell, book.index, "spell") then
+        ok = pcall(PlaceAction, entry.slot)
+      end
+    end
+    pcall(ClearCursor) -- covers a failed pickup AND a rejected placement
+    if ok then placed = placed + 1 end
+    i = i + 1
+  end
+  if plan.shelfFull then F.emit("bar", "shelf full") end
+  if n > 0 or placed > 0 then
+    F.emit("bar", "swept removed=" .. n .. " shelved=" .. placed)
+    F.scanCombatActions() -- the coach's exact-slot map just went stale
+  end
+  -- Echoes land after this returns, so re-stamp: the sweep never defers
+  -- itself into a loop.
+  barSweep.ownAt = GetTime()
+end
+
+function F.barSweepTick()
+  if not barSweep.pending then return end
+  local now = GetTime()
+  if now < barSweep.nextAt then return end
+  -- Combat / dead / casting: hold the request; PLAYER_REGEN_ENABLED re-arms
+  -- it and this tick retries once the window is clear.
+  if UnitAffectingCombat("player") or UnitIsDeadOrGhost("player") then return end
+  if auto.casting then return end
+  -- r44 drag safety. Never yank an action onto a loaded cursor, and stay off
+  -- the bar entirely while the human is mid-rearrange — a macro drag shows up
+  -- in neither cursor query, only in the ACTIONBAR_SLOT_CHANGED quiet period.
+  -- Checked once, HERE, at sweep start: F.barSweepRun's own mutations are
+  -- stamped ownAt and never move changedAt.
+  if (CursorHasItem and CursorHasItem())
+    or (CursorHasSpell and CursorHasSpell())
+    or (now - barSweep.changedAt) < BAR_SWEEP_QUIET then
+    F.barSweepRequest() -- re-arm; retry once the bar settles
+    return
+  end
+  barSweep.pending = false
+  barSweep.nextAt = now + BAR_SWEEP_GAP
+  F.barSweepRun()
+end
+
+-- ACTIONBAR_SLOT_CHANGED bookkeeping: only HUMAN edits arm the quiet period.
+function F.barSweepNoteChange()
+  local now = GetTime()
+  if (now - barSweep.ownAt) <= BAR_SWEEP_OWN then return end
+  barSweep.changedAt = now
 end
 
 --------------------------------------------------------------------------
@@ -1690,7 +3275,7 @@ function F.probeRefreshStatus()
 end
 
 function F.probeRun(kind, ctx)
-  -- kind: status | buffs | cast | loot | pickup | reload
+  -- kind: status | buffs | cast | pickup | reload
   if kind == "status" then
     F.probeEmitVerdict("status ctx=" .. ctx .. " " .. F.probeStatusDump())
     return
@@ -1724,31 +3309,6 @@ function F.probeRun(kind, ctx)
       mana0 = mana0,
       buff0 = left0 and true or false,
     }
-    return
-  end
-  if kind == "loot" then
-    local n, left0 = F.probeCountLootItems()
-    if n == 0 then
-      F.probeEmitVerdict("loot ctx=" .. ctx .. " FAIL no loot window (open a corpse first)")
-      return
-    end
-    local i = n
-    while i >= 1 do
-      pcall(LootSlot, i)
-      pcall(ConfirmLootSlot, i)
-      i = i - 1
-    end
-    local _, left1 = F.probeCountLootItems()
-    local verdict
-    if left1 < left0 then
-      verdict = "OK"
-    elseif left0 == 0 then
-      verdict = "EMPTY"
-    else
-      verdict = "GATED" -- calls returned, items still there
-    end
-    F.probeEmitVerdict(string.format(
-      "loot ctx=%s %s slots=%d items %d->%d", ctx, verdict, n, left0, left1))
     return
   end
   if kind == "pickup" then
@@ -1934,7 +3494,6 @@ F.makeProbeBtn("Help", 356, modeY, 48, function()
   F.probeLog("  Frame: runs on next driver OnUpdate (software).")
   F.probeLog("  Delay: runs after 0.5s timer (software).")
   F.probeLog("Cast: Demon Skin/Armor + 1.2s follow-up (mana/buff).")
-  F.probeLog("Loot: needs open loot window; OK if item count drops.")
   F.probeLog("Pickup: bag item on/off cursor; OK if cursor takes item.")
   F.probeLog("Reload: WILL reload UI if ungated — use last.")
   F.probeLog("Compare same probe under Click vs Frame vs Delay.")
@@ -1943,13 +3502,12 @@ end)
 -- Action row
 local actY = -70
 F.makeProbeBtn("Cast armor", 10, actY, 80, function() F.probeSchedule("cast") end)
-F.makeProbeBtn("Loot all", 94, actY, 70, function() F.probeSchedule("loot") end)
-F.makeProbeBtn("Pickup", 168, actY, 60, function() F.probeSchedule("pickup") end)
-F.makeProbeBtn("|cFFFF6644ReloadUI|r", 232, actY, 80, function() F.probeSchedule("reload") end)
-F.makeProbeBtn("Clear", 316, actY, 48, function()
+F.makeProbeBtn("Pickup", 94, actY, 60, function() F.probeSchedule("pickup") end)
+F.makeProbeBtn("|cFFFF6644ReloadUI|r", 158, actY, 80, function() F.probeSchedule("reload") end)
+F.makeProbeBtn("Clear", 242, actY, 48, function()
   if probeLogMsg then probeLogMsg:Clear() end
 end)
-F.makeProbeBtn("Rec", 368, actY, 36, function()
+F.makeProbeBtn("Rec", 294, actY, 36, function()
   probe.recording = not probe.recording
   F.probeLog("event recording " .. (probe.recording and "ON" or "OFF"))
 end)
@@ -1987,17 +3545,18 @@ function F.probeToggle()
   if probeFrame:IsShown() then F.probeHide() else F.probeShow() end
 end
 
--- Bottom row: Admin (System ops) + Probe (sandbox instrument).
+-- Third row: Admin (System ops) + Probe (sandbox instrument). The bottom row
+-- (y=8) belongs to the r47 Bags window.
 local adminBtn = CreateFrame("Button", "ShadowArmyAdminBtn", panel, "UIPanelButtonTemplate")
 adminBtn:SetWidth(93)
 adminBtn:SetHeight(20)
-adminBtn:SetPoint("BOTTOMLEFT", panel, "BOTTOMLEFT", 8, 8)
+adminBtn:SetPoint("BOTTOMLEFT", panel, "BOTTOMLEFT", 8, 32)
 adminBtn:SetText("|cFFFF8844Admin|r")
 
 local probeBtn = CreateFrame("Button", "ShadowArmyProbeBtn", panel, "UIPanelButtonTemplate")
 probeBtn:SetWidth(93)
 probeBtn:SetHeight(20)
-probeBtn:SetPoint("BOTTOMRIGHT", panel, "BOTTOMRIGHT", -8, 8)
+probeBtn:SetPoint("BOTTOMRIGHT", panel, "BOTTOMRIGHT", -8, 32)
 probeBtn:SetText("|cFF66CCFFProbe|r")
 probeBtn:SetScript("OnClick", function()
   F.probeToggle()
@@ -2230,8 +3789,10 @@ bagsMoney:SetPoint("BOTTOMRIGHT", bagsFrame, "BOTTOMRIGHT", -10, 8)
 bagsMoney:SetJustifyH("RIGHT")
 bagsMoney:SetText("")
 
-function F.moneyString()
-  local c = GetMoney() or 0
+-- Colour-coded g/s/c for an arbitrary copper amount (r47: the bag window
+-- prices a vendor run with it, so it can no longer read GetMoney itself).
+function F.copperString(c)
+  c = c or 0
   local gold = math.floor(c / 10000)
   local silver = math.floor(math.mod(c, 10000) / 100)
   local copper = math.mod(c, 100)
@@ -2241,6 +3802,10 @@ function F.moneyString()
     return string.format("|cFFC7C7CF%ds|r |cFFEDA55F%dc|r", silver, copper)
   end
   return string.format("|cFFEDA55F%dc|r", copper)
+end
+
+function F.moneyString()
+  return F.copperString(GetMoney() or 0)
 end
 
 local bagsClose = CreateFrame("Button", nil, bagsFrame, "UIPanelCloseButton")
@@ -2826,6 +4391,308 @@ end
 -- Escape closes it, like every other UI panel. UISpecialFrames is a list of
 -- frame NAMES resolved with getglobal(), which is why the frame is named.
 tinsert(UISpecialFrames, "ShadowBagsFrame")
+
+--------------------------------------------------------------------------
+-- BAG DISPOSITION WINDOW (r47, ticket 0039 phase 3): the readable half of
+-- BagModel. Every item in bags 0-4 gets a coloured tag chip and the reason
+-- behind it, so "what do I do with these 12 drops" is one click, not twelve
+-- tooltip reads.
+--
+-- WHY IT READS ITEMDATA AND NOT GetItemInfo: 1.12 answers nil for anything
+-- the client has not cached this session, which is most of what a bot's bags
+-- fill with, and it has no sell-price API at all (docs/item-data.md). The
+-- generated table is keyed by item id and every bag slot yields a link, and
+-- every link carries `item:ID` — so the id parse below is the join.
+--
+-- ItemData.lua is registered in the .toc but the TOC file list is cached for
+-- the whole client session, so on a client that has not restarted since
+-- ticket 0040 the global is simply absent. EVERY read goes through
+-- F.bagTagRow and the window says so instead of erroring.
+--------------------------------------------------------------------------
+
+-- Scoped in a do-block for the Lua 5.0 200-locals-per-function budget, the
+-- same reason RouteModel's UI half below is: the main chunk was at 174 of
+-- them before r47 and a window costs a frame local per widget. Registers
+-- are released at the `end`, so only the F.* entry points survive it.
+do
+  local BAGTAG_TICK = 1.0    -- seconds; BAG_UPDATE arrives in bursts while looting
+  local BAGTAG_LINE = 14
+  local BAGTAG_NAME_MAX = 22
+
+  local BAGTAG_COLOR = {
+    SELL       = "FFFFD100",
+    EQUIP      = "FF44FF44",
+    KEEP_QUEST = "FFCC66FF",
+    USE        = "FF44CCFF",
+    HOLD       = "FF999999",
+  }
+
+  -- Sort order: the two tags that ask for an action float to the top.
+  local BAGTAG_RANK = { EQUIP = 1, SELL = 2, KEEP_QUEST = 3, USE = 4, HOLD = 5 }
+
+  -- BagModel.EQUIP_SLOT values -> the 1.12 equipment slot id GetInventoryItemLink
+  -- wants. These are INVSLOT ids (1 head .. 19 tabard), NOT inventory_type: the
+  -- two enums overlap numerically and disagree, which is exactly why they are
+  -- kept in separate tables with different key spaces.
+  local BAGTAG_WORN_SLOT = {
+    head = 1, neck = 2, shoulder = 3, chest = 5, waist = 6, legs = 7,
+    feet = 8, wrist = 9, hands = 10, back = 15, ["off-hand"] = 17,
+  }
+
+  local bagTag = { nextAt = 0, dirty = true }
+
+  -- The ONLY read of the generated table. Absent file -> nil everywhere, and
+  -- BagModel already answers HOLD "unknown item" for that.
+  function F.bagTagRow(id)
+    if not id then return nil end
+    if not ShadowArmyItemData then return nil end
+    return ShadowArmyItemData[id]
+  end
+
+  function F.bagTagLinkId(link)
+    if not link then return nil end
+    local _, _, idStr = string.find(link, "item:(%d+)")
+    if not idStr then return nil end
+    return tonumber(idStr)
+  end
+
+  function F.bagTagLinkName(link)
+    if not link then return nil end
+    local _, _, name = string.find(link, "%[(.-)%]")
+    return name
+  end
+
+  function F.bagTagItems()
+    local items, n = {}, 0
+    local bag = 0
+    while bag <= 4 do
+      local slots = GetContainerNumSlots(bag)
+      if slots and slots > 0 then
+        local slot = 1
+        while slot <= slots do
+          local link = GetContainerItemLink(bag, slot)
+          if link then
+            local id = F.bagTagLinkId(link)
+            -- 1.12 signature: texture, itemCount, locked, quality, readable
+            local _, count = GetContainerItemInfo(bag, slot)
+            n = n + 1
+            items[n] = {
+              id = id,
+              name = F.bagTagLinkName(link),
+              count = count or 1,
+              bag = bag, bagSlot = slot,
+              data = F.bagTagRow(id),
+            }
+          end
+          slot = slot + 1
+        end
+      end
+      bag = bag + 1
+    end
+    return items
+  end
+
+  -- What is already worn, as ItemData rows keyed the way BagModel.EQUIP_SLOT
+  -- names them. An equipped item with no row becomes an EMPTY row rather than
+  -- nil: nil means "slot is empty" to the model, and calling a filled slot
+  -- empty is the one wrong answer here. An empty row defaults `lvl` to 0, so
+  -- the worst case is an over-eager upgrade hint on an item we cannot price.
+  function F.bagTagWorn()
+    local out = {}
+    for key, slotId in pairs(BAGTAG_WORN_SLOT) do
+      local link = GetInventoryItemLink("player", slotId)
+      if link then
+        out[key] = F.bagTagRow(F.bagTagLinkId(link)) or {}
+      end
+    end
+    return out
+  end
+
+  function F.bagTagSnapshot()
+    local _, classToken = UnitClass("player")
+    return {
+      items = F.bagTagItems(),
+      player = {
+        level = UnitLevel("player") or 1,
+        classToken = classToken,
+        equipped = F.bagTagWorn(),
+      },
+    }
+  end
+
+  local function bagTagCmp(a, b)
+    local ra = BAGTAG_RANK[a.tag] or 9
+    local rb = BAGTAG_RANK[b.tag] or 9
+    if ra ~= rb then return ra < rb end
+    local na, nb = a.name or "", b.name or ""
+    if na ~= nb then return na < nb end
+    return (a.id or 0) < (b.id or 0)
+  end
+
+  local bagTagFrame = CreateFrame("Frame", "ShadowArmyBagTagFrame", UIParent)
+  bagTagFrame:SetWidth(430)
+  bagTagFrame:SetHeight(360)
+  bagTagFrame:SetPoint("CENTER", UIParent, "CENTER", -180, 0)
+  bagTagFrame:SetFrameStrata("HIGH")
+  bagTagFrame:SetBackdrop({
+    bgFile = "Interface\\Tooltips\\UI-Tooltip-Background",
+    edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+    tile = true, tileSize = 16, edgeSize = 16,
+    insets = { left = 4, right = 4, top = 4, bottom = 4 },
+  })
+  bagTagFrame:SetBackdropColor(0.05, 0.02, 0.10, 0.92)
+  bagTagFrame:EnableMouse(true)
+  bagTagFrame:SetMovable(true)
+  bagTagFrame:RegisterForDrag("LeftButton")
+  bagTagFrame:SetScript("OnDragStart", function() bagTagFrame:StartMoving() end)
+  bagTagFrame:SetScript("OnDragStop", function() bagTagFrame:StopMovingOrSizing() end)
+  bagTagFrame:Hide()
+  tinsert(UISpecialFrames, "ShadowArmyBagTagFrame")
+
+  local bagTagTitle = bagTagFrame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+  bagTagTitle:SetPoint("TOP", bagTagFrame, "TOP", 0, -9)
+  bagTagTitle:SetText("|cFF9482C9Shadow Bags — what to do with it|r")
+
+  local bagTagClose = CreateFrame("Button", nil, bagTagFrame, "UIPanelCloseButton")
+  bagTagClose:SetPoint("TOPRIGHT", bagTagFrame, "TOPRIGHT", -2, -2)
+  bagTagClose:SetScript("OnClick", function() bagTagFrame:Hide() end)
+
+  local bagTagSummary = bagTagFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+  bagTagSummary:SetPoint("BOTTOMLEFT", bagTagFrame, "BOTTOMLEFT", 14, 14)
+  bagTagSummary:SetJustifyH("LEFT")
+  bagTagSummary:SetText("")
+
+  local bagTagScroll = CreateFrame(
+    "ScrollFrame", "ShadowArmyBagTagScroll", bagTagFrame, "UIPanelScrollFrameTemplate")
+  bagTagScroll:SetPoint("TOPLEFT", bagTagFrame, "TOPLEFT", 12, -30)
+  bagTagScroll:SetPoint("BOTTOMRIGHT", bagTagFrame, "BOTTOMRIGHT", -30, 34)
+
+  local bagTagChild = CreateFrame("Frame", "ShadowArmyBagTagScrollChild", bagTagScroll)
+  bagTagChild:SetWidth(376)
+  bagTagChild:SetHeight(1)
+  bagTagScroll:SetScrollChild(bagTagChild)
+
+  -- Same rule as every other list in this file: FontStrings are created once and
+  -- reused forever. 1.12 frames and regions cannot be destroyed.
+  local bagTagLines = {}
+  function F.bagTagLine(i)
+    local line = bagTagLines[i]
+    if line then return line end
+    line = bagTagChild:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    line:SetWidth(370)
+    line:SetHeight(BAGTAG_LINE)
+    line:SetJustifyH("LEFT")
+    line:SetPoint("TOPLEFT", bagTagChild, "TOPLEFT", 0, -((i - 1) * BAGTAG_LINE))
+    line:SetText("")
+    bagTagLines[i] = line
+    return line
+  end
+
+  function F.bagTagRows()
+    if not ShadowArmyItemData then
+      return { "|cFFFFAA00item data not loaded yet (client restart pending)|r",
+        "|cFF888888ItemData.lua is in the .toc, but 1.12 caches the TOC file|r",
+        "|cFF888888list for the whole client session — it loads on next launch.|r" },
+        nil
+    end
+    local result = BagModel.evaluate(F.bagTagSnapshot())
+    local list, n = {}, 0
+    local i = 1
+    while result.items[i] do
+      n = n + 1
+      list[n] = result.items[i]
+      i = i + 1
+    end
+    if n > 1 then table.sort(list, bagTagCmp) end
+    local rows, nr = {}, 0
+    i = 1
+    while i <= n do
+      local it = list[i]
+      local hex = BAGTAG_COLOR[it.tag] or BAGTAG_COLOR.HOLD
+      local stack = (it.count and it.count > 1) and ("x" .. it.count) or ""
+      nr = nr + 1
+      rows[nr] = string.format("|c%s[%s]|r |cFFDDDDDD%s|r |cFF777777%s|r  |cFF999999%s|r",
+        hex, it.tag, F.questShort(it.name or ("item " .. tostring(it.id)), BAGTAG_NAME_MAX),
+        stack, it.reason or "")
+      i = i + 1
+    end
+    if nr == 0 then rows[1] = "|cFF777777bags are empty|r" end
+    return rows, result
+  end
+
+  function F.bagTagRefresh()
+    if not bagTagFrame:IsShown() then
+      bagTag.dirty = true
+      return
+    end
+    bagTag.dirty = false
+    local rows, result = F.bagTagRows()
+    local i = 1
+    while rows[i] do
+      F.bagTagLine(i):SetText(rows[i])
+      i = i + 1
+    end
+    local painted = i - 1
+    while bagTagLines[i] do
+      bagTagLines[i]:SetText("")
+      i = i + 1
+    end
+    local height = painted * BAGTAG_LINE
+    if height < 1 then height = 1 end
+    bagTagChild:SetHeight(height)
+    if bagTagScroll.UpdateScrollChildRect then bagTagScroll:UpdateScrollChildRect() end
+    if result then
+      local summary = string.format("|cFFCCCCCC%d items|r", table.getn(result.items))
+      if result.sellCount > 0 then
+        summary = summary .. string.format("  |cFFFFD100%d to sell|r %s",
+          result.sellCount, F.copperString(result.sellCopper))
+      end
+      if result.unknown > 0 then
+        summary = summary .. string.format("  |cFF888888%d unknown|r", result.unknown)
+      end
+      bagTagSummary:SetText(summary)
+    else
+      bagTagSummary:SetText("")
+    end
+  end
+
+  -- Debounced from the driver: BAG_UPDATE fires several times per loot, and the
+  -- refresh walks every bag slot plus eleven equipped slots. Only ever runs
+  -- while the window is actually up.
+  function F.bagTagTick()
+    if not bagTagFrame:IsShown() then return end
+    if not bagTag.dirty then return end
+    local now = GetTime()
+    if now < bagTag.nextAt then return end
+    bagTag.nextAt = now + BAGTAG_TICK
+    F.bagTagRefresh()
+  end
+
+  function F.bagTagToggle()
+    if bagTagFrame:IsShown() then
+      bagTagFrame:Hide()
+    else
+      bagTagFrame:Show()
+      F.bagTagRefresh()
+    end
+  end
+
+  local bagTagEvents = CreateFrame("Frame", "ShadowArmyBagTagEvents", UIParent)
+  bagTagEvents:RegisterEvent("BAG_UPDATE")
+  bagTagEvents:SetScript("OnEvent", function()
+    bagTag.dirty = true
+  end)
+
+  local bagTagBtn = CreateFrame("Button", "ShadowArmyBagTagBtn", panel, "UIPanelButtonTemplate")
+  bagTagBtn:SetWidth(194) -- full inner width; bottom row is its own
+  bagTagBtn:SetHeight(20)
+  bagTagBtn:SetPoint("BOTTOMLEFT", panel, "BOTTOMLEFT", 8, 8)
+  bagTagBtn:SetText("|cFF9482C9Bags|r")
+  bagTagBtn:SetScript("OnClick", function()
+    local ok, err = pcall(F.bagTagToggle)
+    if not ok then F.emit("err", "bagTag: " .. tostring(err)) end
+  end)
+end
 
 --------------------------------------------------------------------------
 -- QUEST HELPER (r18, r32 checklist): "where do I go next" — quest-identity
@@ -3630,6 +5497,352 @@ function F.questDrawMarkers()
   end
 end
 
+--------------------------------------------------------------------------
+-- ROUTE (r45): a road-following path from the player to the TOP quest's
+-- nearest waypoint, drawn as a trail of small dots on the world map and used
+-- as the "go" bearing on the panel. RouteModel does all the thinking; this
+-- half only feeds it, caches the answer, and paints it.
+--
+-- Every read of the generated data is guarded, so a missing or unparsable
+-- RoadData.lua costs exactly the route: quest.target still points straight at
+-- the objective and the checklist reads exactly as it did in r44.
+--
+-- Zone ids come from ShadowArmyQuestZones (name -> id, reversed once). That
+-- is the same bridge the quest waypoints already need, so a route can only
+-- exist where the enrichment that produced quest.target exists anyway.
+--------------------------------------------------------------------------
+
+-- Scoped for the same Lua 5.0 200-local budget as RouteModel above; the F.*
+-- entry points stay global to the addon, only the state does not.
+do
+  local ROUTE_MAX_DOTS = 40      -- world map dots (created once, reused forever)
+  local ROUTE_TARGET_MOVE = 1.0  -- % target drift before the route is recomputed
+  local ROUTE_PLAYER_MOVE = 2.0  -- % player drift before the route is recomputed
+  local ROUTE_LEAD = 1.0         -- % lookahead for the "go" bearing
+
+  local route = {
+    zone = nil,        -- AreaTable id the cached graph was built for
+    zoneName = nil,    -- GetRealZoneText the cached ROUTE was computed in
+    graph = nil,
+    zoneIds = nil,     -- zone NAME -> AreaTable id, reversed from QuestZones
+    points = {},       -- RouteModel waypoints, percent
+    n = 0,
+    straight = true,   -- true = no road involved; draw nothing, bear as before
+    have = false,      -- a route has been computed for tx,ty from px,py
+    tx = 0, ty = 0,
+    px = 0, py = 0,
+    r = 1, g = 0.82, b = 0,
+  }
+
+  function F.routeZoneId(zoneName)
+    if not zoneName or zoneName == "" then return nil end
+    if not route.zoneIds then
+      if not ShadowArmyQuestZones then return nil end
+      local ids = {}
+      -- Lowest id wins a duplicate name so the reversal is order-independent
+      -- (pairs() has no defined order).
+      for id, name in pairs(ShadowArmyQuestZones) do
+        if ids[name] == nil or id < ids[name] then ids[name] = id end
+      end
+      route.zoneIds = ids
+    end
+    return route.zoneIds[zoneName]
+  end
+
+  -- Built once per zone; a zone change is the only invalidation. Tirisfal is 94
+  -- nodes / 0.3 ms on host Lua, and the worst zone in the file is under 1 ms.
+  function F.routeGraph()
+    local model = ShadowArmy and ShadowArmy.routeModel
+    if not model or not ShadowArmyRoadData then return nil end
+    local id = F.routeZoneId(quest.zoneName)
+    if not id then return nil end
+    if route.zone ~= id then
+      route.zone = id
+      route.graph = nil
+      local segs = ShadowArmyRoadData[id]
+      if segs then
+        local ok, graph = pcall(model.build, segs)
+        if ok then route.graph = graph end
+      end
+    end
+    return route.graph
+  end
+
+  function F.routeClear()
+    route.points, route.n, route.straight, route.have = {}, 0, true, false
+  end
+
+  function F.routeDrift(ax, ay, bx, by)
+    local dx, dy = ax - bx, ay - by
+    return math.sqrt(dx * dx + dy * dy)
+  end
+
+  function F.routeUpdate()
+    local t = quest.target
+    if not (quest.posOK and t and t.x and t.y) then
+      F.routeClear()
+      return
+    end
+    local model = ShadowArmy and ShadowArmy.routeModel
+    if not model then
+      F.routeClear()
+      return
+    end
+    route.r, route.g, route.b = t.r or 1, t.g or 0.82, t.b or 0
+    -- Percent coordinates are per-zone, so a zone change makes every cached
+    -- number mean something else. Crossing a border always moves the player
+    -- far enough to invalidate on its own, but not by construction — say so.
+    if route.zoneName ~= quest.zoneName then
+      route.zoneName = quest.zoneName
+      route.have = false
+    end
+    -- Recompute only on a real change: a fresh Dijkstra every half second for a
+    -- target that has not moved is pure heat.
+    if route.have
+        and F.routeDrift(route.tx, route.ty, t.x, t.y) <= ROUTE_TARGET_MOVE
+        and F.routeDrift(route.px, route.py, quest.px, quest.py) <= ROUTE_PLAYER_MOVE then
+      return
+    end
+    local ok, pts, meta = pcall(model.route, F.routeGraph(),
+      { x = quest.px, y = quest.py }, { x = t.x, y = t.y })
+    if not ok or not pts then
+      F.routeClear()
+      return
+    end
+    route.points = pts
+    route.n = table.getn(pts)
+    route.straight = true
+    if meta and not meta.straight then route.straight = false end
+    route.have = true
+    route.tx, route.ty = t.x, t.y
+    route.px, route.py = quest.px, quest.py
+  end
+
+  -- Percent delta from the player to the next route waypoint, or nil when there
+  -- is no road route to follow (caller then uses the straight-line delta).
+  function F.routeNextDelta()
+    if route.straight or route.n < 2 or not quest.posOK then return nil end
+    local model = ShadowArmy and ShadowArmy.routeModel
+    if not model then return nil end
+    local wx, wy = model.nextPoint(route.points, quest.px, quest.py, ROUTE_LEAD)
+    if not wx then return nil end
+    return wx - quest.px, wy - quest.py
+  end
+
+  local routeDots = {}
+  function F.routeDot(i)
+    local t = routeDots[i]
+    if t then return t end
+    -- ARTWORK, not OVERLAY: the trail passes UNDER the objective pins.
+    -- MUST stay lazily created: 1.12 ignores SetDrawLayer's sublevel, so
+    -- within ARTWORK only creation order puts this trail ABOVE the road
+    -- layer's eagerly-built pool. Prebuild this at load and the trail sinks.
+    t = WorldMapDetailFrame:CreateTexture(nil, "ARTWORK")
+    t:SetWidth(5)
+    t:SetHeight(5)
+    t:Hide()
+    routeDots[i] = t
+    return t
+  end
+
+  -- Same guards as F.questDrawMarkers: quest.posOK is the oracle for "the map is
+  -- showing the player's own zone", so the trail can never decorate a zone the
+  -- human is merely browsing.
+  function F.routeDrawMarkers()
+    if not WorldMapDetailFrame then return end
+    local show = quest.markersEnabled and quest.posOK
+      and (not route.straight) and route.n >= 2
+      and WorldMapFrame and WorldMapFrame:IsVisible()
+    local w = WorldMapDetailFrame:GetWidth()
+    local h = WorldMapDetailFrame:GetHeight()
+
+    -- A long route outruns the dot pool, so sample it evenly and always keep the
+    -- last point: the trail must end at the pin it is pointing at.
+    local pick, np = {}, 0
+    if show then
+      local step = 1
+      if route.n > ROUTE_MAX_DOTS then
+        step = math.ceil((route.n - 1) / (ROUTE_MAX_DOTS - 1))
+      end
+      local idx = 1
+      while idx < route.n and np < ROUTE_MAX_DOTS - 1 do
+        np = np + 1
+        pick[np] = idx
+        idx = idx + step
+      end
+      np = np + 1
+      pick[np] = route.n
+    end
+
+    local i = 1
+    while i <= ROUTE_MAX_DOTS do
+      local t = F.routeDot(i)
+      local p = pick[i] and route.points[pick[i]] or nil
+      if p then
+        t:ClearAllPoints() -- SetPoint ACCUMULATES anchors in 1.12
+        t:SetPoint("CENTER", WorldMapDetailFrame, "TOPLEFT",
+          p.x / 100 * w, -(p.y / 100 * h))
+        -- Quest colour, but smaller and dimmer than an objective pin: the trail
+        -- is context, the pins are the answer.
+        t:SetTexture(route.r, route.g, route.b, 0.55)
+        t:Show()
+      else
+        t:Hide()
+      end
+      i = i + 1
+    end
+  end
+end
+
+--------------------------------------------------------------------------
+-- ROAD LAYER (r48): the WHOLE baked road network of the zone the map is
+-- showing, as a faint dot field under the route trail and the quest pins.
+-- The route draws one path; this is the coverage view — the in-game twin of
+-- the map-browser's road layer — so a human can point at the map and say
+-- "that road isn't in the data".
+--
+-- Guards are the existing ones: quest.posOK is the oracle for "the map is
+-- showing the player's OWN zone" (GetPlayerMapPosition reads 0,0 the moment
+-- the map points anywhere else), so zone A's roads can never land on zone B's
+-- map. Nothing happens while the map is closed, and a missing
+-- ShadowArmyRoadData (pre-restart) costs exactly the dots — the toggle and
+-- everything else still work.
+--
+-- Bridge segments are plain 2-point polylines in the data and render as a
+-- sparse dot pair. That is the point: visible is criticizable.
+--------------------------------------------------------------------------
+
+-- Scoped like the route block above for the Lua 5.0 200-local budget.
+do
+  local ROAD_MAX_DOTS = 180 -- texture pool, created once, reused forever
+  local ROAD_DOT = 3        -- px; deliberately smaller than a route dot (5)
+
+  local road = {
+    on = true,        -- session toggle; ON by default (coverage is the point)
+    zone = nil,       -- AreaTable id the current sample was thinned for
+    pts = {}, n = 0,  -- sampled points, percent
+    anchored = false, -- dots currently positioned for zone/size below
+    pw = 0, ph = 0,   -- detail-frame size those anchors were computed against
+    live = 0,         -- dots currently shown
+  }
+
+  local roadDots = {}
+  function F.roadDot(i)
+    local t = roadDots[i]
+    if t then return t end
+    -- ARTWORK sublevel -1: under the route trail (ARTWORK 0) and well under
+    -- the objective pins (OVERLAY). Old clients that ignore the sublevel
+    -- argument still get the right order from the eager pool below, because
+    -- within one layer 1.12 draws in creation order.
+    t = WorldMapDetailFrame:CreateTexture(nil, "ARTWORK")
+    if t.SetDrawLayer then pcall(t.SetDrawLayer, t, "ARTWORK", -1) end
+    t:SetWidth(ROAD_DOT)
+    t:SetHeight(ROAD_DOT)
+    -- Dim neutral gray-tan: road, not quest. Set once — colour never varies.
+    t:SetTexture(0.70, 0.64, 0.52, 0.40)
+    t:Hide()
+    roadDots[i] = t
+    return t
+  end
+
+  -- Independent of the quest-marker toggle on purpose: "is the road data
+  -- there" is a question you ask with the pins switched off too.
+  function F.roadDrawLayer()
+    if not WorldMapDetailFrame then return end
+    local show = road.on and quest.posOK
+      and WorldMapFrame and WorldMapFrame:IsVisible()
+    if not show then
+      if road.live > 0 then
+        local i = 1
+        while i <= ROAD_MAX_DOTS do
+          F.roadDot(i):Hide()
+          i = i + 1
+        end
+        road.live, road.anchored = 0, false
+      end
+      return
+    end
+    local id = F.routeZoneId(quest.zoneName)
+    if id ~= road.zone then
+      -- A zone change is the only invalidation: percent coordinates are
+      -- per-zone, so every cached number means something else after it.
+      road.zone, road.anchored = id, false
+      road.pts, road.n = {}, 0
+      local model = ShadowArmy and ShadowArmy.routeModel
+      local segs = nil
+      if id and ShadowArmyRoadData then segs = ShadowArmyRoadData[id] end
+      if segs and model and model.sample then
+        local ok, pts, np = pcall(model.sample, segs, ROAD_MAX_DOTS)
+        if ok and pts then road.pts, road.n = pts, np or 0 end
+      end
+    end
+    local w = WorldMapDetailFrame:GetWidth()
+    local h = WorldMapDetailFrame:GetHeight()
+    -- Anchors only move when the zone or the map surface changes, so
+    -- repainting an already-painted zone costs three comparisons.
+    if road.anchored and road.pw == w and road.ph == h then return end
+    local i = 1
+    while i <= ROAD_MAX_DOTS do
+      local t = F.roadDot(i)
+      local p = nil
+      if i <= road.n then p = road.pts[i] end
+      if p then
+        t:ClearAllPoints() -- SetPoint ACCUMULATES anchors in 1.12
+        t:SetPoint("CENTER", WorldMapDetailFrame, "TOPLEFT",
+          p.x / 100 * w, -(p.y / 100 * h))
+        t:Show()
+      else
+        t:Hide()
+      end
+      i = i + 1
+    end
+    road.pw, road.ph, road.live, road.anchored = w, h, road.n, true
+  end
+
+  -- Toggle: a small button in the bottom-left corner of the map surface (the
+  -- 1.12 map keeps its dropdowns up top and the zoom-out button bottom-right).
+  -- Parented to the detail frame so it draws above the map tiles and hides
+  -- with the map; session-only state, exactly like the marker button.
+  local roadBtn = nil
+  if WorldMapDetailFrame or WorldMapFrame then
+    roadBtn = CreateFrame("Button", "ShadowArmyRoadBtn",
+      WorldMapDetailFrame or WorldMapFrame, "UIPanelButtonTemplate")
+    roadBtn:SetWidth(64)
+    roadBtn:SetHeight(20)
+    roadBtn:SetPoint("BOTTOMLEFT", roadBtn:GetParent(), "BOTTOMLEFT", 6, 6)
+    roadBtn:SetScript("OnClick", function()
+      F.roadToggle()
+    end)
+  end
+
+  function F.roadSetLayer(on)
+    road.on = on and true or false
+    if roadBtn then
+      roadBtn:SetText(road.on and "|cFF44FF44Roads|r" or "|cFF999999Roads|r")
+    end
+    pcall(F.roadDrawLayer) -- hide/show immediately, no waiting for the tick
+  end
+
+  function F.roadToggle()
+    F.roadSetLayer(not road.on)
+    F.say("road layer " .. (road.on and "ON" or "OFF")
+      .. " — " .. road.n .. " dots of the zone's baked network")
+  end
+
+  F.roadSetLayer(true)
+
+  -- Built once, at load. Within one draw layer 1.12 renders in CREATION
+  -- order, so making the whole pool before the first route dot exists is what
+  -- actually guarantees the trail stays on top of the network.
+  if WorldMapDetailFrame then
+    local i = 1
+    while i <= ROAD_MAX_DOTS do
+      F.roadDot(i)
+      i = i + 1
+    end
+  end
+end
+
 -- Paint the multi-line quest checklist into questLines[]. Corpse compass
 -- overrides the whole block while ghosting.
 function F.questClearLines()
@@ -3678,11 +5891,24 @@ function F.questChecklistRows()
     local nObj = table.getn(e.objs)
     while oi <= nObj and nr < QUEST_PANEL_LINES do
       local o = e.objs[oi]
-      local dir = o.dist and F.questBearing(o.dx, o.dy) or nil
-      local yards = o.dist and math.floor(o.dist + 0.5) or nil
       local isGo = (e.title == goTitle)
         and ((goTurn and o.turnIn) or ((not goTurn) and (not o.turnIn)
           and o.label == goLabel))
+      -- The "go" row steers along the ROAD when one exists: the distance is
+      -- still the honest crow-flies estimate to the objective, but the compass
+      -- points at the next route waypoint, so following it keeps you on the
+      -- freeway instead of walking into the woods between here and there.
+      local dir = nil
+      if o.dist then
+        local rdx, rdy = nil, nil
+        if isGo then rdx, rdy = F.routeNextDelta() end
+        if rdx then
+          dir = F.questBearing(rdx, rdy)
+        else
+          dir = F.questBearing(o.dx, o.dy)
+        end
+      end
+      local yards = o.dist and math.floor(o.dist + 0.5) or nil
       local prog = ""
       if (not o.turnIn) and o.need and o.need > 0 then
         prog = string.format(" %d/%d", o.have or 0, o.need)
@@ -3709,6 +5935,20 @@ function F.questChecklistRows()
         nr = nr + 1
         rows[nr] = string.format("|c%s  %s%s|r", hex, mark,
           F.questShort(o.text or o.label, 20))
+      end
+      -- r47 (ticket 0047): "Notched Rib 0/5" with no mention of Cracked Skull
+      -- Soldier was a live complaint — monofuel reads objectives HERE, not in
+      -- the checklist window, and the hunt hint only rendered there. The
+      -- objective row is already ~35 characters wide with its distance and
+      -- bearing, so the hint gets its own dim sub-line inside the SAME
+      -- QUEST_PANEL_LINES budget (row heights are unchanged; a full panel
+      -- simply shows fewer objectives, exactly as it already did).
+      if o.from and not o.done and not o.turnIn and nr < QUEST_PANEL_LINES then
+        local hint = QuestModel.fromText(o.from, 2, QUEST_HINT_CHARS, "")
+        if hint then
+          nr = nr + 1
+          rows[nr] = "|cFF777777      from " .. hint .. "|r"
+        end
       end
       oi = oi + 1
     end
@@ -3780,6 +6020,14 @@ function F.questWindowLine(i)
   return line
 end
 
+-- "who do I hunt for this item" hint. Join + truncation live in QuestModel so
+-- lua/tests can drive the width math (r47, ticket 0047); the window has room
+-- for the wordy " more" tail, the panel below does not.
+local QUEST_FROM_MAX = 2
+function F.questFromText(from)
+  return QuestModel.fromText(from, QUEST_FROM_MAX, nil, " more")
+end
+
 function F.questWindowRows()
   local rows = {}
   if quest.status then
@@ -3807,8 +6055,13 @@ function F.questWindowRows()
       elseif obj.zoneName and obj.zoneName ~= quest.zoneName then
         suffix = "  |cFF888888" .. obj.zoneName .. "|r"
       end
+      local hunt = ""
+      if obj.from and not obj.done then
+        local names = F.questFromText(obj.from)
+        if names then hunt = " |cFF888888(" .. names .. ")|r" end
+      end
       rows[table.getn(rows) + 1] = string.format(
-        "|c%s  %s %s|r%s", hex, prefix, text, suffix)
+        "|c%s  %s %s|r%s%s", hex, prefix, text, hunt, suffix)
       oi = oi + 1
     end
     if table.getn(entry.objs) == 0 then
@@ -3851,6 +6104,7 @@ function F.questSetMarkers(on)
   else
     pcall(F.questDrawBlips)
     pcall(F.questDrawMarkers)
+    pcall(F.routeDrawMarkers)
   end
 end
 questMarkersBtn:SetScript("OnClick", function()
@@ -3864,15 +6118,18 @@ function F.questTick()
   quest.nextTickAt = now + QUEST_TICK_EVERY
   F.questPosition()
   F.questScan()
+  F.routeUpdate()
   F.questDrawBlips()
   F.questDrawMarkers()
+  F.routeDrawMarkers()
+  F.roadDrawLayer()
   F.questRefreshWindow()
 end
 
 questBtn = CreateFrame("Button", "ShadowArmyQuestBtn", panel, "UIPanelButtonTemplate")
 questBtn:SetWidth(93) -- 8 + 93 + 8 + 93 + 8 = 210 = panel width
 questBtn:SetHeight(20)
-questBtn:SetPoint("BOTTOMRIGHT", panel, "BOTTOMRIGHT", -8, 32) -- middle row, right of Log
+questBtn:SetPoint("BOTTOMRIGHT", panel, "BOTTOMRIGHT", -8, 56) -- second row, right of Log
 questBtn:SetText("|cFF9482C9Quests|r")
 questBtn:SetScript("OnClick", function()
   if questFrame:IsShown() then
@@ -3901,6 +6158,10 @@ questEvents:SetScript("OnEvent", function()
   quest.nextMarkerAt = now + QUEST_MARKER_EVERY
   local ok, err = pcall(F.questDrawMarkers)
   if not ok then F.emit("err", "questMarkers: " .. tostring(err)) end
+  local rok, rerr = pcall(F.routeDrawMarkers)
+  if not rok then F.emit("err", "routeMarkers: " .. tostring(rerr)) end
+  local dok, derr = pcall(F.roadDrawLayer)
+  if not dok then F.emit("err", "roadLayer: " .. tostring(derr)) end
 end)
 
 --------------------------------------------------------------------------
@@ -4153,83 +6414,12 @@ end)
 -- programmatic UI reload on hardware-event context (the slash path starts
 -- from a keypress). So: try the free paths, then light up the panel's
 -- Reload! button — a mouse click IS a hardware event, so its OnClick works.
+--
+-- r43: auto-loot deleted. r11-r14 measured it end to end — LootSlot is a
+-- no-op outside hardware-event context here, so the retry ladder only ever
+-- produced `loot gated` / `loot result took=0` noise. Looting is the human's
+-- click; do not rebuild this.
 --------------------------------------------------------------------------
--- Auto-loot (r11): single-shot LootSlot() at LOOT_OPENED provably did not
--- empty the window (live: `trace loot opened slots=N`, items still there).
--- Three candidate causes, and this code is built to tell them apart:
---   (a) the client gates LootSlot the way it gates ReloadUI -> retries can
---       never work, and `loot gated` says so out loud;
---   (b) the first call races the server's loot packet -> retries fix it;
---   (c) BoP/quest items want ConfirmLootSlot -> the confirm pass fixes it.
--- GetNumLootItems() counts SLOTS, which do not disappear as they are
--- looted, so "how much is left" is measured by how many slots still carry
--- an item (GetLootSlotInfo returns nil texture for a cleared slot).
---------------------------------------------------------------------------
-
-local LOOT_RETRY_EVERY = 0.25
-local LOOT_RETRY_FOR = 2.0
-
-local loot = {
-  active = false,
-  openedAt = 0,
-  startSlots = 0,   -- item-bearing slots when the window opened
-  lastSeen = 0,     -- item-bearing slots at the most recent observation
-  nextTryAt = 0,
-  gatedReported = false, -- one `loot gated` per session is the whole signal
-}
-
-function F.lootSlotsLeft()
-  local n = GetNumLootItems()
-  if not n then return 0 end
-  local left = 0
-  local i = 1
-  while i <= n do
-    if GetLootSlotInfo(i) then -- first return is the texture; nil = cleared
-      left = left + 1
-    end
-    i = i + 1
-  end
-  return left
-end
-
-function F.lootSweep()
-  local n = GetNumLootItems()
-  if not n then return end
-  -- Backwards: LootSlot removes entries, so forward indexing skips slots.
-  local i = n
-  while i >= 1 do
-    LootSlot(i)
-    -- BoP/quest items raise a confirmation prompt; on clients with nothing
-    -- pending this call errors, and an unguarded error here would kill the
-    -- rest of the sweep silently (scriptErrors is off).
-    pcall(ConfirmLootSlot, i)
-    i = i - 1
-  end
-  loot.lastSeen = F.lootSlotsLeft()
-end
-
-function F.lootTick()
-  local now = GetTime()
-  if now < loot.nextTryAt then return end
-  loot.nextTryAt = now + LOOT_RETRY_EVERY
-  loot.lastSeen = F.lootSlotsLeft()
-  if loot.lastSeen <= 0 then
-    loot.active = false -- window is empty; summary lands on LOOT_CLOSED
-    return
-  end
-  if (now - loot.openedAt) > LOOT_RETRY_FOR then
-    loot.active = false -- retry budget spent
-    if loot.lastSeen >= loot.startSlots and not loot.gatedReported then
-      -- Two seconds of retries moved exactly nothing: these calls are being
-      -- ignored, not raced. More retries are wasted; the next rev needs a
-      -- hardware-event piggyback (same shape as the reload button).
-      loot.gatedReported = true
-      F.emit("loot", "gated")
-    end
-    return
-  end
-  F.lootSweep()
-end
 
 local pendingReload = 0 -- countdown of escalation steps; 0 = idle
 -- r11: every request gets a number so the ladder is traceable end to end, and
@@ -4249,6 +6439,9 @@ driver:SetScript("OnUpdate", function()
   -- legacy path). pcall so a failure cannot kill the rest of OnUpdate.
   local aok, aerr = pcall(F.armorTick)
   if not aok then F.emit("err", "armorTick: " .. tostring(aerr)) end
+  -- r43: debounced action-bar sweep of advisor-managed spells.
+  local sbok, sberr = pcall(F.barSweepTick)
+  if not sbok then F.emit("err", "barSweepTick: " .. tostring(sberr)) end
   -- r13: bag autosort (one swap in flight).
   if sort.active then
     local sok, serr = pcall(F.sortTick)
@@ -4257,6 +6450,9 @@ driver:SetScript("OnUpdate", function()
       pcall(F.sortStop, "error")
     end
   end
+  -- r47: bag disposition list, 1s debounce, only while the window is open.
+  local btok, bterr = pcall(F.bagTagTick)
+  if not btok then F.emit("err", "bagTagTick: " .. tostring(bterr)) end
   -- r33: the quest checklist is always live; markers have their own toggle.
   local qok, qerr = pcall(F.questTick)
   if not qok then F.emit("err", "questTick: " .. tostring(qerr)) end
@@ -4265,7 +6461,6 @@ driver:SetScript("OnUpdate", function()
     local cok, cerr = pcall(F.crewTick)
     if not cok then F.emit("err", "crewTick: " .. tostring(cerr)) end
   end
-  if loot.active then F.lootTick() end
   -- r35: combat coach panel refresh (~4 Hz when open). Display only.
   if combatFrame:IsShown() then
     combatAcc = combatAcc + (arg1 or 0)
@@ -4307,7 +6502,7 @@ panel:SetScript("OnUpdate", function()
   local t1, t2 = F.targetSummary()
   line3:SetText(t1)
   line4:SetText(t2)
-  line5:SetText(F.buffWatchLine())
+  line5:SetText(F.passiveLine())
   -- r32: multi-line quest checklist (corpse compass overrides while ghosting).
   local ok, err = pcall(F.questRefreshPanel)
   if not ok then
@@ -4344,6 +6539,10 @@ end
 local frame = CreateFrame("Frame", "ShadowArmyFrame", UIParent)
 frame:RegisterEvent("PLAYER_ENTERING_WORLD")
 frame:RegisterEvent("LEARNED_SPELL_IN_TAB")
+-- r43: managed-spell bar sweep triggers (debounced in F.barSweepRequest);
+-- PLAYER_REGEN_ENABLED is where a combat-deferred sweep lands.
+frame:RegisterEvent("SPELLS_CHANGED")
+frame:RegisterEvent("PLAYER_REGEN_ENABLED")
 frame:RegisterEvent("ACTIONBAR_SLOT_CHANGED")
 frame:RegisterEvent("ACTIONBAR_PAGE_CHANGED")
 frame:RegisterEvent("PLAYER_AURAS_CHANGED")
@@ -4362,12 +6561,6 @@ frame:RegisterEvent("PLAYER_ENTER_COMBAT")
 frame:RegisterEvent("PLAYER_LEAVE_COMBAT")
 -- The System inbound: GM announce arrives as CHAT_MSG_SYSTEM
 frame:RegisterEvent("CHAT_MSG_SYSTEM")
--- auto-loot: vanilla has no always-auto-loot option (that's a TBC setting),
--- and LootSlot isn't protected in 1.12 — vacuum the window on open, then
--- retry from the driver (r11) and report the result on close
-frame:RegisterEvent("LOOT_OPENED")
-frame:RegisterEvent("LOOT_SLOT_CLEARED")
-frame:RegisterEvent("LOOT_CLOSED")
 
 frame:SetScript("OnEvent", function()
   if event == "PLAYER_ENTERING_WORLD" then
@@ -4376,6 +6569,7 @@ frame:SetScript("OnEvent", function()
     F.scanSpellbook()
     F.installSuggestedKeyHook()
     F.bindSuggestedKey()
+    F.bindPassiveKey()
     -- QoL defaults the advisor asserts on every login:
     -- F.instantQuestText() DISABLED (r14): prime remaining suspect for the
     -- reproducible crash+lockup on Complete Quest (it nils the quest
@@ -4383,6 +6577,7 @@ frame:SetScript("OnEvent", function()
     -- fanfare mute didn't take (music still played), so this is the next
     -- single-variable test. Re-enable only after turn-ins are proven safe.
     F.panelShowReset()
+    F.barSweepRequest()
     F.say("ARISE. Advisor online for " .. UnitName("player") .. " — /sa help (rev=" .. REV .. ")")
     F.emit("loaded", "rev=" .. REV)
     if not ShadowArmyQuestData then
@@ -4390,7 +6585,20 @@ frame:SetScript("OnEvent", function()
     end
   elseif event == "LEARNED_SPELL_IN_TAB" then
     F.scanSpellbook()
-  elseif event == "ACTIONBAR_SLOT_CHANGED" or event == "ACTIONBAR_PAGE_CHANGED" then
+  elseif event == "SPELLS_CHANGED" then
+    -- Respecs fire SPELLS_CHANGED without LEARNED_SPELL_IN_TAB; the sweep's
+    -- PickupSpell indices come from auto.spells, so rescan before sweeping.
+    F.scanSpellbook()
+    F.barSweepRequest()
+  elseif event == "PLAYER_REGEN_ENABLED" then
+    -- Only re-arms a sweep the combat check already deferred.
+    if barSweep.pending then F.barSweepRequest() end
+  elseif event == "ACTIONBAR_SLOT_CHANGED" then
+    -- r44: a slot edit is the only signal a macro drag leaves, so it arms the
+    -- sweep's quiet period (F.barSweepNoteChange ignores our own mutations).
+    F.barSweepNoteChange()
+    F.scanCombatActions()
+  elseif event == "ACTIONBAR_PAGE_CHANGED" then
     F.scanCombatActions()
   elseif event == "PLAYER_AURAS_CHANGED" then
     -- Druid forms page a different action-bar bank. Re-scan so exact range
@@ -4407,8 +6615,11 @@ frame:SetScript("OnEvent", function()
     auto.failure = nil
   elseif event == "SPELLCAST_STOP" then
     auto.casting = false
+    F.armorNoteCast(true)
   elseif event == "SPELLCAST_FAILED" or event == "SPELLCAST_INTERRUPTED" then
     auto.casting = false
+    -- r47: a failed cast cannot explain a new aura — drop the pending sample.
+    F.armorNoteCast(false)
     -- brief backoff so a failing cast (moving/silenced/oom) can't retry
     -- every frame and starve the wand fallback
     auto.failUntil = GetTime() + 0.5
@@ -4421,27 +6632,6 @@ frame:SetScript("OnEvent", function()
     auto.melee = true
   elseif event == "PLAYER_LEAVE_COMBAT" then
     auto.melee = false
-  elseif event == "LOOT_OPENED" then
-    loot.active = true
-    loot.openedAt = GetTime()
-    loot.startSlots = F.lootSlotsLeft()
-    loot.lastSeen = loot.startSlots
-    loot.nextTryAt = GetTime() + LOOT_RETRY_EVERY
-    F.dtrace("loot opened slots=" .. tostring(GetNumLootItems())
-      .. " items=" .. loot.startSlots)
-    F.lootSweep() -- first attempt now; the driver retries for ~2s after this
-  elseif event == "LOOT_SLOT_CLEARED" then
-    -- Keeps lastSeen honest when the window empties and auto-closes inside
-    -- a single retry interval.
-    loot.lastSeen = F.lootSlotsLeft()
-  elseif event == "LOOT_CLOSED" then
-    loot.active = false
-    if loot.startSlots > 0 then
-      -- The one line that settles "do these calls do anything at all".
-      F.emit("loot", "result took=" .. (loot.startSlots - loot.lastSeen)
-        .. " left=" .. loot.lastSeen)
-      loot.startSlots = 0
-    end
   elseif event == "CHAT_MSG_SYSTEM" then
     -- The System speaks via GM `announce`, which arrives as CHAT_MSG_SYSTEM:
     -- "|cffff0000[System Message]: <SYS> reload|r". Strip color codes, look for
@@ -4514,6 +6704,7 @@ function F.saHelp()
   F.say("  /sa bags       open ShadowBags")
   F.say("  /sa quests     toggle the complete quest window")
   F.say("  /sa crew       toggle party + corpse map blips")
+  F.say("  /sa roads      toggle the zone road layer on the world map")
   F.say("  /sa reload     ReloadUI() — pick up disk edits")
 end
 
@@ -4558,6 +6749,11 @@ SlashCmdList["SHADOWARMY"] = function(msg)
     end
     F.say("crew blips " .. (crew.enabled and "ON" or "OFF")
       .. " (party cyan / ghost white / corpse purple)")
+    return
+  end
+  -- Same valve as the map button, for when the map corner is covered.
+  if msg == "roads" then
+    F.roadToggle()
     return
   end
   if msg == "log" then

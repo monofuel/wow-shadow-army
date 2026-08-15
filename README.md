@@ -37,6 +37,7 @@ against. The upstream checkout lives as a sibling:
 ## Layout
 
 - `lua/tools/` — named-intent tool library (the LLM-facing language)
+- `lua/entry/home.lua` — persistent-realm party/role/recovery policy
 - `lua/tests/` — fast unit tests, run by `make test` (must stay instant)
 - `tools/` — party promote, fair-play audit, traverse/replay tooling
 - `kb/` — bot memory for the future LLM planner (map facts, quest ids, tool
@@ -63,8 +64,12 @@ make start-server
 # Once (or after a fresh DB wipe) — ensure the playtest account
 make account
 
-# Terminal B — native client at the normal login screen
+# Terminal B — native human client
 make play
+
+# Separately, when the four bot seats should be online
+make home-army-start
+make home-army-status
 ```
 
 | Item | Value |
@@ -75,12 +80,19 @@ make play
 | world | `127.0.0.1:8085` |
 | healthz | `http://127.0.0.1:8080` |
 
-- **Login screen:** `make play` passes `--login-screen` only (plus local
-  realm ports). Type `monofuel` / `password` yourself. Do **not** pass
-  `--username`/`--password` with this flow: with `--login-screen` the
-  launcher does not forward credentials to the player; without
-  `--login-screen`, a local realm falls back to the seeded
-  `COWORLD`/`Nightsun` direct-world path.
+- **Bot lifecycle:** realm start/stop and bot start/stop are intentionally
+  separate. `make home-army-start`, `home-army-status`, `home-army-stop`, and
+  `home-army-restart` manage only Shadowfel, Igris, Tusk, and Beru. They do not
+  create accounts or alter persistent realm data.
+- **Bot policy:** each headless client runs the embedded `lua-bot` with
+  `lua/entry/home.lua`. It accepts Murist's invite, promotes Murist when
+  necessary, follows/assists him, performs its class role, and recovers from
+  death. Without an observable grouped Murist it safely uses the solo
+  `accelerated` policy.
+- **Runtime state:** each seat writes under
+  `local_data/home-army/<Character>/` (`launcher.pid`, `launcher.log`,
+  `status/status.json`, and `observer/`). The System uses PID plus the fresh
+  Lua status heartbeat for liveness.
 - **Stop:** `make stop-server` (compose stop/rm of `coworld-game`). Never
   `docker kill`. Ctrl-C on `make start-server` only detaches log follow —
   containers keep running until `make stop-server`.
@@ -88,12 +100,13 @@ make play
   (`vmangos-coworld-db`). Accounts and characters survive `stop-server` /
   restarts. Only `docker_vmangos_server.py down --volumes` or `up --fresh`
   wipes state (not exposed by these targets).
-- **Unit tests:** `make test` stays instant (no docker): Lua tools under
-  `lua/tests/` + Nim tiers (`system/tests/`, `tools/tests/`). No Python.
-  Live seats run through `make escort-army` / `make grind` (Nim host).
+- **Unit tests:** `make test` stays local (no realm mutation): Lua tools under
+  `lua/tests/` + Nim tiers (`system/tests/`, `tools/tests/`) and existing
+  operator-script checks.
+  All build/test/run commands belong inside this repo's `nix develop` shell.
 
 ## Rules
 
-See `AGENTS.md`. Highlights: fair play (no cross-seat collusion — party
-cooperation only through the game's typed assignment), never modify
-upstream, `make test` green before every commit.
+See `AGENTS.md`. Highlights: fair play (party cooperation only through facts
+the client observes), keep generic client-interface changes in
+`../monofuel-vanilla-wow`, and keep `make test` green before every commit.

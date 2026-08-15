@@ -5,6 +5,13 @@
 
 # Core UI first so a QuestData load failure cannot kill /sa / panel.
 ShadowArmy.lua
-# Optional pure-data file (~1.1MB). If it fails to load (size/parse), the
-# quest helper degrades; the advisor panel still works.
+# Optional pure-data files. Every addon read of these is guarded
+# (`ShadowArmyQuestData and ...`), so a file that fails to load (size, parse,
+# missing after a fresh checkout) only degrades the feature that uses it -
+# the advisor panel and /sa keep working.
+#   QuestData ~1.6MB : quest waypoints; absent -> checklist without waypoints
+#   ItemData  ~1.1MB : item facts;      absent -> no vendor-price knowledge
+#   RoadData  ~52KB  : road polylines;  absent -> straight-line routing
 QuestData.lua
+ItemData.lua
+RoadData.lua

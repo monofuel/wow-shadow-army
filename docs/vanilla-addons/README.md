@@ -19,6 +19,11 @@ Also: bulk `LootSlot` failed even on panel click in our probe
 ([advisor-sandbox-gates.md](../advisor-sandbox-gates.md)) — do not document
 vanilla auto-loot as working.
 
+**When a live probe proves the reference docs wrong for OUR build, record
+it in [client-quirks.md](client-quirks.md)** — proven divergences only
+(SetAction's missing populate flag, the ReloadUI hardware gate, guessed
+buff textures), each with how it was proven and the working pattern.
+
 Modern wowwiki / retail macro pages are **not** authoritative for this
 client. Stock slash aliases and handlers come from 1.12.1 FrameXML
 (`GlobalStrings.lua` `SLASH_*` + `ChatFrame.lua` `SlashCmdList`). Readable

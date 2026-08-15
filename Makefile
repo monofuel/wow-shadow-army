@@ -70,12 +70,120 @@ COMPOSE_FILE := infra/compose.vmangos.yml
 ACCOUNT_USER := monofuel
 ACCOUNT_PASS := password
 
-.PHONY: test test-lua test-nim system pin-check start-server stop-server server-logging logs account soap-account play play-classic play-classic-netlog play-xr traverse traverse-field traverse-replay traverse-pack-replay traverse-headed traverse-pol traverse-desert traverse-wet traverse-checkpoints traverse-lint traverse-lint-soft lift-tele quest-data warlock-account warlock-bot botwarrior-bot tusk-account tusk-bot beru-account beru-bot party-army navmesh-helper navmesh-status map-browser map-browser-once map-browser-probe
+# Persistent-home bot runtime. All four seats connect to the already-running
+# local realm through its direct WebSocket bridges; starting the realm never
+# starts the bots. Each seat owns a separate observer/status directory so The
+# System and operators can inspect liveness without the retired TCP control
+# sockets.
+HOME_WS ?= ws://127.0.0.1:8080
+HOME_SLOT ?= 0
+HOME_TOKEN ?= token-0
+HOME_ENTRY ?= home
+HOME_ARMY_DIR := $(CURDIR)/local_data/home-army
+HOME_STATUS_MAX_AGE ?= 30
+
+# Live Lua debug port for home seats (docs/lua-debug-port.md, ticket 0053).
+# EMPTY = OFF, and off means the seat env carries no control dir and no admin
+# process exists — the feature is absent, not idle. HOME LANE ONLY: league,
+# traverse, and every hosted policy image must never set this.
+#
+#   make home-army-start HOME_DEBUG_PORT_BASE=7788
+#
+# Ports are base + seat index: shadowfel 7788, igris 7789, tusk 7790,
+# beru 7791. A seat reads its control dir from the environment AT LAUNCH, so a
+# already-running seat gains nothing until its next restart.
+HOME_DEBUG_PORT_BASE ?=
+
+define launch_home_seat
+	@set -e; \
+	seat_dir="$(HOME_ARMY_DIR)/$(1)"; \
+	mkdir -p "$$seat_dir/status" "$$seat_dir/observer"; \
+	debug_dir=""; \
+	if [ -n "$(HOME_DEBUG_PORT_BASE)" ]; then \
+		debug_dir="$$seat_dir/control"; mkdir -p "$$debug_dir/acks"; \
+	fi; \
+	cd "$(FORK_CLIENT)"; \
+	VANILLA_WOW_LOGIN_WS_URL="$(HOME_WS)/tcp/realmd?slot=$(HOME_SLOT)&token=$(HOME_TOKEN)" \
+	VANILLA_WOW_GAME_WS_URL="$(HOME_WS)/tcp/world?slot=$(HOME_SLOT)&token=$(HOME_TOKEN)" \
+	VANILLA_WOW_LUA_DEBUG_DIR="$$debug_dir" \
+	COWORLD_PLAYER_OBSERVER_DIR="$$seat_dir/observer" \
+	nix develop --command nim r tools/launch_nim_player.nim -- \
+		--controller=embedded --presentation=headless --bot=lua-bot \
+		--owner=home-$(1) \
+		--lua-repo="$(CURDIR)" --lua-entry="$(HOME_ENTRY)" \
+		--lua-status-dir="$$seat_dir/status" \
+		--username="$(2)" --password="$(3)" --character-name="$(1)" \
+		--skip-cinematic
+endef
+
+define start_home_seat
+	@set -e; \
+	seat_dir="$(HOME_ARMY_DIR)/$(1)"; \
+	pid_file="$$seat_dir/launcher.pid"; \
+	mkdir -p "$$seat_dir"; \
+	if [ -s "$$pid_file" ]; then \
+		pid=$$(cat "$$pid_file"); \
+		if kill -0 "$$pid" 2>/dev/null; then \
+			echo "$(1) already running (pid $$pid)"; exit 0; \
+		fi; \
+	fi; \
+	rm -f "$$pid_file" "$$seat_dir/status/status.json" "$$seat_dir/control/request.json"; \
+	if [ -s "$$seat_dir/launcher.log" ]; then \
+		mv "$$seat_dir/launcher.log" "$$seat_dir/launcher.log.$$(date -u +%Y%m%dT%H%M%SZ)"; \
+	fi; \
+	setsid $(MAKE) --no-print-directory $(2) >"$$seat_dir/launcher.log" 2>&1 < /dev/null & \
+	pid=$$!; echo "$$pid" > "$$pid_file"; \
+	echo "starting $(1) (pid $$pid; log $$seat_dir/launcher.log)"; \
+	if [ -n "$(HOME_DEBUG_PORT_BASE)" ]; then \
+		port=$$(($(HOME_DEBUG_PORT_BASE) + $(3))); \
+		admin_pid="$$seat_dir/lua-debug-admin.pid"; \
+		mkdir -p "$$seat_dir/control/acks"; \
+		if [ -s "$$admin_pid" ] && kill -0 "$$(cat $$admin_pid)" 2>/dev/null; then \
+			echo "  debug admin already running (pid $$(cat $$admin_pid))"; \
+		else \
+			setsid nix develop --command nim r tools/lua_debug_admin.nim -- \
+				--seat="$(1)" --port="$$port" \
+				--control-dir="$$seat_dir/control" \
+				--status-dir="$$seat_dir/status" \
+				>"$$seat_dir/lua-debug-admin.log" 2>&1 < /dev/null & \
+			echo "$$!" > "$$admin_pid"; \
+			echo "  debug port http://127.0.0.1:$$port (log $$seat_dir/lua-debug-admin.log)"; \
+		fi; \
+	fi
+endef
+
+define stop_home_seat
+	@set -e; \
+	seat_dir="$(HOME_ARMY_DIR)/$(1)"; \
+	pid_file="$$seat_dir/launcher.pid"; \
+	admin_pid="$$seat_dir/lua-debug-admin.pid"; \
+	if [ -s "$$admin_pid" ]; then \
+		apid=$$(cat "$$admin_pid"); \
+		if kill -0 "$$apid" 2>/dev/null; then \
+			kill -TERM -- "-$$apid" 2>/dev/null || kill -TERM "$$apid" 2>/dev/null || true; \
+			echo "stopped $(1) debug admin (pid $$apid)"; \
+		fi; \
+		rm -f "$$admin_pid"; \
+	fi; \
+	if [ ! -s "$$pid_file" ]; then echo "$(1) is stopped"; exit 0; fi; \
+	pid=$$(cat "$$pid_file"); \
+	if ! kill -0 "$$pid" 2>/dev/null; then \
+		rm -f "$$pid_file"; echo "$(1) is stopped (removed stale pid)"; exit 0; \
+	fi; \
+	kill -TERM -- "-$$pid" 2>/dev/null || kill -TERM "$$pid"; \
+	i=0; while kill -0 "$$pid" 2>/dev/null && [ $$i -lt 30 ]; do sleep 0.5; i=$$((i + 1)); done; \
+	if kill -0 "$$pid" 2>/dev/null; then \
+		echo "error: $(1) did not stop after 15 seconds (pid $$pid)" >&2; exit 1; \
+	fi; \
+	rm -f "$$pid_file"; echo "stopped $(1)"
+endef
+
+.PHONY: test test-lua test-nim system pin-check start-server stop-server server-logging logs account soap-account play play-classic play-classic-netlog play-xr traverse traverse-field traverse-replay traverse-pack-replay traverse-headed traverse-pol traverse-desert traverse-wet traverse-checkpoints traverse-lint traverse-lint-soft lift-tele quest-data item-data road-data warlock-account warlock-bot botwarrior-bot tusk-account tusk-bot beru-account beru-bot party-army home-army-start home-army-stop home-army-restart home-army-status shadowfel-start shadowfel-stop igris-start igris-stop tusk-start tusk-stop beru-start beru-stop navmesh-helper navmesh-status map-browser map-browser-once map-browser-debug map-browser-probe
 
 # Unit tier: Lua tools + Nim host/system tests only (v2 DoD: no Python required
 # for bot correctness). If nim is missing, test-nim-soft skips rather than
 # failing bare CI hosts. Smoke tier parse/compile-checks code no unit test
-# executes (addon Lua, army_host) — doctrine: a cheap compile-check is a
+# executes (including addon Lua) — doctrine: a cheap compile-check is a
 # legitimate leg for a binary with no unit tests yet.
 test: test-lua test-nim-soft test-smoke test-traverse-soap test-traverse-checkpoint traverse-lint-soft
 
@@ -107,10 +215,11 @@ traverse-lint:
 	@python3 tools/traverse_route_lint.py \
 		--beats lua/config/traverse_finale_beats.json
 
-# Every Nim entrypoint/module must at least compile (`nim check`), even where
-# no unit suite imports it yet (army_host, msgpack_json).
+# Every maintained Nim entrypoint/module must at least compile (`nim check`),
+# even where no unit suite imports it yet.
 NIM_CHECK_FILES = system/system_server.nim \
 	tools/fair_play_audit.nim tools/party_promote.nim \
+	tools/lua_debug_admin.nim \
 	src/conductor.nim
 
 .PHONY: test-smoke test-smoke-lua test-smoke-nim test-smoke-nim-soft
@@ -235,63 +344,7 @@ pin-check:
 	fi; \
 	echo "pin ok: $$want"
 
-# Escort army: Nim host + Lua escort_leader (NO PYTHON decide path).
-# Accept invites + follow formation + assist/attack leader target.
-# Docs: docs/rolling-issues-2026-07-26.md
-#
-#   make escort SLOT=2 EXTRA='--max-seconds 120'
-#   make escort-army
-SLOT ?= 0
 EXTRA ?=
-ESCORT_LEADER ?= Murist
-# Full 5-man cast: human + 2 locks + warrior tank + priest healer.
-ESCORT_PARTY ?= Murist,Shadowfel,Igris,Tusk,Beru
-ESCORT_ACCEPT_FROM ?= Murist
-# Prefer fork SDK when the fork checkout exists (matches igris/warlock-bot-fork seats).
-ESCORT_UPSTREAM ?= $(shell if [ -d "$(abspath ../coworld-vanilla-wow-fork)" ]; then echo $(abspath ../coworld-vanilla-wow-fork); else echo $(UPSTREAM); fi)
-
-# Seat identity map (docs/work-2026-08-04.md). Under the new interface, attach
-# CREATES the session: army_host logs into realmd itself with these credentials
-# instead of dialing a seat process that already logged in. Without them the
-# host falls back to its own defaults (coworld/coworld, character "Slot<N>"),
-# which is not a real seat.
-#
-# Recursive `=` is deliberate — the per-seat vars live with the seat targets
-# further down this file and would be empty under `:=` here.
-SEAT_2_ACCOUNT = $(WARLOCK_ACCOUNT)
-SEAT_2_PASS = $(WARLOCK_PASS)
-SEAT_2_CHARACTER = $(WARLOCK_CHARACTER)
-SEAT_3_ACCOUNT = $(IGRIS_ACCOUNT)
-SEAT_3_PASS = $(IGRIS_PASS)
-SEAT_3_CHARACTER = $(IGRIS_CHARACTER)
-SEAT_4_ACCOUNT = $(TUSK_ACCOUNT)
-SEAT_4_PASS = $(TUSK_PASS)
-SEAT_4_CHARACTER = $(TUSK_CHARACTER)
-SEAT_5_ACCOUNT = $(BERU_ACCOUNT)
-SEAT_5_PASS = $(BERU_PASS)
-SEAT_5_CHARACTER = $(BERU_CHARACTER)
-
-# Credential flags for whichever SLOT a single-seat target was invoked with.
-# Unmapped slots (0/1) emit nothing and keep the host defaults.
-SEAT_CREDS = $(if $(SEAT_$(SLOT)_ACCOUNT),--account=$(SEAT_$(SLOT)_ACCOUNT) \
-	--password=$(SEAT_$(SLOT)_PASS) --character=$(SEAT_$(SLOT)_CHARACTER))
-
-# Same map for the shell `for s in 2 3 4 5` loops below.
-define seat_creds_case
-case $$s in \
-  2) acct=$(SEAT_2_ACCOUNT); pass=$(SEAT_2_PASS); char=$(SEAT_2_CHARACTER) ;; \
-  3) acct=$(SEAT_3_ACCOUNT); pass=$(SEAT_3_PASS); char=$(SEAT_3_CHARACTER) ;; \
-  4) acct=$(SEAT_4_ACCOUNT); pass=$(SEAT_4_PASS); char=$(SEAT_4_CHARACTER) ;; \
-  5) acct=$(SEAT_5_ACCOUNT); pass=$(SEAT_5_PASS); char=$(SEAT_5_CHARACTER) ;; \
-  *) echo "no seat mapping for slot $$s" >&2; exit 1 ;; \
-esac
-endef
-
-# Native environment host on 127.0.0.1:41113. Required before any seat can
-# attach: the local realm image omits /usr/local/bin/vanilla-wow-env-host, so
-# the game's WS /env relay is dead and direct TCP is the only path
-# (docs/work-2026-08-04.md). Rebuilds itself when upstream source is newer;
-# use FORCE_BUILD=1 after an upstream jump.
 .PHONY: accelerated accelerated-episode accelerated-pol accelerated-headed
 # Full-length league episode (720 wall seconds at 10x) with the final score
 # read back from the bot's own status file.
@@ -376,6 +429,32 @@ persistent:
 
 persistent-headed:
 	@cd $(FORK_CLIENT) && $(PERSISTENT_LAUNCH) --presentation=headed
+
+# Regenerate addons/ShadowArmy/QuestData.lua from the world DB + WorldMapArea.dbc
+# (docs/quest-data.md). Read-only DB access; requires the realm up. Deterministic,
+# so a no-op rerun leaves the file byte-identical. Scope with:
+#   make quest-data QUEST_DATA_ARGS="--max-level 20"
+#   make quest-data QUEST_DATA_ARGS="--zones 85,130,12"
+QUEST_DATA_ARGS ?=
+quest-data:
+	@python3 tools/gen_quest_data.py \
+		--dbc-dir "$(VANILLA_WOW_EXTRACTED_DATA_DIR)/dbc" $(QUEST_DATA_ARGS)
+
+# Regenerate addons/ShadowArmy/ItemData.lua from the world DB (docs/item-data.md).
+# Read-only DB access; requires the realm up. Deterministic, so a no-op rerun
+# leaves the file byte-identical. Whole game, no DBCs needed.
+ITEM_DATA_ARGS ?=
+item-data:
+	@python3 tools/gen_item_data.py $(ITEM_DATA_ARGS)
+
+# Regenerate addons/ShadowArmy/RoadData.lua from the baked road waypoints
+# (docs/road-data.md). No DB and no realm — tools/data/road_waypoints_*.jsonl
+# plus WorldMapArea.dbc are the whole input. Deterministic, so a no-op rerun
+# leaves the file byte-identical.
+ROAD_DATA_ARGS ?=
+road-data:
+	@python3 tools/gen_road_data.py \
+		--dbc-dir "$(VANILLA_WOW_EXTRACTED_DATA_DIR)/dbc" $(ROAD_DATA_ARGS)
 
 .PHONY: backup-server
 backup-server:
@@ -574,30 +653,14 @@ botwarrior-bot:
 # ---------------------------------------------------------------------------
 # Shadowfel — headless UNDEAD WARLOCK seat (docs/warlock-seat.md).
 #
-# Undead is deliberately absent from the upstream seed scripts' race maps
-# (game/vmangos_character.py RACE_NAME_TO_ID is Horde-with-coverage only, and
-# upstream docs/leveling-character-selection.md says not to offer Undead as a
-# *hosted submission* option). That is a seeding/submission constraint, not a
-# server one — so this seat never touches the characters table. The reference
-# player creates the character over the wire with CMSG_CHAR_CREATE, exactly
-# like a human at the CharacterCreate screen: when
-# VANILLA_WOW_PLAYER_CHARACTER_NAME is not on the account,
-# connectBotControlSession creates it from the RACE/CLASS/GENDER env tuple
-# (nim_control_server.nim botControlCharacterSpec →
-#  control_session_packets.nim). Race/class validity comes from ChrRaces.dbc /
-# CharBaseInfo.dbc (client/character_identity.nim), so undead+warlock is legal.
+# The account and character already live in the persistent realm; account
+# creation and bot launch remain separate explicit operations.
 WARLOCK_ACCOUNT := shadow1
 WARLOCK_PASS := shadow1
 WARLOCK_CHARACTER := Shadowfel
 WARLOCK_RACE := undead
 WARLOCK_CLASS := warlock
 WARLOCK_GENDER := male
-# Slot map (docs/control-plane.md): 0=Botwarrior, 1=Botpriest, 2=Shadowfel.
-# The control socket is 41114 + slot, so this seat answers on 127.0.0.1:41116.
-# Leave WOW_SDK_NIM_CONTROL_PORT unset on BOTH sides — an explicit value is
-# used verbatim and is NOT offset by the slot (nim_control_server.nim:666-673).
-WARLOCK_SLOT := 2
-WARLOCK_RUNTIME_DIR := $(CURDIR)/local_data/nim-runtime-slot$(WARLOCK_SLOT)
 
 # Idempotently ensure the shadow1 account (same upstream SRP script as `account`).
 warlock-account:
@@ -620,45 +683,10 @@ warlock-account:
 		--apply; \
 	echo "account ready: $(WARLOCK_ACCOUNT) / $(WARLOCK_PASS)"
 
-# Bring the Shadowfel seat online. First run also creates the character.
-#
-# AUTONOMOUS=0 is load-bearing: a seat launched with AUTONOMOUS=1 was observed
-# exiting shortly after listen. 0 parks the seat logged in and lets an external
-# brain own the goal.
-#
-# The Detour navmesh helper IS built now (docs/navmesh.md) and this target
-# inherits VANILLA_WOW_NAVMESH_HELPER from the export above, so movement is no
-# longer blocked on it. Shadowfel specifically still cannot walk under a
-# `leveling` goal — an undead warlock resolves `unsupported_profile`. Use
-# `botwarrior-bot` for movement work until that is fixed.
-#
-# Foreground like `make play` / `make shadow`. Detach with:
-#   nohup make warlock-bot > local_data/warlock-bot.log 2>&1 &
-# Stop with: kill <pid>  (SIGTERM; the seat logs out and characters.online→0)
+# Run Shadowfel's embedded home policy in the foreground. The detached
+# operator surface is `make shadowfel-start` / `make shadowfel-stop`.
 warlock-bot:
-	@set -e; \
-	if [ ! -d "$(UPSTREAM)" ]; then \
-		echo "error: upstream checkout missing: $(UPSTREAM)" >&2; exit 1; \
-	fi; \
-	if [ ! -f "$(WOW_ENV)" ]; then \
-		echo "error: missing $(WOW_ENV)" >&2; exit 1; \
-	fi; \
-	mkdir -p "$(WARLOCK_RUNTIME_DIR)"; \
-	cd "$(UPSTREAM)"; \
-	. "$(WOW_ENV)"; \
-	VANILLA_WOW_PLAYER_REALM_HOST=127.0.0.1 \
-	VANILLA_WOW_PLAYER_REALM_PORT=3724 \
-	VANILLA_WOW_PLAYER_USERNAME=$(WARLOCK_ACCOUNT) \
-	VANILLA_WOW_PLAYER_PASSWORD=$(WARLOCK_PASS) \
-	VANILLA_WOW_PLAYER_CHARACTER_NAME=$(WARLOCK_CHARACTER) \
-	VANILLA_WOW_PLAYER_CHARACTER_RACE=$(WARLOCK_RACE) \
-	VANILLA_WOW_PLAYER_CHARACTER_CLASS=$(WARLOCK_CLASS) \
-	VANILLA_WOW_PLAYER_CHARACTER_GENDER=$(WARLOCK_GENDER) \
-	VANILLA_WOW_PLAYER_AUTONOMOUS=0 \
-	WOW_SDK_NIM_RUNTIME_SLOT=$(WARLOCK_SLOT) \
-	WOW_SDK_NIM_RUNTIME_DIR=$(WARLOCK_RUNTIME_DIR) \
-	WOW_SDK_NIM_CONTROL_HOST=127.0.0.1 \
-	nim r player/reference_player/reference_player.nim --scenario=nim-control
+	$(call launch_home_seat,$(WARLOCK_CHARACTER),$(WARLOCK_ACCOUNT),$(WARLOCK_PASS))
 
 # Launch the native client for HUMAN play against OUR local persistent realm.
 #
@@ -909,24 +937,13 @@ play-xr:
 			--xr'
 
 # ---------------------------------------------------------------------------
-# Igris — testbed UNDEAD WARLOCK for the indoor-navigation fix
-# (docs/indoor-navigation-plan.md). Identical seat pattern to warlock-bot,
-# except the reference player runs from OUR FORK worktree (branch
-# indoor-wmo-navigation) against the stock realm — so the patched client can
-# be A/B'd (fork main = baseline, fix branch = patched) without touching the
-# upstream checkout or the realm image. Character auto-creates over the wire
-# on first login (CMSG_CHAR_CREATE), spawning in the Shadow Grave crypt —
-# the indoor-nav reproduce case.
+# Igris — undead warlock DPS seat.
 IGRIS_ACCOUNT := shadow2
 IGRIS_PASS := shadow2
 IGRIS_CHARACTER := Igris
 IGRIS_RACE := undead
 IGRIS_CLASS := warlock
 IGRIS_GENDER := male
-# Slot map (docs/control-plane.md): 0=Botwarrior, 1=Botpriest, 2=Shadowfel,
-# 3=Igris. Control socket 41114 + slot = 127.0.0.1:41117.
-IGRIS_SLOT := 3
-IGRIS_RUNTIME_DIR := $(CURDIR)/local_data/nim-runtime-slot$(IGRIS_SLOT)
 
 .PHONY: igris-account igris-bot
 igris-account:
@@ -949,71 +966,22 @@ igris-account:
 		--apply; \
 	echo "account ready: $(IGRIS_ACCOUNT) / $(IGRIS_PASS)"
 
-# Foreground. Detach with:
-#   nohup make igris-bot > local_data/igris-bot.log 2>&1 &
-# Ready at: "Nim binary control socket listening on 127.0.0.1:41117."
+# Run Igris's embedded home policy in the foreground.
 igris-bot:
-	@set -e; \
-	if [ ! -d "$(FORK)" ]; then \
-		echo "error: fork checkout missing: $(FORK) (see docs/coworld-fork.md)" >&2; exit 1; \
-	fi; \
-	if [ ! -f "$(WOW_ENV)" ]; then \
-		echo "error: missing $(WOW_ENV)" >&2; exit 1; \
-	fi; \
-	mkdir -p "$(IGRIS_RUNTIME_DIR)"; \
-	cd "$(FORK)"; \
-	. "$(WOW_ENV)"; \
-	VANILLA_WOW_PLAYER_REALM_HOST=127.0.0.1 \
-	VANILLA_WOW_PLAYER_REALM_PORT=3724 \
-	VANILLA_WOW_PLAYER_USERNAME=$(IGRIS_ACCOUNT) \
-	VANILLA_WOW_PLAYER_PASSWORD=$(IGRIS_PASS) \
-	VANILLA_WOW_PLAYER_CHARACTER_NAME=$(IGRIS_CHARACTER) \
-	VANILLA_WOW_PLAYER_CHARACTER_RACE=$(IGRIS_RACE) \
-	VANILLA_WOW_PLAYER_CHARACTER_CLASS=$(IGRIS_CLASS) \
-	VANILLA_WOW_PLAYER_CHARACTER_GENDER=$(IGRIS_GENDER) \
-	VANILLA_WOW_PLAYER_AUTONOMOUS=0 \
-	WOW_SDK_NIM_RUNTIME_SLOT=$(IGRIS_SLOT) \
-	WOW_SDK_NIM_RUNTIME_DIR=$(IGRIS_RUNTIME_DIR) \
-	WOW_SDK_NIM_CONTROL_HOST=127.0.0.1 \
-	nim r player/reference_player/reference_player.nim --scenario=nim-control
+	$(call launch_home_seat,$(IGRIS_CHARACTER),$(IGRIS_ACCOUNT),$(IGRIS_PASS))
 
-# Shadowfel on the FORK build (same env tuple as warlock-bot, cd FORK) —
-# for play sessions that need fork-carried client fixes on both seats
-# (e.g. party-invite-observation). Stock target remains `warlock-bot`.
+# Compatibility alias: every home bot now runs from the fork.
 .PHONY: warlock-bot-fork
-warlock-bot-fork:
-	@set -e; \
-	if [ ! -d "$(FORK)" ]; then \
-		echo "error: fork checkout missing: $(FORK)" >&2; exit 1; \
-	fi; \
-	mkdir -p "$(WARLOCK_RUNTIME_DIR)"; \
-	cd "$(FORK)"; \
-	. "$(WOW_ENV)"; \
-	VANILLA_WOW_PLAYER_REALM_HOST=127.0.0.1 \
-	VANILLA_WOW_PLAYER_REALM_PORT=3724 \
-	VANILLA_WOW_PLAYER_USERNAME=$(WARLOCK_ACCOUNT) \
-	VANILLA_WOW_PLAYER_PASSWORD=$(WARLOCK_PASS) \
-	VANILLA_WOW_PLAYER_CHARACTER_NAME=$(WARLOCK_CHARACTER) \
-	VANILLA_WOW_PLAYER_CHARACTER_RACE=$(WARLOCK_RACE) \
-	VANILLA_WOW_PLAYER_CHARACTER_CLASS=$(WARLOCK_CLASS) \
-	VANILLA_WOW_PLAYER_CHARACTER_GENDER=$(WARLOCK_GENDER) \
-	VANILLA_WOW_PLAYER_AUTONOMOUS=0 \
-	WOW_SDK_NIM_RUNTIME_SLOT=$(WARLOCK_SLOT) \
-	WOW_SDK_NIM_RUNTIME_DIR=$(WARLOCK_RUNTIME_DIR) \
-	WOW_SDK_NIM_CONTROL_HOST=127.0.0.1 \
-	nim r player/reference_player/reference_player.nim --scenario=nim-control
+warlock-bot-fork: warlock-bot
 
 # ---------------------------------------------------------------------------
 # Tusk — undead WARRIOR (tank) for the 5-man cast (docs/personas/tusk.md).
-# Same wire-create seat pattern as Igris/Shadowfel. Slot 4 → :41118.
 TUSK_ACCOUNT := shadow3
 TUSK_PASS := shadow3
 TUSK_CHARACTER := Tusk
 TUSK_RACE := undead
 TUSK_CLASS := warrior
 TUSK_GENDER := male
-TUSK_SLOT := 4
-TUSK_RUNTIME_DIR := $(CURDIR)/local_data/nim-runtime-slot$(TUSK_SLOT)
 
 tusk-account:
 	@set -e; \
@@ -1035,45 +1003,18 @@ tusk-account:
 		--apply; \
 	echo "account ready: $(TUSK_ACCOUNT) / $(TUSK_PASS)"
 
-# Foreground. Detach with:
-#   nohup make tusk-bot > local_data/tusk-bot.log 2>&1 &
-# Ready at: "Nim binary control socket listening on 127.0.0.1:41118."
+# Run Tusk's embedded home policy in the foreground.
 tusk-bot:
-	@set -e; \
-	if [ ! -d "$(FORK)" ]; then \
-		echo "error: fork checkout missing: $(FORK) (see docs/coworld-fork.md)" >&2; exit 1; \
-	fi; \
-	if [ ! -f "$(WOW_ENV)" ]; then \
-		echo "error: missing $(WOW_ENV)" >&2; exit 1; \
-	fi; \
-	mkdir -p "$(TUSK_RUNTIME_DIR)"; \
-	cd "$(FORK)"; \
-	. "$(WOW_ENV)"; \
-	VANILLA_WOW_PLAYER_REALM_HOST=127.0.0.1 \
-	VANILLA_WOW_PLAYER_REALM_PORT=3724 \
-	VANILLA_WOW_PLAYER_USERNAME=$(TUSK_ACCOUNT) \
-	VANILLA_WOW_PLAYER_PASSWORD=$(TUSK_PASS) \
-	VANILLA_WOW_PLAYER_CHARACTER_NAME=$(TUSK_CHARACTER) \
-	VANILLA_WOW_PLAYER_CHARACTER_RACE=$(TUSK_RACE) \
-	VANILLA_WOW_PLAYER_CHARACTER_CLASS=$(TUSK_CLASS) \
-	VANILLA_WOW_PLAYER_CHARACTER_GENDER=$(TUSK_GENDER) \
-	VANILLA_WOW_PLAYER_AUTONOMOUS=0 \
-	WOW_SDK_NIM_RUNTIME_SLOT=$(TUSK_SLOT) \
-	WOW_SDK_NIM_RUNTIME_DIR=$(TUSK_RUNTIME_DIR) \
-	WOW_SDK_NIM_CONTROL_HOST=127.0.0.1 \
-	nim r player/reference_player/reference_player.nim --scenario=nim-control
+	$(call launch_home_seat,$(TUSK_CHARACTER),$(TUSK_ACCOUNT),$(TUSK_PASS))
 
 # ---------------------------------------------------------------------------
 # Beru — undead PRIEST (healer) for the 5-man cast (docs/personas/beru.md).
-# Same wire-create seat pattern. Slot 5 → :41119.
 BERU_ACCOUNT := shadow4
 BERU_PASS := shadow4
 BERU_CHARACTER := Beru
 BERU_RACE := undead
 BERU_CLASS := priest
 BERU_GENDER := male
-BERU_SLOT := 5
-BERU_RUNTIME_DIR := $(CURDIR)/local_data/nim-runtime-slot$(BERU_SLOT)
 
 beru-account:
 	@set -e; \
@@ -1095,67 +1036,59 @@ beru-account:
 		--apply; \
 	echo "account ready: $(BERU_ACCOUNT) / $(BERU_PASS)"
 
-# Foreground. Detach with:
-#   nohup make beru-bot > local_data/beru-bot.log 2>&1 &
-# Ready at: "Nim binary control socket listening on 127.0.0.1:41119."
+# Run Beru's embedded home policy in the foreground.
 beru-bot:
-	@set -e; \
-	if [ ! -d "$(FORK)" ]; then \
-		echo "error: fork checkout missing: $(FORK) (see docs/coworld-fork.md)" >&2; exit 1; \
-	fi; \
-	if [ ! -f "$(WOW_ENV)" ]; then \
-		echo "error: missing $(WOW_ENV)" >&2; exit 1; \
-	fi; \
-	mkdir -p "$(BERU_RUNTIME_DIR)"; \
-	cd "$(FORK)"; \
-	. "$(WOW_ENV)"; \
-	VANILLA_WOW_PLAYER_REALM_HOST=127.0.0.1 \
-	VANILLA_WOW_PLAYER_REALM_PORT=3724 \
-	VANILLA_WOW_PLAYER_USERNAME=$(BERU_ACCOUNT) \
-	VANILLA_WOW_PLAYER_PASSWORD=$(BERU_PASS) \
-	VANILLA_WOW_PLAYER_CHARACTER_NAME=$(BERU_CHARACTER) \
-	VANILLA_WOW_PLAYER_CHARACTER_RACE=$(BERU_RACE) \
-	VANILLA_WOW_PLAYER_CHARACTER_CLASS=$(BERU_CLASS) \
-	VANILLA_WOW_PLAYER_CHARACTER_GENDER=$(BERU_GENDER) \
-	VANILLA_WOW_PLAYER_AUTONOMOUS=0 \
-	WOW_SDK_NIM_RUNTIME_SLOT=$(BERU_SLOT) \
-	WOW_SDK_NIM_RUNTIME_DIR=$(BERU_RUNTIME_DIR) \
-	WOW_SDK_NIM_CONTROL_HOST=127.0.0.1 \
-	nim r player/reference_player/reference_player.nim --scenario=nim-control
+	$(call launch_home_seat,$(BERU_CHARACTER),$(BERU_ACCOUNT),$(BERU_PASS))
 
-# Rotate non-empty client/brain logs so restarts never clobber fair-play proof.
-# Creates local_data/audit/ for army_host fair-play JSONL.
-.PHONY: rotate-client-logs
-rotate-client-logs:
-	@mkdir -p "$(CURDIR)/local_data" "$(CURDIR)/local_data/brain-logs" "$(CURDIR)/local_data/audit"
-	@ts=$$(date -u +%Y%m%dT%H%M%SZ); \
-	for f in warlock-bot igris-bot tusk-bot beru-bot murist-bot botwarrior-bot; do \
-		p="$(CURDIR)/local_data/$$f.log"; \
-		if [ -s "$$p" ]; then mv "$$p" "$$p.$$ts"; echo "rotated $$f.log → $$f.log.$$ts"; fi; \
-	done; \
-	for p in "$(CURDIR)"/local_data/brain-logs/army-slot{2,3,4,5}.log \
-	         "$(CURDIR)"/local_data/brain-logs/grind-slot{2,3,4,5}.log; do \
-		if [ -s "$$p" ]; then mv "$$p" "$$p.$$ts"; echo "rotated $$(basename $$p)"; fi; \
+# Explicit bot lifecycle. These targets do not start or stop the persistent
+# realm and do not create accounts; character/server state stays untouched.
+shadowfel-start:
+	$(call start_home_seat,$(WARLOCK_CHARACTER),warlock-bot,0)
+igris-start:
+	$(call start_home_seat,$(IGRIS_CHARACTER),igris-bot,1)
+tusk-start:
+	$(call start_home_seat,$(TUSK_CHARACTER),tusk-bot,2)
+beru-start:
+	$(call start_home_seat,$(BERU_CHARACTER),beru-bot,3)
+
+shadowfel-stop:
+	$(call stop_home_seat,$(WARLOCK_CHARACTER))
+igris-stop:
+	$(call stop_home_seat,$(IGRIS_CHARACTER))
+tusk-stop:
+	$(call stop_home_seat,$(TUSK_CHARACTER))
+beru-stop:
+	$(call stop_home_seat,$(BERU_CHARACTER))
+
+home-army-start: shadowfel-start igris-start tusk-start beru-start
+	@echo "home army requested; use 'make home-army-status' while clients connect"
+
+home-army-stop: beru-stop tusk-stop igris-stop shadowfel-stop
+
+home-army-restart: home-army-stop home-army-start
+
+home-army-status:
+	@now=$$(date +%s); \
+	for seat in $(WARLOCK_CHARACTER) $(IGRIS_CHARACTER) $(TUSK_CHARACTER) $(BERU_CHARACTER); do \
+		seat_dir="$(HOME_ARMY_DIR)/$$seat"; pid_file="$$seat_dir/launcher.pid"; status_file="$$seat_dir/status/status.json"; \
+		state=stopped; detail=""; \
+		if [ -s "$$pid_file" ]; then \
+			pid=$$(cat "$$pid_file"); \
+			if kill -0 "$$pid" 2>/dev/null; then state=starting; detail="pid=$$pid"; \
+			else detail="stale_pid=$$pid"; fi; \
+		fi; \
+		if [ "$$state" = starting ] && [ -s "$$status_file" ]; then \
+			age=$$((now - $$(stat -c %Y "$$status_file"))); \
+			if [ $$age -le $(HOME_STATUS_MAX_AGE) ]; then \
+				state=running; mode=$$(jq -r '.bot.mode // "unknown"' "$$status_file" 2>/dev/null || echo unreadable); \
+				detail="$$detail mode=$$mode status_age=$${age}s"; \
+			else detail="$$detail stale_status=$${age}s"; fi; \
+		fi; \
+		printf '%-10s %-8s %s\n' "$$seat" "$$state" "$$detail"; \
 	done
 
-# Bring the full 5-man bot side online (accounts if needed + 4 headless seats).
-# Human (Murist) is still classic client. Does NOT start escort brains —
-# run `make escort-army` after seats print "listening".
-# Client logs are rotated first (append-only history for fair-play greps).
-party-army: rotate-client-logs
-	@set -e; \
-	$(MAKE) tusk-account; \
-	$(MAKE) beru-account; \
-	mkdir -p "$(CURDIR)/local_data/brain-logs" "$(CURDIR)/local_data/audit"; \
-	echo "starting headless seats (fork): Shadowfel:2 Igris:3 Tusk:4 Beru:5"; \
-	nohup $(MAKE) warlock-bot-fork > local_data/warlock-bot.log 2>&1 & echo $$! > local_data/brain-logs/warlock-bot.pid; \
-	nohup $(MAKE) igris-bot > local_data/igris-bot.log 2>&1 & echo $$! > local_data/brain-logs/igris-bot.pid; \
-	nohup $(MAKE) tusk-bot > local_data/tusk-bot.log 2>&1 & echo $$! > local_data/brain-logs/tusk-bot.pid; \
-	nohup $(MAKE) beru-bot > local_data/beru-bot.log 2>&1 & echo $$! > local_data/brain-logs/beru-bot.pid; \
-	echo "bot pids: $$(cat local_data/brain-logs/warlock-bot.pid) $$(cat local_data/brain-logs/igris-bot.pid) $$(cat local_data/brain-logs/tusk-bot.pid) $$(cat local_data/brain-logs/beru-bot.pid)"; \
-	echo "wait for :41116–:41119 listening, then: make escort-army"; \
-	echo "fair-play audit: local_data/audit/fair-play.jsonl (written by army_host)"; \
-	echo "invite order in-game (Murist): Shadowfel, Igris, Tusk, Beru"
+# Compatibility name retained for operators and The System.
+party-army: home-army-start
 
 # ---------------------------------------------------------------------------
 # Our fork of coworld-vanilla-wow (docs/coworld-fork.md): thin rebase layer

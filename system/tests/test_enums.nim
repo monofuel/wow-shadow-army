@@ -122,16 +122,16 @@ suite "classic 1.12 enums":
     check primaryPower(4, 0, 0, 80, 0) == (kind: "energy", cur: 80, max: 100)
     check primaryPower(9, 200, 0, 0, 300) == (kind: "mana", cur: 200, max: 300)
 
-  test "roster display order and seat ports":
+  test "roster display order and embedded seat compatibility ports":
     check rosterSortRank("Murist") < rosterSortRank("Shadowfel")
     check rosterSortRank("Shadowfel") < rosterSortRank("Igris")
     check rosterSortRank("Igris") < rosterSortRank("Tusk")
     check rosterSortRank("Tusk") < rosterSortRank("Beru")
     check rosterSortRank("Beru") < rosterSortRank("Cowcam")
-    check seatControlPort("Shadowfel") == 41116
-    check seatControlPort("Igris") == 41117
-    check seatControlPort("Tusk") == 41118
-    check seatControlPort("Beru") == 41119
+    check seatControlPort("Shadowfel") == 0
+    check seatControlPort("Igris") == 0
+    check seatControlPort("Tusk") == 0
+    check seatControlPort("Beru") == 0
     check seatControlPort("Murist") == 0
     var mixed = @[
       Character(name: "Beru", level: 1, life: "alive", online: true),

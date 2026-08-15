@@ -45,6 +45,9 @@ ShadowArmyQuestData = {
     objectives = {
       { label = "Mindless Zombie", kind = "mob", count = 8,
         spots = { {zone = 85, x = 43.2, y = 61.7}, ... } },
+      { label = "Darkhound Blood", kind = "item", count = 5,
+        from = { "Cursed Darkhound", "Decrepit Darkhound" },
+        spots = { {zone = 85, x = 62.8, y = 38.1}, ... } },
     },
     turnIn    = { label = "Shadow Priest Sarvis", zone = 85, x = 30.8, y = 66.2 },
     startedBy = { label = "Undertaker Mordo",     zone = 85, x = 30.2, y = 71.7 },
@@ -57,7 +60,14 @@ ShadowArmyQuestData = {
 - `zone` is an `AreaTable` zone id; `x`/`y` are zone-normalized percent — the
   same space `GetPlayerMapPosition` returns, multiplied by 100.
 - `kind` is `"mob"`, `"object"` or `"item"`.
+- `from` names who to hunt for an item objective — the densest in-zone
+  sources (up to 4, selected by spawn-point count, NOT drop rate), emitted
+  alphabetically for a stable file; do not read `from[1]` as "best".
+  Omitted when it would add nothing: mob-kill objectives never carry it (their
+  `label` *is* the enemy), nor does an item whose only source shares its name.
 - Quests with nothing locatable are omitted entirely rather than emitted empty.
+- Same-title quests carry their other variants in an `alts` list on the
+  primary entry (same shape, nested once) — see title collisions below.
 
 ## Coordinate conversion (verified, not assumed)
 
@@ -173,10 +183,14 @@ filters on it, and templates with several patch rows resolve to the highest
   entrance* coordinates.
 - **Title collisions.** The quest log gives titles, not ids, and 1344 locatable
   quests share a title with an earlier one (faction mirrors, "Wanted!" bounty
-  boards, class quests keyed by race). The lower-level quest wins, so the
-  Alliance twin of a shared title can shadow the Horde one. Fix path: the addon
-  *can* see zone headers while walking the quest log, so a later contract rev
-  could key on `(title, zone)`.
+  boards, chain steps like Fields of Grief 365→407, class quests keyed by
+  race). The lower-level quest is the primary entry and every other variant is
+  emitted under its `alts` list (same shape, nested once). The addon's
+  `QuestModel.resolve` picks the variant whose objective labels match the live
+  leaderboard text — a variant scores +2 per matched label and -1 per label
+  the log does not show, so a delivery sequel with no tracked objectives beats
+  a gather part 1 once the log stops showing gather lines. Ties keep the
+  primary.
 - **Items with no locatable source** (~1103 objectives): crafted, vendor-bought,
   handed out by scripts/spells, or produced by quest-object interactions that
   do not go through a loot template.

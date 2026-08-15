@@ -120,15 +120,15 @@ const
   ## Named game_tele destination (mangos.game_tele / `lookup tele death`).
   ## Safe valley floor near Deathknell undead start — not NightWebsHollow.
   ShadowArmyRespawnTele* = "Deathknell"
-  ## Base nim_control port: slot N listens on 41114 + N (docs/control-plane.md).
-  NimControlBasePort = 41114
-  ## Bot seat launch map: seat name → Makefile seat target (slot = control
-  ## port offset, matching seatControlPort). Murist is human — never listed.
+  ## A seat heartbeat older than this is not considered a live policy.
+  HomeBotStatusMaxAgeSec = 30.0
+  ## Bot seat lifecycle maps to the canonical Makefile targets. Murist is
+  ## human-controlled and is intentionally never listed.
   SeatMakeTargets* = [
-    (name: "Shadowfel", target: "warlock-bot", slot: 2),
-    (name: "Igris", target: "igris-bot", slot: 3),
-    (name: "Tusk", target: "tusk-bot", slot: 4),
-    (name: "Beru", target: "beru-bot", slot: 5)
+    (name: "Shadowfel", startTarget: "shadowfel-start", stopTarget: "shadowfel-stop"),
+    (name: "Igris", startTarget: "igris-start", stopTarget: "igris-stop"),
+    (name: "Tusk", startTarget: "tusk-start", stopTarget: "tusk-stop"),
+    (name: "Beru", startTarget: "beru-start", stopTarget: "beru-stop")
   ]
   ## SELECT-only projection of characters (VMaNGOS schema) + xp bar + life/zone + HP/MP + pos.
   ## `xp` is progress into the current level; next-level threshold joins
@@ -233,9 +233,9 @@ type
     zoneName*: string ## mangos.area_template.name, or Zone#N fallback
     mapId*: int ## characters.map (0 EK, 1 Kalimdor, …)
     posX*, posY*, posZ*: float ## characters.position_*
-    ## nim_control socket for known bot seats (0 = none / human / unknown).
+    ## Retained API field. Embedded home bots do not expose a TCP control port.
     controlPort*: int
-    ## True when controlPort is listening on 127.0.0.1 (seat client up).
+    ## True when the seat PID is alive and its Lua status heartbeat is fresh.
     controlUp*: bool
 
   AddonEvent* = object
@@ -1064,14 +1064,10 @@ proc parseRosterTsv*(tsv: string): seq[Character] =
     ))
 
 proc seatControlPort*(name: string): int =
-  ## nim_control port for a known bot seat, or 0 if none.
-  ## Slot map: 2=Shadowfel, 3=Igris, 4=Tusk, 5=Beru (Makefile / control-plane).
-  case name
-  of "Shadowfel": NimControlBasePort + 2
-  of "Igris": NimControlBasePort + 3
-  of "Tusk": NimControlBasePort + 4
-  of "Beru": NimControlBasePort + 5
-  else: 0
+  ## Compatibility field for API consumers. The embedded Lua seats have no
+  ## control socket; their liveness comes from PID + status heartbeat files.
+  discard name
+  result = 0
 
 proc isTcpPortOpen*(host: string, port: int, timeoutMs = 80): bool =
   ## True when a TCP connect to host:port succeeds within timeoutMs.
@@ -1088,15 +1084,13 @@ proc isTcpPortOpen*(host: string, port: int, timeoutMs = 80): bool =
     if sock != nil:
       sock.close()
 
+proc seatRuntimeUp*(name: string): bool
+
 proc enrichControlPlane*(characters: var seq[Character]) =
-  ## Fill controlPort / controlUp for known bot seats (local sockets only).
+  ## Fill compatibility control fields from the embedded Lua seat runtime.
   for i in 0 ..< characters.len:
-    let port = seatControlPort(characters[i].name)
-    characters[i].controlPort = port
-    if port > 0:
-      characters[i].controlUp = isTcpPortOpen("127.0.0.1", port)
-    else:
-      characters[i].controlUp = false
+    characters[i].controlPort = 0
+    characters[i].controlUp = seatRuntimeUp(characters[i].name)
 
 proc rosterSortRank*(name: string): int =
   ## Stable party order: Murist → Shadowfel → Igris → Tusk → Beru → rest A–Z.
@@ -1937,11 +1931,52 @@ proc startServerOpWorker() =
 # ---------------------------------------------------------------------------
 
 proc seatMakeTarget*(name: string): string =
-  ## Makefile seat target for a bot seat, or "" (human / unknown).
+  ## Makefile start target for a bot seat, or "" (human / unknown).
   for seat in SeatMakeTargets:
     if seat.name == name:
-      return seat.target
+      return seat.startTarget
   result = ""
+
+proc seatStopTarget*(name: string): string =
+  ## Makefile stop target for a bot seat, or "" (human / unknown).
+  for seat in SeatMakeTargets:
+    if seat.name == name:
+      return seat.stopTarget
+  result = ""
+
+proc seatRuntimeDir*(name: string): string =
+  armyRoot() / "local_data" / "home-army" / name
+
+proc seatPidPath*(name: string): string =
+  seatRuntimeDir(name) / "launcher.pid"
+
+proc seatStatusPath*(name: string): string =
+  seatRuntimeDir(name) / "status" / "status.json"
+
+proc seatPidAlive*(name: string): bool =
+  if seatMakeTarget(name).len == 0:
+    return false
+  var pid = 0
+  try:
+    if fileExists(seatPidPath(name)):
+      pid = parseInt(readFile(seatPidPath(name)).strip().splitLines()[0])
+  except CatchableError:
+    pid = 0
+  result = pid > 0 and dirExists("/proc/" & $pid)
+
+proc seatRuntimeUp*(name: string): bool =
+  ## A live home policy needs both its launcher process and a current per-frame
+  ## heartbeat. This detects wedged clients that a PID-only check would miss.
+  if not seatPidAlive(name):
+    return false
+  try:
+    let statusPath = seatStatusPath(name)
+    if not fileExists(statusPath):
+      return false
+    let age = epochTime() - getLastModificationTime(statusPath).toUnixFloat()
+    result = age >= -2.0 and age <= HomeBotStatusMaxAgeSec
+  except CatchableError:
+    result = false
 
 proc runShell(cmd: string): tuple[ok: bool, detail: string] =
   ## Run one shell line, capture combined output (short admin ops only).
@@ -1985,49 +2020,46 @@ proc runShellDetached(cmd: string): tuple[ok: bool, detail: string] =
     result = (ok: false, detail: e.msg)
 
 proc startBotSeat*(name: string): JsonNode =
-  ## Launch one bot seat: detached `make <seat>-bot` appending to its
-  ## local_data log (the documented nohup pattern). Ready when the seat's
-  ## nim_control socket (41114+slot) starts listening — the roster poll
-  ## flips the button on its own.
+  ## Request one embedded Lua seat through the Makefile lifecycle. The target
+  ## detaches the launcher and records its PID/log/status under home-army/.
   let target = seatMakeTarget(name)
   if target.len == 0:
     return %*{"ok": false, "name": name, "action": "start",
               "detail": "not a launchable bot seat"}
-  let port = seatControlPort(name)
-  if isTcpPortOpen("127.0.0.1", port):
+  if seatRuntimeUp(name):
     return %*{"ok": true, "name": name, "action": "start",
-              "detail": &"already running (ctrl :{port})"}
+              "detail": "already running (fresh Lua heartbeat)"}
+  if seatPidAlive(name):
+    return %*{"ok": true, "name": name, "action": "start",
+              "detail": "launcher is already starting or its Lua heartbeat is stale; stop it before retrying"}
   let root = armyRoot()
   if not fileExists(root / "Makefile"):
     return %*{"ok": false, "name": name, "action": "start",
               "detail": &"Makefile missing in {root} — set SYSTEM_ARMY_DIR"}
-  let log = root / "local_data" / (target & ".log")
-  # The ( … & ) subshell orphans the seat to init immediately — without it the
-  # launching shell lives as make's parent holding our output pipe open, which
-  # blocks the HTTP worker for the bot's entire lifetime.
-  let r = runShell(
-    &"mkdir -p '{root}/local_data' && ( setsid nohup make -C '{root}' {target} >> '{log}' 2>&1 < /dev/null & )")
+  let r = runShell(&"make -C {quoteShell(root)} {quoteShell(target)}")
   if not r.ok:
     return %*{"ok": false, "name": name, "action": "start", "detail": r.detail}
   result = %*{"ok": true, "name": name, "action": "start",
-              "detail": &"launched make {target} (log: local_data/{target}.log; ctrl :{port} when ready)"}
+              "detail": &"requested {target}; ready when the Lua heartbeat is fresh"}
 
 proc stopBotSeat*(name: string): JsonNode =
-  ## Stop one bot seat: TERM whoever holds the seat's nim_control port.
-  ## The reference_player logs out; its parent make/nohup exits with it.
-  let target = seatMakeTarget(name)
+  ## Stop one embedded Lua seat through the same Makefile lifecycle.
+  let target = seatStopTarget(name)
   if target.len == 0:
     return %*{"ok": false, "name": name, "action": "stop",
               "detail": "not a launchable bot seat"}
-  let port = seatControlPort(name)
-  if not isTcpPortOpen("127.0.0.1", port):
+  if not seatPidAlive(name):
     return %*{"ok": true, "name": name, "action": "stop",
-              "detail": "already stopped (no ctrl listener)"}
-  let r = runShell(&"lsof -ti tcp:{port} | xargs -r kill")
+              "detail": "already stopped"}
+  let root = armyRoot()
+  if not fileExists(root / "Makefile"):
+    return %*{"ok": false, "name": name, "action": "stop",
+              "detail": &"Makefile missing in {root} — set SYSTEM_ARMY_DIR"}
+  let r = runShell(&"make -C {quoteShell(root)} {quoteShell(target)}")
   if not r.ok:
     return %*{"ok": false, "name": name, "action": "stop", "detail": r.detail}
   result = %*{"ok": true, "name": name, "action": "stop",
-              "detail": &"sent TERM to ctrl :{port} holder"}
+              "detail": &"requested {target}"}
 
 # ---------------------------------------------------------------------------
 # Traverse detached ops: Lua proof-of-life + local watch_bots observer
@@ -3448,22 +3480,22 @@ proc renderPosCell*(s: Character): string =
   result = &"""<span class="pos" title="{escapeHtml(title)}">{escapeHtml(label)}</span>"""
 
 proc renderSeatCell*(s: Character): string =
-  ## Realm connection as a terse On/Off. Port/ctrl detail lives in the
-  ## tooltip only — it blew out table rows and duplicated the Bot column.
+  ## Realm connection as a terse On/Off. Bot runtime detail stays in the
+  ## tooltip so it does not duplicate the Bot column.
   let net = if s.online: "On" else: "Off"
   let netCls = if s.online: "online" else: "offline"
   let title =
-    if s.controlPort <= 0:
+    if seatMakeTarget(s.name).len == 0:
       "human seat"
     elif s.controlUp:
-      &"nim_control listening on 127.0.0.1:{s.controlPort}"
+      "embedded Lua policy heartbeat is fresh"
     else:
-      &"seat slot port {s.controlPort} (not listening)"
+      "embedded Lua policy is stopped, starting, or stale"
   result = &"""<span class="seat-net {netCls}" title="{escapeHtml(title)}">{escapeHtml(net)}</span>"""
 
 proc renderBotCell*(s: Character): string =
   ## Per-seat Start/Stop button for launchable bot seats ("—" otherwise).
-  ## controlUp is the truth signal: socket up = seat process alive.
+  ## controlUp is the truth signal: PID alive + Lua heartbeat fresh.
   if seatMakeTarget(s.name).len == 0:
     return """<span class="xp-muted">—</span>"""
   if s.controlUp:
@@ -3486,7 +3518,7 @@ proc renderBotCell*(s: Character): string =
 
 proc armySummary*(characters: seq[Character]): string =
   ## One-line army health strip for the roster panel head.
-  var online, alive, ghost, dead, ctrlUp, ctrlKnown = 0
+  var online, alive, ghost, dead, botsUp, botsKnown = 0
   for s in characters:
     if s.online: inc online
     case s.life
@@ -3494,12 +3526,12 @@ proc armySummary*(characters: seq[Character]): string =
     of "ghost": inc ghost
     of "dead": inc dead
     else: discard
-    if s.controlPort > 0:
-      inc ctrlKnown
-      if s.controlUp: inc ctrlUp
+    if seatMakeTarget(s.name).len > 0:
+      inc botsKnown
+      if s.controlUp: inc botsUp
   result = &"{online} online · {alive} alive · {ghost} ghost · {dead} dead"
-  if ctrlKnown > 0:
-    result.add(&" · ctrl {ctrlUp}/{ctrlKnown}")
+  if botsKnown > 0:
+    result.add(&" · bots {botsUp}/{botsKnown}")
 
 proc renderRosterRows*(characters: seq[Character]): string =
   ## htmx partial: `<tr>` rows for the roster table body.
@@ -5151,7 +5183,7 @@ proc registerMcpTools(server: McpServer) =
 
   let startBotTool = McpTool(
     name: "start_bot",
-    description: "Launch one bot seat (detached `make <seat>-bot`). Seat is ready when its nim_control socket (41114+slot) listens; check list_characters control_up.",
+    description: "Launch one embedded Lua home bot. The Make lifecycle detaches it; list_characters control_up becomes true when its PID is alive and status heartbeat is fresh.",
     inputSchema: botNameSchema
   )
 
@@ -5169,7 +5201,7 @@ proc registerMcpTools(server: McpServer) =
 
   let stopBotTool = McpTool(
     name: "stop_bot",
-    description: "Stop one bot seat (TERM the nim_control socket holder; the client logs out).",
+    description: "Stop one embedded Lua home bot through its Make lifecycle target; the client receives TERM and logs out.",
     inputSchema: botNameSchema
   )
 
