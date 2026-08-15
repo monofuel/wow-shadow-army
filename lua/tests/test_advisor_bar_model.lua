@@ -135,4 +135,22 @@ check(#plan.place == #order or plan.shelfFull,
 check(#model.plan({}, managed, {}).place == 0,
   "no shelf order, no placement — a hash set has no stable fill order")
 
+-- r44's unreadable-bar bug parked duplicate copies on the shelf (the sweep
+-- could not read its own placements, so every run re-placed them). Once the
+-- bar reads again, the same name in two shelf slots must simply stop the
+-- placement, not crash and not remove anything: `kept` is a set.
+plan = model.plan({
+  [109] = "Curse of Agony", [110] = "Curse of Agony",
+  [111] = "Summon Imp", [112] = "Summon Imp", [113] = "Summon Imp",
+}, managed, { order = order, trained = trained,
+  occupied = { [109] = true, [110] = true, [111] = true,
+    [112] = true, [113] = true } })
+check(#plan.remove == 0, "duplicate shelf copies are never removed")
+placedNames = {}
+for _, entry in ipairs(plan.place) do placedNames[entry.name] = entry.slot end
+check(not placedNames["curse of agony"] and not placedNames["summon imp"],
+  "a spell duplicated across two shelf slots is not placed a third time")
+check(not plan.shelfFull,
+  "duplicates left by a broken sweep do not report the shelf full")
+
 print("test_advisor_bar_model: " .. passed .. " checks passed")

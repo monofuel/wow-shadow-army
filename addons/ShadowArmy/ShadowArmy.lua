@@ -351,6 +351,351 @@ end
 ShadowArmy.questModel = QuestModel
 
 --------------------------------------------------------------------------
+-- Pure route model (r45): google-maps pathing over the generated road
+-- polylines (RoadData.lua, tools/gen_road_data.py). Roads are freeways —
+-- fewer patrols, fewer adds, fewer corpse runs — so a road yard is CHEAPER
+-- than an off-road yard and the search happily walks extra distance to use
+-- one. Everything here is percent-space arithmetic over plain tables: no WoW
+-- API, no frames, no globals, so lua/tests exercises it on host Lua and the
+-- bots can reuse the same primitive for quest pathing later.
+--
+-- Coordinates are zone-normalized percent, the space GetPlayerMapPosition
+-- and QuestData already speak. Distances are therefore percent-space
+-- euclidean, not yards: a vanilla zone is wider than it is tall (~3:2), so a
+-- percent of x is more yards than a percent of y. Every comparison in here is
+-- between two numbers in that same space, so the anisotropy cancels out of
+-- the decisions and only shows up as a mild preference for north-south road
+-- legs — cheap to live with, and it keeps the model unit-free.
+--------------------------------------------------------------------------
+
+-- Scoped so its private helpers release their slots at `end`: Lua 5.0 caps a
+-- function (the addon file itself counts) at 200 live locals, and this file
+-- is a long way down that budget already.
+do
+  local RouteModel = {}
+
+  -- Same Lua 5.0/5.3 dance as questGetn.
+  local function routeGetn(t)
+    local n = 0
+    while t[n + 1] ~= nil do n = n + 1 end
+    return n
+  end
+
+  -- Points from DIFFERENT polylines closer than this are the same junction. The
+  -- bake cuts a road wherever the mask breaks (bridges, crossings, zone borders),
+  -- so without this the network is a pile of disconnected sticks.
+  RouteModel.junctionDist = 1.5
+  -- Off-road yards cost this much more than road yards. 1.0 would make roads
+  -- irrelevant; the higher it goes the more detour the router accepts to reach
+  -- one.
+  RouteModel.offRoadPenalty = 1.6
+  -- Dijkstra settle cap. A zone graph is a few hundred nodes, so hitting this
+  -- means something is wrong with the data, and a stuck advisor is worse than a
+  -- straight line.
+  RouteModel.nodeBudget = 3000
+  -- "The road is further away than the thing I want" — skip routing entirely.
+  RouteModel.shortHopFactor = 1.25
+  -- Lookahead for the "go" bearing: the first route point this far ahead.
+  RouteModel.leadPct = 1.0
+  -- Two waypoints closer than this are one waypoint.
+  RouteModel.epsilon = 0.05
+
+  local function routeDist(ax, ay, bx, by)
+    local dx, dy = ax - bx, ay - by
+    return math.sqrt(dx * dx + dy * dy)
+  end
+
+  local function routeKey(cx, cy)
+    return cx .. ":" .. cy
+  end
+
+  local function routeEdge(graph, a, b)
+    local w = routeDist(graph.nodes[a].x, graph.nodes[a].y,
+                        graph.nodes[b].x, graph.nodes[b].y)
+    local la = graph.adj[a]
+    la[routeGetn(la) + 1] = { to = b, w = w }
+    local lb = graph.adj[b]
+    lb[routeGetn(lb) + 1] = { to = a, w = w }
+  end
+
+  -- zoneSegments is one zone's entry from ShadowArmyRoadData: an array of flat
+  -- {x1,y1,x2,y2,...} polylines. The result is a plain adjacency graph; build it
+  -- once per zone and cache it, because this is the only expensive call here.
+  function RouteModel.build(zoneSegments, opts)
+    opts = opts or {}
+    local join = opts.junctionDist or RouteModel.junctionDist
+    local graph = { nodes = {}, adj = {}, n = 0, cell = join, grid = {} }
+    if not zoneSegments then return graph end
+
+    local nodes, adj, grid = graph.nodes, graph.adj, graph.grid
+    local nn = 0
+    local si = 1
+    local nSeg = routeGetn(zoneSegments)
+    while si <= nSeg do
+      local flat = zoneSegments[si]
+      local nf = routeGetn(flat)
+      local prev = nil
+      local fi = 1
+      while fi + 1 <= nf do
+        local x, y = flat[fi], flat[fi + 1]
+        nn = nn + 1
+        nodes[nn] = { x = x, y = y, seg = si }
+        adj[nn] = {}
+        local key = routeKey(math.floor(x / join), math.floor(y / join))
+        local bucket = grid[key]
+        if not bucket then bucket = {}; grid[key] = bucket end
+        bucket[routeGetn(bucket) + 1] = nn
+        graph.n = nn
+        if prev then routeEdge(graph, prev, nn) end
+        prev = nn
+        fi = fi + 2
+      end
+      si = si + 1
+    end
+
+    -- Junction pass. The spatial hash keeps this linear-ish: only the 3x3 cell
+    -- neighbourhood can hold a point within `join`, so a dense zone does not
+    -- turn a zone change into a visible hitch.
+    local i = 1
+    while i <= nn do
+      local a = nodes[i]
+      local cx = math.floor(a.x / join)
+      local cy = math.floor(a.y / join)
+      local ox = -1
+      while ox <= 1 do
+        local oy = -1
+        while oy <= 1 do
+          local bucket = grid[routeKey(cx + ox, cy + oy)]
+          if bucket then
+            local bi = 1
+            local nb = routeGetn(bucket)
+            while bi <= nb do
+              local j = bucket[bi]
+              -- j > i emits each pair once; different seg only, because points
+              -- inside one polyline are already chained.
+              if j > i and nodes[j].seg ~= a.seg
+                  and routeDist(a.x, a.y, nodes[j].x, nodes[j].y) <= join then
+                routeEdge(graph, i, j)
+              end
+              bi = bi + 1
+            end
+          end
+          oy = oy + 1
+        end
+        ox = ox + 1
+      end
+      i = i + 1
+    end
+    return graph
+  end
+
+  -- Nearest graph node to a point. A zone tops out around 300 nodes, so the
+  -- straight scan is both faster and more predictable than a ring search, and it
+  -- always returns the lowest index on a tie (determinism).
+  local function routeNearest(graph, x, y)
+    local best, bestD = nil, nil
+    local i = 1
+    while i <= graph.n do
+      local nd = graph.nodes[i]
+      local d = routeDist(x, y, nd.x, nd.y)
+      if bestD == nil or d < bestD then best, bestD = i, d end
+      i = i + 1
+    end
+    return best, bestD
+  end
+
+  -- Binary min-heap over node indices. Ties break on the lower node index so two
+  -- equal-cost paths always resolve the same way.
+  local function routeHeapLess(h, a, b)
+    if h.cost[a] ~= h.cost[b] then return h.cost[a] < h.cost[b] end
+    return h.node[a] < h.node[b]
+  end
+
+  local function routeHeapPush(h, node, cost)
+    local n = h.n + 1
+    h.n = n
+    h.node[n] = node
+    h.cost[n] = cost
+    while n > 1 do
+      local p = math.floor(n / 2)
+      if not routeHeapLess(h, n, p) then break end
+      h.node[p], h.node[n] = h.node[n], h.node[p]
+      h.cost[p], h.cost[n] = h.cost[n], h.cost[p]
+      n = p
+    end
+  end
+
+  local function routeHeapPop(h)
+    if h.n == 0 then return nil end
+    local top = h.node[1]
+    h.node[1], h.cost[1] = h.node[h.n], h.cost[h.n]
+    h.node[h.n], h.cost[h.n] = nil, nil
+    h.n = h.n - 1
+    local i = 1
+    local stop = false
+    while not stop do
+      local l, r = i * 2, i * 2 + 1
+      local best = i
+      if l <= h.n and routeHeapLess(h, l, best) then best = l end
+      if r <= h.n and routeHeapLess(h, r, best) then best = r end
+      if best == i then
+        stop = true
+      else
+        h.node[best], h.node[i] = h.node[i], h.node[best]
+        h.cost[best], h.cost[i] = h.cost[i], h.cost[best]
+        i = best
+      end
+    end
+    return top
+  end
+
+  local function routeAppend(pts, x, y, eps)
+    local n = routeGetn(pts)
+    if n > 0 and routeDist(pts[n].x, pts[n].y, x, y) < eps then return end
+    pts[n + 1] = { x = x, y = y }
+  end
+
+  -- route(graph, start, goal) -> waypoints, meta
+  --   waypoints : { {x=,y=}, ... } always at least start and goal
+  --   meta      : { straight = bool, reason = string, cost, length, nodes }
+  -- Never errors and never returns nil: every failure mode (no data, budget
+  -- overflow, disconnected road network, a road that would not actually help)
+  -- degrades to the two-point straight line the advisor drew before roads
+  -- existed.
+  function RouteModel.route(graph, start, goal, opts)
+    opts = opts or {}
+    local penalty = opts.penalty or RouteModel.offRoadPenalty
+    local budget = opts.nodeBudget or RouteModel.nodeBudget
+    local shortHop = opts.shortHopFactor or RouteModel.shortHopFactor
+    local eps = opts.epsilon or RouteModel.epsilon
+    local sx, sy = start.x, start.y
+    local gx, gy = goal.x, goal.y
+    local straightLen = routeDist(sx, sy, gx, gy)
+
+    local function bail(reason)
+      local pts = {}
+      routeAppend(pts, sx, sy, eps)
+      routeAppend(pts, gx, gy, eps)
+      return pts, {
+        straight = true, reason = reason,
+        length = straightLen, cost = straightLen * penalty, nodes = 0,
+      }
+    end
+
+    if not graph or (graph.n or 0) < 2 then return bail("no-roads") end
+    local entry, dEntry = routeNearest(graph, sx, sy)
+    local goalNode, dExit = routeNearest(graph, gx, gy)
+    if not entry or not goalNode then return bail("no-roads") end
+    -- The goal is closer than the nearest tarmac: walking to a road to walk back
+    -- is exactly the detour nobody wants.
+    if straightLen <= dEntry * shortHop then return bail("short-hop") end
+    -- Even a free road cannot beat the straight line once both off-road legs
+    -- already cost more than the whole trip.
+    if straightLen <= dEntry + dExit then return bail("short-hop") end
+
+    local dist, prev, done = {}, {}, {}
+    local h = { n = 0, node = {}, cost = {} }
+    dist[entry] = 0
+    routeHeapPush(h, entry, 0)
+    local settled, reached, overflow = 0, false, false
+    while h.n > 0 and not reached and not overflow do
+      local u = routeHeapPop(h)
+      if not done[u] then
+        done[u] = true
+        settled = settled + 1
+        if settled > budget then
+          overflow = true
+        elseif u == goalNode then
+          reached = true
+        else
+          local es = graph.adj[u]
+          local ei = 1
+          local ne = routeGetn(es)
+          while ei <= ne do
+            local e = es[ei]
+            local nd = dist[u] + e.w
+            if dist[e.to] == nil or nd < dist[e.to] then
+              dist[e.to] = nd
+              prev[e.to] = u
+              routeHeapPush(h, e.to, nd)
+            end
+            ei = ei + 1
+          end
+        end
+      end
+    end
+    if overflow then return bail("budget") end
+    if not reached then return bail("disconnected") end
+
+    local roadCost = dist[goalNode]
+    local total = (dEntry + dExit) * penalty + roadCost
+    if total >= straightLen * penalty then return bail("straight-cheaper") end
+
+    -- Walk prev back to the entry node; the guard is belt-and-braces against a
+    -- malformed graph, since Dijkstra's tree cannot contain a cycle.
+    local back, nb = {}, 0
+    local u = goalNode
+    while u and nb <= graph.n do
+      nb = nb + 1
+      back[nb] = u
+      if u == entry then u = nil else u = prev[u] end
+    end
+    if back[nb] ~= entry then return bail("no-path") end
+
+    local pts = {}
+    routeAppend(pts, sx, sy, eps)
+    local i = nb
+    while i >= 1 do
+      local nd = graph.nodes[back[i]]
+      routeAppend(pts, nd.x, nd.y, eps)
+      i = i - 1
+    end
+    routeAppend(pts, gx, gy, eps)
+
+    local length = 0
+    i = 2
+    local np = routeGetn(pts)
+    while i <= np do
+      length = length + routeDist(pts[i - 1].x, pts[i - 1].y, pts[i].x, pts[i].y)
+      i = i + 1
+    end
+    return pts, {
+      straight = false, reason = "road",
+      length = length, cost = total, nodes = settled,
+    }
+  end
+
+  -- The point to actually face right now: snap to the nearest route point, then
+  -- walk FORWARD along the path until `lead` percent of route is behind us.
+  -- Measuring progress along the route rather than as-the-crow-flies is what
+  -- stops a player standing just past a waypoint from being told to turn around
+  -- and walk back to it.
+  function RouteModel.nextPoint(pts, x, y, lead)
+    if not pts then return nil end
+    local n = routeGetn(pts)
+    if n < 2 then return nil end
+    lead = lead or RouteModel.leadPct
+    local near, nearD = 1, nil
+    local i = 1
+    while i <= n do
+      local d = routeDist(x, y, pts[i].x, pts[i].y)
+      if nearD == nil or d < nearD then near, nearD = i, d end
+      i = i + 1
+    end
+    local acc = 0
+    i = near + 1
+    while i <= n do
+      acc = acc + routeDist(pts[i - 1].x, pts[i - 1].y, pts[i].x, pts[i].y)
+      if acc > lead then return pts[i].x, pts[i].y, i end
+      i = i + 1
+    end
+    return pts[n].x, pts[n].y, n
+  end
+
+  ShadowArmy.routeModel = RouteModel
+end
+
+--------------------------------------------------------------------------
 -- Pure combat-coach model. Like QuestModel, this stays above the WoW UI
 -- guard so ordinary Lua tests can exercise priorities and error handling.
 -- The live adapter below supplies only facts exposed by the 1.12 API.
@@ -459,18 +804,84 @@ local function combatAdd(snapshot, result, id, want, idleReason)
   return row
 end
 
+-- r46 (ticket 0041): resource policy is denominated in CASTS, not percent.
+-- The old percent gates opened a dead band — at 272 max mana, "bolt only above
+-- 35%" is ~95 mana against a 40-mana Shadow Bolt, so 20-35% mana neither bolted
+-- ("save mana") nor tapped ("mana OK") and the coach fell through to melee.
+-- The band widens as max mana grows, so the constants cannot be retuned; the
+-- gates must read actual cost.
+--
+-- CONSTRAINT: these percent numbers are the FALLBACK ONLY. `snapshot.costs` is
+-- built from spellbook tooltips (F.spellCost), which can legitimately come back
+-- empty — a tooltip that will not populate, a spell the sweep has not seen yet.
+-- When a cost (or `snapshot.power`) is missing, the affected gate degrades to
+-- exactly the pre-r46 percent behavior below. It must never degrade to
+-- "always recommend": suggesting an unaffordable cast every tick is a worse
+-- failure than the dead band this ticket closes.
+CombatModel.percentGates = {
+  shadowbolt = 35,
+  immolate = 45,
+  lifetap = 20,
+  wrath = 30,
+}
+
+-- Mana cost of an action id, or nil when cost data is unavailable.
+local function combatCost(snapshot, id)
+  local costs = snapshot.costs
+  local cost = costs and costs[id] or nil
+  if type(cost) ~= "number" then return nil end
+  return cost
+end
+
+-- true/false when castability is known, nil when it is not (caller falls back).
+local function combatCanAfford(snapshot, id)
+  local cost = combatCost(snapshot, id)
+  if cost == nil then return nil end
+  if type(snapshot.power) ~= "number" then return nil end
+  return snapshot.power >= cost
+end
+
 local function combatWarlock(snapshot, result)
   local hp = snapshot.hpPct or 100
   local mana = snapshot.powerPct or 100
   local targetHp = snapshot.targetHpPct or 100
   local actions = snapshot.actions or {}
+  local gates = CombatModel.percentGates
+
+  -- Shadow Bolt is the unit of account: it is the filler, so "can I still
+  -- bolt?" is what decides both the nuke gate and when tapping starts.
+  local boltOK = combatCanAfford(snapshot, "shadowbolt")
+  local boltWant, boltReason
+  if boltOK ~= nil then
+    boltWant = boltOK
+    if boltOK then boltReason = "nuke" else boltReason = "not enough mana" end
+  else
+    boltWant = mana > gates.shadowbolt
+    if boltWant then boltReason = "nuke" else boltReason = "save mana" end
+  end
+
+  -- Immolate keeps one bolt in reserve so a long cast cannot strand the
+  -- rotation with no filler left.
+  local boltCost, immoCost = combatCost(snapshot, "shadowbolt"), combatCost(snapshot, "immolate")
+  local immoAfford, immoBlocked
+  if boltCost and immoCost and type(snapshot.power) == "number" then
+    immoAfford = snapshot.power >= immoCost + boltCost
+    immoBlocked = "bolt reserve"
+  else
+    immoAfford = mana > gates.immolate
+    immoBlocked = "mana reserve"
+  end
+
+  -- Life Tap turns on exactly where bolting turns off: no gap, no overlap.
+  local tapNeeded
+  if boltOK ~= nil then tapNeeded = not boltOK else tapNeeded = mana < gates.lifetap end
 
   combatAdd(snapshot, result, "drainlife", hp <= 45, hp <= 45 and "recover health" or "health OK")
   combatAdd(snapshot, result, "fear", snapshot.danger and hp < 50,
     snapshot.danger and "defensive option" or "defensive")
   combatAdd(snapshot, result, "lifetap",
-    snapshot.hostile and mana < 20 and hp > 65,
-    (hp <= 65 and mana < 20) and "health too low" or "mana OK")
+    snapshot.hostile and tapNeeded and hp > 65,
+    (hp <= 65 and tapNeeded) and "health too low" or "mana OK")
   combatAdd(snapshot, result, "corruption",
     snapshot.hostile and not (actions.corruption and actions.corruption.debuff),
     (actions.corruption and actions.corruption.debuff) and "already up" or "DoT")
@@ -478,11 +889,11 @@ local function combatWarlock(snapshot, result)
     snapshot.hostile and targetHp > 50 and not (actions.agony and actions.agony.debuff),
     targetHp <= 50 and "target low" or ((actions.agony and actions.agony.debuff) and "already up" or "curse"))
   combatAdd(snapshot, result, "immolate",
-    snapshot.hostile and targetHp > 65 and mana > 45
+    snapshot.hostile and targetHp > 65 and immoAfford
       and not (actions.immolate and actions.immolate.debuff),
-    targetHp <= 65 and "target low" or ((actions.immolate and actions.immolate.debuff) and "already up" or "mana reserve"))
-  combatAdd(snapshot, result, "shadowbolt", snapshot.hostile and mana > 35,
-    mana <= 35 and "save mana" or "nuke")
+    targetHp <= 65 and "target low" or ((actions.immolate and actions.immolate.debuff) and "already up"
+      or (immoAfford and "DoT" or immoBlocked)))
+  combatAdd(snapshot, result, "shadowbolt", snapshot.hostile and boltWant, boltReason)
   combatAdd(snapshot, result, "shoot", snapshot.hostile and snapshot.hasWand,
     snapshot.shooting and "firing" or (snapshot.hasWand and "wand" or "no wand"))
   combatAdd(snapshot, result, "melee", snapshot.hostile,
@@ -504,8 +915,18 @@ local function combatDruidHumanoid(snapshot, result)
   combatAdd(snapshot, result, "faeriefire",
     snapshot.hostile and snapshot.danger and not (actions.faeriefire and actions.faeriefire.debuff),
     (actions.faeriefire and actions.faeriefire.debuff) and "already up" or "elite armor")
-  combatAdd(snapshot, result, "wrath", snapshot.hostile and mana > 30,
-    mana <= 30 and "save mana" or "nuke")
+  -- Same cast-denominated gate as the Warlock filler (r46, ticket 0041), with
+  -- the same fall back to the old percent constant when cost data is missing.
+  local wrathOK = combatCanAfford(snapshot, "wrath")
+  local wrathWant, wrathReason
+  if wrathOK ~= nil then
+    wrathWant = wrathOK
+    if wrathOK then wrathReason = "nuke" else wrathReason = "not enough mana" end
+  else
+    wrathWant = mana > CombatModel.percentGates.wrath
+    if wrathWant then wrathReason = "nuke" else wrathReason = "save mana" end
+  end
+  combatAdd(snapshot, result, "wrath", snapshot.hostile and wrathWant, wrathReason)
   combatAdd(snapshot, result, "catform", false, "form option")
   combatAdd(snapshot, result, "bearform", false, "form option")
   combatAdd(snapshot, result, "melee", snapshot.hostile, "fallback")
@@ -815,7 +1236,10 @@ function BarModel.plan(slotNames, managed, opts)
   local out = { remove = BarModel.sweep(slotNames, managed, sweepMax),
     place = {}, shelfFull = false }
   -- Anything already parked in the untouched banks still feeds the coach, so
-  -- it needs no shelf copy.
+  -- it needs no shelf copy. `kept` is a SET, so the duplicate shelf copies a
+  -- broken sweep may have left behind (r44's unreadable-bar bug) collapse to
+  -- one entry: the name is simply never placed again. Nothing removes them —
+  -- removal stops at sweepMax and a spare copy on the shelf is harmless.
   local kept = {}
   local slot = sweepMax + 1
   while slot <= maxSlot do
@@ -862,7 +1286,7 @@ local F = {}
 
 -- Bump on every edit. The System watches Chat.log for "<SA> loaded rev=..."
 -- after sending a reload — a new rev proves the edit actually loaded.
-local REV = "r44"
+local REV = "r46"
 
 -- Log window (r16): every F.say()/F.emit() line also lands here with a
 -- timestamp, so errors survive chat scroll-off and can be reviewed in-game.
@@ -1053,8 +1477,17 @@ local line5 = F.makeLine(line4, -6) -- buff watch / warnings
 -- sits 5px lower than it did in r41; from there it only moves when a button
 -- actually appears, and r43's TOPRIGHT panel anchor keeps that growth
 -- downward.
+--
+-- r46 (ticket 0042): they are ability icons now, not red text slabs — square
+-- spell-texture buttons with a hover tooltip. Still two per row, still four
+-- frames, so the row/panel height math below only needs the new step.
 local PASSIVE_MAX_BUTTONS = 4
-local PASSIVE_BTN_STEP = 20
+local PASSIVE_BTN_SIZE = 24
+local PASSIVE_BTN_GAP = 4
+local PASSIVE_BTN_STEP = PASSIVE_BTN_SIZE + PASSIVE_BTN_GAP
+-- Used when the spell has no captured texture yet (scan has not run, or the
+-- spell is not in the book). An icon button with no icon reads as broken.
+local PASSIVE_ICON_FALLBACK = "Interface\\Icons\\INV_Misc_QuestionMark"
 local passiveRow = CreateFrame("Frame", "ShadowArmyPassiveRow", panel)
 passiveRow:SetPoint("TOPLEFT", line5, "BOTTOMLEFT", 0, -4)
 passiveRow:SetWidth(194)
@@ -1062,16 +1495,35 @@ passiveRow:SetHeight(1)
 local passiveBtns = {}
 local _pbi = 1
 while _pbi <= PASSIVE_MAX_BUTTONS do
-  local b = CreateFrame("Button", "ShadowArmyPassiveBtn" .. _pbi, passiveRow,
-    "UIPanelButtonTemplate")
-  b:SetWidth(94)
-  b:SetHeight(18)
+  local b = CreateFrame("Button", "ShadowArmyPassiveBtn" .. _pbi, passiveRow)
+  b:SetWidth(PASSIVE_BTN_SIZE)
+  b:SetHeight(PASSIVE_BTN_SIZE)
   b:SetPoint("TOPLEFT", passiveRow, "TOPLEFT",
-    math.mod(_pbi - 1, 2) * 98,
+    math.mod(_pbi - 1, 2) * PASSIVE_BTN_STEP,
     -math.floor((_pbi - 1) / 2) * PASSIVE_BTN_STEP)
+  local icon = b:CreateTexture("ShadowArmyPassiveBtn" .. _pbi .. "Icon", "BACKGROUND")
+  icon:SetAllPoints(b)
+  icon:SetTexture(PASSIVE_ICON_FALLBACK)
+  b.icon = icon
+  b:SetPushedTexture("Interface\\Buttons\\UI-Quickslot-Depress")
+  b:SetHighlightTexture("Interface\\Buttons\\ButtonHilight-Square")
+  -- Additive highlight is the stock icon-button look; the getter is guarded
+  -- because this build's widget surface is not the reference one.
+  if b.GetHighlightTexture then
+    local hl = b:GetHighlightTexture()
+    if hl and hl.SetBlendMode then hl:SetBlendMode("ADD") end
+  end
   b:SetScript("OnClick", function()
     F.passiveClick(this.passiveSpell, this.passiveSelf)
   end)
+  b:SetScript("OnEnter", function()
+    if not this.passiveSpell then return end
+    GameTooltip:SetOwner(this, "ANCHOR_LEFT")
+    GameTooltip:SetText(this.passiveLabel or this.passiveSpell)
+    if this.passiveRank then GameTooltip:AddLine(this.passiveRank, 0.8, 0.8, 0.8) end
+    GameTooltip:Show()
+  end)
+  b:SetScript("OnLeave", function() GameTooltip:Hide() end)
   b:Hide()
   passiveBtns[_pbi] = b
   _pbi = _pbi + 1
@@ -1151,6 +1603,57 @@ function F.scanCombatActions()
   end
 end
 
+-- r46 (ticket 0041): the coach needs each spell's REAL mana cost, and 1.12 has
+-- no GetSpellCost — the spellbook tooltip is the only source. One hidden
+-- tooltip, built here at load and never per scan.
+local bookTip = CreateFrame("GameTooltip", "ShadowArmyBookTip", UIParent,
+  "GameTooltipTemplate")
+bookTip:SetOwner(UIParent, "ANCHOR_NONE")
+
+-- Cost lives in the tooltip's header block (line 2 in practice); a few lines of
+-- slack covers reagent/requires lines without reaching the description, where a
+-- sentence could otherwise look like a cost.
+local BOOK_TIP_LINES = 6
+
+-- Mana cost of spellbook entry `index`, or nil for a costless/non-mana spell
+-- and for any read that did not populate.
+--
+-- CONSTRAINT (r46, docs/vanilla-addons/client-quirks.md): tooltip populate
+-- calls on this wine 1.12 build return NO flag, so SetSpell's return value is
+-- never consulted. Every line we are about to read is blanked FIRST, exactly
+-- like F.barSlotName does for SetAction; text read back after SetSpell can then
+-- only have come from this spell. A failed read yields nil, and the model falls
+-- back to its percent gate rather than inventing a cost.
+function F.spellCost(index)
+  bookTip:SetOwner(UIParent, "ANCHOR_NONE")
+  bookTip:ClearLines()
+  local i = 1
+  while i <= BOOK_TIP_LINES do
+    local left = getglobal("ShadowArmyBookTipTextLeft" .. i)
+    local right = getglobal("ShadowArmyBookTipTextRight" .. i)
+    if left then left:SetText(nil) end
+    if right then right:SetText(nil) end
+    i = i + 1
+  end
+  if not pcall(bookTip.SetSpell, bookTip, index, "spell") then return nil end
+  i = 1
+  while i <= BOOK_TIP_LINES do
+    local side = 1
+    while side <= 2 do
+      local name = "ShadowArmyBookTipText" .. (side == 1 and "Left" or "Right") .. i
+      local fs = getglobal(name)
+      local text = fs and fs:GetText()
+      if text and text ~= "" then
+        local _, _, cost = string.find(text, "^(%d+) Mana")
+        if cost then return tonumber(cost) end
+      end
+      side = side + 1
+    end
+    i = i + 1
+  end
+  return nil
+end
+
 function F.scanSpellbook()
   auto.known, auto.spells = {}, {}
   local classLabel, classToken = UnitClass("player")
@@ -1164,9 +1667,13 @@ function F.scanSpellbook()
     if not name then break end
     local key = string.lower(name)
     auto.known[key] = true
+    -- Ranks are walked upward and overwrite, so `index` names the highest
+    -- trained rank — `cost` is read from that same index and stays consistent
+    -- with it.
     auto.spells[key] = {
       name = name, rank = rank, index = i,
       texture = GetSpellTexture(i, "spell"),
+      cost = F.spellCost(i),
     }
     i = i + 1
   end
@@ -1299,6 +1806,10 @@ function F.combatSnapshot()
     form = F.currentDruidForm(),
     playerDead = UnitIsDeadOrGhost("player") and true or false,
     hpPct = hpMax > 0 and UnitHealth("player") / hpMax * 100 or 0,
+    -- r46: POINTS are what the coach gates on (cost vs. pool). powerPct stays
+    -- for display and for the percent fallback when cost data is missing.
+    power = UnitMana("player") or 0,
+    powerMax = powerMax or 0,
     powerPct = powerMax > 0 and UnitMana("player") / powerMax * 100 or 0,
     resourceName = resourceName, resourceLowReason = resourceName .. " low",
     moving = move.moving, casting = auto.casting,
@@ -1311,12 +1822,18 @@ function F.combatSnapshot()
     combo = GetComboPoints() or 0,
     hasWand = GetInventoryItemLink("player", 18) and true or false,
     shooting = auto.shooting, melee = auto.melee,
-    actions = {},
+    actions = {}, costs = {},
   }
   local defs = F.combatDefs()
   local i = 1
   while i <= table.getn(defs) do
-    snapshot.actions[defs[i].id] = F.combatActionState(defs[i], snapshot)
+    local def = defs[i]
+    snapshot.actions[def.id] = F.combatActionState(def, snapshot)
+    -- Missing entry (untrained, non-mana, or an unreadable tooltip) is left
+    -- absent on purpose: the model reads that as "no cost data" and falls back
+    -- to its percent gate.
+    local book = def.spell and auto.spells[string.lower(def.spell)] or nil
+    if book and book.cost then snapshot.costs[def.id] = book.cost end
     i = i + 1
   end
   return snapshot
@@ -1929,9 +2446,14 @@ function F.passiveLine()
     local btn = passiveBtns[i]
     local want = i <= shown and result.buttons[i] or nil
     if want then
+      -- r46: the button IS the spell icon. Texture and rank come from the same
+      -- spellbook capture the coach and the bar sweep already use.
+      local book = want.spell and auto.spells[string.lower(want.spell)] or nil
       btn.passiveSpell = want.spell
       btn.passiveSelf = want.selfCast and 1 or nil
-      btn:SetText(want.label)
+      btn.passiveLabel = want.label
+      btn.passiveRank = book and book.rank or nil
+      btn.icon:SetTexture((book and book.texture) or PASSIVE_ICON_FALLBACK)
       btn:Show()
     else
       btn.passiveSpell = nil
@@ -2001,13 +2523,23 @@ function F.barSlotName(slot)
   if GetActionText and GetActionText(slot) then return nil end
   barTip:SetOwner(UIParent, "ANCHOR_NONE")
   barTip:ClearLines()
-  -- SetAction returns truthy only when it actually populated the tooltip —
-  -- stock ActionButton_SetTooltip branches on the same result. Without it a
-  -- STALE tooltip from the previous slot would name this one.
-  local ok, filled = pcall(barTip.SetAction, barTip, slot)
-  if not (ok and filled) then return nil end
-  if barTip:NumLines() <= 0 then return nil end
   local fs = getglobal("ShadowArmyBarTipTextLeft1")
+  -- CONSTRAINT (r45, live client): this wine 1.12 build's
+  -- GameTooltip:SetAction returns NO populate flag, so blank-then-read is the
+  -- reliable populate proof. r44 required that flag ("if not (ok and filled)")
+  -- and therefore called EVERY slot unreadable: the sweep removed nothing
+  -- (fail-safe, fine) but also could not see its own shelf, so every run
+  -- re-placed the same spells until 109-120 filled up. Live evidence:
+  -- "swept removed=0 shelved=6" followed by "shelf full".
+  --
+  -- ClearLines() alone can leave the FontString's stale text in place, so the
+  -- name line is blanked explicitly first. Any text read back AFTER SetAction
+  -- can then only have come from this slot, which is a strictly stronger
+  -- guarantee than the flag was. NumLines() is deliberately not gated on
+  -- either: another populate signal from the same widget on the same build is
+  -- another way to fail closed for the whole bar.
+  if fs then fs:SetText(nil) end
+  if not pcall(barTip.SetAction, barTip, slot) then return nil end
   local text = fs and fs:GetText()
   if not text or text == "" then return nil end
   return text
@@ -4121,6 +4653,200 @@ function F.questDrawMarkers()
   end
 end
 
+--------------------------------------------------------------------------
+-- ROUTE (r45): a road-following path from the player to the TOP quest's
+-- nearest waypoint, drawn as a trail of small dots on the world map and used
+-- as the "go" bearing on the panel. RouteModel does all the thinking; this
+-- half only feeds it, caches the answer, and paints it.
+--
+-- Every read of the generated data is guarded, so a missing or unparsable
+-- RoadData.lua costs exactly the route: quest.target still points straight at
+-- the objective and the checklist reads exactly as it did in r44.
+--
+-- Zone ids come from ShadowArmyQuestZones (name -> id, reversed once). That
+-- is the same bridge the quest waypoints already need, so a route can only
+-- exist where the enrichment that produced quest.target exists anyway.
+--------------------------------------------------------------------------
+
+-- Scoped for the same Lua 5.0 200-local budget as RouteModel above; the F.*
+-- entry points stay global to the addon, only the state does not.
+do
+  local ROUTE_MAX_DOTS = 40      -- world map dots (created once, reused forever)
+  local ROUTE_TARGET_MOVE = 1.0  -- % target drift before the route is recomputed
+  local ROUTE_PLAYER_MOVE = 2.0  -- % player drift before the route is recomputed
+  local ROUTE_LEAD = 1.0         -- % lookahead for the "go" bearing
+
+  local route = {
+    zone = nil,        -- AreaTable id the cached graph was built for
+    zoneName = nil,    -- GetRealZoneText the cached ROUTE was computed in
+    graph = nil,
+    zoneIds = nil,     -- zone NAME -> AreaTable id, reversed from QuestZones
+    points = {},       -- RouteModel waypoints, percent
+    n = 0,
+    straight = true,   -- true = no road involved; draw nothing, bear as before
+    have = false,      -- a route has been computed for tx,ty from px,py
+    tx = 0, ty = 0,
+    px = 0, py = 0,
+    r = 1, g = 0.82, b = 0,
+  }
+
+  function F.routeZoneId(zoneName)
+    if not zoneName or zoneName == "" then return nil end
+    if not route.zoneIds then
+      if not ShadowArmyQuestZones then return nil end
+      local ids = {}
+      -- Lowest id wins a duplicate name so the reversal is order-independent
+      -- (pairs() has no defined order).
+      for id, name in pairs(ShadowArmyQuestZones) do
+        if ids[name] == nil or id < ids[name] then ids[name] = id end
+      end
+      route.zoneIds = ids
+    end
+    return route.zoneIds[zoneName]
+  end
+
+  -- Built once per zone; a zone change is the only invalidation. Tirisfal is 94
+  -- nodes / 0.3 ms on host Lua, and the worst zone in the file is under 1 ms.
+  function F.routeGraph()
+    local model = ShadowArmy and ShadowArmy.routeModel
+    if not model or not ShadowArmyRoadData then return nil end
+    local id = F.routeZoneId(quest.zoneName)
+    if not id then return nil end
+    if route.zone ~= id then
+      route.zone = id
+      route.graph = nil
+      local segs = ShadowArmyRoadData[id]
+      if segs then
+        local ok, graph = pcall(model.build, segs)
+        if ok then route.graph = graph end
+      end
+    end
+    return route.graph
+  end
+
+  function F.routeClear()
+    route.points, route.n, route.straight, route.have = {}, 0, true, false
+  end
+
+  function F.routeDrift(ax, ay, bx, by)
+    local dx, dy = ax - bx, ay - by
+    return math.sqrt(dx * dx + dy * dy)
+  end
+
+  function F.routeUpdate()
+    local t = quest.target
+    if not (quest.posOK and t and t.x and t.y) then
+      F.routeClear()
+      return
+    end
+    local model = ShadowArmy and ShadowArmy.routeModel
+    if not model then
+      F.routeClear()
+      return
+    end
+    route.r, route.g, route.b = t.r or 1, t.g or 0.82, t.b or 0
+    -- Percent coordinates are per-zone, so a zone change makes every cached
+    -- number mean something else. Crossing a border always moves the player
+    -- far enough to invalidate on its own, but not by construction — say so.
+    if route.zoneName ~= quest.zoneName then
+      route.zoneName = quest.zoneName
+      route.have = false
+    end
+    -- Recompute only on a real change: a fresh Dijkstra every half second for a
+    -- target that has not moved is pure heat.
+    if route.have
+        and F.routeDrift(route.tx, route.ty, t.x, t.y) <= ROUTE_TARGET_MOVE
+        and F.routeDrift(route.px, route.py, quest.px, quest.py) <= ROUTE_PLAYER_MOVE then
+      return
+    end
+    local ok, pts, meta = pcall(model.route, F.routeGraph(),
+      { x = quest.px, y = quest.py }, { x = t.x, y = t.y })
+    if not ok or not pts then
+      F.routeClear()
+      return
+    end
+    route.points = pts
+    route.n = table.getn(pts)
+    route.straight = true
+    if meta and not meta.straight then route.straight = false end
+    route.have = true
+    route.tx, route.ty = t.x, t.y
+    route.px, route.py = quest.px, quest.py
+  end
+
+  -- Percent delta from the player to the next route waypoint, or nil when there
+  -- is no road route to follow (caller then uses the straight-line delta).
+  function F.routeNextDelta()
+    if route.straight or route.n < 2 or not quest.posOK then return nil end
+    local model = ShadowArmy and ShadowArmy.routeModel
+    if not model then return nil end
+    local wx, wy = model.nextPoint(route.points, quest.px, quest.py, ROUTE_LEAD)
+    if not wx then return nil end
+    return wx - quest.px, wy - quest.py
+  end
+
+  local routeDots = {}
+  function F.routeDot(i)
+    local t = routeDots[i]
+    if t then return t end
+    -- ARTWORK, not OVERLAY: the trail passes UNDER the objective pins.
+    t = WorldMapDetailFrame:CreateTexture(nil, "ARTWORK")
+    t:SetWidth(5)
+    t:SetHeight(5)
+    t:Hide()
+    routeDots[i] = t
+    return t
+  end
+
+  -- Same guards as F.questDrawMarkers: quest.posOK is the oracle for "the map is
+  -- showing the player's own zone", so the trail can never decorate a zone the
+  -- human is merely browsing.
+  function F.routeDrawMarkers()
+    if not WorldMapDetailFrame then return end
+    local show = quest.markersEnabled and quest.posOK
+      and (not route.straight) and route.n >= 2
+      and WorldMapFrame and WorldMapFrame:IsVisible()
+    local w = WorldMapDetailFrame:GetWidth()
+    local h = WorldMapDetailFrame:GetHeight()
+
+    -- A long route outruns the dot pool, so sample it evenly and always keep the
+    -- last point: the trail must end at the pin it is pointing at.
+    local pick, np = {}, 0
+    if show then
+      local step = 1
+      if route.n > ROUTE_MAX_DOTS then
+        step = math.ceil((route.n - 1) / (ROUTE_MAX_DOTS - 1))
+      end
+      local idx = 1
+      while idx < route.n and np < ROUTE_MAX_DOTS - 1 do
+        np = np + 1
+        pick[np] = idx
+        idx = idx + step
+      end
+      np = np + 1
+      pick[np] = route.n
+    end
+
+    local i = 1
+    while i <= ROUTE_MAX_DOTS do
+      local t = F.routeDot(i)
+      local p = pick[i] and route.points[pick[i]] or nil
+      if p then
+        t:ClearAllPoints() -- SetPoint ACCUMULATES anchors in 1.12
+        t:SetPoint("CENTER", WorldMapDetailFrame, "TOPLEFT",
+          p.x / 100 * w, -(p.y / 100 * h))
+        -- Quest colour, but smaller and dimmer than an objective pin: the trail
+        -- is context, the pins are the answer.
+        t:SetTexture(route.r, route.g, route.b, 0.55)
+        t:Show()
+      else
+        t:Hide()
+      end
+      i = i + 1
+    end
+  end
+end
+
 -- Paint the multi-line quest checklist into questLines[]. Corpse compass
 -- overrides the whole block while ghosting.
 function F.questClearLines()
@@ -4169,11 +4895,24 @@ function F.questChecklistRows()
     local nObj = table.getn(e.objs)
     while oi <= nObj and nr < QUEST_PANEL_LINES do
       local o = e.objs[oi]
-      local dir = o.dist and F.questBearing(o.dx, o.dy) or nil
-      local yards = o.dist and math.floor(o.dist + 0.5) or nil
       local isGo = (e.title == goTitle)
         and ((goTurn and o.turnIn) or ((not goTurn) and (not o.turnIn)
           and o.label == goLabel))
+      -- The "go" row steers along the ROAD when one exists: the distance is
+      -- still the honest crow-flies estimate to the objective, but the compass
+      -- points at the next route waypoint, so following it keeps you on the
+      -- freeway instead of walking into the woods between here and there.
+      local dir = nil
+      if o.dist then
+        local rdx, rdy = nil, nil
+        if isGo then rdx, rdy = F.routeNextDelta() end
+        if rdx then
+          dir = F.questBearing(rdx, rdy)
+        else
+          dir = F.questBearing(o.dx, o.dy)
+        end
+      end
+      local yards = o.dist and math.floor(o.dist + 0.5) or nil
       local prog = ""
       if (not o.turnIn) and o.need and o.need > 0 then
         prog = string.format(" %d/%d", o.have or 0, o.need)
@@ -4365,6 +5104,7 @@ function F.questSetMarkers(on)
   else
     pcall(F.questDrawBlips)
     pcall(F.questDrawMarkers)
+    pcall(F.routeDrawMarkers)
   end
 end
 questMarkersBtn:SetScript("OnClick", function()
@@ -4378,8 +5118,10 @@ function F.questTick()
   quest.nextTickAt = now + QUEST_TICK_EVERY
   F.questPosition()
   F.questScan()
+  F.routeUpdate()
   F.questDrawBlips()
   F.questDrawMarkers()
+  F.routeDrawMarkers()
   F.questRefreshWindow()
 end
 
@@ -4415,6 +5157,8 @@ questEvents:SetScript("OnEvent", function()
   quest.nextMarkerAt = now + QUEST_MARKER_EVERY
   local ok, err = pcall(F.questDrawMarkers)
   if not ok then F.emit("err", "questMarkers: " .. tostring(err)) end
+  local rok, rerr = pcall(F.routeDrawMarkers)
+  if not rok then F.emit("err", "routeMarkers: " .. tostring(rerr)) end
 end)
 
 --------------------------------------------------------------------------

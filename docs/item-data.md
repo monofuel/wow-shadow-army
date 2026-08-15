@@ -13,9 +13,13 @@ pointed at bags instead of quests.
 writes `addons/ShadowArmy/ItemData.lua`: a pure data file (no logic, Lua 5.0
 loadable) covering **every item in the game**.
 
-**Not yet in the `.toc`.** The file is generated but not registered in
-`addons/ShadowArmy/ShadowArmy.toc`, so nothing loads it yet — the shadow-bags
-disposition feature wires it up when it lands.
+**Registered in the `.toc`, not yet read.** Ticket 0040 added `ItemData.lua`
+(and `RoadData.lua`) to `addons/ShadowArmy/ShadowArmy.toc` in one go, so the
+table is loaded and `ShadowArmyItemData` is there for the taking — but no
+addon code reads it yet. The shadow-bags disposition feature is the first
+consumer. Registering it costs one client restart (the TOC file list is
+cached for the whole client session), which is why it was bundled rather than
+paid twice.
 
 ## How to regenerate
 
