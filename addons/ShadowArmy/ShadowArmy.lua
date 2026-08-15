@@ -1923,7 +1923,7 @@ local F = {}
 
 -- Bump on every edit. The System watches Chat.log for "<SA> loaded rev=..."
 -- after sending a reload — a new rev proves the edit actually loaded.
-local REV = "r49"
+local REV = "r50"
 
 -- Log window (r16): every F.say()/F.emit() line also lands here with a
 -- timestamp, so errors survive chat scroll-off and can be reviewed in-game.
@@ -3270,7 +3270,9 @@ function F.passiveSnapshot()
     classToken = auto.classToken,
     known = auto.known,
     buffs = buffs,
-    hasPet = UnitExists("pet") and true or false,
+    -- A dead minion still exists as "pet" until it despawns; resummoning
+    -- over the corpse is legal, so only a LIVING pet suppresses the button.
+    hasPet = (UnitExists("pet") and not UnitIsDeadOrGhost("pet")) and true or false,
     inCombat = UnitAffectingCombat("player") and true or false,
     dead = UnitIsDeadOrGhost("player") and true or false,
   }

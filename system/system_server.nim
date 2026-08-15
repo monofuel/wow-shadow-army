@@ -211,6 +211,7 @@ ORDER BY FIELD(cq.status, 1, 3, 5), qt.QuestLevel, cq.quest"""
   ## Ignore staleness for this long after The System boots (`nim r` recompiles
   ## on restart; seats must not be blamed for the dashboard's own downtime).
   SeatWatchStartupGraceSec = 60.0
+  SeatRecoveryMaxPerPass = 2
   ## Minimum spacing between two recovery attempts on the same seat — a restart
   ## needs longer than one poll to bring a heartbeat back.
   SeatRecoveryCooldownSec = 180.0
@@ -220,6 +221,14 @@ ORDER BY FIELD(cq.status, 1, 3, 5), qt.QuestLevel, cq.quest"""
   SeatWedgeEvidenceBytes = 256 * 1024
   ## Durable babysitter state (restart budget survives a dashboard restart).
   SeatWatchStateRel = "local_data/seat-watch.json"
+  ## Scale-out roster the babysitter also watches (same table `make
+  ## army-scale-*` reads): character<TAB>account<TAB>class. Re-read whenever
+  ## its mtime moves, so seats added to the file get covered without a restart.
+  SeatRosterRel* = "tools/data/home_army_roster.tsv"
+  ## Seats the roster may never name: the original four keep their dedicated
+  ## Makefile targets, Kaisel is the disposable quest-QA seat (different
+  ## runtime root), Murist is the human. Mirrors the Makefile seat-guard list.
+  SeatRosterProtected* = ["Shadowfel", "Igris", "Tusk", "Beru", "Kaisel", "Murist"]
   ## Inventory over the chat bus (ticket 0052): parts of one snapshot arriving
   ## inside this window belong to the same snapshot; a later `full` line starts
   ## a new one.
@@ -2338,6 +2347,150 @@ proc seatStopTarget*(name: string): string =
       return seat.stopTarget
   result = ""
 
+# ---------------------------------------------------------------------------
+# Seat roster: the original four (dedicated targets) + the scale-out seats
+#
+# The scaled seats live in the SAME local_data/home-army/<Seat>/ layout but
+# have no hand-written Makefile pair — they run through the parameterized
+# `seat-start SEAT=… SEAT_USER=… SEAT_CLASS=…` family, driven by
+# tools/data/home_army_roster.tsv. The System re-reads that table on mtime so
+# a growing roster is covered without a dashboard restart.
+# ---------------------------------------------------------------------------
+
+type
+  SeatTarget* = object
+    ## One seat the babysitter may watch and recover.
+    name*: string
+    account*: string ## realmd account — scaled seats only ("" for the four)
+    class*: string ## class selector — scaled seats only
+    scaled*: bool ## true → parameterized seat-start/seat-stop targets
+
+var
+  gSeatRosterLock: Lock
+  gSeatRoster: seq[SeatTarget]
+  gSeatRosterSrc: string
+  gSeatRosterMtime: float
+  gSeatRosterLoaded: bool
+
+initLock(gSeatRosterLock)
+
+proc seatRosterPath*(): string =
+  ## Roster table path (SYSTEM_SEAT_ROSTER wins; default is repo-relative,
+  ## the same file `make army-scale-status` reads).
+  let env = getEnv("SYSTEM_SEAT_ROSTER", "").strip()
+  if env.len > 0:
+    return absolutePath(env)
+  result = armyRoot() / SeatRosterRel
+
+proc isProtectedSeatName*(name: string): bool =
+  ## Names the scaled lane must never touch (dedicated targets / human seat).
+  ## Case-insensitive: a lowercase roster row must not slip past the guard
+  ## and log a second client onto a protected seat's account.
+  for n in SeatRosterProtected:
+    if cmpIgnoreCase(n, name) == 0:
+      return true
+  result = false
+
+proc isSafeSeatToken(s: string): bool =
+  ## Roster fields end up in a `make` command line; keep them boring.
+  if s.len == 0 or s.len > 24:
+    return false
+  for c in s:
+    if c notin {'A' .. 'Z', 'a' .. 'z', '0' .. '9'}:
+      return false
+  result = true
+
+proc parseSeatRoster*(text: string): seq[SeatTarget] =
+  ## character<TAB>account<TAB>class rows. Comments (`#`), blanks, short rows,
+  ## protected names, duplicates and non-boring tokens are dropped — a bad row
+  ## must never become a shell argument or a restart of the original four.
+  result = @[]
+  for raw in text.splitLines():
+    let line = raw.strip()
+    if line.len == 0 or line.startsWith("#"):
+      continue
+    let cols = raw.split('\t')
+    if cols.len < 3:
+      continue
+    let
+      name = cols[0].strip()
+      account = cols[1].strip()
+      class = cols[2].strip()
+    if not isSafeSeatToken(name) or not isSafeSeatToken(account) or
+        not isSafeSeatToken(class):
+      continue
+    if isProtectedSeatName(name):
+      continue
+    var dup = false
+    for t in result:
+      if t.name == name:
+        dup = true
+    if dup:
+      continue
+    result.add(SeatTarget(
+      name: name, account: account, class: class, scaled: true))
+
+proc refreshSeatRoster*() =
+  ## Re-parse the roster when the file (or the army root) changed. Cheap in
+  ## the steady state: one stat per call, no read.
+  let path = seatRosterPath()
+  var
+    mtime = 0.0
+    found = fileExists(path)
+  if found:
+    try:
+      mtime = getLastModificationTime(path).toUnixFloat()
+    except CatchableError:
+      found = false
+  var stale = true
+  withLock gSeatRosterLock:
+    stale = not (gSeatRosterLoaded and gSeatRosterSrc == path and
+                 gSeatRosterMtime == mtime)
+  if not stale:
+    return
+  var text = ""
+  if found:
+    try:
+      text = readFile(path)
+    except CatchableError:
+      text = ""
+  let parsed = parseSeatRoster(text)
+  withLock gSeatRosterLock:
+    gSeatRoster = parsed
+    gSeatRosterSrc = path
+    gSeatRosterMtime = mtime
+    gSeatRosterLoaded = true
+
+proc scaledSeatTargets*(): seq[SeatTarget] =
+  ## Roster-driven seats only (loads the table on first use).
+  var loaded = false
+  withLock gSeatRosterLock:
+    loaded = gSeatRosterLoaded
+  if not loaded:
+    refreshSeatRoster()
+  withLock gSeatRosterLock:
+    result = gSeatRoster
+
+proc seatTargets*(): seq[SeatTarget] =
+  ## Every seat the babysitter watches: original four first (stable order for
+  ## the dashboard), then the roster in file order.
+  result = @[]
+  for seat in SeatMakeTargets:
+    result.add(SeatTarget(name: seat.name, scaled: false))
+  for t in scaledSeatTargets():
+    result.add(t)
+
+proc seatTargetFor*(name: string): SeatTarget =
+  ## Watched seat by name; `.name == ""` when the name is not watched.
+  for t in seatTargets():
+    if t.name == name:
+      return t
+  result = SeatTarget()
+
+proc isWatchedSeatName*(name: string): bool =
+  ## True for the original four and for any current roster seat.
+  seatTargetFor(name).name.len > 0
+
 proc seatRuntimeDir*(name: string): string =
   armyRoot() / "local_data" / "home-army" / name
 
@@ -2348,7 +2501,9 @@ proc seatStatusPath*(name: string): string =
   seatRuntimeDir(name) / "status" / "status.json"
 
 proc seatPidAlive*(name: string): bool =
-  if seatMakeTarget(name).len == 0:
+  ## Watched seats only (original four + roster) — a human name never has a
+  ## launcher pid file to read.
+  if not isWatchedSeatName(name):
     return false
   var pid = 0
   try:
@@ -2454,6 +2609,58 @@ proc stopBotSeat*(name: string): JsonNode =
     return %*{"ok": false, "name": name, "action": "stop", "detail": r.detail}
   result = %*{"ok": true, "name": name, "action": "stop",
               "detail": &"requested {target}"}
+
+proc startScaledSeat*(t: SeatTarget): JsonNode =
+  ## Start one roster seat through the parameterized Makefile family. Nice
+  ## level, display and lease handling are the launcher's business — this only
+  ## passes the three roster columns the target needs.
+  if not t.scaled or t.account.len == 0 or t.class.len == 0:
+    return %*{"ok": false, "name": t.name, "action": "start",
+              "detail": "not a roster seat"}
+  if seatRuntimeUp(t.name):
+    return %*{"ok": true, "name": t.name, "action": "start",
+              "detail": "already running (fresh Lua heartbeat)"}
+  if seatPidAlive(t.name):
+    return %*{"ok": true, "name": t.name, "action": "start",
+              "detail": "launcher is already starting or its Lua heartbeat is stale; stop it before retrying"}
+  let root = armyRoot()
+  if not fileExists(root / "Makefile"):
+    return %*{"ok": false, "name": t.name, "action": "start",
+              "detail": &"Makefile missing in {root} — set SYSTEM_ARMY_DIR"}
+  let r = runShell(
+    &"make -C {quoteShell(root)} seat-start SEAT={quoteShell(t.name)} " &
+    &"SEAT_USER={quoteShell(t.account)} SEAT_CLASS={quoteShell(t.class)}")
+  if not r.ok:
+    return %*{"ok": false, "name": t.name, "action": "start", "detail": r.detail}
+  result = %*{"ok": true, "name": t.name, "action": "start",
+              "detail": &"requested seat-start SEAT={t.name} ({t.class}); ready when the Lua heartbeat is fresh"}
+
+proc stopScaledSeat*(t: SeatTarget): JsonNode =
+  ## Stop one roster seat through the same parameterized family.
+  if not t.scaled:
+    return %*{"ok": false, "name": t.name, "action": "stop",
+              "detail": "not a roster seat"}
+  if not seatPidAlive(t.name):
+    return %*{"ok": true, "name": t.name, "action": "stop",
+              "detail": "already stopped"}
+  let root = armyRoot()
+  if not fileExists(root / "Makefile"):
+    return %*{"ok": false, "name": t.name, "action": "stop",
+              "detail": &"Makefile missing in {root} — set SYSTEM_ARMY_DIR"}
+  let r = runShell(
+    &"make -C {quoteShell(root)} seat-stop SEAT={quoteShell(t.name)}")
+  if not r.ok:
+    return %*{"ok": false, "name": t.name, "action": "stop", "detail": r.detail}
+  result = %*{"ok": true, "name": t.name, "action": "stop",
+              "detail": &"requested seat-stop SEAT={t.name}"}
+
+proc startSeatTarget*(t: SeatTarget): JsonNode =
+  ## Lifecycle dispatch: dedicated targets for the original four, the
+  ## parameterized family for roster seats.
+  if t.scaled: startScaledSeat(t) else: startBotSeat(t.name)
+
+proc stopSeatTarget*(t: SeatTarget): JsonNode =
+  if t.scaled: stopScaledSeat(t) else: stopBotSeat(t.name)
 
 # ---------------------------------------------------------------------------
 # Traverse detached ops: Lua proof-of-life + local watch_bots observer
@@ -3729,6 +3936,12 @@ proc requestInventorySnapshot*(name = AdminRequesterName): JsonNode =
 # the same Makefile targets the roster buttons use. Bounded to
 # SeatRestartBudget per SeatRestartWindowSec so a genuinely broken build turns
 # into one persistent red alert instead of a restart loop.
+#
+# Coverage is the WHOLE home fleet: the original four through their dedicated
+# targets, plus every seat in tools/data/home_army_roster.tsv through the
+# parameterized `seat-start SEAT=… SEAT_USER=… SEAT_CLASS=…` family (the scaled
+# seats wedge with the same post-settle signature). The roster is re-read when
+# its mtime moves, so seats added to the table are covered without a restart.
 # ---------------------------------------------------------------------------
 
 type
@@ -3746,6 +3959,7 @@ type
     lastAction*: string ## last babysitter action line ("" when idle)
     lastActionAgeSec*: float ## -1 when nothing has happened yet
     evidence*: string ## basename of the last wedge evidence file
+    scaled*: bool ## roster seat (parameterized targets) vs original four
 
   SeatWatchRec = object
     ## Internal record: public view + the restart timestamps behind the budget.
@@ -3854,32 +4068,73 @@ proc captureWedgeEvidence*(
   except CatchableError:
     result = ""
 
-proc loadSeatWatchState() =
-  ## Restore restart stamps so a dashboard restart cannot refill the budget.
+proc seatWatchRosterMatches(targets: seq[SeatTarget]): bool =
+  ## True when the watch list already covers exactly these seats, in order.
+  withLock gSeatWatchLock:
+    if gSeatWatch.len != targets.len:
+      return false
+    for i, t in targets:
+      if gSeatWatch[i].watch.name != t.name:
+        return false
+  result = true
+
+proc syncSeatWatch(targets: seq[SeatTarget]) =
+  ## Make the watch list match the current targets. Existing records keep
+  ## their in-memory state (a roster reload must not refill a spent budget);
+  ## seats seen for the first time are seeded from the persisted state file so
+  ## a dashboard restart cannot refill it either.
+  if seatWatchRosterMatches(targets):
+    return
   var node: JsonNode = nil
   try:
     if fileExists(seatWatchStatePath()):
       node = parseJson(readFile(seatWatchStatePath()))
   except CatchableError:
     node = nil
+  let persisted =
+    if node != nil and node.kind == JObject and node.hasKey("seats") and
+        node["seats"].kind == JObject: node["seats"]
+    else: newJObject()
   withLock gSeatWatchLock:
-    gSeatWatch = @[]
-    for seat in SeatMakeTargets:
+    var rebuilt: seq[SeatWatchRec] = @[]
+    for t in targets:
+      var carried = false
+      for rec in gSeatWatch:
+        if rec.watch.name == t.name:
+          var r = rec
+          r.watch.scaled = t.scaled
+          rebuilt.add(r)
+          carried = true
+          break
+      if carried:
+        continue
       var rec = SeatWatchRec(
         watch: SeatWatch(
-          name: seat.name, state: "stopped", statusAgeSec: -1.0,
-          lastActionAgeSec: -1.0),
+          name: t.name, state: "stopped", statusAgeSec: -1.0,
+          lastActionAgeSec: -1.0, scaled: t.scaled),
         stamps: @[]
       )
-      if node != nil and node.kind == JObject and node.hasKey("seats") and
-          node["seats"].hasKey(seat.name):
-        let s = node["seats"][seat.name]
+      if persisted.hasKey(t.name):
+        let s = persisted[t.name]
         if s.hasKey("restarts") and s["restarts"].kind == JArray:
-          for t in s["restarts"]:
-            rec.stamps.add(t.getFloat(0.0))
+          for stamp in s["restarts"]:
+            rec.stamps.add(stamp.getFloat(0.0))
         if s.hasKey("alerting"):
           rec.watch.alerting = s["alerting"].getBool(false)
-      gSeatWatch.add(rec)
+        # lastActionAt is persisted so the recovery cooldown survives a
+        # dashboard restart: without it a seat wedged mid-restart could be
+        # stopped again seconds after the first attempt.
+        if s.hasKey("last_action_at"):
+          rec.lastActionAt = s["last_action_at"].getFloat(0.0)
+        if s.hasKey("last_action"):
+          rec.watch.lastAction = s["last_action"].getStr("")
+      rebuilt.add(rec)
+    gSeatWatch = rebuilt
+
+proc loadSeatWatchState() =
+  ## Build the watch list for the current roster (boot path).
+  refreshSeatRoster()
+  syncSeatWatch(seatTargets())
 
 proc saveSeatWatchState() =
   ## Persist the rate-limit window (best effort; never fails a recovery).
@@ -3892,7 +4147,9 @@ proc saveSeatWatchState() =
           stamps.add(%t)
         seats[rec.watch.name] = %*{
           "restarts": stamps,
-          "alerting": rec.watch.alerting
+          "alerting": rec.watch.alerting,
+          "last_action_at": rec.lastActionAt,
+          "last_action": rec.watch.lastAction
         }
     let path = seatWatchStatePath()
     createDir(path.parentDir)
@@ -3927,11 +4184,15 @@ proc seatWatchToJson*(seats: seq[SeatWatch]): JsonNode =
       "wedges": w.wedges,
       "last_action": w.lastAction,
       "last_action_age_sec": w.lastActionAgeSec,
-      "evidence": w.evidence
+      "evidence": w.evidence,
+      "scaled": w.scaled
     })
 
-proc recoverWedgedSeat(idx: int, name: string, statusAgeSec: float) =
-  ## Evidence first, then a bounded stop+start through the Makefile targets.
+proc recoverWedgedSeat(idx: int, target: SeatTarget, statusAgeSec: float) =
+  ## Evidence first, then a bounded stop+start through the seat's own Makefile
+  ## lifecycle (dedicated targets for the original four, the parameterized
+  ## seat-start/seat-stop family for roster seats).
+  let name = target.name
   let nowSec = epochTime()
   let evidence = captureWedgeEvidence(name, statusAgeSec)
   var allowed = false
@@ -3961,9 +4222,9 @@ proc recoverWedgedSeat(idx: int, name: string, statusAgeSec: float) =
   saveSeatWatchState()
   var detail = ""
   try:
-    let stopped = stopBotSeat(name)
+    let stopped = stopSeatTarget(target)
     detail = stopped{"detail"}.getStr("")
-    let started = startBotSeat(name)
+    let started = startSeatTarget(target)
     detail.add(" · " & started{"detail"}.getStr(""))
   except CatchableError as e:
     detail = "restart failed: " & e.msg
@@ -3973,17 +4234,16 @@ proc recoverWedgedSeat(idx: int, name: string, statusAgeSec: float) =
 
 proc babysitSeatsOnce*() =
   ## One sampling pass over every home seat: classify, then recover if wedged.
-  ## Safe to call from a test — it only ever touches SeatMakeTargets seats
-  ## under armyRoot().
+  ## Safe to call from a test — it only ever touches watched seats (the four
+  ## dedicated ones plus the roster) under armyRoot().
   let nowSec = epochTime()
   let staleSec = seatWedgeStaleSec()
-  var initialized = false
-  withLock gSeatWatchLock:
-    initialized = gSeatWatch.len == SeatMakeTargets.len
-  if not initialized:
-    loadSeatWatchState()
-  for idx, seat in SeatMakeTargets:
-    let name = seat.name
+  var recoveredThisPass = 0
+  refreshSeatRoster() # roster grows; pick it up without a dashboard restart
+  let targets = seatTargets()
+  syncSeatWatch(targets)
+  for idx, target in targets:
+    let name = target.name
     let pidAlive = seatPidAlive(name)
     let statusPath = seatStatusPath(name)
     let hasStatus = fileExists(statusPath)
@@ -3995,6 +4255,11 @@ proc babysitSeatsOnce*() =
         age = -1.0
     let state = classifySeat(pidAlive, hasStatus, age, staleSec)
     var lastActionAt = 0.0
+    var tracked = false
+    withLock gSeatWatchLock:
+      tracked = idx < gSeatWatch.len and gSeatWatch[idx].watch.name == name
+    if not tracked:
+      continue # roster moved under us; next pass re-syncs
     withLock gSeatWatchLock:
       gSeatWatch[idx].watch.name = name
       gSeatWatch[idx].watch.state = state
@@ -4015,7 +4280,14 @@ proc babysitSeatsOnce*() =
       continue # our own restart, not the seat's fault
     if lastActionAt > 0 and nowSec - lastActionAt < SeatRecoveryCooldownSec:
       continue # a restart is still landing
-    recoverWedgedSeat(idx, name, age)
+    # A box-wide staleness event (asset-server hiccup, suspend/resume) wedges
+    # every seat at once; recovering all of them in one pass is the login
+    # stampede the scale script's stagger exists to prevent. Cap per pass and
+    # let the 10s cadence supply the stagger.
+    if recoveredThisPass >= SeatRecoveryMaxPerPass:
+      continue
+    inc recoveredThisPass
+    recoverWedgedSeat(idx, target, age)
 
 proc seatWatchLoop() {.thread.} =
   ## Babysitter thread: sample every SeatWatchPollMs, forever.
@@ -6213,7 +6485,7 @@ proc registerMcpTools(server: McpServer) =
 
   let seatWatchTool = McpTool(
     name: "seat_watch",
-    description: "Seat babysitter view: per home seat liveness (running/starting/stopped/wedged), status heartbeat age, auto-restarts in the last hour, persistent alert flag, and the last wedge evidence file.",
+    description: "Seat babysitter view for every watched home seat (the four dedicated seats plus the scale-out roster): liveness (running/starting/stopped/wedged), status heartbeat age, auto-restarts in the last hour, persistent alert flag, `scaled` (roster seat vs dedicated target), and the last wedge evidence file.",
     inputSchema: %*{
       "type": "object",
       "properties": newJObject(),

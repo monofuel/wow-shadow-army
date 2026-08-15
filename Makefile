@@ -1216,7 +1216,8 @@ seat-guard:
 		echo "error: SEAT=<Name> is required (e.g. make seat-start SEAT=Bellion SEAT_USER=shadow5 SEAT_CLASS=mage)" >&2; \
 		exit 1; \
 	fi; \
-	case " Shadowfel Igris Tusk Beru Kaisel " in *" $(SEAT) "*) \
+	seat_lc=$$(printf '%s' "$(SEAT)" | tr 'A-Z' 'a-z'); \
+	case " shadowfel igris tusk beru kaisel murist " in *" $$seat_lc "*) \
 		echo "error: $(SEAT) is a protected seat — use its dedicated targets" >&2; \
 		exit 1;; \
 	esac

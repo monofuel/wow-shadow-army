@@ -191,3 +191,16 @@ decide loop, not just the renderer), manifest fetch failures in the
 tail — all with keepalive_requests 100000 confirmed live. Keepalive
 exhaustion (H1) is definitively not the whole story; H2/H4 remain.
 Details: docs/quest-qa-2026-08-15.md "Environment issue" section.
+
+## 2026-08-15 update 6 — pod verdicts from the instrumented v14 round
+
+First hosted round with inflight=/oldest= aboard (petrel:v14):
+"pending=491 inflight=4 oldest=0s" during load-in — no worker leak, no
+stuck transfer; 4 concurrent fetches is the natural operating point of
+2 vCPU against an 800-deep queue. **H4 REFUTED ON PODS** (H2 stands as
+the pod drop mechanism), and the COWORLD_HTTP_FETCH_WORKERS=4 sizing
+is formalizing observed reality rather than changing behavior. The
+HOME post-settle freeze remains its own open mechanism (updates 3/5) —
+pod data neither explains nor excuses it. v14 fps: 2.9 -> 3.7 (the
+whole S3a-d/pump/keepalive stack ≈ +1 fps); raster remains ~77% of
+frame cost, making 0061 the dominant remaining lever.
