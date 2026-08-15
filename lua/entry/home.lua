@@ -2,6 +2,10 @@
 -- Runs in the fork's embedded lua-bot against the raw Observation mirror.
 
 local solo = require("accelerated")
+-- Home is the dogfood pen, not a scored league: run the soft-quest path here
+-- so the new quest stack gets exercised where monofuel can watch. Scored
+-- leagues stay grind-only until a rerun A/B beats the 4.791 baseline.
+solo.set_quests(true)
 
 local M = {}
 
