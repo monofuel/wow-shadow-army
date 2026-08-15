@@ -595,6 +595,73 @@ end
 
 ShadowArmy.combatModel = CombatModel
 
+--------------------------------------------------------------------------
+-- Pure passive-upkeep model (r42): given the watched self-buffs, the pet
+-- state and the class, decide which one-click buttons the panel shows and
+-- which lines stay plain text. Buttons are for upkeep the human still owns;
+-- anything the advisor already auto-casts stays a note.
+--------------------------------------------------------------------------
+
+local PassiveModel = {}
+
+-- Class summons. A class with no entry simply never gets a summon button.
+PassiveModel.summons = {
+  WARLOCK = "Summon Imp",
+}
+
+local function passiveGetn(t)
+  local n = 0
+  while t and t[n + 1] ~= nil do n = n + 1 end
+  return n
+end
+
+function PassiveModel.evaluate(snapshot)
+  local result = { buttons = {}, notes = {}, ok = true }
+  local nb, nn = 0, 0
+  local buffs = snapshot.buffs or {}
+  local i = 1
+  while i <= passiveGetn(buffs) do
+    local buff = buffs[i]
+    if buff.missing or buff.expiring then
+      if buff.auto then
+        nn = nn + 1
+        result.notes[nn] = {
+          tone = "ok",
+          text = string.format("%s: auto (%s)",
+            buff.autoLabel or buff.label, buff.spell or "untrained"),
+        }
+      elseif buff.spell and not snapshot.dead then
+        nb = nb + 1
+        result.buttons[nb] = {
+          id = "buff:" .. (buff.id or buff.label),
+          label = buff.spell, spell = buff.spell, selfCast = true,
+        }
+      elseif buff.missing then
+        nn = nn + 1
+        result.notes[nn] = { tone = "bad", text = buff.label .. " MISSING" }
+      else
+        nn = nn + 1
+        result.notes[nn] = {
+          tone = "warn",
+          text = string.format("%s %dm left", buff.label, buff.minutes or 0),
+        }
+      end
+    end
+    i = i + 1
+  end
+  local summon = PassiveModel.summons[snapshot.classToken or ""]
+  if summon and not snapshot.hasPet and not snapshot.inCombat
+      and not snapshot.dead
+      and snapshot.known and snapshot.known[string.lower(summon)] then
+    nb = nb + 1
+    result.buttons[nb] = { id = "summon", label = summon, spell = summon }
+  end
+  result.ok = (nb == 0 and nn == 0)
+  return result
+end
+
+ShadowArmy.passiveModel = PassiveModel
+
 -- Unit tests load this file without the WoW UI and stop after the pure model.
 if not CreateFrame then return end
 
@@ -603,7 +670,7 @@ local F = {}
 
 -- Bump on every edit. The System watches Chat.log for "<SA> loaded rev=..."
 -- after sending a reload — a new rev proves the edit actually loaded.
-local REV = "r41"
+local REV = "r42"
 
 -- Log window (r16): every F.say()/F.emit() line also lands here with a
 -- timestamp, so errors survive chat scroll-off and can be reviewed in-game.
@@ -733,9 +800,10 @@ end
 -- Advisor panel: draggable window with live lines + buttons.
 --------------------------------------------------------------------------
 
+local PANEL_BASE_HEIGHT = 300 -- r32: room for quest checklist under grind lines
 local panel = CreateFrame("Frame", "ShadowArmyPanel", UIParent)
 panel:SetWidth(210)
-panel:SetHeight(300) -- r32: room for quest checklist under grind lines
+panel:SetHeight(PANEL_BASE_HEIGHT)
 panel:SetPoint("RIGHT", UIParent, "RIGHT", -40, 60)
 panel:SetFrameStrata("HIGH")
 panel:SetBackdrop({
@@ -781,11 +849,40 @@ local line2 = F.makeLine(line1)
 local line3 = F.makeLine(line2)
 local line4 = F.makeLine(line3)
 local line5 = F.makeLine(line4, -6) -- buff watch / warnings
+
+-- r42: long-term passive upkeep buttons (missing self-buff, missing minion).
+-- Frames are built once here and only shown/hidden on refresh. The row keeps
+-- zero height while nothing is pending, so the quest checklist below never
+-- moves in the common case.
+local PASSIVE_MAX_BUTTONS = 4
+local PASSIVE_BTN_STEP = 20
+local passiveRow = CreateFrame("Frame", "ShadowArmyPassiveRow", panel)
+passiveRow:SetPoint("TOPLEFT", line5, "BOTTOMLEFT", 0, -4)
+passiveRow:SetWidth(194)
+passiveRow:SetHeight(1)
+local passiveBtns = {}
+local _pbi = 1
+while _pbi <= PASSIVE_MAX_BUTTONS do
+  local b = CreateFrame("Button", "ShadowArmyPassiveBtn" .. _pbi, passiveRow,
+    "UIPanelButtonTemplate")
+  b:SetWidth(94)
+  b:SetHeight(18)
+  b:SetPoint("TOPLEFT", passiveRow, "TOPLEFT",
+    math.mod(_pbi - 1, 2) * 98,
+    -math.floor((_pbi - 1) / 2) * PASSIVE_BTN_STEP)
+  b:SetScript("OnClick", function()
+    F.passiveClick(this.passiveSpell, this.passiveSelf)
+  end)
+  b:Hide()
+  passiveBtns[_pbi] = b
+  _pbi = _pbi + 1
+end
+
 -- r32: multi-line quest checklist (quest identity + objectives). line6 is
 -- slot 1 so corpse-run can still steal the first row while ghosting.
 local QUEST_PANEL_LINES = 8
 local questLines = {}
-questLines[1] = F.makeLine(line5, -6)
+questLines[1] = F.makeLine(passiveRow, -6)
 local _qli = 2
 while _qli <= QUEST_PANEL_LINES do
   questLines[_qli] = F.makeLine(questLines[_qli - 1], -2)
@@ -1479,17 +1576,21 @@ end)
 -- but buff NAMES aren't exposed directly — identify by texture instead
 -- (stable across ranks). Demon Skin and Demon Armor share the watch slot:
 -- either one counts as "armored".
-local WATCHED_BUFFS = {
-  {
-    label = "Demon Skin",
-    textures = {
-      "Interface\\Icons\\Spell_Shadow_RagingScream",  -- Demon Skin
-      "Interface\\Icons\\Spell_Shadow_SpectralSight", -- Demon Armor (lvl 20+)
-    },
-    warnBelow = 300, -- seconds; warn under 5 minutes
-    autoCast = true, -- r12: the advisor keeps this one up itself (see F.armorTick)
+local ARMOR_WATCH = {
+  id = "armor",
+  label = "Demon Skin",
+  autoLabel = "armor",
+  -- Preference order; Demon Armor supersedes Demon Skin at 20+.
+  spells = { "Demon Armor", "Demon Skin" },
+  textures = {
+    "Interface\\Icons\\Spell_Shadow_RagingScream",  -- Demon Skin
+    "Interface\\Icons\\Spell_Shadow_SpectralSight", -- Demon Armor (lvl 20+)
   },
+  warnBelow = 300, -- seconds; warn under 5 minutes
+  autoCast = true, -- r12: the advisor keeps this one up itself (see F.armorTick)
 }
+
+local WATCHED_BUFFS = { ARMOR_WATCH }
 
 function F.buffTimeLeftByTexture(textures)
   local i = 0
@@ -1532,13 +1633,21 @@ local ARMOR_CHECK_EVERY = 1    -- buff scan cadence (driver ticks every frame)
 
 local armorNextCheck = 0
 
--- Which spell to use. Demon Armor supersedes Demon Skin at 20+; auto.known
--- is the spellbook scan, so we never CastSpellByName something untrained
--- (that throws "you don't know that spell" red text at the human).
-function F.armorSpell()
-  if auto.known["demon armor"] then return "Demon Armor" end
-  if auto.known["demon skin"] then return "Demon Skin" end
+-- Which spell to use for a watch. auto.known is the spellbook scan, so we
+-- never CastSpellByName something untrained (that throws "you don't know
+-- that spell" red text at the human).
+function F.watchSpell(watch)
+  local names = watch.spells or {}
+  local i = 1
+  while i <= table.getn(names) do
+    if auto.known[string.lower(names[i])] then return names[i] end
+    i = i + 1
+  end
   return nil
+end
+
+function F.armorSpell()
+  return F.watchSpell(ARMOR_WATCH)
 end
 
 -- Comma-separated list of the player's current buff icons with the
@@ -1602,39 +1711,85 @@ function F.armorTick()
   end
 end
 
-local lastNag = 0
-function F.buffWatchLine()
-  local warnings = nil
-  local nags = nil
+--------------------------------------------------------------------------
+-- r42: long-term passives are buttons, not nags. A missing self-buff the
+-- advisor does NOT auto-cast, and a missing minion, become one-click panel
+-- buttons; anything already handled (or untrained) stays a status line.
+--------------------------------------------------------------------------
+
+function F.passiveSnapshot()
+  local buffs, n = {}, 0
   for _, watch in ipairs(WATCHED_BUFFS) do
     local left = F.buffTimeLeftByTexture(watch.textures)
-    local warn
-    if not left then
-      warn = string.format("|cFFFF4444%s MISSING|r", watch.label)
-    elseif left < watch.warnBelow then
-      warn = string.format("|cFFFFAA00%s %dm left|r", watch.label, math.ceil(left / 60))
-    end
-    if warn then
-      local nag = warn
-      -- r12: when auto-cast owns this buff there is nothing for the human to
-      -- do — show the auto state and stay out of chat entirely. If the
-      -- texture-guess safety disabled auto-cast, we fall straight back to the
-      -- old warning text AND the old once-a-minute chat nag.
-      if watch.autoCast and not watch.acDisabled then
-        warn = string.format("|cFF44FF44armor: auto (%s)|r", F.armorSpell() or "untrained")
-        nag = nil
-      end
-      warnings = warnings and (warnings .. "  " .. warn) or warn
-      if nag then
-        nags = nags and (nags .. "  " .. nag) or nag
-      end
+    if not left or left < watch.warnBelow then
+      n = n + 1
+      buffs[n] = {
+        id = watch.id, label = watch.label, autoLabel = watch.autoLabel,
+        spell = F.watchSpell(watch),
+        missing = (not left) and true or false,
+        expiring = left and true or false,
+        minutes = left and math.ceil(left / 60) or nil,
+        auto = (watch.autoCast and not watch.acDisabled) and true or false,
+      }
     end
   end
+  return {
+    classToken = auto.classToken,
+    known = auto.known,
+    buffs = buffs,
+    hasPet = UnitExists("pet") and true or false,
+    inCombat = UnitAffectingCombat("player") and true or false,
+    dead = UnitIsDeadOrGhost("player") and true or false,
+  }
+end
+
+function F.passiveClick(spell, onSelf)
+  if not spell or auto.casting then return end
+  F.castNow(spell, onSelf)
+end
+
+local PASSIVE_TONES = { ok = "|cFF44FF44", bad = "|cFFFF4444", warn = "|cFFFFAA00" }
+
+local lastNag = 0
+function F.passiveLine()
+  local result = PassiveModel.evaluate(F.passiveSnapshot())
+  local text, nags = nil, nil
+  for _, note in ipairs(result.notes) do
+    local painted = (PASSIVE_TONES[note.tone] or "|cFFFFAA00") .. note.text .. "|r"
+    text = text and (text .. "  " .. painted) or painted
+    if note.tone ~= "ok" then
+      nags = nags and (nags .. "  " .. note.text) or note.text
+    end
+  end
+
+  local shown = table.getn(result.buttons)
+  local i = 1
+  while i <= PASSIVE_MAX_BUTTONS do
+    local btn = passiveBtns[i]
+    local want = i <= shown and result.buttons[i] or nil
+    if want then
+      btn.passiveSpell = want.spell
+      btn.passiveSelf = want.selfCast and 1 or nil
+      btn:SetText(want.label)
+      btn:Show()
+    else
+      btn.passiveSpell = nil
+      btn:Hide()
+    end
+    i = i + 1
+  end
+  local rows = math.ceil(shown / 2)
+  passiveRow:SetHeight(rows > 0 and rows * PASSIVE_BTN_STEP or 1)
+  panel:SetHeight(PANEL_BASE_HEIGHT + rows * PASSIVE_BTN_STEP)
+
+  -- Nag only about things the human cannot fix with a click.
   if nags and (GetTime() - lastNag) > 60 then
     lastNag = GetTime()
     F.say("buff watch: " .. nags) -- chat nag at most once a minute
   end
-  return warnings or "|cFF44FF44buffs OK|r"
+  if text then return text end
+  if shown > 0 then return "" end
+  return "|cFF44FF44buffs OK|r"
 end
 
 --------------------------------------------------------------------------
@@ -4356,7 +4511,7 @@ panel:SetScript("OnUpdate", function()
   local t1, t2 = F.targetSummary()
   line3:SetText(t1)
   line4:SetText(t2)
-  line5:SetText(F.buffWatchLine())
+  line5:SetText(F.passiveLine())
   -- r32: multi-line quest checklist (corpse compass overrides while ghosting).
   local ok, err = pcall(F.questRefreshPanel)
   if not ok then
