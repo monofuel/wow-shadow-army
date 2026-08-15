@@ -1,7 +1,8 @@
 ## Road waypoint overlay artifacts for the map browser.
 ##
 ## Each JSONL starts with a meta object (`meta`, `map`, `map_id`; default
-## map_id 1). Every following line is a segment: `id`, `source` baked|hand,
+## map_id 1). Every following line is a segment: `id`, `source` (baked,
+## minimap_ribbon, terrain_medial, visual_gap_bridge, or legacy hand),
 ## `pts` as world `[x, y, z]` with z already baked. Optional `note`. Missing
 ## files are skipped.
 
@@ -14,6 +15,7 @@ type
 
   RoadSegment* = object
     id*, source*: string
+    confidence*: float32
     mapId*: uint32
     points*: seq[RoadPoint]
 
@@ -66,6 +68,8 @@ proc loadRoadWaypointsFile*(path: string; segments: var seq[RoadSegment]) =
       segments.add RoadSegment(
         id: obj{"id"}.getStr(),
         source: obj{"source"}.getStr(),
+        confidence: float32(obj{"confidence"}.getFloat(
+          if obj{"source"}.getStr() == "visual_gap_bridge": 0.0 else: 1.0)),
         mapId: mapId,
         points: points
       )
