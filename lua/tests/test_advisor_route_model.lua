@@ -163,4 +163,41 @@ check(model.nextPoint(nil, 0, 0, 1.0) == nil, "no route means no route bearing")
 check(model.nextPoint({ { x = 1, y = 1 } }, 0, 0, 1.0) == nil,
   "a one-point route means no route bearing")
 
+-- --------------------------------------------------------------- sample ---
+-- The world-map road layer: every segment of a zone thinned to a dot budget.
+
+local sPts, sN = model.sample(elbow, 180)
+check(sN == #sPts, "sample returns its own count")
+check(sN == 18, "a zone that fits the budget is drawn whole (9 + 9 points)")
+check(sPts[1].x == 10 and sPts[1].y == 10, "the first point survives thinning")
+check(sPts[sN].x == 90 and sPts[sN].y == 90, "the last point survives thinning")
+
+-- Over budget: never more dots than asked for, and no segment vanishes.
+local big = {}
+for i = 1, 40 do big[i] = column(i, 0, 90) end -- 40 segments x 10 points
+local bN
+sPts, bN = model.sample(big, 180)
+check(bN <= 180, "sampling never exceeds the dot budget (" .. bN .. ")")
+check(bN >= 80, "every segment still gets at least its two endpoints")
+local seen = {}
+for _, p in ipairs(sPts) do seen[p.x] = (seen[p.x] or 0) + 1 end
+local missing = 0
+for i = 1, 40 do
+  if not seen[i] then missing = missing + 1 end
+end
+check(missing == 0, "no segment is thinned out of existence")
+
+-- More segments than the budget can seat: still bounded, still spread out.
+local many = {}
+for i = 1, 300 do many[i] = row(i, 0, 10) end
+local mPts, mN = model.sample(many, 180)
+check(mN <= 180 and mN > 0, "a zone with more segments than dots stays bounded")
+check(#mPts == mN, "the overflow case still returns a dense array")
+
+-- Absent or degenerate data is empty, never an error.
+local zPts, zN = model.sample(nil, 180)
+check(zN == 0 and #zPts == 0, "no road data means no dots")
+zPts, zN = model.sample(elbow, 0)
+check(zN == 0 and #zPts == 0, "a zero budget draws nothing")
+
 print("test_advisor_route_model: " .. passed .. " checks passed")

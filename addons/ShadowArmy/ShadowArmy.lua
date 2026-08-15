@@ -743,6 +743,72 @@ do
     return pts[n].x, pts[n].y, n
   end
 
+  -- Every point of every segment of one zone, thinned to `budget` points for
+  -- the world-map road layer. That layer exists so a human can say "that road
+  -- isn't in the data", so a segment DISAPPEARING is the one unacceptable
+  -- outcome: each segment keeps its two endpoints whenever the budget can seat
+  -- them all, and only the leftover is shared out in proportion to length.
+  -- A zone whose points already fit is drawn whole.
+  -- -> a dense array of { x=, y= }, and its count (percent coordinates, the
+  -- same space build() and route() speak)
+  function RouteModel.sample(zoneSegments, budget)
+    local out, np = {}, 0
+    if not zoneSegments then return out, 0 end
+    budget = budget or 180
+    if budget < 1 then return out, 0 end
+    local nSeg = routeGetn(zoneSegments)
+    local total = 0
+    local si = 1
+    while si <= nSeg do
+      total = total + math.floor(routeGetn(zoneSegments[si]) / 2)
+      si = si + 1
+    end
+    if total < 1 then return out, 0 end
+    -- Endpoint floor per segment, dropped entirely when there are more
+    -- segments than the budget can even give two dots each.
+    local base = 2
+    if nSeg * base > budget then base = 0 end
+    local extra = budget - base * nSeg
+    local spare = total - base * nSeg
+    if spare < 1 then spare = 1 end
+    si = 1
+    while si <= nSeg and np < budget do
+      local flat = zoneSegments[si]
+      local cnt = math.floor(routeGetn(flat) / 2)
+      local take
+      if total <= budget then
+        take = cnt
+      else
+        take = base + math.floor((cnt - base) * extra / spare)
+        if take < 1 then take = 1 end
+        if take > cnt then take = cnt end
+      end
+      if take > budget - np then take = budget - np end
+      if take >= cnt then
+        local fi = 1
+        while fi + 1 <= cnt * 2 do
+          np = np + 1
+          out[np] = { x = flat[fi], y = flat[fi + 1] }
+          fi = fi + 2
+        end
+      elseif take == 1 then
+        np = np + 1
+        out[np] = { x = flat[1], y = flat[2] }
+      elseif take > 1 then
+        -- Evenly spaced along the polyline, both endpoints always included.
+        local k = 0
+        while k < take do
+          local idx = math.floor(k * (cnt - 1) / (take - 1) + 0.5) + 1
+          np = np + 1
+          out[np] = { x = flat[idx * 2 - 1], y = flat[idx * 2] }
+          k = k + 1
+        end
+      end
+      si = si + 1
+    end
+    return out, np
+  end
+
   ShadowArmy.routeModel = RouteModel
 end
 
@@ -1542,7 +1608,7 @@ local F = {}
 
 -- Bump on every edit. The System watches Chat.log for "<SA> loaded rev=..."
 -- after sending a reload — a new rev proves the edit actually loaded.
-local REV = "r47"
+local REV = "r48"
 
 -- Log window (r16): every F.say()/F.emit() line also lands here with a
 -- timestamp, so errors survive chat scroll-off and can be reviewed in-game.
@@ -5568,6 +5634,9 @@ do
     local t = routeDots[i]
     if t then return t end
     -- ARTWORK, not OVERLAY: the trail passes UNDER the objective pins.
+    -- MUST stay lazily created: 1.12 ignores SetDrawLayer's sublevel, so
+    -- within ARTWORK only creation order puts this trail ABOVE the road
+    -- layer's eagerly-built pool. Prebuild this at load and the trail sinks.
     t = WorldMapDetailFrame:CreateTexture(nil, "ARTWORK")
     t:SetWidth(5)
     t:SetHeight(5)
@@ -5620,6 +5689,155 @@ do
       else
         t:Hide()
       end
+      i = i + 1
+    end
+  end
+end
+
+--------------------------------------------------------------------------
+-- ROAD LAYER (r48): the WHOLE baked road network of the zone the map is
+-- showing, as a faint dot field under the route trail and the quest pins.
+-- The route draws one path; this is the coverage view — the in-game twin of
+-- the map-browser's road layer — so a human can point at the map and say
+-- "that road isn't in the data".
+--
+-- Guards are the existing ones: quest.posOK is the oracle for "the map is
+-- showing the player's OWN zone" (GetPlayerMapPosition reads 0,0 the moment
+-- the map points anywhere else), so zone A's roads can never land on zone B's
+-- map. Nothing happens while the map is closed, and a missing
+-- ShadowArmyRoadData (pre-restart) costs exactly the dots — the toggle and
+-- everything else still work.
+--
+-- Bridge segments are plain 2-point polylines in the data and render as a
+-- sparse dot pair. That is the point: visible is criticizable.
+--------------------------------------------------------------------------
+
+-- Scoped like the route block above for the Lua 5.0 200-local budget.
+do
+  local ROAD_MAX_DOTS = 180 -- texture pool, created once, reused forever
+  local ROAD_DOT = 3        -- px; deliberately smaller than a route dot (5)
+
+  local road = {
+    on = true,        -- session toggle; ON by default (coverage is the point)
+    zone = nil,       -- AreaTable id the current sample was thinned for
+    pts = {}, n = 0,  -- sampled points, percent
+    anchored = false, -- dots currently positioned for zone/size below
+    pw = 0, ph = 0,   -- detail-frame size those anchors were computed against
+    live = 0,         -- dots currently shown
+  }
+
+  local roadDots = {}
+  function F.roadDot(i)
+    local t = roadDots[i]
+    if t then return t end
+    -- ARTWORK sublevel -1: under the route trail (ARTWORK 0) and well under
+    -- the objective pins (OVERLAY). Old clients that ignore the sublevel
+    -- argument still get the right order from the eager pool below, because
+    -- within one layer 1.12 draws in creation order.
+    t = WorldMapDetailFrame:CreateTexture(nil, "ARTWORK")
+    if t.SetDrawLayer then pcall(t.SetDrawLayer, t, "ARTWORK", -1) end
+    t:SetWidth(ROAD_DOT)
+    t:SetHeight(ROAD_DOT)
+    -- Dim neutral gray-tan: road, not quest. Set once — colour never varies.
+    t:SetTexture(0.70, 0.64, 0.52, 0.40)
+    t:Hide()
+    roadDots[i] = t
+    return t
+  end
+
+  -- Independent of the quest-marker toggle on purpose: "is the road data
+  -- there" is a question you ask with the pins switched off too.
+  function F.roadDrawLayer()
+    if not WorldMapDetailFrame then return end
+    local show = road.on and quest.posOK
+      and WorldMapFrame and WorldMapFrame:IsVisible()
+    if not show then
+      if road.live > 0 then
+        local i = 1
+        while i <= ROAD_MAX_DOTS do
+          F.roadDot(i):Hide()
+          i = i + 1
+        end
+        road.live, road.anchored = 0, false
+      end
+      return
+    end
+    local id = F.routeZoneId(quest.zoneName)
+    if id ~= road.zone then
+      -- A zone change is the only invalidation: percent coordinates are
+      -- per-zone, so every cached number means something else after it.
+      road.zone, road.anchored = id, false
+      road.pts, road.n = {}, 0
+      local model = ShadowArmy and ShadowArmy.routeModel
+      local segs = nil
+      if id and ShadowArmyRoadData then segs = ShadowArmyRoadData[id] end
+      if segs and model and model.sample then
+        local ok, pts, np = pcall(model.sample, segs, ROAD_MAX_DOTS)
+        if ok and pts then road.pts, road.n = pts, np or 0 end
+      end
+    end
+    local w = WorldMapDetailFrame:GetWidth()
+    local h = WorldMapDetailFrame:GetHeight()
+    -- Anchors only move when the zone or the map surface changes, so
+    -- repainting an already-painted zone costs three comparisons.
+    if road.anchored and road.pw == w and road.ph == h then return end
+    local i = 1
+    while i <= ROAD_MAX_DOTS do
+      local t = F.roadDot(i)
+      local p = nil
+      if i <= road.n then p = road.pts[i] end
+      if p then
+        t:ClearAllPoints() -- SetPoint ACCUMULATES anchors in 1.12
+        t:SetPoint("CENTER", WorldMapDetailFrame, "TOPLEFT",
+          p.x / 100 * w, -(p.y / 100 * h))
+        t:Show()
+      else
+        t:Hide()
+      end
+      i = i + 1
+    end
+    road.pw, road.ph, road.live, road.anchored = w, h, road.n, true
+  end
+
+  -- Toggle: a small button in the bottom-left corner of the map surface (the
+  -- 1.12 map keeps its dropdowns up top and the zoom-out button bottom-right).
+  -- Parented to the detail frame so it draws above the map tiles and hides
+  -- with the map; session-only state, exactly like the marker button.
+  local roadBtn = nil
+  if WorldMapDetailFrame or WorldMapFrame then
+    roadBtn = CreateFrame("Button", "ShadowArmyRoadBtn",
+      WorldMapDetailFrame or WorldMapFrame, "UIPanelButtonTemplate")
+    roadBtn:SetWidth(64)
+    roadBtn:SetHeight(20)
+    roadBtn:SetPoint("BOTTOMLEFT", roadBtn:GetParent(), "BOTTOMLEFT", 6, 6)
+    roadBtn:SetScript("OnClick", function()
+      F.roadToggle()
+    end)
+  end
+
+  function F.roadSetLayer(on)
+    road.on = on and true or false
+    if roadBtn then
+      roadBtn:SetText(road.on and "|cFF44FF44Roads|r" or "|cFF999999Roads|r")
+    end
+    pcall(F.roadDrawLayer) -- hide/show immediately, no waiting for the tick
+  end
+
+  function F.roadToggle()
+    F.roadSetLayer(not road.on)
+    F.say("road layer " .. (road.on and "ON" or "OFF")
+      .. " — " .. road.n .. " dots of the zone's baked network")
+  end
+
+  F.roadSetLayer(true)
+
+  -- Built once, at load. Within one draw layer 1.12 renders in CREATION
+  -- order, so making the whole pool before the first route dot exists is what
+  -- actually guarantees the trail stays on top of the network.
+  if WorldMapDetailFrame then
+    local i = 1
+    while i <= ROAD_MAX_DOTS do
+      F.roadDot(i)
       i = i + 1
     end
   end
@@ -5904,6 +6122,7 @@ function F.questTick()
   F.questDrawBlips()
   F.questDrawMarkers()
   F.routeDrawMarkers()
+  F.roadDrawLayer()
   F.questRefreshWindow()
 end
 
@@ -5941,6 +6160,8 @@ questEvents:SetScript("OnEvent", function()
   if not ok then F.emit("err", "questMarkers: " .. tostring(err)) end
   local rok, rerr = pcall(F.routeDrawMarkers)
   if not rok then F.emit("err", "routeMarkers: " .. tostring(rerr)) end
+  local dok, derr = pcall(F.roadDrawLayer)
+  if not dok then F.emit("err", "roadLayer: " .. tostring(derr)) end
 end)
 
 --------------------------------------------------------------------------
@@ -6483,6 +6704,7 @@ function F.saHelp()
   F.say("  /sa bags       open ShadowBags")
   F.say("  /sa quests     toggle the complete quest window")
   F.say("  /sa crew       toggle party + corpse map blips")
+  F.say("  /sa roads      toggle the zone road layer on the world map")
   F.say("  /sa reload     ReloadUI() — pick up disk edits")
 end
 
@@ -6527,6 +6749,11 @@ SlashCmdList["SHADOWARMY"] = function(msg)
     end
     F.say("crew blips " .. (crew.enabled and "ON" or "OFF")
       .. " (party cyan / ghost white / corpse purple)")
+    return
+  end
+  -- Same valve as the map button, for when the map corner is covered.
+  if msg == "roads" then
+    F.roadToggle()
     return
   end
   if msg == "log" then
