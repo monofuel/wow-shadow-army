@@ -148,3 +148,19 @@ Full audit on branch monofuel/h3-manifest-retry (no changes needed):
 - Minor non-freeze defect logged: the manifest 3-attempt retry ladder is
   reachable only by definite 404s (which retries can't help); transients
   never reach it. Cosmetic, left alone for rebase friction.
+
+## 2026-08-15 update 3 — triple simultaneous wedge during the 15-seat ramp
+
+During the new-army cold-stream stampede (H1 fix LIVE, box healthy: load
+~6, RAM 42/125G), Igris, Tusk, and Beru froze within a ~10s window
+(status.json stale together); Shadowfel on the same nginx survived.
+All three logs end with a COMPLETED "World stream settled" line
+(failed=8 / 22 / 73; Tusk again shows .assets.txt manifest failures;
+Beru shows unusually large 4,300-4,700-asset re-stream churn) — the
+freeze is POST-settle, same as the original Tusk wedge. This weakens
+"mid-stream pool paralysis" and points at whatever runs after settle
+(retention sync / released-asset accounting / the settle epilogue) or
+at pool exhaustion whose symptom emerges between streams. Evidence in
+the rotated launcher.log.<timestamp> files per seat. The three seats
+were restarted onto the INSTRUMENTED build (inflight=/oldest= now in
+their logs) — the next wedge is self-diagnosing.
