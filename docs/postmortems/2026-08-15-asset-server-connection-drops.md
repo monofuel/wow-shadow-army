@@ -180,3 +180,14 @@ peak ~58, steady 38-52 on 32 cores) produced:
 - The original four seats stayed fresh through the whole ramp, and the
   new babysitter performed its first live recoveries (Igris/Tusk/Beru
   re-pidded) without human involvement.
+
+## 2026-08-15 update 5 — QA-seat freezes with H1 live (independent corroboration)
+
+The quest-QA scenario seat (Kaisel) froze twice in the exact wedge
+shape: status.json stops advancing, process alive ~50% CPU / 2.5GB
+RSS, DEBUG PORT STOPS ACKING (new signal — the control-file poll on
+the decide thread dies with it, placing the freeze at or above the
+decide loop, not just the renderer), manifest fetch failures in the
+tail — all with keepalive_requests 100000 confirmed live. Keepalive
+exhaustion (H1) is definitively not the whole story; H2/H4 remain.
+Details: docs/quest-qa-2026-08-15.md "Environment issue" section.
