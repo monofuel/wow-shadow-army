@@ -11,7 +11,7 @@ ShadowArmy.lua
 # the advisor panel and /sa keep working.
 #   QuestData ~1.6MB : quest waypoints; absent -> checklist without waypoints
 #   ItemData  ~1.1MB : item facts;      absent -> no vendor-price knowledge
-#   RoadData  ~46KB  : road polylines;  absent -> straight-line routing
+#   RoadData  ~52KB  : road polylines;  absent -> straight-line routing
 QuestData.lua
 ItemData.lua
 RoadData.lua

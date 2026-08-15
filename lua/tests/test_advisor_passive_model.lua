@@ -95,6 +95,13 @@ check(r.notes[1].text == "Demon Skin 3m left" and r.notes[1].tone == "warn",
 r = model.evaluate(snapshot({ buffs = { armor() } }))
 check(r.buttons[1].id == "buff:armor" and r.buttons[2].id == "summon",
   "buff upkeep is offered before the summon")
+-- r47 (ticket 0049): key 2 casts result.buttons[1] and nothing re-sorts the
+-- row on the way, so "which spell does key 2 fire" is decided RIGHT HERE.
+check(#r.buttons == 2 and r.buttons[1].spell == "Demon Skin" and r.buttons[1].selfCast,
+  "key 2 takes the first model button: the buff, self-cast, ahead of the summon")
+
+r = model.evaluate(snapshot({ hasPet = true }))
+check(r.buttons[1] == nil, "a quiet passive row leaves key 2 with nothing to cast")
 
 r = model.evaluate(snapshot({ hasPet = true, buffs = {
   armor({ missing = false, expiring = true, minutes = 4, spell = "Demon Armor" }) } }))

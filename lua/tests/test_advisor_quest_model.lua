@@ -247,4 +247,24 @@ r = model.build({
 })
 check(r.list[1].objs[1].from == nil, "an objective with no source list stays bare")
 
+local ft = model.fromText
+check(ft(nil) == nil, "no source list says nothing")
+check(ft({}) == nil, "an empty source list says nothing")
+check(ft({"Kobold Miner"}, 2, nil, " more") == "Kobold Miner",
+  "one name renders bare")
+check(ft({"Kobold Miner", "Kobold Digger"}, 2, nil, " more") == "Kobold Miner, Kobold Digger",
+  "two names join with a comma")
+check(ft({"A", "B", "C"}, 2, nil, " more") == "A, B +1 more",
+  "the window spells the leftovers out")
+check(ft({"Cracked Skull Soldier"}, 2, 24, "") == "Cracked Skull Soldier",
+  "one name that fits the panel is untouched")
+check(ft({"Cracked Skull Soldier", "Rattlecage Soldier"}, 2, 24, "") == "Cracked Skull Soldier +1",
+  "a tight panel width drops the second name for a +1")
+check(ft({"Cracked Skull Soldier", "Rattlecage Soldier", "C", "D", "E"}, 2, 24, "") == "Cracked Skull Soldier +4",
+  "five names at panel width keep one name and a +4 count")
+check(ft({"Extremely Long Mob Name Of Doom"}, 2, 12, "") == "Extremely L+",
+  "a single name too long for the width is clipped with a +")
+check(string.len(ft({"Cracked Skull Soldier", "Rattlecage Soldier", "C", "D", "E"}, 2, 24, "")) <= 24,
+  "the panel hint never exceeds its character budget")
+
 print("test_advisor_quest_model: " .. passed .. " checks passed")

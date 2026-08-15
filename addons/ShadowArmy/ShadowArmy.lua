@@ -348,6 +348,57 @@ function QuestModel.build(opts)
   return { list = list, candidates = kept }
 end
 
+-- "who do I hunt for this item" hint (ticket 0047). The window has room to
+-- spell two names out; the 210px advisor PANEL does not, and monofuel reads
+-- objectives on the panel — "Notched Rib 0/5" with no mention of Cracked
+-- Skull Soldier is the bug. So the join lives here, in the pure model, with
+-- an optional character budget: names are dropped (never wrapped, never
+-- clipped mid-word) until the rendered string fits.
+--
+-- Names arrive alphabetical, so the first is not the "best" one — the cap is
+-- line width, nothing more, which is why the dropped ones still show as +N.
+QuestModel.fromMaxNames = 2
+
+local function questFromJoin(from, k, n, more)
+  local out, i = nil, 1
+  while i <= k do
+    out = out and (out .. ", " .. from[i]) or from[i]
+    i = i + 1
+  end
+  if not out then return nil end
+  if n > k then out = out .. " +" .. (n - k) .. (more or "") end
+  return out
+end
+
+-- from      array of source names ({} / nil -> nil, "say nothing")
+-- maxNames  how many get spelled out at most (default 2)
+-- maxChars  optional hard budget for the WHOLE string
+-- more      suffix after the "+N" count (" more" for the window, "" for the panel)
+function QuestModel.fromText(from, maxNames, maxChars, more)
+  -- questGetn indexes its argument unguarded (every other caller feeds it a
+  -- built list); this one is reached straight off a live objective, where the
+  -- field is simply absent on anything that is not an item objective.
+  if not from then return nil end
+  local n = questGetn(from)
+  if n == 0 then return nil end
+  maxNames = maxNames or QuestModel.fromMaxNames
+  if maxNames > n then maxNames = n end
+  if maxNames < 1 then maxNames = 1 end
+  local k = maxNames
+  local s = questFromJoin(from, k, n, more)
+  while maxChars and k > 1 and string.len(s) > maxChars do
+    k = k - 1
+    s = questFromJoin(from, k, n, more)
+  end
+  if maxChars and string.len(s) > maxChars then
+    -- One name alone still overflows: hard-clip with the trailing "+" the
+    -- rest of the panel uses for a shortened string (see F.questShort).
+    if maxChars < 2 then return nil end
+    s = string.sub(s, 1, maxChars - 1) .. "+"
+  end
+  return s
+end
+
 ShadowArmy.questModel = QuestModel
 
 --------------------------------------------------------------------------
@@ -1278,6 +1329,211 @@ end
 
 ShadowArmy.barModel = BarModel
 
+--------------------------------------------------------------------------
+-- Pure bag disposition model (r47, ticket 0039 phase 2): "a bot picked up
+-- 12 random items — what should it do with them?" Tags every bag item the
+-- human sees first and the bots consume later.
+--
+-- THE DATA CONTRACT IS THE WHOLE TRAP (docs/item-data.md; the phase-1 review
+-- called this exact footgun out): ItemData OMITS every field that equals its
+-- default, so an absent `class` means 0 = Consumable and an absent `q` means
+-- 0 = Poor. Reading `row.class` raw turns every consumable into "no class"
+-- and every gray into "unknown quality". Every field read here goes through
+-- BagModel.field() and nothing else may read a row directly.
+--
+-- A missing ROW is a different thing entirely: `ShadowArmyItemData[id] == nil`
+-- means this patch's dump never saw the item, and the only honest answer is
+-- HOLD "unknown item". Do not fold that into the defaulting.
+--
+-- Pure: no WoW API, no frames, no globals — lua/tests drives it on host Lua.
+--------------------------------------------------------------------------
+
+local BagModel = {}
+
+local function bagGetn(t)
+  local n = 0
+  while t and t[n + 1] ~= nil do n = n + 1 end
+  return n
+end
+
+BagModel.SELL = "SELL"
+BagModel.EQUIP = "EQUIP"
+BagModel.KEEP_QUEST = "KEEP_QUEST"
+BagModel.HOLD = "HOLD"
+-- Declared so the UI can colour it, NEVER returned by v1. Deciding "drink
+-- this / eat this / this is a bandage" needs `spellid_1` + `flags` out of
+-- item_template, which phase 1 did not emit (ticket 0039 note 2026-08-14).
+-- Consumables land on HOLD with a reason that says so, rather than a guess
+-- that heals nothing.
+BagModel.USE = "USE"
+BagModel.useImplemented = false
+
+BagModel.CLASS_CONSUMABLE = 0
+BagModel.CLASS_WEAPON = 2
+BagModel.CLASS_ARMOR = 4
+BagModel.CLASS_QUEST = 12
+
+BagModel.ARMOR_MISC = 0  -- necks, rings, trinkets, held-in-off-hand
+BagModel.ARMOR_CLOTH = 1
+
+-- `slot` is inventory_type. These are the SINGLE-position slots we are
+-- willing to compare by item level. FINGER (11) and TRINKET (12) have two
+-- positions each, and weapons are not comparable by item level at all (a
+-- wand and a one-hand sword share `lvl` and nothing else) — those punt to
+-- MANUAL_SLOT. ROBE (20) is a chest piece; warlock gear is full of them.
+BagModel.EQUIP_SLOT = {
+  [1] = "head", [2] = "neck", [3] = "shoulder", [5] = "chest",
+  [6] = "waist", [7] = "legs", [8] = "feet", [9] = "wrist",
+  [10] = "hands", [16] = "back", [20] = "chest", [23] = "off-hand",
+}
+
+-- Equippable, but the call is the human's this rev. The reason text names
+-- the slot so the bag window explains itself instead of just saying "hold".
+BagModel.MANUAL_SLOT = {
+  [4] = "shirt", [11] = "ring", [12] = "trinket", [13] = "weapon",
+  [14] = "shield", [15] = "ranged", [17] = "two-hander", [19] = "tabard",
+  [21] = "main hand", [22] = "off hand", [25] = "thrown",
+  [26] = "ranged", [28] = "relic",
+}
+
+-- Cloth casters wear cloth (armor subclass 1) plus the Misc pieces every
+-- class can wear (subclass 0: necks, rings, trinkets, held-in-off-hand).
+BagModel.CLOTH_CLASSES = { WARLOCK = true, MAGE = true, PRIEST = true }
+
+-- THE defaulting accessor. Absent == the column's default, never "unknown".
+function BagModel.field(row, key)
+  if not row then return 0 end
+  local v = row[key]
+  if v == nil then return 0 end
+  return v
+end
+
+-- true / false / nil, where nil is "we have no proficiency rule for this
+-- class yet" and the caller must punt rather than guess.
+function BagModel.canEquip(classToken, class, sub)
+  if class ~= BagModel.CLASS_ARMOR then return nil end
+  if classToken and BagModel.CLOTH_CLASSES[classToken] then
+    return (sub == BagModel.ARMOR_CLOTH or sub == BagModel.ARMOR_MISC)
+  end
+  return nil
+end
+
+-- One item -> { tag, reason, sell, equipSlot? }. ORDER MATTERS; first match
+-- wins. Keep the order comment honest, it is the spec.
+function BagModel.decide(item, level, classToken, equipped)
+  item = item or {}
+  equipped = equipped or {}
+  local row = item.data
+  if not row then
+    return { tag = BagModel.HOLD, reason = "unknown item", sell = 0 }
+  end
+  local f = BagModel.field
+  local class = f(row, "class")
+  local sub = f(row, "sub")
+  local q = f(row, "q")
+  local sell = f(row, "sell")
+  local req = f(row, "req")
+  local ilvl = f(row, "lvl")
+  local slot = f(row, "slot")
+
+  -- 1. Quest items are never sold and never dropped, whatever they are
+  --    worth. This sits FIRST precisely so a high sell price cannot reach
+  --    the gray rule below and vendor away a quest chain.
+  if class == BagModel.CLASS_QUEST then
+    return { tag = BagModel.KEEP_QUEST, reason = "quest item", sell = sell }
+  end
+
+  -- 2. Gray with a vendor price: the reason to walk to a merchant at all.
+  if q == 0 and sell > 0 then
+    return { tag = BagModel.SELL, reason = "gray", sell = sell }
+  end
+
+  -- 3. Equippable upgrade. A miss here does not end the decision — it
+  --    records WHY it missed and falls through to the HOLD rules, so the
+  --    window can say "needs level 20" instead of a bare "hold".
+  local equipHold = nil
+  local slotKey = BagModel.EQUIP_SLOT[slot]
+  if slotKey then
+    local wearable = BagModel.canEquip(classToken, class, sub)
+    if wearable == nil then
+      equipHold = "equippable — no proficiency rule"
+    elseif not wearable then
+      equipHold = "not your armor type"
+    elseif req > level then
+      equipHold = "needs level " .. req
+    else
+      local cur = equipped[slotKey]
+      if not cur then
+        return { tag = BagModel.EQUIP, sell = sell, equipSlot = slotKey,
+          reason = slotKey .. " slot is empty" }
+      end
+      local curLvl = f(cur, "lvl")
+      if ilvl > curLvl then
+        return { tag = BagModel.EQUIP, sell = sell, equipSlot = slotKey,
+          reason = string.format("%s upgrade il%d>%d", slotKey, ilvl, curLvl) }
+      end
+      equipHold = string.format("%s il%d <= worn il%d", slotKey, ilvl, curLvl)
+    end
+  elseif BagModel.MANUAL_SLOT[slot] then
+    equipHold = BagModel.MANUAL_SLOT[slot] .. " — your call"
+  end
+
+  -- 4. Gray with NO vendor price is NOT "sell it for nothing" — there is
+  --    nothing to sell it FOR. It is the drop-when-bags-are-full pile, so it
+  --    holds with a reason that says so and never sends anyone to a vendor.
+  if q == 0 and sell == 0 then
+    return { tag = BagModel.HOLD, reason = equipHold or "no value", sell = 0 }
+  end
+
+  if equipHold then
+    return { tag = BagModel.HOLD, reason = equipHold, sell = sell }
+  end
+
+  -- 5. Everything else holds, with a reason. Consumables get the honest
+  --    "USE is not built yet" instead of being lumped into "keep".
+  if class == BagModel.CLASS_CONSUMABLE then
+    return { tag = BagModel.HOLD, reason = "consumable — USE not implemented",
+      sell = sell }
+  end
+  return { tag = BagModel.HOLD, reason = "keep", sell = sell }
+end
+
+-- snapshot = {
+--   items  = { { id, count, name?, bag?, bagSlot?, data = <ItemData row or nil> } },
+--   player = { level, classToken, equipped = { <slotKey> = <ItemData row> } },
+-- }
+-- `bag`/`bagSlot` are the container coordinates (deliberately NOT called
+-- `slot` — in a row, `slot` is inventory_type, and one name for two numbers
+-- is how a bag-slot index ends up compared against INVTYPE_HEAD).
+-- -> { items = { { id, count, name, bag, bagSlot, tag, reason, sell } },
+--      sellCopper, sellCount, unknown }
+function BagModel.evaluate(snapshot)
+  snapshot = snapshot or {}
+  local player = snapshot.player or {}
+  local level = player.level or 1
+  local classToken = player.classToken
+  local equipped = player.equipped or {}
+  local items = snapshot.items or {}
+  local out = { items = {}, sellCopper = 0, sellCount = 0, unknown = 0 }
+  local i, n = 1, bagGetn(items)
+  while i <= n do
+    local it = items[i] or {}
+    local d = BagModel.decide(it, level, classToken, equipped)
+    d.id, d.name, d.bag, d.bagSlot = it.id, it.name, it.bag, it.bagSlot
+    d.count = it.count or 1
+    if d.tag == BagModel.SELL then
+      out.sellCount = out.sellCount + 1
+      out.sellCopper = out.sellCopper + (d.sell or 0) * d.count
+    end
+    if not it.data then out.unknown = out.unknown + 1 end
+    out.items[i] = d
+    i = i + 1
+  end
+  return out
+end
+
+ShadowArmy.bagModel = BagModel
+
 -- Unit tests load this file without the WoW UI and stop after the pure model.
 if not CreateFrame then return end
 
@@ -1286,7 +1542,7 @@ local F = {}
 
 -- Bump on every edit. The System watches Chat.log for "<SA> loaded rev=..."
 -- after sending a reload — a new rev proves the edit actually loaded.
-local REV = "r46"
+local REV = "r47"
 
 -- Log window (r16): every F.say()/F.emit() line also lands here with a
 -- timestamp, so errors survive chat scroll-off and can be reviewed in-game.
@@ -1416,7 +1672,11 @@ end
 -- Advisor panel: draggable window with live lines + buttons.
 --------------------------------------------------------------------------
 
-local PANEL_BASE_HEIGHT = 300 -- r32: room for quest checklist under grind lines
+-- r32: room for quest checklist under grind lines.
+-- r47: +24 for a fourth button row (Bags). Buttons anchor to the panel BOTTOM
+-- and the panel anchors by TOPRIGHT, so the extra row grows downward and the
+-- checklist lines above it do not move.
+local PANEL_BASE_HEIGHT = 324
 -- r43: anchored by TOPRIGHT so the passive row growing the panel pushes only
 -- downward. A RIGHT anchor grows from the center and shifts every line above
 -- it too. Y keeps the top edge exactly where the old RIGHT/-40/60 anchor put
@@ -1532,6 +1792,13 @@ end
 -- r32: multi-line quest checklist (quest identity + objectives). line6 is
 -- slot 1 so corpse-run can still steal the first row while ghosting.
 local QUEST_PANEL_LINES = 8
+-- r47: character budget for the hunt-hint sub-line. The panel is 210px wide
+-- with 194px of usable room, GameFontNormalSmall averages ~5.5px/char, so a
+-- row holds roughly 35 characters; the sub-line spends 11 of them on its
+-- "      from " prefix. QuestModel.fromText drops NAMES to fit this rather
+-- than letting a FontString run off the panel edge (1.12 FontStrings with no
+-- width neither wrap nor clip — they just overhang).
+local QUEST_HINT_CHARS = 24
 local questLines = {}
 questLines[1] = F.makeLine(passiveRow, -6)
 local _qli = 2
@@ -1915,34 +2182,90 @@ function ShadowArmy.UseSuggested()
   end
 end
 
+-- r47 (ticket 0049): key 2 is the PASSIVE row, on the same hook as key 1.
+--
+-- The row's order IS the model's order — PassiveModel.evaluate emits the
+-- buff buttons before the summon — so "first active button" is
+-- `result.buttons[1]` and nothing here re-sorts it. The press re-evaluates
+-- instead of reading the last painted row, for the same reason key 1 does:
+-- a minion can die, a buff can drop, between the paint and the keypress.
+local passiveKeySeen = false
+
+-- The button key 2 would cast right now, or nil. No side effects, so the
+-- key hook can ask "do I own this press?" before committing to it.
+function F.passiveEvaluate()
+  return PassiveModel.evaluate(F.passiveSnapshot())
+end
+
+function F.passiveKeyWant()
+  if auto.casting then return nil end
+  -- The SNAPSHOT is inside the pcall too: it reads UnitBuff, the spellbook
+  -- scan and the pet, and this runs on a keypress. An error escaping here
+  -- would take ActionButtonUp with it and the human's key 2 would just die.
+  local ok, result = pcall(F.passiveEvaluate)
+  if not ok or not result then return nil end
+  local want = result.buttons and result.buttons[1] or nil
+  if not want or not want.spell then return nil end
+  return want
+end
+
+function ShadowArmy.UsePassive(want)
+  want = want or F.passiveKeyWant()
+  if not want then return false end
+  if not passiveKeySeen then
+    passiveKeySeen = true
+    F.emit("bindpress", "key=2 passive=" .. tostring(want.id))
+  end
+  -- EXACTLY the path the on-screen button takes, guards included.
+  F.passiveClick(want.spell, want.selfCast and 1 or nil)
+  return true
+end
+
 local stockActionButtonDown = ActionButtonDown
 local stockActionButtonUp = ActionButtonUp
 
+-- Stock ActionButtonDown leaves the button depressed; whoever swallows the
+-- release owes it the reset UseAction would otherwise have done.
+function F.actionButtonClearPushed(id)
+  local button
+  if BonusActionBarFrame and BonusActionBarFrame:IsShown() then
+    button = getglobal("BonusActionButton" .. id)
+  else
+    button = getglobal("ActionButton" .. id)
+  end
+  if button and button.GetButtonState and button:GetButtonState() == "PUSHED" then
+    button:SetButtonState("NORMAL")
+  end
+end
+
 function F.installSuggestedKeyHook()
   if not stockActionButtonDown or not stockActionButtonUp then
-    F.emit("err", "bind ACTIONBUTTON1 hook unavailable")
+    F.emit("err", "bind ACTIONBUTTON1/2 hook unavailable")
     return false
   end
-  -- Down remains stock so the first action button visibly depresses. On key
-  -- release, reset that visual without UseAction(slot 1), then use the coach.
+  -- Down remains stock so the action button visibly depresses. On key
+  -- release, reset that visual without UseAction(slot), then use the coach.
   ActionButtonDown = function(id)
     stockActionButtonDown(id)
   end
   ActionButtonUp = function(id, onSelf)
-    if id ~= 1 then
-      stockActionButtonUp(id, onSelf)
+    if id == 1 then
+      F.actionButtonClearPushed(1)
+      ShadowArmy.UseSuggested()
       return
     end
-    local button
-    if BonusActionBarFrame and BonusActionBarFrame:IsShown() then
-      button = getglobal("BonusActionButton1")
-    else
-      button = getglobal("ActionButton1")
+    if id == 2 and not (HasAction and HasAction(2)) then
+      -- The advisor only OWNS key 2 while slot 2 is empty AND the passive
+      -- row has something to cast. An action the human parked in slot 2
+      -- always wins; a quiet row falls through to stock behaviour.
+      local want = F.passiveKeyWant()
+      if want then
+        F.actionButtonClearPushed(2)
+        ShadowArmy.UsePassive(want)
+        return
+      end
     end
-    if button and button:GetButtonState() == "PUSHED" then
-      button:SetButtonState("NORMAL")
-    end
-    ShadowArmy.UseSuggested()
+    stockActionButtonUp(id, onSelf)
   end
   return true
 end
@@ -1959,6 +2282,24 @@ function F.bindSuggestedKey()
   end
   F.say("1 = suggested ability")
   F.emit("bind", "key=1 action=" .. tostring(GetBindingAction and GetBindingAction("1"))
+    .. " driver=advisor-hook")
+  return true
+end
+
+-- Same binding path as key 1, one key over. ACTIONBUTTON2 is what the hook
+-- above intercepts, so the binding and the interception cannot drift apart.
+function F.bindPassiveKey()
+  local command = "ACTIONBUTTON2"
+  if not SetBinding or not SetBinding("2", command) then
+    F.say("could not bind passive upkeep to 2")
+    F.emit("err", "bind key=2 failed")
+    return false
+  end
+  if SaveBindings and GetCurrentBindingSet then
+    SaveBindings(GetCurrentBindingSet())
+  end
+  F.say("2 = passive upkeep (buff / summon)")
+  F.emit("bind", "key=2 action=" .. tostring(GetBindingAction and GetBindingAction("2"))
     .. " driver=advisor-hook")
   return true
 end
@@ -2132,7 +2473,7 @@ combatClose:SetScript("OnClick", function() combatFrame:Hide() end)
 local combatBtn = CreateFrame("Button", "ShadowArmyCombatBtn", panel, "UIPanelButtonTemplate")
 combatBtn:SetWidth(118)
 combatBtn:SetHeight(20)
-combatBtn:SetPoint("BOTTOMLEFT", panel, "BOTTOMLEFT", 8, 56)
+combatBtn:SetPoint("BOTTOMLEFT", panel, "BOTTOMLEFT", 8, 80)
 combatBtn:SetText("|cFF9482C9Combat|r")
 combatBtn:SetScript("OnClick", function() F.combatToggle() end)
 -- Remote-reload button: hidden until The System requests a reload. It must
@@ -2141,7 +2482,7 @@ combatBtn:SetScript("OnClick", function() F.combatToggle() end)
 local reloadBtn = CreateFrame("Button", "ShadowArmyReloadBtn", panel, "UIPanelButtonTemplate")
 reloadBtn:SetWidth(68) -- 118 + 8 gap + 68 = 194 = panel width minus insets
 reloadBtn:SetHeight(20)
-reloadBtn:SetPoint("BOTTOMRIGHT", panel, "BOTTOMRIGHT", -8, 56) -- top row, beside Combat
+reloadBtn:SetPoint("BOTTOMRIGHT", panel, "BOTTOMRIGHT", -8, 80) -- top row, beside Combat
 reloadBtn:SetText("|cFF44FF44Reload!|r")
 reloadBtn:Hide()
 reloadBtn:SetScript("OnClick", function()
@@ -2247,7 +2588,7 @@ local logBtn = CreateFrame("Button", "ShadowArmyLogBtn", panel, "UIPanelButtonTe
 -- r18: half the bottom row; the Quests toggle takes the other half.
 logBtn:SetWidth(93)
 logBtn:SetHeight(20)
-logBtn:SetPoint("BOTTOMLEFT", panel, "BOTTOMLEFT", 8, 32) -- middle row
+logBtn:SetPoint("BOTTOMLEFT", panel, "BOTTOMLEFT", 8, 56) -- second row
 logBtn:SetText("Log")
 logBtn:SetScript("OnClick", function()
   if logFrame:IsVisible() then
@@ -2324,26 +2665,133 @@ function F.armorSpell()
   return F.watchSpell(ARMOR_WATCH)
 end
 
--- Comma-separated list of the player's current buff icons with the
--- "Interface\Icons\" prefix stripped — the payload of the one diagnostic
--- line. Hard-bounded: 1.12 buff indices are 0..31 and a runaway while-loop
--- here would hang the client, not just the addon.
-function F.playerBuffTextureList(maxN)
-  local out, n, i = nil, 0, 0
-  while n < maxN and i < 32 do
-    local buffIndex = GetPlayerBuff(i, "HELPFUL")
-    if not buffIndex or buffIndex < 0 then break end
-    local tex = GetPlayerBuffTexture(buffIndex)
-    if tex then
-      -- Lua patterns: backslash is NOT special (only % is), so the path
-      -- literal doubles as its own pattern.
-      tex = string.gsub(tex, "Interface\\Icons\\", "")
-      out = out and (out .. "," .. tex) or tex
+--------------------------------------------------------------------------
+-- r47 — TEXTURE CAPTURE, because the guess was wrong exactly as predicted.
+--
+-- Live 2026-08-15: `demon-skin autocast: buff never detected after cast —
+-- texture guess likely wrong; captured=none`. Two separate facts hide in that
+-- one line. The obvious one is the guessed icon path being wrong. The other
+-- is `captured=none`: the diagnostic that was supposed to name the RIGHT
+-- texture came back empty on a player who had just been buffed, because it
+-- enumerated with GetPlayerBuff — so the instrument was blind in precisely
+-- the situation it exists for.
+--
+-- So everything below reads UnitBuff("player", i) instead (the same call
+-- F.unitHasTexture already relies on for target debuffs), and the addon stops
+-- guessing entirely: it snapshots the buff textures immediately BEFORE a cast,
+-- diffs them against the set ~1s after, and the single new texture IS the
+-- buff's real icon. That texture is appended to the watch and used for
+-- detection from then on, and a successful capture clears acDisabled.
+--
+-- Attribution is deliberately strict: exactly ONE new texture, or nothing is
+-- learned. Zero means the cast produced no readable aura and the old
+-- disable-and-report path stays in charge; two or more means something else
+-- landed in the same second and picking one would be the same guess this code
+-- exists to eliminate.
+--
+-- PERSISTENCE is session-only: the addon has no SavedVariables, and adding
+-- one costs a full client restart (the TOC is scanned once per launch), which
+-- is not worth spending mid-session. The capture is cheap — one cast — so it
+-- simply happens again after a reload. Captures are mirrored onto
+-- ShadowArmy.capturedBuffTextures so a live /script can read them out.
+--------------------------------------------------------------------------
+
+local ARMOR_CAPTURE_AFTER = 1.0 -- seconds a cast gets to put its aura up
+
+-- Set of the player's current buff textures. Hard-bounded: a runaway
+-- while-loop here would hang the client, not just the addon.
+function F.playerBuffTextureSet()
+  local set, n, i = {}, 0, 1
+  while i <= 32 do
+    local tex = UnitBuff("player", i)
+    if not tex then break end
+    if not set[tex] then
+      set[tex] = true
       n = n + 1
     end
     i = i + 1
   end
+  return set, n
+end
+
+-- Comma-separated list of the player's current buff icons with the
+-- "Interface\Icons\" prefix stripped — the payload of the one diagnostic line.
+function F.playerBuffTextureList(maxN)
+  local out, n, i = nil, 0, 1
+  while n < maxN and i <= 32 do
+    local tex = UnitBuff("player", i)
+    if not tex then break end
+    -- Lua patterns: backslash is NOT special (only % is), so the path
+    -- literal doubles as its own pattern.
+    tex = string.gsub(tex, "Interface\\Icons\\", "")
+    out = out and (out .. "," .. tex) or tex
+    n = n + 1
+    i = i + 1
+  end
   return out or "none"
+end
+
+function F.watchHasTexture(watch, tex)
+  if not tex then return false end
+  for _, want in ipairs(watch.textures) do
+    if want == tex then return true end
+  end
+  return false
+end
+
+-- Presence without a timer. GetPlayerBuffTimeLeft needs a GetPlayerBuff index
+-- and that enumeration is the suspect, so "is it up at all" gets an
+-- independent answer: an unknown remaining time is not a reason to recast.
+function F.watchBuffPresent(watch)
+  for _, tex in ipairs(watch.textures) do
+    if F.unitHasTexture("player", true, tex) then return true end
+  end
+  return false
+end
+
+function F.armorCaptureDiff(watch)
+  local before = watch.acBefore
+  if not before then return end
+  local after = F.playerBuffTextureSet()
+  local found, extra = nil, 0
+  for tex in pairs(after) do
+    if not before[tex] then
+      extra = extra + 1
+      found = tex
+    end
+  end
+  if extra ~= 1 or not found then
+    F.dtrace("armor capture: " .. extra .. " new buff textures — no attribution")
+    return
+  end
+  if F.watchHasTexture(watch, found) then
+    -- The guess was right after all; nothing to learn, but the cast proved it.
+    watch.acProven = true
+    watch.acVerifyAt = nil
+    return
+  end
+  watch.textures[table.getn(watch.textures) + 1] = found
+  watch.acCaptured = found
+  watch.acProven = true
+  watch.acVerifyAt = nil
+  watch.acDisabled = false
+  ShadowArmy.capturedBuffTextures = ShadowArmy.capturedBuffTextures or {}
+  ShadowArmy.capturedBuffTextures[watch.id] = found
+  F.emit("buff-texture", watch.id .. " captured="
+    .. string.gsub(found, "Interface\\Icons\\", ""))
+end
+
+-- Cast outcome for a capture that is in flight. Instant self-buffs on this
+-- build do not reliably emit SPELLCAST_STOP, so ABSENCE OF A FAILURE is the
+-- confirmation and STOP only records that it arrived; a SPELLCAST_FAILED /
+-- SPELLCAST_INTERRUPTED inside the window throws the sample away, because a
+-- cast that never happened cannot explain a new aura.
+function F.armorNoteCast(ok)
+  for _, watch in ipairs(WATCHED_BUFFS) do
+    if watch.acCaptureAt then
+      if ok then watch.acCastStopped = true else watch.acCastFailed = true end
+    end
+  end
 end
 
 function F.armorTick()
@@ -2351,21 +2799,33 @@ function F.armorTick()
   if now < armorNextCheck then return end
   armorNextCheck = now + ARMOR_CHECK_EVERY
   for _, watch in ipairs(WATCHED_BUFFS) do
+    if watch.autoCast then
+      -- Capture first, and OUTSIDE the acDisabled gate: a successful capture
+      -- is the one thing that can turn the watch back on.
+      if watch.acCaptureAt and now >= watch.acCaptureAt then
+        watch.acCaptureAt = nil
+        if not watch.acCastFailed then F.armorCaptureDiff(watch) end
+        watch.acBefore = nil
+      end
+    end
     if watch.autoCast and not watch.acDisabled then
       local left = F.buffTimeLeftByTexture(watch.textures)
-      if left then
-        -- Texture guess CONFIRMED the first time the buff reads at all. From
-        -- here the safety can never trip: a short timer is not a bad texture,
-        -- and warnBelow refreshes must not look like failed casts.
+      local present = left and true or F.watchBuffPresent(watch)
+      if present then
+        -- Texture CONFIRMED the first time the buff reads at all. From here
+        -- the safety can never trip: a short timer is not a bad texture, and
+        -- warnBelow refreshes must not look like failed casts.
         watch.acProven = true
         watch.acVerifyAt = nil
       elseif watch.acVerifyAt and now >= watch.acVerifyAt then
         watch.acDisabled = true
         F.emit("err", "demon-skin autocast: buff never detected after cast — "
-          .. "texture guess likely wrong; captured=" .. F.playerBuffTextureList(8))
+          .. "capture found nothing; buffs=" .. F.playerBuffTextureList(8))
       end
       -- Cast when the buff is missing entirely OR inside the refresh window.
-      if not watch.acDisabled and (not left or left < watch.warnBelow) then
+      -- `present` without `left` means "up, duration unreadable" — do not
+      -- recast that, it is not a failure.
+      if not watch.acDisabled and (not present or (left and left < watch.warnBelow)) then
         local spell = F.armorSpell()
         if spell and not auto.casting
             and now >= auto.gcdUntil and now >= auto.failUntil
@@ -2378,6 +2838,12 @@ function F.armorTick()
           if not watch.acProven and not watch.acVerifyAt then
             watch.acVerifyAt = now + ARMOR_VERIFY_AFTER
           end
+          -- The before-set is taken RIGHT HERE, one statement before the cast,
+          -- so nothing can slip into the baseline.
+          watch.acBefore = F.playerBuffTextureSet()
+          watch.acCaptureAt = now + ARMOR_CAPTURE_AFTER
+          watch.acCastFailed = false
+          watch.acCastStopped = false
           F.castNow(spell) -- shared GCD bookkeeping + F.dtrace
         end
       end
@@ -2395,12 +2861,15 @@ function F.passiveSnapshot()
   local buffs, n = {}, 0
   for _, watch in ipairs(WATCHED_BUFFS) do
     local left = F.buffTimeLeftByTexture(watch.textures)
-    if not left or left < watch.warnBelow then
+    -- r47: same split as F.armorTick — a buff that is UP but whose remaining
+    -- time this build will not hand over must not be painted as missing.
+    local present = left and true or F.watchBuffPresent(watch)
+    if not present or (left and left < watch.warnBelow) then
       n = n + 1
       buffs[n] = {
         id = watch.id, label = watch.label, autoLabel = watch.autoLabel,
         spell = F.watchSpell(watch),
-        missing = (not left) and true or false,
+        missing = (not present) and true or false,
         expiring = left and true or false,
         minutes = left and math.ceil(left / 60) or nil,
         auto = (watch.autoCast and not watch.acDisabled) and true or false,
@@ -2426,7 +2895,7 @@ local PASSIVE_TONES = { ok = "|cFF44FF44", bad = "|cFFFF4444", warn = "|cFFFFAA0
 
 local lastNag = 0
 function F.passiveLine()
-  local result = PassiveModel.evaluate(F.passiveSnapshot())
+  local result = F.passiveEvaluate()
   local text, nags = nil, nil
   for _, note in ipairs(result.notes) do
     local painted = (PASSIVE_TONES[note.tone] or "|cFFFFAA00") .. note.text .. "|r"
@@ -3010,17 +3479,18 @@ function F.probeToggle()
   if probeFrame:IsShown() then F.probeHide() else F.probeShow() end
 end
 
--- Bottom row: Admin (System ops) + Probe (sandbox instrument).
+-- Third row: Admin (System ops) + Probe (sandbox instrument). The bottom row
+-- (y=8) belongs to the r47 Bags window.
 local adminBtn = CreateFrame("Button", "ShadowArmyAdminBtn", panel, "UIPanelButtonTemplate")
 adminBtn:SetWidth(93)
 adminBtn:SetHeight(20)
-adminBtn:SetPoint("BOTTOMLEFT", panel, "BOTTOMLEFT", 8, 8)
+adminBtn:SetPoint("BOTTOMLEFT", panel, "BOTTOMLEFT", 8, 32)
 adminBtn:SetText("|cFFFF8844Admin|r")
 
 local probeBtn = CreateFrame("Button", "ShadowArmyProbeBtn", panel, "UIPanelButtonTemplate")
 probeBtn:SetWidth(93)
 probeBtn:SetHeight(20)
-probeBtn:SetPoint("BOTTOMRIGHT", panel, "BOTTOMRIGHT", -8, 8)
+probeBtn:SetPoint("BOTTOMRIGHT", panel, "BOTTOMRIGHT", -8, 32)
 probeBtn:SetText("|cFF66CCFFProbe|r")
 probeBtn:SetScript("OnClick", function()
   F.probeToggle()
@@ -3253,8 +3723,10 @@ bagsMoney:SetPoint("BOTTOMRIGHT", bagsFrame, "BOTTOMRIGHT", -10, 8)
 bagsMoney:SetJustifyH("RIGHT")
 bagsMoney:SetText("")
 
-function F.moneyString()
-  local c = GetMoney() or 0
+-- Colour-coded g/s/c for an arbitrary copper amount (r47: the bag window
+-- prices a vendor run with it, so it can no longer read GetMoney itself).
+function F.copperString(c)
+  c = c or 0
   local gold = math.floor(c / 10000)
   local silver = math.floor(math.mod(c, 10000) / 100)
   local copper = math.mod(c, 100)
@@ -3264,6 +3736,10 @@ function F.moneyString()
     return string.format("|cFFC7C7CF%ds|r |cFFEDA55F%dc|r", silver, copper)
   end
   return string.format("|cFFEDA55F%dc|r", copper)
+end
+
+function F.moneyString()
+  return F.copperString(GetMoney() or 0)
 end
 
 local bagsClose = CreateFrame("Button", nil, bagsFrame, "UIPanelCloseButton")
@@ -3849,6 +4325,308 @@ end
 -- Escape closes it, like every other UI panel. UISpecialFrames is a list of
 -- frame NAMES resolved with getglobal(), which is why the frame is named.
 tinsert(UISpecialFrames, "ShadowBagsFrame")
+
+--------------------------------------------------------------------------
+-- BAG DISPOSITION WINDOW (r47, ticket 0039 phase 3): the readable half of
+-- BagModel. Every item in bags 0-4 gets a coloured tag chip and the reason
+-- behind it, so "what do I do with these 12 drops" is one click, not twelve
+-- tooltip reads.
+--
+-- WHY IT READS ITEMDATA AND NOT GetItemInfo: 1.12 answers nil for anything
+-- the client has not cached this session, which is most of what a bot's bags
+-- fill with, and it has no sell-price API at all (docs/item-data.md). The
+-- generated table is keyed by item id and every bag slot yields a link, and
+-- every link carries `item:ID` — so the id parse below is the join.
+--
+-- ItemData.lua is registered in the .toc but the TOC file list is cached for
+-- the whole client session, so on a client that has not restarted since
+-- ticket 0040 the global is simply absent. EVERY read goes through
+-- F.bagTagRow and the window says so instead of erroring.
+--------------------------------------------------------------------------
+
+-- Scoped in a do-block for the Lua 5.0 200-locals-per-function budget, the
+-- same reason RouteModel's UI half below is: the main chunk was at 174 of
+-- them before r47 and a window costs a frame local per widget. Registers
+-- are released at the `end`, so only the F.* entry points survive it.
+do
+  local BAGTAG_TICK = 1.0    -- seconds; BAG_UPDATE arrives in bursts while looting
+  local BAGTAG_LINE = 14
+  local BAGTAG_NAME_MAX = 22
+
+  local BAGTAG_COLOR = {
+    SELL       = "FFFFD100",
+    EQUIP      = "FF44FF44",
+    KEEP_QUEST = "FFCC66FF",
+    USE        = "FF44CCFF",
+    HOLD       = "FF999999",
+  }
+
+  -- Sort order: the two tags that ask for an action float to the top.
+  local BAGTAG_RANK = { EQUIP = 1, SELL = 2, KEEP_QUEST = 3, USE = 4, HOLD = 5 }
+
+  -- BagModel.EQUIP_SLOT values -> the 1.12 equipment slot id GetInventoryItemLink
+  -- wants. These are INVSLOT ids (1 head .. 19 tabard), NOT inventory_type: the
+  -- two enums overlap numerically and disagree, which is exactly why they are
+  -- kept in separate tables with different key spaces.
+  local BAGTAG_WORN_SLOT = {
+    head = 1, neck = 2, shoulder = 3, chest = 5, waist = 6, legs = 7,
+    feet = 8, wrist = 9, hands = 10, back = 15, ["off-hand"] = 17,
+  }
+
+  local bagTag = { nextAt = 0, dirty = true }
+
+  -- The ONLY read of the generated table. Absent file -> nil everywhere, and
+  -- BagModel already answers HOLD "unknown item" for that.
+  function F.bagTagRow(id)
+    if not id then return nil end
+    if not ShadowArmyItemData then return nil end
+    return ShadowArmyItemData[id]
+  end
+
+  function F.bagTagLinkId(link)
+    if not link then return nil end
+    local _, _, idStr = string.find(link, "item:(%d+)")
+    if not idStr then return nil end
+    return tonumber(idStr)
+  end
+
+  function F.bagTagLinkName(link)
+    if not link then return nil end
+    local _, _, name = string.find(link, "%[(.-)%]")
+    return name
+  end
+
+  function F.bagTagItems()
+    local items, n = {}, 0
+    local bag = 0
+    while bag <= 4 do
+      local slots = GetContainerNumSlots(bag)
+      if slots and slots > 0 then
+        local slot = 1
+        while slot <= slots do
+          local link = GetContainerItemLink(bag, slot)
+          if link then
+            local id = F.bagTagLinkId(link)
+            -- 1.12 signature: texture, itemCount, locked, quality, readable
+            local _, count = GetContainerItemInfo(bag, slot)
+            n = n + 1
+            items[n] = {
+              id = id,
+              name = F.bagTagLinkName(link),
+              count = count or 1,
+              bag = bag, bagSlot = slot,
+              data = F.bagTagRow(id),
+            }
+          end
+          slot = slot + 1
+        end
+      end
+      bag = bag + 1
+    end
+    return items
+  end
+
+  -- What is already worn, as ItemData rows keyed the way BagModel.EQUIP_SLOT
+  -- names them. An equipped item with no row becomes an EMPTY row rather than
+  -- nil: nil means "slot is empty" to the model, and calling a filled slot
+  -- empty is the one wrong answer here. An empty row defaults `lvl` to 0, so
+  -- the worst case is an over-eager upgrade hint on an item we cannot price.
+  function F.bagTagWorn()
+    local out = {}
+    for key, slotId in pairs(BAGTAG_WORN_SLOT) do
+      local link = GetInventoryItemLink("player", slotId)
+      if link then
+        out[key] = F.bagTagRow(F.bagTagLinkId(link)) or {}
+      end
+    end
+    return out
+  end
+
+  function F.bagTagSnapshot()
+    local _, classToken = UnitClass("player")
+    return {
+      items = F.bagTagItems(),
+      player = {
+        level = UnitLevel("player") or 1,
+        classToken = classToken,
+        equipped = F.bagTagWorn(),
+      },
+    }
+  end
+
+  local function bagTagCmp(a, b)
+    local ra = BAGTAG_RANK[a.tag] or 9
+    local rb = BAGTAG_RANK[b.tag] or 9
+    if ra ~= rb then return ra < rb end
+    local na, nb = a.name or "", b.name or ""
+    if na ~= nb then return na < nb end
+    return (a.id or 0) < (b.id or 0)
+  end
+
+  local bagTagFrame = CreateFrame("Frame", "ShadowArmyBagTagFrame", UIParent)
+  bagTagFrame:SetWidth(430)
+  bagTagFrame:SetHeight(360)
+  bagTagFrame:SetPoint("CENTER", UIParent, "CENTER", -180, 0)
+  bagTagFrame:SetFrameStrata("HIGH")
+  bagTagFrame:SetBackdrop({
+    bgFile = "Interface\\Tooltips\\UI-Tooltip-Background",
+    edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+    tile = true, tileSize = 16, edgeSize = 16,
+    insets = { left = 4, right = 4, top = 4, bottom = 4 },
+  })
+  bagTagFrame:SetBackdropColor(0.05, 0.02, 0.10, 0.92)
+  bagTagFrame:EnableMouse(true)
+  bagTagFrame:SetMovable(true)
+  bagTagFrame:RegisterForDrag("LeftButton")
+  bagTagFrame:SetScript("OnDragStart", function() bagTagFrame:StartMoving() end)
+  bagTagFrame:SetScript("OnDragStop", function() bagTagFrame:StopMovingOrSizing() end)
+  bagTagFrame:Hide()
+  tinsert(UISpecialFrames, "ShadowArmyBagTagFrame")
+
+  local bagTagTitle = bagTagFrame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+  bagTagTitle:SetPoint("TOP", bagTagFrame, "TOP", 0, -9)
+  bagTagTitle:SetText("|cFF9482C9Shadow Bags — what to do with it|r")
+
+  local bagTagClose = CreateFrame("Button", nil, bagTagFrame, "UIPanelCloseButton")
+  bagTagClose:SetPoint("TOPRIGHT", bagTagFrame, "TOPRIGHT", -2, -2)
+  bagTagClose:SetScript("OnClick", function() bagTagFrame:Hide() end)
+
+  local bagTagSummary = bagTagFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+  bagTagSummary:SetPoint("BOTTOMLEFT", bagTagFrame, "BOTTOMLEFT", 14, 14)
+  bagTagSummary:SetJustifyH("LEFT")
+  bagTagSummary:SetText("")
+
+  local bagTagScroll = CreateFrame(
+    "ScrollFrame", "ShadowArmyBagTagScroll", bagTagFrame, "UIPanelScrollFrameTemplate")
+  bagTagScroll:SetPoint("TOPLEFT", bagTagFrame, "TOPLEFT", 12, -30)
+  bagTagScroll:SetPoint("BOTTOMRIGHT", bagTagFrame, "BOTTOMRIGHT", -30, 34)
+
+  local bagTagChild = CreateFrame("Frame", "ShadowArmyBagTagScrollChild", bagTagScroll)
+  bagTagChild:SetWidth(376)
+  bagTagChild:SetHeight(1)
+  bagTagScroll:SetScrollChild(bagTagChild)
+
+  -- Same rule as every other list in this file: FontStrings are created once and
+  -- reused forever. 1.12 frames and regions cannot be destroyed.
+  local bagTagLines = {}
+  function F.bagTagLine(i)
+    local line = bagTagLines[i]
+    if line then return line end
+    line = bagTagChild:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    line:SetWidth(370)
+    line:SetHeight(BAGTAG_LINE)
+    line:SetJustifyH("LEFT")
+    line:SetPoint("TOPLEFT", bagTagChild, "TOPLEFT", 0, -((i - 1) * BAGTAG_LINE))
+    line:SetText("")
+    bagTagLines[i] = line
+    return line
+  end
+
+  function F.bagTagRows()
+    if not ShadowArmyItemData then
+      return { "|cFFFFAA00item data not loaded yet (client restart pending)|r",
+        "|cFF888888ItemData.lua is in the .toc, but 1.12 caches the TOC file|r",
+        "|cFF888888list for the whole client session — it loads on next launch.|r" },
+        nil
+    end
+    local result = BagModel.evaluate(F.bagTagSnapshot())
+    local list, n = {}, 0
+    local i = 1
+    while result.items[i] do
+      n = n + 1
+      list[n] = result.items[i]
+      i = i + 1
+    end
+    if n > 1 then table.sort(list, bagTagCmp) end
+    local rows, nr = {}, 0
+    i = 1
+    while i <= n do
+      local it = list[i]
+      local hex = BAGTAG_COLOR[it.tag] or BAGTAG_COLOR.HOLD
+      local stack = (it.count and it.count > 1) and ("x" .. it.count) or ""
+      nr = nr + 1
+      rows[nr] = string.format("|c%s[%s]|r |cFFDDDDDD%s|r |cFF777777%s|r  |cFF999999%s|r",
+        hex, it.tag, F.questShort(it.name or ("item " .. tostring(it.id)), BAGTAG_NAME_MAX),
+        stack, it.reason or "")
+      i = i + 1
+    end
+    if nr == 0 then rows[1] = "|cFF777777bags are empty|r" end
+    return rows, result
+  end
+
+  function F.bagTagRefresh()
+    if not bagTagFrame:IsShown() then
+      bagTag.dirty = true
+      return
+    end
+    bagTag.dirty = false
+    local rows, result = F.bagTagRows()
+    local i = 1
+    while rows[i] do
+      F.bagTagLine(i):SetText(rows[i])
+      i = i + 1
+    end
+    local painted = i - 1
+    while bagTagLines[i] do
+      bagTagLines[i]:SetText("")
+      i = i + 1
+    end
+    local height = painted * BAGTAG_LINE
+    if height < 1 then height = 1 end
+    bagTagChild:SetHeight(height)
+    if bagTagScroll.UpdateScrollChildRect then bagTagScroll:UpdateScrollChildRect() end
+    if result then
+      local summary = string.format("|cFFCCCCCC%d items|r", table.getn(result.items))
+      if result.sellCount > 0 then
+        summary = summary .. string.format("  |cFFFFD100%d to sell|r %s",
+          result.sellCount, F.copperString(result.sellCopper))
+      end
+      if result.unknown > 0 then
+        summary = summary .. string.format("  |cFF888888%d unknown|r", result.unknown)
+      end
+      bagTagSummary:SetText(summary)
+    else
+      bagTagSummary:SetText("")
+    end
+  end
+
+  -- Debounced from the driver: BAG_UPDATE fires several times per loot, and the
+  -- refresh walks every bag slot plus eleven equipped slots. Only ever runs
+  -- while the window is actually up.
+  function F.bagTagTick()
+    if not bagTagFrame:IsShown() then return end
+    if not bagTag.dirty then return end
+    local now = GetTime()
+    if now < bagTag.nextAt then return end
+    bagTag.nextAt = now + BAGTAG_TICK
+    F.bagTagRefresh()
+  end
+
+  function F.bagTagToggle()
+    if bagTagFrame:IsShown() then
+      bagTagFrame:Hide()
+    else
+      bagTagFrame:Show()
+      F.bagTagRefresh()
+    end
+  end
+
+  local bagTagEvents = CreateFrame("Frame", "ShadowArmyBagTagEvents", UIParent)
+  bagTagEvents:RegisterEvent("BAG_UPDATE")
+  bagTagEvents:SetScript("OnEvent", function()
+    bagTag.dirty = true
+  end)
+
+  local bagTagBtn = CreateFrame("Button", "ShadowArmyBagTagBtn", panel, "UIPanelButtonTemplate")
+  bagTagBtn:SetWidth(194) -- full inner width; bottom row is its own
+  bagTagBtn:SetHeight(20)
+  bagTagBtn:SetPoint("BOTTOMLEFT", panel, "BOTTOMLEFT", 8, 8)
+  bagTagBtn:SetText("|cFF9482C9Bags|r")
+  bagTagBtn:SetScript("OnClick", function()
+    local ok, err = pcall(F.bagTagToggle)
+    if not ok then F.emit("err", "bagTag: " .. tostring(err)) end
+  end)
+end
 
 --------------------------------------------------------------------------
 -- QUEST HELPER (r18, r32 checklist): "where do I go next" — quest-identity
@@ -4940,6 +5718,20 @@ function F.questChecklistRows()
         rows[nr] = string.format("|c%s  %s%s|r", hex, mark,
           F.questShort(o.text or o.label, 20))
       end
+      -- r47 (ticket 0047): "Notched Rib 0/5" with no mention of Cracked Skull
+      -- Soldier was a live complaint — monofuel reads objectives HERE, not in
+      -- the checklist window, and the hunt hint only rendered there. The
+      -- objective row is already ~35 characters wide with its distance and
+      -- bearing, so the hint gets its own dim sub-line inside the SAME
+      -- QUEST_PANEL_LINES budget (row heights are unchanged; a full panel
+      -- simply shows fewer objectives, exactly as it already did).
+      if o.from and not o.done and not o.turnIn and nr < QUEST_PANEL_LINES then
+        local hint = QuestModel.fromText(o.from, 2, QUEST_HINT_CHARS, "")
+        if hint then
+          nr = nr + 1
+          rows[nr] = "|cFF777777      from " .. hint .. "|r"
+        end
+      end
       oi = oi + 1
     end
     qi = qi + 1
@@ -5010,22 +5802,12 @@ function F.questWindowLine(i)
   return line
 end
 
--- "who do I hunt for this item" hint. The names arrive alphabetical, so the
--- first two are not the best two — the cap is line width, nothing more.
+-- "who do I hunt for this item" hint. Join + truncation live in QuestModel so
+-- lua/tests can drive the width math (r47, ticket 0047); the window has room
+-- for the wordy " more" tail, the panel below does not.
 local QUEST_FROM_MAX = 2
 function F.questFromText(from)
-  local n = table.getn(from)
-  local out = nil
-  local i = 1
-  while i <= n and i <= QUEST_FROM_MAX do
-    out = out and (out .. ", " .. from[i]) or from[i]
-    i = i + 1
-  end
-  if not out then return nil end
-  if n > QUEST_FROM_MAX then
-    out = out .. " +" .. (n - QUEST_FROM_MAX) .. " more"
-  end
-  return out
+  return QuestModel.fromText(from, QUEST_FROM_MAX, nil, " more")
 end
 
 function F.questWindowRows()
@@ -5128,7 +5910,7 @@ end
 questBtn = CreateFrame("Button", "ShadowArmyQuestBtn", panel, "UIPanelButtonTemplate")
 questBtn:SetWidth(93) -- 8 + 93 + 8 + 93 + 8 = 210 = panel width
 questBtn:SetHeight(20)
-questBtn:SetPoint("BOTTOMRIGHT", panel, "BOTTOMRIGHT", -8, 32) -- middle row, right of Log
+questBtn:SetPoint("BOTTOMRIGHT", panel, "BOTTOMRIGHT", -8, 56) -- second row, right of Log
 questBtn:SetText("|cFF9482C9Quests|r")
 questBtn:SetScript("OnClick", function()
   if questFrame:IsShown() then
@@ -5447,6 +6229,9 @@ driver:SetScript("OnUpdate", function()
       pcall(F.sortStop, "error")
     end
   end
+  -- r47: bag disposition list, 1s debounce, only while the window is open.
+  local btok, bterr = pcall(F.bagTagTick)
+  if not btok then F.emit("err", "bagTagTick: " .. tostring(bterr)) end
   -- r33: the quest checklist is always live; markers have their own toggle.
   local qok, qerr = pcall(F.questTick)
   if not qok then F.emit("err", "questTick: " .. tostring(qerr)) end
@@ -5563,6 +6348,7 @@ frame:SetScript("OnEvent", function()
     F.scanSpellbook()
     F.installSuggestedKeyHook()
     F.bindSuggestedKey()
+    F.bindPassiveKey()
     -- QoL defaults the advisor asserts on every login:
     -- F.instantQuestText() DISABLED (r14): prime remaining suspect for the
     -- reproducible crash+lockup on Complete Quest (it nils the quest
@@ -5608,8 +6394,11 @@ frame:SetScript("OnEvent", function()
     auto.failure = nil
   elseif event == "SPELLCAST_STOP" then
     auto.casting = false
+    F.armorNoteCast(true)
   elseif event == "SPELLCAST_FAILED" or event == "SPELLCAST_INTERRUPTED" then
     auto.casting = false
+    -- r47: a failed cast cannot explain a new aura — drop the pending sample.
+    F.armorNoteCast(false)
     -- brief backoff so a failing cast (moving/silenced/oom) can't retry
     -- every frame and starve the wand fallback
     auto.failUntil = GetTime() + 0.5
