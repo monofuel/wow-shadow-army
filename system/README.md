@@ -45,7 +45,7 @@ MCP tools (same dispatch procs as the dashboard):
 | `stop_server` | `stopServer()` | queue operator `down`; characters/accounts persist |
 | `start_bot` | `startBotSeat(name)` | launch a bot seat; ready when `control_up` flips |
 | `stop_bot` | `stopBotSeat(name)` | stop a bot seat (client logs out) |
-| `seat_watch` | `seatWatchStatus()` | babysitter view (wedged seats, restarts, alerts) |
+| `seat_watch` | `seatWatchStatus()` | babysitter view for the whole seat roster (state, heartbeat age, restarts, alerts, `scaled`) |
 | `character_inventory` | `characterInventory(name)` | latest-known bags from the chat bus + item join |
 | `request_inventory` | `requestInventorySnapshot(name)` | announce `<SYS> inv?` for a fresh snapshot |
 
@@ -96,7 +96,7 @@ Open http://127.0.0.1:7777/ (aliases `/army`).
 Tabs in the header: **Army** | **Murist** | **Advisor** | **Admin**.
 
 - **Army** (`GET /army`) — roster only (hides foundation `Bot*` / Nightsun / Cowcam). Order: Murist → Shadowfel → Igris → Tusk → Beru, then others. Columns: name · level · XP · **HP/MP** · class · **zone** · **pos** · gold · **life** · **seat** · **bot** Start/Stop. Panel head shows army strip (`N online · alive/ghost/dead · ctrl k/n`). Polls `GET /roster` every few seconds via htmx. MCP `list_characters` still accepts `include_foundation=true` for the full realm.
-- **Army → Seat watch** — babysitter row per home seat: light (green live / amber starting / grey stopped / **red wedged**), heartbeat age, auto-restarts this hour, last action, wedge evidence file. Polls `GET /seats`; a seat that burned its restart budget shows a persistent red alert banner. See "Seat babysitter" below.
+- **Army → Seat watch** — babysitter row per home seat, **whole fleet**: the four dedicated seats first, then every row of `tools/data/home_army_roster.tsv`. Light (green live / amber starting / grey stopped / **red wedged**), heartbeat age, auto-restarts this hour, last action, wedge evidence file. Panel head counts `N/M live · X wedged`. Polls `GET /seats`; a seat that burned its restart budget shows a persistent red alert banner. See "Seat babysitter" below.
 - **Murist** (`GET /murist`) — human seat snapshot (level, class, race, gold, zone, pos, XP, vitals, life/online) + **quest log** (unrewarded: complete/active/failed + objective progress) + **bags** (chat-bus inventory: item, id, qty, vendor sell/value, data age) + Murist-only addon events. Polls `GET /murist/status`, `GET /murist/quests`, `GET /murist/inventory`, `GET /murist/events`.
 - **Advisor** (`GET /advisor`) — live ring of parsed `<SA>` / `<ShadowArmy>` lines from Chat.log. Table body polls `GET /events`. **Reload addon** posts to `POST /reload`.
 - **Admin** (`GET /admin`) — **Realm** panel (start/stop) + ops buttons (respawn army, tele party to Murist). Local ops only; not fair-play recovery. Realm start/stop runs as a **detached user unit** (`wow-realm-op` via `systemd-run --user`), not as a child of `wow-system`, so restarting the dashboard does not kill a multi-minute image build. Progress is mirrored in `local_data/realm-op.json` + `local_data/realm-op.log`.
@@ -106,7 +106,16 @@ Tabs in the header: **Army** | **Murist** | **Advisor** | **Admin**.
 A home seat can wedge with its launcher PID alive and its Lua heartbeat frozen
 (2026-08-15: Tusk hung on a world-asset stream mid-fight; the realm showed him
 offline and nothing noticed until a human read the roster). A background thread
-samples every seat in `SeatMakeTargets` every 10s:
+samples **every watched seat** every 10s:
+
+- the **original four** (`SeatMakeTargets`) — dedicated Makefile targets;
+- every **scale-out seat** in `tools/data/home_army_roster.tsv`
+  (`character<TAB>account<TAB>class`) — the parameterized targets. The table is
+  re-read whenever its mtime moves, so a growing roster is covered without a
+  dashboard restart. Rows naming a protected seat (the four, Kaisel, Murist),
+  duplicates, and rows with non-alphanumeric fields are ignored.
+
+Kaisel (quest-QA, different runtime root) and Murist (human) are never watched.
 
 | Seat state | Rule |
 |---|---|
@@ -123,11 +132,17 @@ Recovery for a wedged seat, in order:
    first).
 2. **Event line** — `<SYS> wedge …` goes into the same ring the addon feeds, so
    it shows up in the Advisor tail and `addon_events`.
-3. **Auto-restart** — the seat's own Makefile stop + start targets (identical to
-   the roster Bot buttons), then a 3-minute cooldown before the next attempt.
-4. **Bounded** — max 3 restarts per seat per hour (`local_data/seat-watch.json`
-   keeps the window across dashboard restarts). Past the budget the seat stops
-   being restarted and shows a persistent red alert instead of crash-looping.
+3. **Auto-restart** — the seat's own Makefile lifecycle, then a 3-minute
+   cooldown before the next attempt:
+   - original four: `make <seat>-stop` + `make <seat>-start` (identical to the
+     roster Bot buttons);
+   - roster seats: `make seat-stop SEAT=<n>` +
+     `make seat-start SEAT=<n> SEAT_USER=<acct> SEAT_CLASS=<class>`.
+4. **Bounded** — max 3 restarts **per seat name** per hour
+   (`local_data/seat-watch.json` keeps the window, the alert flag and the last
+   action time across dashboard restarts, so the cooldown is not refilled by a
+   `wow-system` restart either). Past the budget the seat stops being restarted
+   and shows a persistent red alert instead of crash-looping.
 
 Alerts clear themselves when the seat's heartbeat comes back. `SYSTEM_SEAT_BABYSITTER=0`
 downgrades the whole thing to observe-only (detection + red light, no restarts).
