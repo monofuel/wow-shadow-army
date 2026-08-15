@@ -15,5 +15,12 @@ economy should honor these rather than optimizing from scratch.
   treat cloth and disenchantable greens as KEEP-for-profession, not
   vendor fodder.
 
+- **Murist's build is the anchor for bot professions.** As seats
+  mature, each bot's professions get decided relative to this anchor —
+  complementary coverage (e.g. the warrior seat taking mining/smithing,
+  a priest taking herbalism/alchemy) rather than everyone cloning the
+  caster pairing. No assignments are canon yet; decide as progress
+  demands and record them here.
+
 See docs/advisor.md for the advisor itself; tickets/goals for what the
 advisor does with this.
