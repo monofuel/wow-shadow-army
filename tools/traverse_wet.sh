@@ -2,7 +2,7 @@
 # Petrel wet-lab: SOAP-tele the traverse episode character to the
 # water_entry checkpoint and prove the cheese-coast swim to Dustwallow on
 # the lua-bot host. Local debug only — the fair prove is the full run from
-# stock spawn (PETREL_SWIM=1 make traverse).
+# stock spawn (make traverse).
 #
 # PASS: lua-bot-status.json ends holding intent_reason=duskwallow_coast
 # while swimming. FAIL: run_over (death — a policy bug to fix, never to
@@ -14,7 +14,7 @@ set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 FORK="$(cd "$ROOT/../monofuel-vanilla-wow" && pwd)"
-STATUS="$ROOT/local_data/lua-bot-status.json"
+STATUS="$ROOT/local_data/traverse-status/status.json"
 LOGDIR="$ROOT/local_data/health-logs"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 RUN_LOG="$LOGDIR/traverse-wet-$STAMP.log"
@@ -34,9 +34,10 @@ export VMANGOS_MANGOSD_CONFIG_OVERRIDES
 echo "traverse-wet: $RUN_SECONDS s headless run -> $RUN_LOG"
 (
   cd "$FORK" &&
-  PETREL_SWIM=1 nix develop "$FORK" --command \
+  nix develop "$FORK" --command \
     timeout "$RUN_SECONDS" nim r tools/launch_nim_player.nim -- \
-    --league=traverse --bot=lua-bot \
+    --league=race --bot=lua-bot \
+    --lua-status-dir="$ROOT/local_data/traverse-status" \
     --lua-repo="$ROOT" --lua-entry=traverse \
     --presentation=headless
 ) >"$RUN_LOG" 2>&1 &
@@ -48,7 +49,7 @@ run_pid=$!
 (
   for _ in $(seq 1 150); do
     if docker ps --format '{{.Names}}' 2>/dev/null |
-        grep -q 'traverse.*coworld-game'; then
+        grep -qE '(traverse|race).*coworld-game'; then
       break
     fi
     kill -0 "$run_pid" 2>/dev/null || exit 0

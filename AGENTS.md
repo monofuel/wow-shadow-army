@@ -21,6 +21,15 @@ govern how we work in the sibling wow repos too:
 
 - please follow the general rules of `../autoresearch` when relevant
 
+## Nim dependencies
+
+Deps are GLOBAL, managed by nimby: always `nimby sync -g nimby.lock` (see
+the monorepo `playbooks/pull-upstream.md`). **Never run plain `nimby sync`**
+— that is workspace mode: it clones every dependency into the current
+directory and rewrites `nim.cfg` with relative paths, trashing the checkout
+(this happened 2026-08-11). Never create scratch sibling clones of the fork
+or these repos either — branch inside the existing checkouts.
+
 ## Mission
 
 Build the solo-leveling bot army per `coworld-playbook/games/solo-leveling.md`:

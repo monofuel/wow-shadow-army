@@ -1,13 +1,4 @@
--- Wet-chain contract for the Petrel brain. The SWIM gate is read from the
--- process environment at module load, so this file re-runs itself with
--- PETREL_SWIM=1 rather than mutating what a process cannot mutate.
-if os.getenv("PETREL_SWIM") ~= "1" then
-  local lua = arg and arg[-1] or "lua"
-  local ok = os.execute('PETREL_SWIM=1 "' .. lua .. '" "' .. arg[0] .. '"')
-  -- Lua 5.1 os.execute returns a number; 5.2+ returns a boolean first.
-  if ok == true or ok == 0 then os.exit(0) end
-  os.exit(1)
-end
+-- Wet-chain contract for the Petrel brain (the wet chain is unconditional).
 
 package.path = "lua/?.lua;lua/entry/?.lua;lua/tools/?.lua;;"
 
@@ -55,28 +46,44 @@ end
 
 local aquatic = { shapeshift_form_id = 4 }
 
--- Dry on the sand inside the entry band: the gate is on, so the brain
--- presses toward the first wet beat instead of holding for a swim pass.
+-- Dry on the sand inside the entry band: the brain presses toward the
+-- first wet beat instead of holding.
 local entry = petrel.decide(view(-6790.0, -4840.0, { shapeshift_form_id = 3 }))
-check(entry.kind == "navigate", "gate on: no awaiting_swim_pass hold")
+check(entry.kind == "navigate", "no hold at the entry band")
 check(entry.reason == "enter_water", "dry entry uses the entry reason")
 check(entry.x == -6737.63, "dry entry targets the first wet beat")
-check(entry.z == -2.5, "shallow wet beats sink to the 2.5 yd draft floor")
+check(entry.z == nil,
+  "a liquid-blind dry entry omits z so planning projects onto the surface")
 check(entry.status and entry.status.dist_goal and entry.status.dist_goal > 0,
   "status carries planar distance to the goal")
 
--- Wading at the shoreline still drives the same entry.
+-- Wading at the shoreline now arms Aquatic FIRST (2026-08-13: a
+-- waterline-shelf grounding auto-cancels the form and waiting for the
+-- swim flag left the seat formless for the whole crossing).
+clock = clock + 20.0
+local wadeCast = petrel.decide(view(-6780.0, -4850.0, {
+  shapeshift_form_id = 3,
+  liquid_known = true, liquid_coverage_known = true,
+  liquid_surface_z = 0.0,
+}))
+check(wadeCast.kind == "cast_spell" and wadeCast.spell == 1066,
+  "formless wading casts Aquatic before pressing on")
+
+-- Already-aquatic wading still drives the same entry.
 clock = clock + 5.0
 local wade = petrel.decide(view(-6780.0, -4850.0, {
-  shapeshift_form_id = 3,
+  shapeshift_form_id = 4,
   liquid_known = true, liquid_coverage_known = true,
   liquid_surface_z = 0.0,
 }))
 check(wade.kind == "navigate" and wade.reason == "enter_water",
   "wading keeps the entry reason")
+check(wade.z == -2.5,
+  "with liquid observable the draft clamp owns the wet z again")
 
 -- Swimming without Aquatic Form casts it before anything else.
-clock = clock + 5.0
+-- (clock clears the form-retry window consumed by the wading cast above)
+clock = clock + 20.0
 local unformed = petrel.decide(view(-6600.0, -4865.0, { is_swimming = true }))
 check(unformed.kind == "cast_spell" and unformed.spell == 1066,
   "swimming casts aquatic form first")
@@ -121,13 +128,93 @@ check(held.kind == "navigate" and held.x == -6413.2,
   "wet beats are never skipped while swimming")
 nav = { state = "following", failed_here = false, walkout_available = false }
 
--- Inside the goal radius, swimming: hold the segment goal.
+-- duskwallow_coast is retired like any ordinary wet beat: swimming there
+-- continues the coast chain toward merchant_coast, not a hold.
 clock = clock + 5.0
-local goal = petrel.decide(view(-4630.0, -4869.0,
+local pastDusk = petrel.decide(view(-4627.0, -4869.5,
   { shapeshift_form_id = 4, is_swimming = true }))
-check(goal.kind == "hold" and goal.reason == "duskwallow_coast",
-  "holds at the duskwallow goal")
+check(pastDusk.kind == "navigate" and pastDusk.water == true,
+  "at duskwallow_coast navigates the coast chain, no hold")
+check(pastDusk.reason == "swim_ribbon",
+  "coast continuation keeps the ribbon goal key")
+
+-- Coast beat selection just north of dusk targets coast_01 or coast_02.
+clock = clock + 5.0
+local coastPick = petrel.decide(view(-4300.0, -4900.0,
+  { shapeshift_form_id = 4, is_swimming = true }))
+check(coastPick.kind == "navigate" and coastPick.water == true,
+  "mid-coast selects a coast beat")
+check(
+  (math.abs(coastPick.x - (-4363.6)) < 0.1 and math.abs(coastPick.y - (-4903.7)) < 0.1)
+    or (math.abs(coastPick.x - (-4125.7)) < 0.1 and math.abs(coastPick.y - (-4841.2)) < 0.1),
+  "at (-4300,-4900) targets coast_01 or coast_02")
+
+-- The bay interior (2026-08-12): capturing bay_center hooks the swimmer
+-- WEST toward the sandbar saddle — the beach goal detour, far outside the
+-- old 40-yd south-lag band.
+clock = clock + 5.0
+local bay = petrel.decide(view(-1533.0, -4088.0,
+  { shapeshift_form_id = 4, is_swimming = true }))
+check(bay.kind == "navigate" and bay.reason == "swim_ribbon" and
+    bay.x == -1652.0,
+  "bay_center hooks west toward the sandbar saddle")
+
+-- The merchant WATER goal (monofuel's scouted inner-bay pose) captures
+-- swimming — 6.6+ yd of water across the ring, no grounding — and hands
+-- off into the departure line at inlet_out.
+clock = clock + 5.0
+local goal = petrel.decide(view(-1816.8, -3899.5,
+  { shapeshift_form_id = 4, is_swimming = true }))
+check(goal.kind == "navigate" and goal.reason == "swim_ribbon" and
+    goal.x == -1805.0,
+  "merchant water goal hands off into the departure line")
 check(goal.status and goal.status.dist_goal < 25.0,
-  "the goal hold reports the closing distance")
+  "the goal handoff retains merchant closing distance")
+
+-- One decide at the last departure beat retires the whole outbound bay
+-- line (capture retires up to the farthest captured index), restoring the
+-- Barrens approach for the shelf checks below.
+clock = clock + 5.0
+local depart = petrel.decide(view(-950.0, -3850.0,
+  { shapeshift_form_id = 4, is_swimming = true }))
+check(depart.kind == "navigate" and depart.x == -910.0,
+  "capturing the last departure beat targets the beach lip")
+
+-- The final shelf beat steers the swimmer onto the waterline at clamped
+-- depth — never above the surface. (A z=+9.5 "shore" bypass here once
+-- launched the bot clear of the water, Aquatic auto-cancel and all;
+-- monofuel watched it drown repeatedly. Gone for good.)
+clock = clock + 5.0
+local shelf = petrel.decide(view(-928.0, -3805.0,
+  { shapeshift_form_id = 4, is_swimming = true }))
+check(shelf.kind == "navigate" and shelf.x == -910.0,
+  "the shore approach targets the beach-lip beat")
+check(shelf.z == -2.5, "the shelf beat is clamped to the draft floor")
+check(shelf.water == true, "the shelf beat stays a declared water goal")
+
+-- Schema: the shore bypass flag no longer exists on any wet route.
+for _, cfg in ipairs({
+  require("config.traverse_beats"),
+  require("config.traverse_coast_beats"),
+  require("config.traverse_connector_wet_beats"),
+}) do
+  for _, b in ipairs(cfg.beats) do
+    check(b.shore == nil, "no beat carries the removed shore flag: " .. b.id)
+  end
+end
+
+-- Once the shore beat has cleared swimming, Travel Form and the land road
+-- take over automatically.
+clock = clock + 20.0
+local shoreForm = petrel.decide(view(-900.0, -3750.0,
+  { shapeshift_form_id = 0, is_swimming = false }))
+check(shoreForm.kind == "cast_spell" and shoreForm.spell == 783,
+  "dry Barrens shore casts Travel Form")
+clock = clock + 20.0
+local shoreRoad = petrel.decide(view(-900.0, -3750.0,
+  { shapeshift_form_id = 3, is_swimming = false }))
+check(shoreRoad.kind == "navigate" and shoreRoad.x == -950.0 and
+    shoreRoad.reason == "barrens_lower_road",
+  "dry Barrens shore joins the land connector")
 
 print("test_traverse_wet: " .. passed .. " ok")

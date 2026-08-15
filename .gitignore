@@ -29,3 +29,4 @@ tools/tests/debug_decide
 
 # Petrel in-process embed (built artifact)
 tools/libpetrel.so
+.conductor/

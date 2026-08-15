@@ -85,7 +85,7 @@ def find_traverse_configs() -> list[Path]:
     found: list[Path] = []
     # Launcher unit runtimes (prepare writes here for native league).
     if RUNTIME_ROOT.is_dir():
-        found.extend(sorted(RUNTIME_ROOT.glob("*/leagues/traverse/config/config.json")))
+        found.extend(sorted(RUNTIME_ROOT.glob("*/leagues/race/config/config.json")) + sorted(RUNTIME_ROOT.glob("*/leagues/traverse/config/config.json")))
     # Checkout-local state dirs if present.
     for base in (
         ROOT / "local_data" / "coworld-config",
@@ -94,7 +94,7 @@ def find_traverse_configs() -> list[Path]:
     ):
         if not base.exists():
             continue
-        found.extend(sorted(base.glob("**/leagues/traverse/config/config.json")))
+        found.extend(sorted(base.glob("**/leagues/race/config/config.json")) + sorted(base.glob("**/leagues/traverse/config/config.json")))
         # bare coworld-config used by compose default
         candidate = base / "config.json"
         if candidate.is_file() and candidate not in found:

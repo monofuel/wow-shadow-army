@@ -22,6 +22,24 @@ class TestTraverseCheckpoint(unittest.TestCase):
         self.assertEqual(pose["map_id"], 1)
         self.assertEqual(pose["tele_name"], "petrel_water_entry")
 
+    def test_primary_course_checkpoints(self) -> None:
+        expected = {
+            "water_entry": (-6784.5, -4833.9, 0.7),
+            "duskwallow_coast": (-4627.01, -4869.45, -2.37),
+            "merchant_coast": (-1816.8, -3899.5, -1.0),
+            "top_barrens": (1071.6, -2303.4, 91.7),
+            "felwood_cave_entrance": (6502.937, -2063.74, 576.017),
+            "everlook": (6687.333052, -4647.667, 721.678),
+        }
+        for name, coordinates in expected.items():
+            with self.subTest(checkpoint=name):
+                pose = tc.resolve_checkpoint(name)
+                self.assertEqual(
+                    (pose["x"], pose["y"], pose["z"]), coordinates
+                )
+                self.assertEqual(pose["map_id"], 1)
+                self.assertTrue(pose["tele_name"])
+
     def test_spawn_has_no_tele(self) -> None:
         pose = tc.resolve_checkpoint("spawn")
         self.assertIsNone(pose.get("tele_name"))
@@ -94,6 +112,212 @@ class TestTraverseCheckpoint(unittest.TestCase):
         out = tc.apply_checkpoint("spawn", skip_wait=True)
         self.assertTrue(out["ok"])
         self.assertTrue(out.get("skipped"))
+
+    def test_apply_no_wait_is_one_shot(self) -> None:
+        """--no-wait fires exactly one accepted tele and never reads status.
+
+        The status file belongs to the bot seat; the old shared verify loop
+        read it after a manual tele and re-fired every cycle, repeatedly
+        yanking a logged-in human back to the checkpoint (2026-08-10).
+        """
+        calls = {"soap": 0}
+
+        def fake_soap(cmd, **_kw):
+            calls["soap"] += 1
+            return "You are teleporting Cowcam to petrel_merchant_coast."
+
+        with (
+            mock.patch.object(tc, "wait_for_soap", return_value="up"),
+            mock.patch.object(tc, "ensure_gm_account"),
+            mock.patch.object(
+                tc, "ensure_game_tele", return_value="petrel_merchant_coast"
+            ),
+            mock.patch.object(tc, "soap_execute", side_effect=fake_soap),
+            mock.patch.object(
+                tc,
+                "read_status",
+                side_effect=AssertionError(
+                    "--no-wait must never read the bot status file"
+                ),
+            ),
+            mock.patch.object(tc.time, "sleep"),
+        ):
+            out = tc.apply_checkpoint(
+                "merchant_coast", character="Cowcam", skip_wait=True
+            )
+        self.assertTrue(out["ok"])
+        self.assertTrue(out.get("one_shot"))
+        self.assertEqual(out["attempts"], 1)
+        self.assertEqual(calls["soap"], 1)
+
+    def test_apply_no_wait_retries_unloaded_tele_location(self) -> None:
+        """A 'location not found' reply re-ensures game_tele, then re-fires."""
+        replies = iter(
+            [
+                "Teleport location not found!",
+                "You are teleporting Cowcam to petrel_merchant_coast.",
+            ]
+        )
+        ensured = {"count": 0}
+
+        def fake_ensure(_pose):
+            ensured["count"] += 1
+            return "petrel_merchant_coast"
+
+        with (
+            mock.patch.object(tc, "wait_for_soap", return_value="up"),
+            mock.patch.object(tc, "ensure_gm_account"),
+            mock.patch.object(tc, "ensure_game_tele", side_effect=fake_ensure),
+            mock.patch.object(
+                tc, "soap_execute", side_effect=lambda *_a, **_k: next(replies)
+            ),
+            mock.patch.object(tc, "read_status"),
+            mock.patch.object(tc.time, "sleep"),
+        ):
+            out = tc.apply_checkpoint(
+                "merchant_coast", character="Cowcam", skip_wait=True
+            )
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["attempts"], 2)
+        self.assertGreaterEqual(ensured["count"], 2)
+
+    def test_segment_wait_starts_at_checkpoint_and_reaches_endpoint(self) -> None:
+        statuses = [
+            {"x": 1071.6, "y": -2303.4, "swimming": False},
+            {"x": 6502.937, "y": -2063.74, "swimming": False, "nav_error": ""},
+        ]
+        clock = iter(range(20))
+        with (
+            mock.patch.object(tc, "read_status", side_effect=statuses),
+            mock.patch.object(tc.time, "sleep"),
+            mock.patch.object(tc.time, "monotonic", side_effect=lambda: float(next(clock))),
+        ):
+            out = tc.wait_for_segment_endpoint(
+                "top_barrens", "felwood_cave_entrance", timeout=15
+            )
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["swimming_samples"], 0)
+        self.assertEqual(out["deaths"], 0)
+        self.assertLessEqual(out["endpoint_distance_yards"], 50)
+        self.assertIn("best_endpoint_distance_yards", out)
+        self.assertLessEqual(
+            out["best_endpoint_distance_yards"], out["endpoint_distance_yards"]
+        )
+
+    def test_segment_wait_reports_death(self) -> None:
+        statuses = [
+            {"x": 1071.6, "y": -2303.4, "swimming": False},
+            {
+                "x": 1100.0,
+                "y": -2290.0,
+                "swimming": False,
+                "intent_reason": "run_over",
+                "nav_error": "",
+            },
+        ]
+        clock = iter(range(20))
+        with (
+            mock.patch.object(tc, "read_status", side_effect=statuses),
+            mock.patch.object(tc.time, "sleep"),
+            mock.patch.object(tc.time, "monotonic", side_effect=lambda: float(next(clock))),
+        ):
+            out = tc.wait_for_segment_endpoint(
+                "top_barrens", "felwood_cave_entrance", timeout=15
+            )
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["deaths"], 1)
+        self.assertIn("best_endpoint_distance_yards", out)
+        self.assertGreater(out["best_endpoint_distance_yards"], 0)
+
+    def test_segment_wait_tracks_best_endpoint_distance(self) -> None:
+        """Closest approach is kept even when the final sample backs off."""
+        end = tc.resolve_checkpoint("felwood_cave_entrance")
+        near = {"x": end["x"] + 30.0, "y": end["y"], "swimming": False}
+        far = {"x": end["x"] + 200.0, "y": end["y"], "swimming": False, "nav_error": ""}
+        seq = iter(
+            [
+                {"x": 1071.6, "y": -2303.4, "swimming": False},
+                near,
+            ]
+        )
+
+        def statuses() -> dict:
+            try:
+                return next(seq)
+            except StopIteration:
+                return far
+
+        t = [0.0]
+
+        def mono() -> float:
+            cur = t[0]
+            t[0] += 0.1
+            return cur
+
+        with (
+            mock.patch.object(tc, "read_status", side_effect=lambda *_a, **_k: statuses()),
+            mock.patch.object(tc.time, "sleep"),
+            mock.patch.object(tc.time, "monotonic", side_effect=mono),
+        ):
+            out = tc.wait_for_segment_endpoint(
+                "top_barrens", "felwood_cave_entrance", timeout=2.0, near_yards=20.0
+            )
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["reason"], "segment endpoint timeout")
+        self.assertAlmostEqual(out["best_endpoint_distance_yards"], 30.0, places=1)
+        self.assertGreater(out["endpoint_distance_yards"], out["best_endpoint_distance_yards"])
+
+    def test_cmd_wait_embeds_scorecard_when_run_log_exists(self) -> None:
+        import argparse
+        import io
+        import tempfile
+
+        statuses = [
+            {"x": 1071.6, "y": -2303.4, "swimming": False},
+            {"x": 6502.937, "y": -2063.74, "swimming": False, "nav_error": ""},
+        ]
+        clock = iter(range(20))
+        flight = (
+            'lua-bot[traverse]: FLIGHT {"t":0.0,"x":0.0,"y":0.0,"z":0,'
+            '"hp":1000,"form":0,"swim":false,"combat":false,'
+            '"nav":"following","beat":"desert","xt":1.0}\n'
+            'lua-bot[traverse]: FLIGHT {"t":5.0,"x":40.0,"y":0.0,"z":0,'
+            '"hp":1000,"form":0,"swim":false,"combat":false,'
+            '"nav":"following","beat":"desert","xt":2.0}\n'
+        )
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            run_dir = tmp / "local_data" / "traverse-status"
+            run_dir.mkdir(parents=True)
+            (run_dir / "run.log").write_text(flight, encoding="utf-8")
+            result_path = tmp / "segment.json"
+            args = argparse.Namespace(
+                start="top_barrens",
+                end="felwood_cave_entrance",
+                status=None,
+                timeout=15.0,
+                near=50.0,
+                start_near=120.0,
+                poll=0.5,
+                result=str(result_path),
+            )
+            buf = io.StringIO()
+            with (
+                mock.patch.object(tc, "ROOT", tmp),
+                mock.patch.object(tc, "read_status", side_effect=statuses),
+                mock.patch.object(tc.time, "sleep"),
+                mock.patch.object(
+                    tc.time, "monotonic", side_effect=lambda: float(next(clock))
+                ),
+                mock.patch("sys.stdout", buf),
+            ):
+                rc = tc.cmd_wait(args)
+            self.assertEqual(rc, 0)
+            data = json.loads(result_path.read_text(encoding="utf-8"))
+            self.assertIn("scorecard", data)
+            self.assertIn("duration_s", data["scorecard"])
+            self.assertAlmostEqual(data["scorecard"]["duration_s"], 5.0, places=2)
+            self.assertIn("traverse scorecard", buf.getvalue())
 
 
 if __name__ == "__main__":

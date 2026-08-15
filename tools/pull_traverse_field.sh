@@ -114,13 +114,17 @@ else
     "memberships -l '$LEAGUE' --mine --limit 1000 --json"
 fi
 
-echo "→ episodes --mine (division)"
+# The --mine membership filter went dead 2026-08-05 (returns [] while the
+# policy filter keeps working) — query by policy name instead. Override
+# with TRAVERSE_POLICY for a different lineage.
+POLICY=${TRAVERSE_POLICY:-petrel}
+echo "→ episodes -p $POLICY (division)"
 if [ -n "$CW_BIN" ]; then
   run_cw_json "$OUTDIR/episodes_mine.json" \
-    episodes -d "$DIV" --mine --limit "$LIMIT" --json
+    episodes -d "$DIV" -p "$POLICY" --limit "$LIMIT" --json
 else
   run_cw_json "$OUTDIR/episodes_mine.json" \
-    "episodes -d '$DIV' --mine --limit $LIMIT --json"
+    "episodes -d '$DIV' -p '$POLICY' --limit $LIMIT --json"
 fi
 
 echo "→ merge into episodes_history.json"
@@ -130,6 +134,9 @@ from pathlib import Path
 out = Path("$OUTDIR")
 hist_path = out / "episodes_history.json"
 pull = json.loads((out / "episodes_mine.json").read_text())
+if isinstance(pull, dict):
+    # 2026-08 API change: episodes come in a {episodes, cursor} envelope
+    pull = pull.get("episodes") or pull.get("items") or pull.get("entries") or []
 if not isinstance(pull, list):
     pull = []
 hist = []

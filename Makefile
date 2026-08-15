@@ -25,14 +25,21 @@ WOW_ENV := $(CURDIR)/tools/wow_env.sh
 FORK_CLIENT := $(abspath ../monofuel-vanilla-wow)
 # Lua entry module driven by the accelerated targets.
 ENTRY ?= accelerated
-# Hosted league is still "accelerated"; local launcher profile is ten-x.
+# Hosted Accelerated is "accelerated"; local 10x launcher profile is ten-x.
 LUA_BOT_LAUNCH = nix develop $(FORK_CLIENT) --command \
 	nim r tools/launch_nim_player.nim -- --league=ten-x \
 	--bot=lua-bot --lua-repo=$(CURDIR) --lua-entry=$(ENTRY)
+# Persistent league local proof / smoke (1x durable profile).
+PERSISTENT_LAUNCH = nix develop $(FORK_CLIENT) --command \
+	nim r tools/launch_nim_player.nim -- --league=persistent \
+	--bot=lua-bot --lua-repo=$(CURDIR) --lua-entry=$(ENTRY)
 # Same host, traverse league: Petrel runs as lua/entry/traverse.lua.
+# Upstream renamed the leagues in the hosted-session protocol update
+# (2026-08-10): traverse -> race (same kalimdor_traversal scenario).
 TRAVERSE_LAUNCH = nix develop $(FORK_CLIENT) --command \
-	nim r tools/launch_nim_player.nim -- --league=traverse \
-	--bot=lua-bot --lua-repo=$(CURDIR) --lua-entry=traverse
+	nim r tools/launch_nim_player.nim -- --league=race \
+	--bot=lua-bot --lua-repo=$(CURDIR) --lua-entry=traverse \
+	--lua-status-dir=$(CURDIR)/local_data/traverse-status
 
 # Local realm operator inputs (paths relative to UPSTREAM).
 export VANILLA_WOW_EXTRACTED_DATA_DIR := $(UPSTREAM)/local_data/vmangos-5875-data
@@ -129,25 +136,48 @@ define stop_home_seat
 	rm -f "$$pid_file"; echo "stopped $(1)"
 endef
 
-.PHONY: test test-lua test-nim system pin-check start-server stop-server server-logging logs account soap-account play play-classic play-classic-netlog play-xr traverse traverse-field traverse-replay traverse-pack-replay traverse-headed traverse-pol traverse-desert traverse-wet traverse-checkpoints lift-tele quest-data warlock-account warlock-bot botwarrior-bot tusk-account tusk-bot beru-account beru-bot party-army home-army-start home-army-stop home-army-restart home-army-status shadowfel-start shadowfel-stop igris-start igris-stop tusk-start tusk-stop beru-start beru-stop navmesh-helper navmesh-status map-browser map-browser-once map-browser-debug map-browser-probe
+.PHONY: test test-lua test-nim system pin-check start-server stop-server server-logging logs account soap-account play play-classic play-classic-netlog play-xr traverse traverse-field traverse-replay traverse-pack-replay traverse-headed traverse-pol traverse-desert traverse-wet traverse-checkpoints traverse-lint traverse-lint-soft lift-tele quest-data warlock-account warlock-bot botwarrior-bot tusk-account tusk-bot beru-account beru-bot party-army home-army-start home-army-stop home-army-restart home-army-status shadowfel-start shadowfel-stop igris-start igris-stop tusk-start tusk-stop beru-start beru-stop navmesh-helper navmesh-status map-browser map-browser-once map-browser-debug map-browser-probe
 
 # Unit tier: Lua tools + Nim host/system tests only (v2 DoD: no Python required
 # for bot correctness). If nim is missing, test-nim-soft skips rather than
 # failing bare CI hosts. Smoke tier parse/compile-checks code no unit test
 # executes (including addon Lua) — doctrine: a cheap compile-check is a
 # legitimate leg for a binary with no unit tests yet.
-test: test-lua test-nim-soft test-smoke test-traverse-soap test-traverse-checkpoint
+test: test-lua test-nim-soft test-smoke test-traverse-soap test-traverse-checkpoint traverse-lint-soft
 
-.PHONY: test-traverse-soap test-traverse-checkpoint
+.PHONY: test-traverse-soap test-traverse-checkpoint test-road-artifacts traverse-lint traverse-lint-soft
 test-traverse-soap:
 	@python3 tools/tests/test_traverse_soap.py
 test-traverse-checkpoint:
 	@python3 tools/tests/test_traverse_checkpoint.py
+	@python3 tools/tests/test_traverse_scorecard.py
+	@python3 tools/tests/test_traverse_route_lint.py
+	@python3 tools/tests/test_road_mask.py
+	@python3 tools/tests/test_minimap_mask.py
+	@python3 tools/tests/test_road_artifacts.py
+test-road-artifacts:
+	@python3 tools/tests/test_road_artifacts.py
+# Offline land-beat corridor lint (Detour helper + spawn TSV). Exits 0 on SKIP
+# when helper/mmaps are missing so bare CI hosts stay green. make test uses
+# --warn-only so corridor FAILs do not red the unit suite; traverse-lint is strict.
+traverse-lint-soft:
+	@python3 tools/traverse_route_lint.py --warn-only
+	@python3 tools/traverse_route_lint.py --warn-only \
+		--beats lua/config/traverse_connector_land_beats.json
+	@python3 tools/traverse_route_lint.py --warn-only \
+		--beats lua/config/traverse_finale_beats.json
+traverse-lint:
+	@python3 tools/traverse_route_lint.py
+	@python3 tools/traverse_route_lint.py \
+		--beats lua/config/traverse_connector_land_beats.json
+	@python3 tools/traverse_route_lint.py \
+		--beats lua/config/traverse_finale_beats.json
 
 # Every maintained Nim entrypoint/module must at least compile (`nim check`),
 # even where no unit suite imports it yet.
 NIM_CHECK_FILES = system/system_server.nim \
-	tools/fair_play_audit.nim tools/party_promote.nim
+	tools/fair_play_audit.nim tools/party_promote.nim \
+	src/conductor.nim
 
 .PHONY: test-smoke test-smoke-lua test-smoke-nim test-smoke-nim-soft
 test-smoke: test-smoke-lua test-smoke-nim-soft
@@ -228,8 +258,9 @@ system:
 		SYSTEM_ARMY_DIR="$${SYSTEM_ARMY_DIR:-$$(pwd)}" \
 		nix develop --command nim r system/system_server.nim
 
-# Map browser (docs/map-plan.md). Single window: 2D drill + client terrain 3D.
-# Zone view reuses fork runMapViewer terrain (fog off, no doodads).
+# Map browser: standalone bird's-eye WDL terrain viewer (no fork renderer).
+# MAP_BROWSER_STATS / MAP_BROWSER_AUTO are the agent-facing instrumentation
+# (formerly also MAP_BROWSER_DEBUG zone-drill probe — that era is gone).
 CLASSIC_CLIENT := $(abspath ../wow-classic-data/Coworld-WoW-Classic/client)
 ifeq ($(wildcard $(CLASSIC_CLIENT)/Data),)
   CLASSIC_CLIENT := $(abspath ../coworld-vanilla-wow/local_data/coworld-bundle/Coworld-WoW-Classic/client)
@@ -244,22 +275,16 @@ map-browser-once:
 		MAP_BROWSER_ONCE=1 \
 		nix develop --command nim r src/tools/map_browser.nim
 
-# Debug run: per-second [mb-debug] lines + stats JSON for agents.
-map-browser-debug:
-	VANILLA_WOW_EXTRACTED_DATA_DIR="$(VANILLA_WOW_EXTRACTED_DATA_DIR)" \
-	VANILLA_WOW_CLIENT_DATA_DIR="$${VANILLA_WOW_CLIENT_DATA_DIR:-$(CLASSIC_CLIENT)}" \
-		MAP_BROWSER_DEBUG=1 \
-		MAP_BROWSER_STATS=local_data/map_browser_stats.json \
-		nix develop --command nim r src/tools/map_browser.nim
-
-# Autopilot probe: drill a zone, stream, screenshot + stats, exit nonzero on
-# failure. Override with MAP_BROWSER_AUTO="zone=...,seconds=...,screenshot=...".
 map-browser-probe:
 	VANILLA_WOW_EXTRACTED_DATA_DIR="$(VANILLA_WOW_EXTRACTED_DATA_DIR)" \
 	VANILLA_WOW_CLIENT_DATA_DIR="$${VANILLA_WOW_CLIENT_DATA_DIR:-$(CLASSIC_CLIENT)}" \
-		MAP_BROWSER_DEBUG=1 \
-		MAP_BROWSER_AUTO="$${MAP_BROWSER_AUTO:-zone=Durotar,seconds=10,screenshot=local_data/map_browser_probe.png}" \
+		MAP_BROWSER_AUTO="$${MAP_BROWSER_AUTO:-seconds=8,screenshot=local_data/map_browser_probe.png}" \
+		MAP_BROWSER_STATS=local_data/map_browser_stats.json \
 		nix develop --command nim r src/tools/map_browser.nim
+
+.PHONY: minimap-atlas
+minimap-atlas:
+	nix-shell -p python3Packages.pillow --run 'python3 tools/bake_minimap_atlas.py --map kalimdor && python3 tools/bake_minimap_atlas.py --map azeroth'
 
 # Pin-drift only: HEAD of ../coworld-vanilla-wow must match upstream.lock.
 # Pure shell — no Python. Format of upstream.lock: "<name> <sha>".
@@ -324,6 +349,43 @@ peregrine-image: lua-bot-player-image
 		-t $(PEREGRINE_IMAGE) .; \
 	test "$$(docker image inspect $(PEREGRINE_IMAGE) --format '{{.Architecture}}')" = amd64; \
 	echo "built $(PEREGRINE_IMAGE) (policy name: peregrine)"
+
+# Petrel: hosted Traverse policy image (rendered lua-bot + this lua/,
+# entry=traverse). Same shape as Peregrine; see Dockerfile.petrel and
+# playbooks/upload-bot.md. Does NOT upload or submit.
+PETREL_IMAGE ?= petrel:latest
+.PHONY: petrel-image
+petrel-image: lua-bot-player-image
+	@set -e; \
+	docker build --platform linux/amd64 \
+		-f Dockerfile.petrel \
+		--build-arg LUA_BOT_PLAYER_IMAGE=$(LUA_BOT_PLAYER_IMAGE) \
+		-t $(PETREL_IMAGE) .; \
+	test "$$(docker image inspect $(PETREL_IMAGE) --format '{{.Architecture}}')" = amd64; \
+	echo "built $(PETREL_IMAGE) (policy name: petrel)"
+
+# ---------------------------------------------------------------------------
+# Raven: hosted Persistent policy (same lua leveler; undead warlock at submit).
+# ---------------------------------------------------------------------------
+RAVEN_IMAGE ?= raven:latest
+.PHONY: raven-image persistent-pol persistent persistent-headed
+raven-image: lua-bot-player-image
+	@set -e; \
+	docker build --platform linux/amd64 \
+		-f Dockerfile.raven \
+		--build-arg LUA_BOT_PLAYER_IMAGE=$(LUA_BOT_PLAYER_IMAGE) \
+		-t $(RAVEN_IMAGE) .; \
+	test "$$(docker image inspect $(RAVEN_IMAGE) --format '{{.Architecture}}')" = amd64; \
+	echo "built $(RAVEN_IMAGE) (policy name: raven; submit undead/warlock)"
+
+persistent-pol:
+	@cd $(FORK_CLIENT) && $(PERSISTENT_LAUNCH) --proof-of-life
+
+persistent:
+	@cd $(FORK_CLIENT) && $(PERSISTENT_LAUNCH) --presentation=headless
+
+persistent-headed:
+	@cd $(FORK_CLIENT) && $(PERSISTENT_LAUNCH) --presentation=headed
 
 .PHONY: backup-server
 backup-server:
@@ -619,28 +681,51 @@ traverse-pack-replay:
 	@tools/pack_traverse_replay.sh
 
 # Petrel on the lua-bot host (docs/traverse/README.md). Headless full run.
-# The wet chain runs by default: traverse/traverse-headed attempt the
-# ENTIRE course (desert + swim). SWIM=0 opts out; traverse-desert and
-# traverse-pol pin land-only semantics themselves.
-SWIM ?=
+# The wet chain is unconditional (the PETREL_SWIM gate is gone, ticket
+# 0015): every traverse run is the full course — desert, swim, connector,
+# finale. The harness passes NO behavior-changing env vars; what runs
+# locally is what ships.
 # CHECKPOINT=<name> SOAP-teleports the character after login (local debug;
 # names from `make traverse-checkpoints`). The episode realm is recreated
 # per launch, so SOAP is enabled at birth and a background watcher waits
 # for the traverse container before applying — it never touches the
-# persistent realm. A checkpoint run is a wet run: PETREL_SWIM defaults on
-# (override with SWIM=0). wet_start lands swimming; water_entry lands DRY
+# persistent realm. wet_start lands swimming; water_entry lands DRY
 # on the sand (the shoreline entry is a known-open gap on the lua-bot
 # host — you will see the bot work the waterline, not the ribbon).
+# END_CHECKPOINT=<name> turns either launcher into a bounded segment test. It
+# waits until the start tele is observed, records idle/swim/death metrics, and
+# terminates the launcher successfully at 50 yd from the named endpoint.
 CHECKPOINT ?=
-TRAVERSE_SWIM_EFFECTIVE = $(or $(SWIM),1)
+END_CHECKPOINT ?=
+END_TIMEOUT ?=2700
+TRAVERSE_SEGMENT_RESULT := $(CURDIR)/local_data/traverse-segment-result.json
+TRAVERSE_LIVE_LOCK := $(CURDIR)/local_data/traverse-live.lock
+define TRAVERSE_ACQUIRE_LOCK
+	mkdir -p "$(CURDIR)/local_data"; \
+	exec 8>"$(TRAVERSE_LIVE_LOCK)"; \
+	if ! flock -n 8; then \
+		echo "error: another live Traverse run owns $(TRAVERSE_LIVE_LOCK)" >&2; \
+		exit 2; \
+	fi
+endef
 define TRAVERSE_CHECKPOINT_PRELUDE
+	$(TRAVERSE_ACQUIRE_LOCK); \
+	if [ -n "$(END_CHECKPOINT)" ] && [ -z "$(CHECKPOINT)" ]; then \
+		echo "error: END_CHECKPOINT requires CHECKPOINT" >&2; exit 2; \
+	fi; \
+	if [ -n "$(END_CHECKPOINT)" ]; then \
+		python3 tools/traverse_checkpoint.py resolve "$(CHECKPOINT)" >/dev/null; \
+		python3 tools/traverse_checkpoint.py resolve "$(END_CHECKPOINT)" >/dev/null; \
+		rm -f "$(TRAVERSE_SEGMENT_RESULT)"; \
+	fi; \
 	if [ -n "$(CHECKPOINT)" ]; then \
-		rm -f local_data/lua-bot-status.json; \
-		prior_cid="$$(docker ps --format '{{.ID}} {{.Names}}' 2>/dev/null | grep 'traverse.*coworld-game' | awk '{print $$1}' | head -1)"; \
+		mkdir -p local_data/traverse-status; \
+		rm -f local_data/lua-bot-status.json local_data/traverse-status/status.json; \
+		prior_cid="$$(docker ps --format '{{.ID}} {{.Names}}' 2>/dev/null | grep -E '(traverse|race).*coworld-game' | awk '{print $$1}' | head -1)"; \
 		VMANGOS_MANGOSD_CONFIG_OVERRIDES="$$(python3 tools/traverse_soap.py env)"; \
 		export VMANGOS_MANGOSD_CONFIG_OVERRIDES; \
 		( for _ in $$(seq 1 200); do \
-			cid="$$(docker ps --format '{{.ID}} {{.Names}}' 2>/dev/null | grep 'traverse.*coworld-game' | awk '{print $$1}' | head -1)"; \
+			cid="$$(docker ps --format '{{.ID}} {{.Names}}' 2>/dev/null | grep -E '(traverse|race).*coworld-game' | awk '{print $$1}' | head -1)"; \
 			if [ -n "$$cid" ] && [ "$$cid" != "$$prior_cid" ]; then break; fi; \
 			sleep 2; \
 		  done; \
@@ -648,30 +733,59 @@ define TRAVERSE_CHECKPOINT_PRELUDE
 			--character Northbound >> local_data/health-logs/traverse-tele.log 2>&1 ) & \
 	fi
 endef
+
+define TRAVERSE_RUN
+	mkdir -p "$(CURDIR)/local_data/traverse-status"; \
+	if [ -n "$(END_CHECKPOINT)" ]; then \
+		cd $(FORK_CLIENT); \
+		setsid sh -c '$(TRAVERSE_LAUNCH) --presentation=$(1) 2>&1 | tee "$(CURDIR)/local_data/traverse-status/run.log"' & \
+		run_pid=$$!; \
+		cleanup() { \
+			kill -TERM -- -$$run_pid 2>/dev/null || true; \
+			wait $$run_pid 2>/dev/null || true; \
+		}; \
+		trap cleanup EXIT INT TERM; \
+		python3 "$(CURDIR)/tools/traverse_checkpoint.py" wait \
+			"$(CHECKPOINT)" "$(END_CHECKPOINT)" \
+			--timeout "$(END_TIMEOUT)" \
+			--result "$(TRAVERSE_SEGMENT_RESULT)"; \
+		segment_rc=$$?; \
+		trap - EXIT INT TERM; \
+		cleanup; \
+		exit $$segment_rc; \
+	else \
+		cd $(FORK_CLIENT) && set -o pipefail && \
+		$(TRAVERSE_LAUNCH) --presentation=$(1) 2>&1 | \
+			tee "$(CURDIR)/local_data/traverse-status/run.log"; \
+	fi
+endef
 traverse:
 	@mkdir -p local_data/health-logs
 	@$(TRAVERSE_CHECKPOINT_PRELUDE); \
-	cd $(FORK_CLIENT) && PETREL_SWIM=$(TRAVERSE_SWIM_EFFECTIVE) $(TRAVERSE_LAUNCH) --presentation=headless
+	$(call TRAVERSE_RUN,headless)
 
 # Headed Petrel run for manual verification (opens a window — human use).
 traverse-headed:
 	@mkdir -p local_data/health-logs
 	@$(TRAVERSE_CHECKPOINT_PRELUDE); \
-	cd $(FORK_CLIENT) && PETREL_SWIM=$(TRAVERSE_SWIM_EFFECTIVE) $(TRAVERSE_LAUNCH) --presentation=headed
+	$(call TRAVERSE_RUN,headed)
 
 # Fast regression: proof-of-life (level 60, map 1, movement + inputs).
 traverse-pol:
-	@cd $(FORK_CLIENT) && PETREL_SWIM=0 $(TRAVERSE_LAUNCH) --proof-of-life
+	@$(TRAVERSE_ACQUIRE_LOCK); \
+	cd $(FORK_CLIENT) && $(TRAVERSE_LAUNCH) --proof-of-life
 
 # Land-leg proof: spawn → desert ocean coast (water_entry), with client CPU
 # sampling for the streaming-starvation investigation. Readback at exit.
 traverse-desert:
-	@tools/traverse_desert.sh
+	@$(TRAVERSE_ACQUIRE_LOCK); \
+	tools/traverse_desert.sh
 
 # Wet lab: SOAP-tele to water_entry, swim the cheese ribbon to Dustwallow.
 # Local debug only; reports best_planar_to_duskwallow_wet at exit.
 traverse-wet:
-	@tools/traverse_wet.sh
+	@$(TRAVERSE_ACQUIRE_LOCK); \
+	tools/traverse_wet.sh
 
 # List SOAP tele checkpoints (does not launch).
 traverse-checkpoints:
