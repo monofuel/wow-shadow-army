@@ -10,7 +10,7 @@
 # Config: <wow-coworld root>/conductor.json.  Design: docs/conductor.md.
 
 import
-  std/[json, os, sequtils, sets, strutils, tables],
+  std/[algorithm, json, os, sequtils, sets, strutils, tables],
   scriptorium/git_ops,
   conductor/cfg,
   conductor/evalgate,
@@ -108,7 +108,27 @@ proc cmdBaseline(cfgAll: ConductorConfig, leagueName, root: string) =
   let lane = laneDir(root, lc)
   echo "conductor: baseline eval of ", lc.laneBranch, " HEAD (",
     headSha(lane), ") — this takes several minutes"
-  let res = runEval(lane, lc, "baseline")
+  # Same variance discipline as gate-branch (goal-loop.md): the champion
+  # row is "SHAs + median eval". Three rolls, keep the median report.
+  let median3 = getEnv("CONDUCTOR_GATE_MEDIAN3", "1") != "0"
+  let rollTarget = if median3: 3 else: 1
+  var reports: seq[JsonNode] = @[]
+  var res = EvalResult(outcome: evalFailed, detail: "no roll ran")
+  var rollIdx = 0
+  while reports.len < rollTarget and rollIdx < rollTarget + 4:
+    inc rollIdx
+    echo "conductor: baseline roll ", reports.len + 1, "/", rollTarget
+    res = runEval(lane, lc, "baseline-r" & $rollIdx)
+    if res.outcome == evalOk:
+      reports.add(res.report)
+  if reports.len > 0:
+    proc northing(r: JsonNode): float = r{"max_northing"}.getFloat(0.0)
+    reports.sort(proc(a, b: JsonNode): int = cmp(northing(a), northing(b)))
+    res = EvalResult(outcome: evalOk, report: reports[reports.len div 2],
+      detail: "median of " & $reports.len)
+    echo "conductor: baseline rolls ",
+      reports.mapIt($it{"max_northing"}.getFloat(0.0).int).join("/"),
+      " — median kept"
   case res.outcome
   of evalBusy:
     quit "conductor: eval slot busy — " & res.detail
