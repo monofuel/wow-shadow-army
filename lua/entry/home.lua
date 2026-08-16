@@ -21,6 +21,50 @@ local HEAL_RANGE_YARDS = 30.0
 local RES_WAIT_SECONDS = 20.0
 local PROMOTE_RETRY_SECONDS = 5.0
 
+-- The healer's mana IS the party's health bar. Smite is 15-30 mana a cast and
+-- the wand is free, so below the wand floor every point is worth more as the
+-- next heal than as one more Smite tick; below the conserve floor the seat
+-- stops spending mana on damage at all. Shadow Word: Pain is the efficient
+-- middle ground and keeps its own floor. Measured on Beru (priest 8, ~250
+-- mana): a Smite-only filler empties the bar in about nine casts, which is
+-- one add away from a party wipe.
+local WAND_MANA_PCT = 70.0
+local DOT_MANA_PCT = 40.0
+local CONSERVE_MANA_PCT = 20.0
+-- Under the conserve floor the pool is triage only: topping a scratch off at
+-- 85% is exactly what leaves a healer empty for the pull that matters.
+local CONSERVE_HEAL_PCT = 60.0
+-- Shoot is an auto-repeat TOGGLE, not a cast. Re-pressing it while the wand
+-- is firing cancels it (fork environment/client/client_actions_gameplay.nim:
+-- isActiveAutoRepeatSpell -> clearAutoRepeatSpell, on the wire as
+-- CMSG_CANCEL_AUTO_REPEAT_SPELL), and the pilot has no guard of its own -- it
+-- presses ACTIONBUTTON<n> for any intent spell on a 0.4s throttle, so a brain
+-- that asks for 5019 every tick strobes the wand and never lands a shot. The
+-- button's own `active` flag is the client's auto-repeat state for that spell
+-- and is authoritative, but it only latches on the NEXT observation, so the
+-- seat also remembers its own press to cover the gap.
+local WAND_REPRESS_SECONDS = 3.0
+-- Power Word: Shield absorbs; it has to be up BEFORE the swing lands to be
+-- worth its mana. Waiting for the tank to hit the 50% emergency line means
+-- the shield races the hit that takes him to 35 -- and loses. Renew is 15
+-- mana ticking over 15 seconds against a 30 mana Lesser Heal that arrives
+-- 1.5s after the damage, so on a tank who is actively being hit it is upkeep,
+-- not a top-off.
+local TANK_SHIELD_PCT = 60.0
+local TANK_RENEW_PCT = 95.0
+-- Battle Shout is aura-gated, but if a seat's own aura list ever lags the
+-- gate opens every tick and the shout becomes the rage sink instead of the
+-- rotation. The floor bounds that failure to one wasted global per interval.
+local SHOUT_RETRY_SECONDS = 5.0
+-- A mob past this is not peelable whatever its target field says (the same
+-- cap the escort's stale-target scan already uses).
+local PEEL_RANGE_YARDS = 50.0
+-- The roster carries no role field and every home seat is rolled by hand, so
+-- the two seats the tank and the healer care about are named, exactly the way
+-- Murist is.
+local HEALER_NAME = "beru"
+local TANK_NAME = "tusk"
+
 -- Long rejoins go by ROAD. Under this the crow line is the right answer: the
 -- detour to reach pavement costs more than the walk it saves, and the router
 -- says so itself (short-hop). Over it, a straight line through open country is
@@ -100,6 +144,9 @@ local chat_outbox = nil
 local chat_last_poll_at = nil
 local chat_last_sent_at = nil
 local chat_pending = nil
+local wand_pressed_at = nil
+local wand_pressed_guid = nil
+local last_shout_at = nil
 
 local AURA_FAMILIES = {
   ["curse of agony"] = { 980, 1014, 6217, 11711, 11712, 11713 },
@@ -108,6 +155,8 @@ local AURA_FAMILIES = {
   ["demon skin"] = { 687, 696 },
   ["demon armor"] = { 706, 1086, 11733, 11734, 11735 },
   ["battle shout"] = { 6673, 5242, 6192, 11549, 11550, 11551, 25289 },
+  ["rend"] = { 772, 6546, 6547, 6548, 11572, 11573, 11574 },
+  ["demoralizing shout"] = { 1160, 6190, 11554, 11555, 11556 },
   ["power word shield"] = { 17, 592, 600, 3747, 6065, 6066, 10898, 10899, 10900, 10901 },
   ["weakened soul"] = { 6788 },
   ["renew"] = { 139, 6074, 6075, 6076, 6077, 6078, 10927, 10928, 10929 },
@@ -442,6 +491,21 @@ local function visible_unit(view, guid)
   return nil
 end
 
+-- "Is this guid the party's business" -- one of us, a member, or a unit
+-- somebody in the party summoned. The escort's threat scan, the tank's peel
+-- scan and the taunt gate all resolve it here so they cannot disagree about
+-- whose fight this is.
+local function is_party_property(view, guid)
+  if guid_equal(guid, view.player_guid) then return true end
+  if party_member_by_guid(view, guid) then return true end
+  local u = visible_unit(view, guid)
+  if u and (u.summoner_guid or 0) ~= 0 then
+    return guid_equal(u.summoner_guid, view.player_guid) or
+      party_member_by_guid(view, u.summoner_guid) ~= nil
+  end
+  return false
+end
+
 local function visible_player_by_name(view, name)
   local wanted = lower(name)
   for _, unit in ipairs(view.units or {}) do
@@ -494,6 +558,13 @@ local function spell_candidates(view)
         not_enough_mana = button.not_enough_mana,
         cooldown_ms = button.cooldown_ms,
         reagents_available = true,
+        -- The client's toggle state for this button (fork
+        -- client_state/spells.nim ActionButtonModel.checked): true while the
+        -- spell is the live auto-repeat (Shoot), the queued next-swing
+        -- (Heroic Strike), an in-flight cast, or an aura already on us.
+        -- Pressing an already-active modal turns it OFF, so the rotations
+        -- read this before re-pressing anything.
+        active = button.active,
       }
     end
   end
@@ -520,15 +591,22 @@ local function mana_blocked_spell(view, wanted)
   return nil
 end
 
-local function pick_spell(view, priorities)
+-- prefer_low_rank picks the CHEAPEST rank instead of the strongest one, which
+-- is what a small deficit wants: rank 3 Lesser Heal on a 12% scratch is most
+-- of the cast overhealed and all of the mana spent. Bar-derived candidates all
+-- report rank 0, so on a live seat this is a no-op tiebreak until the ranks
+-- come from real facts.
+local function pick_spell(view, priorities, prefer_low_rank)
   for _, wanted in ipairs(priorities) do
     local want = normalized(wanted)
     local best = nil
     for _, spell in ipairs(spell_candidates(view)) do
       local name = normalized(spell.name)
+      local better = not best or (prefer_low_rank
+        and (spell.rank or 0) < (best.rank or 0)
+        or not prefer_low_rank and (spell.rank or 0) > (best.rank or 0))
       if spell.name_known ~= false and spell_ready(spell) and
-          (name == want or name:find(want, 1, true)) and
-          (not best or (spell.rank or 0) > (best.rank or 0)) then
+          (name == want or name:find(want, 1, true)) and better then
         best = spell
       end
     end
@@ -723,11 +801,22 @@ end
 -- FEATURE-DETECTED like the sell half: a host that cannot carry the verb
 -- leaves `equip_supported` unset and this costs one table lookup per tick.
 local EQUIP_GAP_SECONDS = 3.0
+-- Give up after this many attempts that did not raise the worn-bag count.
+-- Measured 2026-08-16: the fork accepts `equip_item` for a container and the
+-- seat emits it happily, but the bag never lands — 68 attempts across seven
+-- seats, `character_inventory` slots 19..22 still empty on every bot, and
+-- `equipment_items` still reporting zero worn bags. Until that fork gap is
+-- closed, an unbounded retry burns a tick every 3s on a live seat forever and
+-- buries the log. Three tries is enough to prove the verb is not landing.
+local EQUIP_MAX_ATTEMPTS = 3
 local equip_last_at = nil
 local equip_tried = {}
+local equip_attempts = 0
+local equip_gave_up = false
 
 local function equip_bags_step(view, now)
   if not view.equip_supported then return nil end
+  if equip_gave_up then return nil end
   -- The verb rejects in combat host-side (bots/lua_bot/pilot.nim), and a
   -- corpse cannot rummage through its own backpack. Refusing here keeps the
   -- rejection out of the status line.
@@ -740,6 +829,20 @@ local function equip_bags_step(view, now)
   -- spare is the sell path's problem, not ours.
   local bags = disposition.equipped_bags(view.equipment_items)
   if bags.count >= disposition.BAG_SLOT_COUNT then return nil end
+
+  -- A bag that actually landed raises bags.count, which both retires the slot
+  -- and resets the patience. Attempts that change nothing are the fork gap
+  -- above, and past the budget the seat stops asking rather than spending a
+  -- tick every 3s on a verb this host cannot finish.
+  if bags.count > 0 then equip_attempts = 0 end
+  if equip_attempts >= EQUIP_MAX_ATTEMPTS then
+    equip_gave_up = true
+    wow.log(string.format(
+      "bags: %d equip attempts changed nothing (still %d/%d worn) — " ..
+      "host accepts equip_item but the bag never lands; standing down",
+      equip_attempts, bags.count, disposition.BAG_SLOT_COUNT))
+    return nil
+  end
 
   if equip_last_at and now - equip_last_at < EQUIP_GAP_SECONDS then
     return nil
@@ -768,6 +871,7 @@ local function equip_bags_step(view, now)
   local guid = tostring(best.item_guid)
   equip_tried[guid] = true
   equip_last_at = now
+  equip_attempts = equip_attempts + 1
   wow.log(string.format(
     "bags: equipping %s (%d slots) into free bag slot %d/%d",
     tostring(best.name), best_slots, bags.count + 1,
@@ -792,14 +896,21 @@ end
 
 local function nearest_vendor(view)
   local best, best_d = nil, nil
+  local pure, pure_d = nil, nil
   for _, unit in ipairs(view.units or {}) do
     if unit_has_service(unit, "vendor") and
         not (unit.death_known and unit.is_dead) and
         unit.object_kind ~= "player" then
       local d = tonumber(unit.distance) or 1e9
       if not best_d or d < best_d then best, best_d = unit, d end
+      -- A questgiver-vendor opens the quest panel, not the merchant
+      -- (Baran vs Joshua Kien, 2026-08-16). Prefer a pure vendor.
+      if not unit_has_service(unit, "questgiver") then
+        if not pure_d or d < pure_d then pure, pure_d = unit, d end
+      end
     end
   end
+  if pure then return pure, pure_d end
   return best, best_d
 end
 
@@ -819,12 +930,30 @@ local function vendor_seek_step(view)
     player = { class_id = view.class_id, level = view.level },
   })
   if #plan.sell == 0 then return nil end
-  local vendor = nearest_vendor(view)
+  local vendor, vendor_d = nearest_vendor(view)
   if not vendor then return nil end
   if (view.quest_frame or {}).open or view.gossip_open then
     if free > 0 then return nil end
     return { kind = "ui_press", control = "QuestFrameCancelButton",
       reason = "vendor_clear_dialog" }
+  end
+  -- Routed interact stalls at nav=planning on short chapel hops (Baran,
+  -- Joshua at 7.6yd, zero displacement). Steer the last yards, then click.
+  local pos = point(vendor)
+  local d = tonumber(vendor_d) or tonumber(vendor.distance) or 1e9
+  local nav = wow.nav_progress()
+  local nav_state = nav and nav.state or ""
+  if pos and d > VENDOR_INTERACT_STOP and
+      (nav_state == "unavailable" or nav_state == "planning") then
+    return {
+      kind = "navigate",
+      x = pos.x, y = pos.y, z = pos.z,
+      map_id = vendor.location and math.floor(vendor.location.map_id or 0),
+      stop_distance = VENDOR_INTERACT_STOP,
+      navigation_mode = "local_steer",
+      allow_jump = true,
+      reason = "open_vendor_walk",
+    }
   end
   return {
     kind = "interact",
@@ -850,6 +979,10 @@ local function status_for(view, mode, role, leader, target, recovery)
     murist_visible = leader ~= nil,
     target_guid = target and target.guid or 0,
     recovery = recovery or "",
+    -- Surfaced so /status answers "why has Beru stopped casting" without a
+    -- log dive: the seat is holding what is left of the bar for heals.
+    conserving = (role == "healer" and mana_pct(view) < CONSERVE_MANA_PCT)
+      or false,
   }
 end
 
@@ -999,10 +1132,63 @@ local function heal_candidate(view)
   return best
 end
 
+-- The roster row for the seat that is holding the mobs, if it is alive, in
+-- range and reachable. Proactive upkeep goes here first: the tank is the only
+-- member taking SCHEDULED damage, so a mitigation placed before the swing is
+-- worth more than a heal chasing it afterwards.
+local function tank_row(view)
+  for _, member in ipairs((view.party and view.party.members) or {}) do
+    if lower(member.name) == TANK_NAME and
+        not guid_equal(member.guid, view.player_guid) and
+        member.death_state_known and not member.is_dead and not member.is_ghost and
+        member.location_known and view.location_known and
+        not member.line_of_sight_blocked and
+        member.active_auras_known ~= false then
+      local d = member_range(view, member)
+      if d and d <= HEAL_RANGE_YARDS then return member end
+    end
+  end
+  return nil
+end
+
+local function tank_upkeep(view)
+  if not view.in_combat then return nil end
+  local row = tank_row(view)
+  if not row then return nil end
+  local auras = row.active_aura_spell_ids or {}
+  local hp = health_pct(row)
+  if hp < TANK_SHIELD_PCT and not aura_present(auras, "weakened soul") then
+    local shield = pick_spell(view, { "Power Word: Shield" })
+    if shield and not aura_present(auras, "power word shield", shield.spell_id) then
+      return cast(shield, "shield_tank", row.guid)
+    end
+  end
+  if hp < TANK_RENEW_PCT and mana_pct(view) >= CONSERVE_MANA_PCT then
+    local renew = pick_spell(view, { "Renew" })
+    if renew and not aura_present(auras, "renew", renew.spell_id) then
+      return cast(renew, "renew_tank", row.guid)
+    end
+  end
+  return nil
+end
+
 local function healer_action(view, emergency_only)
   local candidate = heal_candidate(view)
-  if not candidate or (emergency_only and candidate.hp >= 50) then return nil end
+  if emergency_only and (not candidate or candidate.hp >= 50) then return nil end
+  if not emergency_only and (not candidate or candidate.hp >= 30) then
+    -- Nobody is falling, so spend the window on the tank instead of topping
+    -- someone off: the shield and the renew are both already working by the
+    -- time the next swing lands, and neither is a 1.5s cast he has to
+    -- survive first.
+    local upkeep = tank_upkeep(view)
+    if upkeep then return upkeep end
+  end
+  if not candidate then return nil end
   local row, hp = candidate.row, candidate.hp
+  -- Mana discipline. Under the conserve floor a scratch is not worth a cast.
+  if mana_pct(view) < CONSERVE_MANA_PCT and hp >= CONSERVE_HEAL_PCT then
+    return nil
+  end
   local auras = row.active_aura_spell_ids or {}
   if hp < 50 and row.active_auras_known ~= false then
     local shield = pick_spell(view, { "Power Word: Shield" })
@@ -1014,8 +1200,18 @@ local function healer_action(view, emergency_only)
   local heal = nil
   if hp < 20 then
     heal = pick_spell(view, { "Flash Heal", "Heal", "Lesser Heal" })
-  elseif hp < 70 then
+  elseif hp < 45 then
     heal = pick_spell(view, { "Heal", "Lesser Heal", "Flash Heal" })
+  elseif hp < 70 then
+    -- Shallow deficit: the cheapest rank that exists covers it, and a renew
+    -- that is already ticking covers it for free.
+    if row.active_auras_known ~= false then
+      local renew = pick_spell(view, { "Renew" })
+      if renew and not aura_present(auras, "renew", renew.spell_id) then
+        return cast(renew, "renew_party_member", row.guid)
+      end
+    end
+    heal = pick_spell(view, { "Heal", "Lesser Heal", "Flash Heal" }, true)
   elseif hp < 90 and row.active_auras_known ~= false then
     local renew = pick_spell(view, { "Renew" })
     if renew and not aura_present(auras, "renew", renew.spell_id) then
@@ -1067,9 +1263,69 @@ local function warlock_action(view, target)
     reason = filler and "warlock_filler" or "warlock_melee_fallback" }
 end
 
+-- How badly a mob needs peeling, low number first. A mob already on the tank
+-- scores nothing: it is exactly where a tank wants it and needs no peel. Beru
+-- outranks everyone -- a level 8 priest in cloth dies to two hits from
+-- anything Murist is willing to pull, and the healer that dies ends the fight
+-- for the whole party. Murist himself is last of the players because he is
+-- the one member who chose to be hit.
+local function peel_rank(view, unit)
+  local guid = unit.target_guid
+  if (guid or 0) == 0 or guid_equal(guid, view.player_guid) then return nil end
+  local member = party_member_by_guid(view, guid)
+  if member then
+    if lower(member.name) == HEALER_NAME then return 1 end
+    if lower(member.name) ~= MURIST then return 2 end
+    return 3
+  end
+  if is_party_property(view, guid) then return 4 end
+  return nil
+end
+
+local function tank_peel_target(view)
+  local best, best_rank, best_d = nil, nil, nil
+  for _, unit in ipairs(view.units or {}) do
+    if hostile(unit) and unit.target_guid_known then
+      local rank = peel_rank(view, unit)
+      local d = unit.combat_distance_known and unit.combat_distance
+        or unit.distance or 1e9
+      if rank and d <= PEEL_RANGE_YARDS and
+          (not best_rank or rank < best_rank or
+            (rank == best_rank and d < best_d)) then
+        best, best_rank, best_d = unit, rank, d
+      end
+    end
+  end
+  local current = visible_unit(view, view.auto_attack_guid)
+  local engaged = hostile(current) and current.target_guid_known
+  -- A mob that is already on US is a peel that WORKED. peel_rank deliberately
+  -- scores it nil -- it needs no peel -- so without this the tank hands the
+  -- mob it just pulled straight back to the party to go fetch the next one,
+  -- and the one it dropped walks back to Beru. Only the healer is worth
+  -- breaking off an established pull for.
+  if engaged and guid_equal(current.target_guid, view.player_guid) then
+    if not best or best_rank > 1 then return current end
+    return best
+  end
+  if not best then return nil end
+  -- Sticky between equals. Two adds on the healer trade places in the
+  -- distance sort every tick, and a tank that re-selects on every tie walks
+  -- between them without ever landing a swing.
+  if engaged then
+    local rank = peel_rank(view, current)
+    if rank and rank <= best_rank then return current end
+  end
+  return best
+end
+
 local function warrior_action(view, target)
-  if target.target_guid_known and not guid_equal(target.target_guid, view.player_guid) and
-      party_member_by_guid(view, target.target_guid) then
+  -- Taunt is a 30s cooldown and one mob's worth of threat. Spend it only on a
+  -- mob that is on somebody ELSE -- a mob already chewing on the tank is
+  -- where it belongs, and taunting it buys nothing. Pets count: the escort's
+  -- threat scan already treats them as the party's business.
+  if target.target_guid_known and
+      not guid_equal(target.target_guid, view.player_guid) and
+      is_party_property(view, target.target_guid) then
     local taunt = pick_spell(view, { "Taunt" })
     if taunt then
       return { kind = "attack", guid = target.guid, spell = taunt.spell_id,
@@ -1085,28 +1341,100 @@ local function warrior_action(view, target)
         stop_distance = 25.0, reason = "warrior_charge" }
     end
   end
+  -- Battle Shout is party-wide attack power for 10 rage and it falls off in
+  -- the middle of a pull, so it is upkeep IN combat and not just an idle
+  -- buff. Aura-gated AND floored, because it used to sit at the bottom of the
+  -- blind filler list -- which is exactly where a tank whose rage cannot pay
+  -- for anything else lands, so it became the rage sink.
+  local now = tonumber(view.simulation_time) or 0
+  local shout, shout_family = pick_spell(view, { "Battle Shout" })
+  if shout and
+      not aura_present(view.active_aura_spell_ids, shout_family, shout.spell_id) and
+      (not last_shout_at or now - last_shout_at >= SHOUT_RETRY_SECONDS) then
+    last_shout_at = now
+    return cast(shout, "tank_battle_shout")
+  end
+  -- Debuffs before the dump, aura-gated so a DoT is applied once per mob
+  -- instead of clipping itself with a refresh every tick.
+  local auras = target.active_aura_spell_ids or {}
+  for _, name in ipairs({ "Rend", "Demoralizing Shout" }) do
+    local spell, family = pick_spell(view, { name })
+    if spell and not aura_present(auras, family, spell.spell_id) then
+      return { kind = "attack", guid = target.guid, spell = spell.spell_id,
+        stop_distance = 4.0, reason = "tank_" .. family:gsub(" ", "_") }
+    end
+  end
+  -- Threat filler in rage-cost order, not damage order: Revenge is nearly
+  -- free off a block, Sunder is the threat-per-rage king, and Heroic Strike
+  -- is the DUMP -- last, because it is what a tank presses with rage left
+  -- over, not what he opens with.
   local threat = pick_spell(view, {
-    "Sunder Armor", "Revenge", "Heroic Strike", "Thunder Clap",
-    "Demoralizing Shout", "Battle Shout",
+    "Revenge", "Sunder Armor", "Thunder Clap", "Heroic Strike",
   })
+  -- Heroic Strike is queued on the NEXT swing, and the client reports the
+  -- queue as the button being active. Pressing it again cancels the queue,
+  -- so a tank whose only ability is Heroic Strike (Tusk, level 8) spends the
+  -- whole fight strobing it and landing nothing. Hold and let the swing land.
+  if threat and threat.active == true then
+    return { kind = "attack", guid = target.guid, stop_distance = 4.0,
+      reason = "tank_swing_queued" }
+  end
   return { kind = "attack", guid = target.guid,
     spell = threat and threat.spell_id or nil,
     stop_distance = 4.0,
     reason = threat and "tank_threat" or "tank_melee" }
 end
 
+-- The wand: free damage, and the one button a healer must never press twice.
+-- See WAND_REPRESS_SECONDS. Returns the "keep firing, touch nothing" intent
+-- while the shot train is alive, and only asks for the button when the client
+-- says the wand is idle AND we have not just pressed it ourselves.
+local function wand_intent(view, target)
+  local wand = pick_spell(view, { "Shoot" })
+  if not wand then return nil end
+  local now = tonumber(view.simulation_time) or 0
+  local just_pressed = wand_pressed_at ~= nil and
+    guid_equal(wand_pressed_guid, target.guid) and
+    (now - wand_pressed_at) < WAND_REPRESS_SECONDS
+  if wand.active == true or just_pressed then
+    return { kind = "attack", guid = target.guid, stop_distance = 22.0,
+      reason = "healer_wanding" }
+  end
+  wand_pressed_at, wand_pressed_guid = now, target.guid
+  return { kind = "attack", guid = target.guid, spell = wand.spell_id,
+    stop_distance = 22.0, reason = "healer_wand" }
+end
+
 local function priest_damage(view, target)
+  local mana = mana_pct(view)
+  -- Conserve floor: what is left belongs to the next heal. The seat stops
+  -- PRESSING rather than switching to something cheaper, because a press is
+  -- the one thing that can toggle a running wand back off -- and a wand that
+  -- keeps firing for free is the entire point of conserving.
+  if mana < CONSERVE_MANA_PCT then
+    return { kind = "attack", guid = target.guid, stop_distance = 22.0,
+      reason = "healer_conserve_mana" }
+  end
   local auras = target.active_aura_spell_ids or {}
   local pain, family = pick_spell(view, { "Shadow Word: Pain" })
-  if pain and not aura_present(auras, family, pain.spell_id) then
+  if pain and mana >= DOT_MANA_PCT and
+      not aura_present(auras, family, pain.spell_id) then
     return { kind = "attack", guid = target.guid, spell = pain.spell_id,
       stop_distance = 22.0, reason = "priest_shadow_word_pain" }
   end
-  local spell = pick_spell(view, { "Mind Blast", "Smite", "Shoot" })
-  return { kind = "attack", guid = target.guid,
-    spell = spell and spell.spell_id or nil,
-    stop_distance = spell and 22.0 or 4.0,
-    reason = spell and "priest_damage" or "priest_melee" }
+  if mana < WAND_MANA_PCT then
+    local wand = wand_intent(view, target)
+    if wand then return wand end
+  end
+  local spell = pick_spell(view, { "Mind Blast", "Smite" })
+  if spell then
+    return { kind = "attack", guid = target.guid, spell = spell.spell_id,
+      stop_distance = 22.0, reason = "priest_damage" }
+  end
+  local wand = wand_intent(view, target)
+  if wand then return wand end
+  return { kind = "attack", guid = target.guid, stop_distance = 4.0,
+    reason = "priest_melee" }
 end
 
 local function mage_action(view, target)
@@ -1175,10 +1503,17 @@ local function fortitude_action(view)
   local spell = pick_spell(view, { "Power Word: Fortitude" })
   if not spell then return nil end
   for _, member in ipairs((view.party and view.party.members) or {}) do
+    -- SMSG_GROUP_LIST rosters players only, so pets never reach this loop and
+    -- need no skip of their own. The RANGE is what was missing: an unbuffed
+    -- member across the zone made the healer cast into nothing every idle
+    -- tick instead of buffing the four people standing next to it.
     if member.death_state_known and not member.is_dead and not member.is_ghost and
         member.active_auras_known and
         not aura_present(member.active_aura_spell_ids, "power word fortitude", spell.spell_id) and
-        (guid_equal(member.guid, view.player_guid) or member.location_known) then
+        (guid_equal(member.guid, view.player_guid) or
+          (member.location_known and view.location_known and
+            not member.line_of_sight_blocked and
+            (member_range(view, member) or 1e9) <= HEAL_RANGE_YARDS)) then
       return cast(spell, "fortitude_party_member", member.guid)
     end
   end
@@ -1295,6 +1630,11 @@ function M.reset()
   vendor_last_sell_at = nil
   equip_last_at = nil
   equip_tried = {}
+  equip_attempts = 0
+  equip_gave_up = false
+  wand_pressed_at = nil
+  wand_pressed_guid = nil
+  last_shout_at = nil
 end
 
 function M.decide(view)
@@ -1323,7 +1663,19 @@ function M.decide(view)
   if wear then return finish(wear, view, "vendor", role) end
 
   local seek = vendor_seek_step(view)
-  if seek then return finish(seek, view, "vendor", role) end
+  if seek then
+    -- interact has no navigation_mode, so a 90yd chapel walk that wedges
+    -- at planning (Vulcan, 2026-08-16) never reaches stuck_step otherwise.
+    if seek.kind == "navigate" or seek.kind == "interact" then
+      local escape = stuck_step(view, now, false, "vendor_unstick")
+      if escape then
+        return finish(escape, view, "vendor", role)
+      end
+    else
+      forget_stuck()
+    end
+    return finish(seek, view, "vendor", role)
+  end
 
   -- Flush a STRANDED chat box before any state machine runs — recovery
   -- included, since /reclaim is itself chat-driven and types into the same
@@ -1434,7 +1786,11 @@ function M.decide(view)
   end
 
   local target = nil
-  if leader.is_in_combat and leader.target_guid_known then
+  -- Peel BEFORE assisting. "Hit whatever Murist is hitting" is the right
+  -- default right up until something walks past the tank and starts eating
+  -- Beru; see tank_peel_target for the ordering.
+  if role == "tank" then target = tank_peel_target(view) end
+  if not target and leader.is_in_combat and leader.target_guid_known then
     local candidate = visible_unit(view, leader.target_guid)
     if hostile(candidate) then target = candidate end
   end
@@ -1445,18 +1801,12 @@ function M.decide(view)
     -- nor our own view.in_combat had latched. A hostile whose target IS the
     -- party — or a party member's summoned pet — is the escort's business
     -- regardless of any combat flag.
+    -- One definition of "the party's business", shared with the tank's peel
+    -- scan and taunt gate so they cannot disagree about whose fight this is.
+    -- The leader is on the roster on this branch, so is_party_property covers
+    -- him and his pet without a special case.
     local function party_property(guid)
-      if guid_equal(guid, leader.guid) or guid_equal(guid, view.player_guid) or
-          party_member_by_guid(view, guid) then
-        return true
-      end
-      local u = visible_unit(view, guid)
-      if u and (u.summoner_guid or 0) ~= 0 then
-        return guid_equal(u.summoner_guid, leader.guid) or
-          guid_equal(u.summoner_guid, view.player_guid) or
-          party_member_by_guid(view, u.summoner_guid) ~= nil
-      end
-      return false
+      return is_party_property(view, guid)
     end
     -- Range-capped and nearest-first: a leashed mob a kilometer away keeps
     -- its stale party target set (Igris fixated on a Scarlet Zealot at
