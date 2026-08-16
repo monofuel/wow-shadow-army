@@ -10,7 +10,7 @@
 # Config: <wow-coworld root>/conductor.json.  Design: docs/conductor.md.
 
 import
-  std/[algorithm, json, os, sequtils, sets, strutils, tables],
+  std/[json, os, sequtils, sets, strutils, tables],
   scriptorium/git_ops,
   conductor/cfg,
   conductor/evalgate,
@@ -109,26 +109,19 @@ proc cmdBaseline(cfgAll: ConductorConfig, leagueName, root: string) =
   echo "conductor: baseline eval of ", lc.laneBranch, " HEAD (",
     headSha(lane), ") — this takes several minutes"
   # Same variance discipline as gate-branch (goal-loop.md): the champion
-  # row is "SHAs + median eval". Three rolls, keep the median report.
-  let median3 = getEnv("CONDUCTOR_GATE_MEDIAN3", "1") != "0"
+  # row is "SHAs + median eval". Exactly rollTarget valid reports or
+  # abort — never seed a short series. runEvalSeries releases slots
+  # before it returns, so the quits below cannot leak leases.
+  let median3 = median3Enabled()
   let rollTarget = if median3: 3 else: 1
-  var reports: seq[JsonNode] = @[]
-  var res = EvalResult(outcome: evalFailed, detail: "no roll ran")
-  var rollIdx = 0
-  while reports.len < rollTarget and rollIdx < rollTarget + 4:
-    inc rollIdx
-    echo "conductor: baseline roll ", reports.len + 1, "/", rollTarget
-    res = runEval(lane, lc, "baseline-r" & $rollIdx)
-    if res.outcome == evalOk:
-      reports.add(res.report)
-  if reports.len > 0:
-    proc northing(r: JsonNode): float = r{"max_northing"}.getFloat(0.0)
-    reports.sort(proc(a, b: JsonNode): int = cmp(northing(a), northing(b)))
-    res = EvalResult(outcome: evalOk, report: reports[reports.len div 2],
-      detail: "median of " & $reports.len)
-    echo "conductor: baseline rolls ",
-      reports.mapIt($it{"max_northing"}.getFloat(0.0).int).join("/"),
-      " — median kept"
+  let noVars: seq[(string, string)] = @[]
+  let res =
+    if median3:
+      runEvalSeries(lane, root, lc, "baseline", noVars, rollTarget, "baseline")
+    else:
+      runEval(lane, lc, "baseline-r1")
+  if res.outcome == evalOk:
+    echo "conductor: baseline ", res.detail, " — median kept"
   case res.outcome
   of evalBusy:
     quit "conductor: eval slot busy — " & res.detail
@@ -341,8 +334,9 @@ proc main() =
       quit "conductor: no in-flight worktree in state — nothing to gate"
     let lc = cfgAll.league(leagueName)
     echo "conductor: fresh eval of in-flight candidate ", st.branch
-    let res = runEval(st.worktree, lc, st.ticketId & "-regate",
-      @[("FORK_CLIENT", root / "monofuel-vanilla-wow")])
+    let res = runEvalSeries(st.worktree, root, lc, st.ticketId & "-regate",
+      @[("FORK_CLIENT", root / "monofuel-vanilla-wow")], 1,
+      st.ticketId & "-regate")
     if res.outcome != evalOk:
       quit "conductor: eval " & $res.outcome & " — " & res.detail
     let champ = champion(ledgerPath(root / lc.laneCheckout, leagueName))
