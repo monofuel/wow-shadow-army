@@ -207,3 +207,126 @@ suite "inventory panel":
     check body.find("Silk Cloth") < body.find("Linen Cloth")
     check "updated" in body
     check "2 stacks" in body
+
+## Realm inventory (Inventory tab) — DB-authoritative bags for every
+## character. Fixtures mirror the real TSV:
+##   guid name level class money online item_id count stacks
+const
+  RealmInvTsv = """
+1000007	Murist	11	9	4623	1	2589	12	2
+1000007	Murist	11	9	4623	1	7073	7	2
+1000024	Ashborn	2	5	0	0	159	2	1
+1000099	Emptyguy	1	1	0	0	0	0	0
+"""
+
+suite "parseRealmInventoryTsv — realm bags from the characters DB":
+  test "rows group into characters and stack counts sum":
+    let chars = parseRealmInventoryTsv(RealmInvTsv)
+    check chars.len == 3
+    check chars[0].name == "Murist"
+    check chars[0].level == 11
+    check chars[0].money == 4623
+    check chars[0].online
+    check chars[0].items.len == 2
+    check chars[0].itemTotal == 19
+    check chars[0].stackTotal == 4
+    check chars[1].name == "Ashborn"
+    check not chars[1].online
+    check chars[1].itemTotal == 2
+
+  test "item id 0 is the empty-bags placeholder, not an item":
+    let chars = parseRealmInventoryTsv(RealmInvTsv)
+    check chars[2].name == "Emptyguy"
+    check chars[2].items.len == 0
+    check chars[2].itemTotal == 0
+
+  test "short and malformed rows are skipped, never fatal":
+    let chars = parseRealmInventoryTsv("garbage\n\n1000007\tMurist\t11\n")
+    check chars.len == 0
+
+suite "sortRealmInvStacks — quality desc, then name":
+  test "epic before common, ties broken by name":
+    var info = initTable[int, ItemInfo]()
+    info[1] = ItemInfo(itemId: 1, name: "Zulian Stone", sellPrice: 0, quality: 4)
+    info[2] = ItemInfo(itemId: 2, name: "Linen Cloth", sellPrice: 0, quality: 1)
+    info[3] = ItemInfo(itemId: 3, name: "Copper Bar", sellPrice: 0, quality: 1)
+    let sorted = sortRealmInvStacks(@[
+      RealmInvStack(itemId: 2, count: 5, stacks: 1),
+      RealmInvStack(itemId: 3, count: 5, stacks: 1),
+      RealmInvStack(itemId: 1, count: 1, stacks: 1)
+    ], info)
+    check sorted[0].itemId == 1
+    check sorted[1].itemId == 3 # Copper Bar before Linen Cloth
+    check sorted[2].itemId == 2
+
+  test "unknown items sort last and keep their id":
+    var info = initTable[int, ItemInfo]()
+    info[2] = ItemInfo(itemId: 2, name: "Linen Cloth", sellPrice: 0, quality: 0)
+    let sorted = sortRealmInvStacks(@[
+      RealmInvStack(itemId: 99, count: 1, stacks: 1),
+      RealmInvStack(itemId: 2, count: 5, stacks: 1)
+    ], info)
+    check sorted[0].itemId == 2
+    check sorted[1].itemId == 99
+
+suite "renderRealmInventoryBody — Inventory tab body":
+  test "characters render with gold, totals and quality-coloured items":
+    var info = initTable[int, ItemInfo]()
+    info[2589] = ItemInfo(itemId: 2589, name: "Linen Cloth", sellPrice: 13, quality: 1)
+    info[7073] = ItemInfo(itemId: 7073, name: "Broken Fang", sellPrice: 1, quality: 4)
+    info[159] = ItemInfo(itemId: 159, name: "Refreshing Spring Water", sellPrice: 1, quality: 1)
+    let inv = RealmInventory(
+      characters: parseRealmInventoryTsv(RealmInvTsv),
+      fetchedAt: epochTime(),
+      error: ""
+    )
+    let body = renderRealmInventoryBody(inv, info)
+    check "3 characters" in body
+    check "Murist" in body
+    check "Ashborn" in body
+    check "Linen Cloth" in body
+    check "q4" in body # epic colour class on Broken Fang
+    check "0g 46s 23c" in body
+    check body.find("Broken Fang") < body.find("Linen Cloth")
+
+  test "empty bags say so per character":
+    let inv = RealmInventory(
+      characters: parseRealmInventoryTsv(RealmInvTsv),
+      fetchedAt: epochTime(), error: "")
+    let body = renderRealmInventoryBody(inv, initTable[int, ItemInfo]())
+    check "Bags empty." in body
+
+  test "DB error with no prior read is an honest empty state, not a crash":
+    let inv = RealmInventory(
+      characters: @[], fetchedAt: 0.0, error: "mariadb query failed (exit 1)")
+    let body = renderRealmInventoryBody(inv, initTable[int, ItemInfo]())
+    check "Realm DB unavailable" in body
+    check "mariadb query failed" in body
+    check "/admin" in body
+
+  test "DB error with a prior read keeps the rows and flags them stale":
+    let inv = RealmInventory(
+      characters: parseRealmInventoryTsv(RealmInvTsv),
+      fetchedAt: epochTime() - 300.0,
+      error: "mariadb query failed (exit 1)")
+    let body = renderRealmInventoryBody(inv, initTable[int, ItemInfo]())
+    check "last good read" in body
+    check "Murist" in body
+    check "stale" in body
+
+suite "realmInvItemIds — one join for the whole realm":
+  test "distinct ids across every character":
+    let inv = RealmInventory(characters: parseRealmInventoryTsv(RealmInvTsv))
+    let ids = realmInvItemIds(inv)
+    check ids.len == 3
+    check 2589 in ids
+    check 7073 in ids
+    check 159 in ids
+
+suite "item quality helpers":
+  test "class + label per classic quality":
+    check itemQualityClass(0) == "q0"
+    check itemQualityClass(4) == "q4"
+    check itemQualityClass(99) == "q1"
+    check itemQualityLabel(5) == "legendary"
+    check itemQualityLabel(1) == "common"
