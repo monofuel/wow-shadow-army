@@ -42,7 +42,7 @@
 import
   std/[
     algorithm, base64, httpclient, json, locks, net, options, os, osproc,
-    streams, strformat, strutils, tables, times, uri
+    sets, streams, strformat, strutils, tables, times, uri
   ],
   mummy, mummy/routers,
   webby/httpheaders as mummyheaders,
@@ -5288,8 +5288,40 @@ proc renderRealmInvItemTable*(
       </table>
       </div>"""
 
-proc renderRealmInvCell*(it: RealmInvItem, info: Table[int, ItemInfo]): string =
-  ## One army-pool bag cell: abbreviation face, count badge, hover tip.
+## Real item icons, extracted by tools/gen_item_icons.py (make item-icons)
+## into system/static/icons/item_<id>.png. The set of ids with a PNG on disk
+## is scanned once and cached; a cell whose id is in the set renders the
+## image, anything else keeps the abbreviation face — a new item looted after
+## the last `make item-icons` degrades gracefully, never blanks.
+const IconStaticDir = "system" / "static" / "icons"
+
+var gIconIdsLock: Lock
+initLock(gIconIdsLock)
+var gIconIds: HashSet[int]
+var gIconIdsLoaded = false
+
+proc iconIdsOnDisk*(): HashSet[int] {.gcsafe.} =
+  {.gcsafe.}:
+    withLock gIconIdsLock:
+      if not gIconIdsLoaded:
+        gIconIdsLoaded = true
+        try:
+          for kind, path in walkDir(IconStaticDir):
+            if kind != pcFile: continue
+            let base = path.extractFilename
+            if base.startsWith("item_") and base.endsWith(".png"):
+              try:
+                gIconIds.incl(parseInt(base[5 ..< base.len - 4]))
+              except ValueError:
+                discard
+        except OSError:
+          discard
+      result = gIconIds
+
+proc renderRealmInvCell*(it: RealmInvItem, info: Table[int, ItemInfo],
+                         icons: HashSet[int] = initHashSet[int]()): string =
+  ## One army-pool bag cell: real icon (or abbreviation) face, count badge,
+  ## hover tip.
   let known = info.hasKey(it.itemId) and info[it.itemId].name.len > 0
   let quality = if known: info[it.itemId].quality else: 1
   let name = if known: info[it.itemId].name else: &"Item#{it.itemId}"
@@ -5308,9 +5340,14 @@ proc renderRealmInvCell*(it: RealmInvItem, info: Table[int, ItemInfo]): string =
   let holders = escapeHtml(holdersText)
   let plainTip = escapeHtml(
     &"{name} · {qualityLabel} · id {it.itemId} — {it.total} total, {it.stacks} stacks — {holdersText}")
+  let faceHtml =
+    if it.itemId in icons:
+      &"""<img class="cell-icon" src="/icons/item_{it.itemId}.png" alt="{escapeHtml(face)}">"""
+    else:
+      &"""<span class="cell-face">{escapeHtml(face)}</span>"""
   result = &"""
         <div class="inv-cell {qualityClass}" title="{plainTip}">
-          <span class="cell-face">{escapeHtml(face)}</span>
+          {faceHtml}
           {countBadge}
           <span class="cell-tip">
             <span class="tip-name {qualityClass}">{escapeHtml(name)}</span>
@@ -5322,12 +5359,13 @@ proc renderRealmInvCell*(it: RealmInvItem, info: Table[int, ItemInfo]): string =
 """
 
 proc renderRealmInvGrid*(
-    items: seq[RealmInvItem], info: Table[int, ItemInfo]
+    items: seq[RealmInvItem], info: Table[int, ItemInfo],
+    icons: HashSet[int] = initHashSet[int]()
 ): string =
   ## The army's pool as one giant bag: quality desc, total desc, name asc.
   var cells = ""
   for it in sortRealmInvItems(items, info):
-    cells.add(renderRealmInvCell(it, info))
+    cells.add(renderRealmInvCell(it, info, icons))
   if cells.len == 0:
     return """<p class="empty">The army is carrying nothing.</p>"""
   result = &"""<div class="inv-grid">
@@ -5442,7 +5480,7 @@ proc renderRealmInventoryBody*(
   # Fold the realm into item rows ONCE — the grid and the table view are two
   # renderings of the same pool, not two reads of it.
   let pool = realmInvItems(inv)
-  let itemGrid = renderRealmInvGrid(pool, info)
+  let itemGrid = renderRealmInvGrid(pool, info, iconIdsOnDisk())
   let itemTable = renderRealmInvItemTable(pool, info)
   let age = if inv.fetchedAt > 0: epochTime() - inv.fetchedAt else: -1.0
   let ageCls =
@@ -5822,6 +5860,11 @@ const DashboardCss = """
       font-weight: 700; font-size: 0.82rem; letter-spacing: 0.02em;
       color: var(--q, var(--text));
       font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+    .cell-icon {
+      position: absolute; inset: 2px; width: calc(100% - 4px);
+      height: calc(100% - 4px); object-fit: cover; border-radius: 3px;
+      image-rendering: auto;
     }
     .cell-count {
       position: absolute; right: 2px; bottom: 1px;
@@ -6670,6 +6713,29 @@ proc muristInventoryHandler(request: Request) {.gcsafe.} =
     request.respond(500, htmlHeaders(),
       &"""<p class="empty">error: {escapeHtml(e.msg)}</p>""")
 
+proc iconHandler(request: Request) {.gcsafe.} =
+  ## GET /icons/item_<id>.png — one bag-grid icon. The id is parsed as an
+  ## int and the filename rebuilt from it, so the request path can never
+  ## reach the filesystem (no traversal surface).
+  let base = request.path.extractFilename
+  var itemId = 0
+  if base.startsWith("item_") and base.endsWith(".png"):
+    try:
+      itemId = parseInt(base[5 ..< base.len - 4])
+    except ValueError:
+      itemId = 0
+  if itemId <= 0 or itemId notin iconIdsOnDisk():
+    request.respond(404, emptyHttpHeaders(), "")
+    return
+  try:
+    let png = readFile(IconStaticDir / ("item_" & $itemId & ".png"))
+    var headers = mummyheaders.emptyHttpHeaders()
+    headers["Content-Type"] = "image/png"
+    headers["Cache-Control"] = "public, max-age=86400"
+    request.respond(200, headers, png)
+  except IOError, OSError:
+    request.respond(404, emptyHttpHeaders(), "")
+
 proc inventoryPageHandler(request: Request) {.gcsafe.} =
   ## GET /inventory — Inventory tab: realm-wide bags from the characters DB.
   try:
@@ -7517,6 +7583,7 @@ proc main() =
   router.get("/inventory", inventoryPageHandler)
   router.get("/inventory/all", inventoryAllHandler)
   router.get("/inventory.json", inventoryJsonHandler)
+  router.get("/icons/*", iconHandler)
   router.get("/seats", seatsPartialHandler)
   router.get("/advisor", advisorPageHandler)
   router.get("/traverse", traversePageHandler)

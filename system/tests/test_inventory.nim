@@ -6,7 +6,7 @@
 ## No network, no docker, no realm — pure functions on fixture strings.
 
 import
-  std/[json, options, strutils, tables, times, unittest],
+  std/[json, options, sets, strutils, tables, times, unittest],
   ../system_server
 
 const
@@ -696,3 +696,22 @@ suite "realmInventoryToJson — items and characters":
     check j.hasKey("money_copper_total")
     check j.hasKey("age_sec")
     check j.hasKey("error")
+
+suite "renderRealmInvCell — real icons":
+  test "an id with a PNG on disk renders the image face":
+    var info = initTable[int, ItemInfo]()
+    info[6948] = ItemInfo(name: "Hearthstone", quality: 1)
+    let it = RealmInvItem(itemId: 6948, total: 1, stacks: 1)
+    var icons = initHashSet[int]()
+    icons.incl(6948)
+    let html = renderRealmInvCell(it, info, icons)
+    check "src=\"/icons/item_6948.png\"" in html
+    check "cell-icon" in html
+    check "<span class=\"cell-face\"" notin html
+  test "an id without a PNG keeps the abbreviation face":
+    var info = initTable[int, ItemInfo]()
+    info[6948] = ItemInfo(name: "Hearthstone", quality: 1)
+    let it = RealmInvItem(itemId: 6948, total: 1, stacks: 1)
+    let html = renderRealmInvCell(it, info, initHashSet[int]())
+    check "cell-face" in html
+    check "/icons/" notin html
