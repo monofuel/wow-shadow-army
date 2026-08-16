@@ -272,5 +272,13 @@ health = loadMasterHealth(mhRepo)
 check(health.status == mhUnknown, "corrupt state file reads as unknown")
 check(needsCheck(health, "abc123def"), "corrupt state file forces a check")
 
+# eval load gate: parseable, garbage-safe, never blocks on bad input
+check(oneMinuteLoad("16.55 35.34 39.41 12/12558 4115644") == 16.55,
+  "loadavg first field parses")
+check(oneMinuteLoad("") == 0.0, "empty loadavg reads as quiet")
+check(oneMinuteLoad("garbage fields here") == 0.0,
+  "unparseable loadavg reads as quiet, never wedges the eval")
+
 removeDir(tmp)
+
 echo "test_conductor_gate: ", passed, " ok"

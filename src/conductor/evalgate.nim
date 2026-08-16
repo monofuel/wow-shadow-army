@@ -93,11 +93,41 @@ proc warningClasses*(report: JsonNode): HashSet[string] =
     if w.kind == JString:
       result.incl(w.getStr().split(':')[0].strip())
 
+proc oneMinuteLoad*(loadavgLine: string): float =
+  ## First field of /proc/loadavg; 0.0 when unparseable (never blocks).
+  let fields = loadavgLine.splitWhitespace()
+  if fields.len == 0: return 0.0
+  try: parseFloat(fields[0]) except ValueError: 0.0
+
+proc waitForQuietBox(capEnv = "CONDUCTOR_EVAL_LOAD_CAP"): bool =
+  ## Scores rolled on a loaded box are noise, not verdicts (0070's 8,380
+  ## park and the 0072 park both rolled at load 40+ next to navmesh
+  ## bakes). Hold the eval until 1-min load is under the cap, bounded so
+  ## a stuck storm degrades to evalBusy (uncharged) instead of wedging.
+  let cap = try: parseFloat(getEnv(capEnv, "20")) except ValueError: 20.0
+  const waitLimitS = 1800
+  var waited = 0
+  while waited <= waitLimitS:
+    let load =
+      try: oneMinuteLoad(readFile("/proc/loadavg")) except IOError: 0.0
+    if load <= cap:
+      return true
+    if waited == 0:
+      echo "conductor: eval waiting for quiet box (load ",
+        load.formatFloat(ffDecimal, 1), " > cap ",
+        cap.formatFloat(ffDecimal, 1), ")"
+    sleep(60_000)
+    waited += 60
+  false
+
 proc runEval*(checkoutDir: string, lc: LeagueConfig, slug: string,
     extraVars: openArray[(string, string)] = []): EvalResult =
   ## One eval run in checkoutDir. Exit code 2 (flock held / bad bracket
   ## args) and a stale run.log both come back evalBusy — the candidate
   ## is NOT charged for slot contention.
+  if not waitForQuietBox():
+    return EvalResult(outcome: evalBusy,
+      detail: "box load stayed over the eval cap for 30 min — not rolling")
   let runLogPath = checkoutDir / RunLogRelPath
   let beforeMtime =
     if fileExists(runLogPath): getLastModificationTime(runLogPath)
