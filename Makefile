@@ -519,6 +519,13 @@ BOT_QUEST_HUBS_ARGS ?=
 bot-quest-hubs:
 	@python3 tools/gen_bot_quest_hubs.py $(BOT_QUEST_HUBS_ARGS)
 
+# Real icons for the dashboard bag grid. Pillow (BLP decode) comes from nix —
+# the one sanctioned deviation from the stdlib-only generator rule.
+.PHONY: item-icons
+item-icons:
+	@nix shell --impure --expr "with import <nixpkgs> {}; python3.withPackages (ps: [ ps.pillow ])" \
+		--command python3 tools/gen_item_icons.py $(ITEM_ICONS_ARGS)
+
 .PHONY: backup-server
 backup-server:
 	@tools/backup_server.sh $(LABEL)
