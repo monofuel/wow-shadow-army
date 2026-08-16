@@ -522,6 +522,144 @@ suite "isTruthyParam — Refresh force flag":
     check not isTruthyParam("no")
     check not isTruthyParam("junk")
 
+suite "itemAbbrev — cell faces":
+  test "initials of significant words":
+    check itemAbbrev("Chipped Claw") == "CC"
+    check itemAbbrev("Linen Cloth") == "LC"
+
+  test "filler words dropped":
+    check itemAbbrev("Cracked Sabre of the Wilds") == "CSW"
+
+  test "single word uses first three letters":
+    check itemAbbrev("Hearthstone") == "HEA"
+
+  test "short words uppercase the whole word":
+    check itemAbbrev("Ore") == "ORE"
+    check itemAbbrev("Xy") == "XY"
+
+  test "punctuation is a word break":
+    check itemAbbrev("Ash'ka Blade") == "AKB"
+
+  test "possessive crumbs are dropped, not counted as a word":
+    check itemAbbrev("Advisor's Ring") == "AR"
+    check itemAbbrev("Hotshot Pilot's Gloves") == "HPG"
+    # A one-letter name is all we have, so it survives.
+    check itemAbbrev("X") == "X"
+
+  test "five or more words cap at four chars":
+    check itemAbbrev("One Two Three Four Five") == "OTTF"
+
+  test "all-filler name keeps the original words":
+    check itemAbbrev("The Of") == "TO"
+
+  test "empty and punctuation-only yield a question mark":
+    check itemAbbrev("") == "?"
+    check itemAbbrev("---") == "?"
+
+suite "renderRealmInvGrid — the army's bag":
+  test "one cell per item, quality class and abbreviation present":
+    var info = initTable[int, ItemInfo]()
+    info[2589] = ItemInfo(itemId: 2589, name: "Linen Cloth", sellPrice: 13, quality: 1)
+    info[7073] = ItemInfo(itemId: 7073, name: "Broken Fang", sellPrice: 1, quality: 4)
+    let inv = RealmInventory(characters: parseRealmInventoryTsv(RealmInvSharedTsv))
+    let html = renderRealmInvGrid(realmInvItems(inv), info)
+    check html.count("inv-cell") == 2
+    check "q4" in html
+    check "q1" in html
+    check "LC" in html
+    check "BF" in html
+
+  test "count badge shows the realm total only when total > 1":
+    var info = initTable[int, ItemInfo]()
+    info[1] = ItemInfo(itemId: 1, name: "Solo Thing", sellPrice: 0, quality: 1)
+    info[2] = ItemInfo(itemId: 2, name: "Many Things", sellPrice: 0, quality: 1)
+    let html = renderRealmInvGrid(@[
+      RealmInvItem(itemId: 1, total: 1, stacks: 1,
+        holders: @[RealmInvHolder(name: "Igris", count: 1)]),
+      RealmInvItem(itemId: 2, total: 7, stacks: 2,
+        holders: @[RealmInvHolder(name: "Igris", count: 7)])
+    ], info)
+    check """class="cell-count"""" in html
+    check """class="cell-count">7</span>""" in html
+    check html.count("cell-count") == 1
+    check """class="cell-count">1</span>""" notin html
+
+  test "tooltip carries name, id, total, stacks and holders richest first":
+    var info = initTable[int, ItemInfo]()
+    info[2589] = ItemInfo(itemId: 2589, name: "Linen Cloth", sellPrice: 13, quality: 1)
+    let inv = RealmInventory(characters: parseRealmInventoryTsv(RealmInvSharedTsv))
+    let html = renderRealmInvGrid(realmInvItems(inv), info)
+    check "Linen Cloth" in html
+    check "id 2589" in html
+    check "20 total · 4 stacks" in html
+    check "Murist ×12, Igris ×5, Ashborn ×3" in html
+
+  test "injection probe escapes holder names and item names":
+    var info = initTable[int, ItemInfo]()
+    info[1] = ItemInfo(
+      itemId: 1, name: "<img src=x onerror=alert(1)>", sellPrice: 0, quality: 1)
+    info[2] = ItemInfo(itemId: 2, name: "Safe Cloth", sellPrice: 0, quality: 1)
+    let html = renderRealmInvGrid(@[
+      RealmInvItem(
+        itemId: 1, total: 2, stacks: 1,
+        holders: @[RealmInvHolder(name: "Igris", count: 2)]),
+      RealmInvItem(
+        itemId: 2, total: 3, stacks: 1,
+        holders: @[RealmInvHolder(name: "<script>alert(1)</script>", count: 3)])
+    ], info)
+    check "&lt;script&gt;" in html
+    check "<script>" notin html
+    check "&lt;img" in html
+    check "<img src=x onerror=alert" notin html
+    var pos = 0
+    while true:
+      let t = html.find("title=\"", pos)
+      if t < 0:
+        break
+      let start = t + 7
+      let stop = html.find("\"", start)
+      check stop >= 0
+      let content = html[start ..< stop]
+      check "<" notin content
+      check "\"" notin content
+      pos = stop + 1
+
+  test "unknown item (negative-cache) uses raw id, common class, Item# tip":
+    var info = initTable[int, ItemInfo]()
+    info[4242] = ItemInfo(itemId: 4242, name: "", sellPrice: 0, quality: 0)
+    let html = renderRealmInvGrid(@[
+      RealmInvItem(itemId: 4242, total: 3, stacks: 1,
+        holders: @[RealmInvHolder(name: "Igris", count: 3)])
+    ], info)
+    check """<span class="cell-face">4242</span>""" in html
+    check "q1" in html
+    check "q0" notin html
+    check "Item#4242" in html
+
+  test "a holderless row says so instead of trailing an empty tooltip line":
+    var info = initTable[int, ItemInfo]()
+    info[5] = ItemInfo(itemId: 5, name: "Orphan Gem", sellPrice: 0, quality: 3)
+    let html = renderRealmInvGrid(@[
+      RealmInvItem(itemId: 5, total: 2, stacks: 1, holders: @[])
+    ], info)
+    check """<span class="tip-line">no holders</span>""" in html
+    check "stacks — no holders" in html
+
+  test "empty pool says so":
+    let html = renderRealmInvGrid(@[], initTable[int, ItemInfo]())
+    check "The army is carrying nothing." in html
+
+  test "grid order matches sortRealmInvItems (epic before a bigger common pile)":
+    var info = initTable[int, ItemInfo]()
+    info[1] = ItemInfo(itemId: 1, name: "Tiny Epic", sellPrice: 0, quality: 4)
+    info[2] = ItemInfo(itemId: 2, name: "Huge Common", sellPrice: 0, quality: 1)
+    let html = renderRealmInvGrid(@[
+      RealmInvItem(itemId: 2, total: 99, stacks: 5),
+      RealmInvItem(itemId: 1, total: 1, stacks: 1)
+    ], info)
+    check html.find("TE") < html.find("HC")
+    check html.find("q4") < html.find("q1")
+
 suite "realmInventoryToJson — items and characters":
   test "top level carries the aggregated items array":
     var info = initTable[int, ItemInfo]()
