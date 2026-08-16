@@ -169,8 +169,12 @@ COALESCE(ii.item_id, 0), COALESCE(SUM(ii.count), 0), COUNT(ii.guid)
 FROM characters c
 LEFT JOIN character_inventory ci ON ci.guid = c.guid
 LEFT JOIN item_instance ii ON ii.guid = ci.item_guid
+WHERE c.name NOT IN ('Botmage', 'Botpriest', 'Botrogue', 'Botshaman',
+  'Botwarrior', 'Cowcam', 'Nightsun')
 GROUP BY c.guid, COALESCE(ii.item_id, 0)
 ORDER BY c.name, ii.item_id"""
+  ## ^ the seeded lvl-30 test characters and camera seats are not the army;
+  ## their (substantial) seeded inventories drowned out the real pool.
   ## Active quest log for one character (unrewarded only).
   ## VMaNGOS status: 1=complete (turn-in ready), 3=incomplete/active, 5=failed.
   ## quest_template is multi-patch — take MAX(patch) per entry for Title/reqs.
