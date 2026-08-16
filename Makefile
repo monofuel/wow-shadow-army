@@ -207,7 +207,7 @@ define stop_home_seat
 	rm -f "$$pid_file"; echo "stopped $(1)"
 endef
 
-.PHONY: test test-lua test-nim system pin-check start-server stop-server server-logging logs account soap-account play play-classic play-classic-netlog play-xr traverse traverse-field traverse-replay traverse-pack-replay traverse-headed traverse-pol traverse-desert traverse-wet traverse-checkpoints traverse-lint traverse-lint-soft lift-tele quest-data item-data road-data warlock-account warlock-bot botwarrior-bot tusk-account tusk-bot beru-account beru-bot party-army home-army-start home-army-stop home-army-restart home-army-status shadowfel-start shadowfel-stop igris-start igris-stop tusk-start tusk-stop beru-start beru-stop navmesh-helper navmesh-status map-browser map-browser-once map-browser-debug map-browser-probe
+.PHONY: test test-lua test-nim system pin-check start-server stop-server server-logging logs account soap-account play play-classic play-classic-netlog play-xr traverse traverse-field traverse-replay traverse-pack-replay traverse-headed traverse-pol traverse-desert traverse-wet traverse-checkpoints traverse-lint traverse-lint-soft lift-tele quest-data item-data road-data bot-road-data bot-quest-hubs warlock-account warlock-bot botwarrior-bot tusk-account tusk-bot beru-account beru-bot party-army home-army-start home-army-stop home-army-restart home-army-status shadowfel-start shadowfel-stop igris-start igris-stop tusk-start tusk-stop beru-start beru-stop navmesh-helper navmesh-status map-browser map-browser-once map-browser-debug map-browser-probe
 
 # Unit tier: Lua tools + Nim host/system tests only (v2 DoD: no Python required
 # for bot correctness). If nim is missing, test-nim-soft skips rather than
@@ -270,7 +270,7 @@ test-smoke-sh:
 # but 5.3 luac still catches syntax errors; the addon itself is never run by
 # lua/tests, so this is its only automated gate).
 test-smoke-lua:
-	@rc=0; for f in addons/*/*.lua lua/*.lua lua/tools/*.lua lua/entry/*.lua; do \
+	@rc=0; for f in addons/*/*.lua lua/*.lua lua/data/*.lua lua/tools/*.lua lua/entry/*.lua; do \
 		[ -f "$$f" ] || continue; \
 		$(RUN_LUAC) -p "$$f" || { echo "PARSE FAIL: $$f"; rc=1; }; \
 	done; \
@@ -490,12 +490,34 @@ item-data:
 
 # Regenerate addons/ShadowArmy/RoadData.lua from the baked road waypoints
 # (docs/road-data.md). No DB and no realm — tools/data/road_waypoints_*.jsonl
-# plus WorldMapArea.dbc are the whole input. Deterministic, so a no-op rerun
+# plus the DBCs and the maps/*.map area grids are the whole input (the grids
+# arbitrate which zone a point is in; --map-dir defaults to maps/ beside
+# --dbc-dir). Deterministic, so a no-op rerun
 # leaves the file byte-identical.
 ROAD_DATA_ARGS ?=
 road-data:
 	@python3 tools/gen_road_data.py \
 		--dbc-dir "$(VANILLA_WOW_EXTRACTED_DATA_DIR)/dbc" $(ROAD_DATA_ARGS)
+
+# Regenerate lua/data/bot_roads.lua from the same baked road waypoints, in
+# WORLD coordinates for the bots (lua/tools/road_route.lua). No DBCs, no maps,
+# no realm — the two JSONL artifacts are the whole input, because bots speak
+# world coords and never need the zone projection the addon is stuck with.
+# Deterministic, so a no-op rerun leaves the file byte-identical.
+BOT_ROAD_DATA_ARGS ?=
+bot-road-data:
+	@python3 tools/gen_bot_road_data.py $(BOT_ROAD_DATA_ARGS)
+
+# Regenerate lua/data/bot_quest_hubs.lua: quest id -> the WORLD position of the
+# creature that starts it and the creature that ends it. Reads the world DB
+# read-only through the same docker shell-out gen_quest_data.py uses (whose
+# relation/spawn loaders this imports rather than re-derives). The bots' own
+# questgiver memory only holds NPCs a seat has SEEN and dies on reload, so
+# without this table a completed quest in a giver-free field has nothing to
+# walk back to. Deterministic: a no-op rerun leaves the file byte-identical.
+BOT_QUEST_HUBS_ARGS ?=
+bot-quest-hubs:
+	@python3 tools/gen_bot_quest_hubs.py $(BOT_QUEST_HUBS_ARGS)
 
 .PHONY: backup-server
 backup-server:

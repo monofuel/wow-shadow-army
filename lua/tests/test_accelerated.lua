@@ -193,12 +193,17 @@ nav = { state = "following", failed_here = false, walkout_available = false }
 local function giver(guid, distance, name)
   return unit(guid, distance, 3, {
     name = name or "Giver",
+    player_can_attack_known = true,
     player_can_attack = false,
   })
 end
 
 -- Soft-quest unit tests force the flag on (default is off after 2.009 score).
 grind.set_quests(true)
+-- No generated quest-hub table unless a test asks for one: every check below
+-- this line is therefore also a check that a deploy without the artifact
+-- behaves exactly as it did before it existed.
+grind.set_quest_hubs({})
 
 local lowLevelGiver = view({
   giver(900, 10.0, "Chief"),
@@ -216,6 +221,8 @@ clock = clock + 10.0
 check(grind.decide(lowLevelGiver).kind ~= "interact",
   "does not walk to new quests at level 1")
 
+-- An idle quest log outranks the next pull: grinding with nothing to
+-- progress is wasted XP, so the available giver wins even with a mob close.
 local huntAndGiver = view({
   unit(901, 8.0, 3),
   giver(900, 10.0, "Chief"),
@@ -229,8 +236,133 @@ local huntAndGiver = view({
     { slot = 1, spell_id = 5176, usable = true, usable_known = true },
   },
 })
-check(grind.decide(huntAndGiver).kind == "attack",
-  "prefers grinding when a huntable mob is nearby")
+clock = clock + 10.0
+local idleAccept = grind.decide(huntAndGiver)
+check(idleAccept.kind == "interact" and idleAccept.guid == 900,
+  "idle log: walks to the available giver past a nearby hunt")
+
+-- With an unfinished objective in the log, the old rule stands: the pull wins.
+local huntWithWork = view({
+  unit(901, 8.0, 3),
+  giver(900, 10.0, "Chief"),
+}, {
+  level = 3,
+  quest_markers = { { questgiver_guid = 900, status = 5 } },
+  quest_frame = { open = false },
+  accepted_quests = { 1 },
+  quest_objectives = { { complete = false } },
+  completed_quest_ids = {},
+  ui_nodes = {},
+  action_buttons = {
+    { slot = 1, spell_id = 5176, usable = true, usable_known = true },
+  },
+})
+clock = clock + 10.0
+check(grind.decide(huntWithWork).kind == "attack",
+  "busy log: prefers grinding when a huntable mob is nearby")
+
+-- Scouting: an idle log and no markers anywhere sends the seat to the
+-- nearest untried friendly NPC — dialogs are the only marker source for a
+-- client that never sends the giver-status query.
+local unmarkedNpc = view({
+  giver(910, 20.0, "Deathguard"),
+}, {
+  level = 3,
+  quest_markers = {},
+  quest_frame = { open = false },
+  accepted_quests = {}, quest_objectives = {}, completed_quest_ids = {},
+  ui_nodes = {},
+  action_buttons = {
+    { slot = 1, spell_id = 5176, usable = true, usable_known = true },
+  },
+})
+clock = clock + 10.0
+local scout = grind.decide(unmarkedNpc)
+check(scout.kind == "interact" and scout.guid == 910 and
+  scout.reason == "scout_npc",
+  "idle log: scouts an unmarked friendly NPC")
+
+-- When routing has no path to a distant giver, the pursuit falls back to a
+-- local-steer leg at the NPC instead of stalling on "unavailable".
+nav = { state = "unavailable", failed_here = true, walkout_available = false }
+clock = clock + 10.0
+local steer = grind.decide(unmarkedNpc)
+check(steer.kind == "navigate" and steer.navigation_mode == "local_steer" and
+  steer.reason == "scout_walk",
+  "unroutable scout falls back to a local-steer leg")
+nav = { state = "following", failed_here = false, walkout_available = false }
+
+-- A friendly PLAYER is not a scout target: no dialog to give.
+local playerNoScout = view({
+  giver(915, 10.0, "Igris"),
+}, {
+  level = 3,
+  quest_markers = {},
+  quest_frame = { open = false },
+  accepted_quests = {}, quest_objectives = {}, completed_quest_ids = {},
+  ui_nodes = {},
+  action_buttons = {
+    { slot = 1, spell_id = 5176, usable = true, usable_known = true },
+  },
+})
+playerNoScout.units[1].object_kind = "player"
+clock = clock + 10.0
+check(grind.decide(playerNoScout).kind ~= "interact",
+  "does not scout friendly players")
+
+-- A busy log never scouts: unmarked NPCs are only interesting when idle.
+local busyNoScout = view({
+  giver(910, 20.0, "Deathguard"),
+}, {
+  level = 3,
+  quest_markers = {},
+  quest_frame = { open = false },
+  accepted_quests = { 1 },
+  quest_objectives = { { complete = false } },
+  completed_quest_ids = {},
+  ui_nodes = {},
+  action_buttons = {
+    { slot = 1, spell_id = 5176, usable = true, usable_known = true },
+  },
+})
+clock = clock + 10.0
+check(grind.decide(busyNoScout).kind ~= "interact",
+  "busy log: does not scout unmarked NPCs")
+
+-- An empty greeting exhausts the NPC, so the scout rank moves on instead of
+-- bouncing off the same guard forever.
+local emptyGreeting = view({
+  giver(910, 2.0, "Deathguard"),
+}, {
+  level = 3,
+  quest_markers = {},
+  quest_frame = { open = true, panel = "greeting", npc_guid = 910,
+    greeting_rows = {} },
+  accepted_quests = {}, quest_objectives = {}, completed_quest_ids = {},
+  ui_nodes = {},
+  action_buttons = {
+    { slot = 1, spell_id = 5176, usable = true, usable_known = true },
+  },
+})
+clock = clock + 10.0
+local goodbye = grind.decide(emptyGreeting)
+check(goodbye.kind == "ui_press" and goodbye.reason == "nothing_offered",
+  "empty greeting says goodbye")
+local afterGoodbye = view({
+  giver(910, 20.0, "Deathguard"),
+}, {
+  level = 3,
+  quest_markers = {},
+  quest_frame = { open = false },
+  accepted_quests = {}, quest_objectives = {}, completed_quest_ids = {},
+  ui_nodes = {},
+  action_buttons = {
+    { slot = 1, spell_id = 5176, usable = true, usable_known = true },
+  },
+})
+clock = clock + 10.0
+check(grind.decide(afterGoodbye).kind ~= "interact",
+  "empty greeting exhausts the NPC for the scout rank")
 
 local openDialog = view({}, {
   level = 3,
@@ -242,8 +374,8 @@ local openDialog = view({}, {
   },
 })
 local accept = grind.decide(openDialog)
-check(accept.kind == "quest_cmd" and accept.command == "/questaccept",
-  "accepts when the details panel is open")
+check(accept.kind == "ui_press" and accept.control == "QuestFrameAcceptButton",
+  "accepts by button when the details panel is open")
 
 local turnInOnly = view({
   giver(902, 12.0, "TurnIn"),
@@ -262,6 +394,76 @@ check(turnInWalk.kind == "interact" and turnInWalk.guid == 902,
   "walks to reward markers even at level 1")
 check(turnInWalk.stop_distance and turnInWalk.stop_distance <= 4.0,
   "stops close enough to interact")
+
+-- A completed quest arms the hub walk-back even with mobs nearby: banked
+-- work outranks the next pull for the return leg too.
+do
+  -- Seed the hub memory: see a giver once, then lose sight of it.
+  local seeGiver = view({
+    giver(905, 10.0, "HubGiver"),
+  }, {
+    level = 3,
+    quest_markers = { { questgiver_guid = 905, status = 5 } },
+    quest_frame = { open = false },
+    accepted_quests = { 1 },
+    quest_objectives = { { complete = false } },
+    completed_quest_ids = {},
+    ui_nodes = {},
+    action_buttons = {
+      { slot = 1, spell_id = 5176, usable = true, usable_known = true },
+    },
+  })
+  seeGiver.units[1].location = { map_id = 1,
+    position = { x = 500.0, y = 500.0, z = 50.0 } }
+  clock = clock + 10.0
+  grind.decide(seeGiver)
+  local walkBack = view({
+    unit(906, 8.0, 3),
+  }, {
+    level = 3,
+    quest_markers = {},
+    quest_frame = { open = false },
+    accepted_quests = { 1 },
+    quest_objectives = { { complete = true } },
+    completed_quest_ids = {},
+    ui_nodes = {},
+    action_buttons = {
+      { slot = 1, spell_id = 5176, usable = true, usable_known = true },
+    },
+  })
+  clock = clock + 10.0
+  local back = grind.decide(walkBack)
+  check(back.kind == "navigate" and back.reason == "quest_hub",
+    "a banked quest walks back to the hub past a nearby hunt")
+end
+
+-- Fights en route pause the pursuit clocks: two minutes of combat must not
+-- exhaust the giver the courier was 20yd short of (Sarvis, live 2026-08-16).
+do
+  local fighting = view({
+    unit(908, 2.0, 3),
+    giver(902, 12.0, "TurnIn"),
+  }, {
+    level = 1,
+    in_combat = true,
+    auto_attack_guid = 908,
+    quest_markers = { { questgiver_guid = 902, status = 6 } },
+    quest_frame = { open = false },
+    accepted_quests = { 1 }, quest_objectives = {}, completed_quest_ids = {},
+    ui_nodes = {},
+    action_buttons = {
+      { slot = 1, spell_id = 5176, usable = true, usable_known = true },
+    },
+  })
+  clock = clock + 5.0
+  grind.decide(fighting)          -- pursuit pauses here
+  clock = clock + 120.0           -- a long fight, way past both budgets
+  grind.decide(fighting)
+  clock = clock + 5.0
+  local resumed = grind.decide(turnInOnly)
+  check(resumed.kind == "interact" and resumed.guid == 902,
+    "combat time does not burn the pursuit budget")
+end
 
 -- Patience: a giver that never opens is exhausted and grind resumes.
 local stuckGiver = view({
@@ -316,15 +518,16 @@ local takeReward = grind.decide(rewardView({
   open = true, panel = "reward", selected_choice = 1,
   choice_items = { { item_id = 3270, count = 1 }, { item_id = 3273, count = 1 } },
 }, rewardChoiceNodes))
-check(takeReward.kind == "quest_cmd" and takeReward.command == "/questreward",
-  "turns in once a choice is selected")
+check(takeReward.kind == "ui_press" and
+  takeReward.control == "QuestFrameCompleteQuestButton",
+  "turns in by button once a choice is selected")
 
 local noChoiceReward = grind.decide(rewardView({
   open = true, panel = "reward", selected_choice = 0, choice_items = {},
 }))
-check(noChoiceReward.kind == "quest_cmd" and
-  noChoiceReward.command == "/questreward",
-  "turns in directly when the quest offers no choice")
+check(noChoiceReward.kind == "ui_press" and
+  noChoiceReward.control == "QuestFrameCompleteQuestButton",
+  "turns in by button when the quest offers no choice")
 
 -- Banking a turn-in outranks the next pull. Every Deathknell giver has mobs
 -- inside the hunt radius, so a shared gate stranded finished quests forever.
@@ -352,14 +555,16 @@ local acceptWithHunt = view({
   level = 3,
   quest_markers = { { questgiver_guid = 913, status = 5 } },
   quest_frame = { open = false },
-  accepted_quests = {}, quest_objectives = {}, completed_quest_ids = {},
+  accepted_quests = { 1 },
+  quest_objectives = { { complete = false } },
+  completed_quest_ids = {},
   ui_nodes = {},
   action_buttons = {
     { slot = 1, spell_id = 5176, usable = true, usable_known = true },
   },
 })
 check(grind.decide(acceptWithHunt).kind == "attack",
-  "still yields a new accept to a nearby pull")
+  "busy log still yields a new accept to a nearby pull")
 
 -- Questgiver memory: standing next to a giver records where it was, so a seat
 -- that grinds its way out of sight can walk back to hand work in.
@@ -412,6 +617,86 @@ local farAwayIdle = view({}, {
 check(grind.decide(farAwayIdle).reason ~= "quest_hub",
   "does not walk back with unfinished work in the log")
 
+-- A banked quest whose ender this seat has NEVER seen. Remembered hubs are
+-- all on map 1, so on map 0 the seen-givers table is structurally empty and
+-- the generated turn-in position is the only thing that knows where to walk.
+local strandedView = view({}, {
+  level = 3,
+  quest_markers = {},
+  quest_frame = { open = false },
+  accepted_quests = { { quest_id = 364, title = "The Mindless Ones" } },
+  quest_objectives = { { quest_id = 364, complete = true, entry = 0 } },
+  completed_quest_ids = {},
+  ui_nodes = {},
+  location = { map_id = 0, position = { x = 2400.0, y = 1900.0, z = 85.0, o = 0 } },
+  action_buttons = {
+    { slot = 1, spell_id = 5176, usable = true, usable_known = true },
+  },
+})
+
+clock = clock + 5.0
+check(grind.decide(strandedView).reason ~= "quest_hub",
+  "without generated data a never-seen turn-in is still unreachable")
+
+grind.set_quest_hubs({
+  [364] = {
+    starter = { 0, 1857.9, 1600.9, 93.6, "Deathguard Simmer" },
+    ender = { 0, 1843.3, 1639.9, 97.8, "Shadow Priest Sarvis" },
+  },
+})
+clock = clock + 5.0
+local generated = grind.decide(strandedView)
+check(generated.reason == "quest_hub",
+  "walks to the generated turn-in of a banked quest with no giver in memory")
+check(math.abs(generated.x - 1843.3) < 1.0 and
+  math.abs(generated.y - 1639.9) < 1.0 and generated.map_id == 0,
+  "aims at the ender, not the starter")
+check(generated.stop_distance == 25.0 and
+  generated.route_profile == "safe_ground",
+  "generated leg uses the same arrive distance and route profile as a hub walk")
+
+-- Unfinished work in that same quest is field work, not a walk to the ender.
+local strandedBusy = view({}, {
+  level = 3,
+  quest_markers = {},
+  quest_frame = { open = false },
+  accepted_quests = { { quest_id = 364, title = "The Mindless Ones" } },
+  quest_objectives = {
+    { quest_id = 364, complete = true, entry = 0 },
+    { quest_id = 364, complete = false, entry = 0 },
+  },
+  completed_quest_ids = {},
+  ui_nodes = {},
+  location = { map_id = 0, position = { x = 2400.0, y = 1900.0, z = 85.0, o = 0 } },
+  action_buttons = {
+    { slot = 1, spell_id = 5176, usable = true, usable_known = true },
+  },
+})
+clock = clock + 5.0
+check(grind.decide(strandedBusy).reason ~= "quest_hub",
+  "one finished objective out of two is not a banked quest")
+
+-- A quest the generated table does not cover falls straight back to today's
+-- behavior rather than walking somewhere else's turn-in.
+local strandedUnknown = view({}, {
+  level = 3,
+  quest_markers = {},
+  quest_frame = { open = false },
+  accepted_quests = { { quest_id = 999999, title = "Unknown" } },
+  quest_objectives = { { quest_id = 999999, complete = true, entry = 0 } },
+  completed_quest_ids = {},
+  ui_nodes = {},
+  location = { map_id = 0, position = { x = 2400.0, y = 1900.0, z = 85.0, o = 0 } },
+  action_buttons = {
+    { slot = 1, spell_id = 5176, usable = true, usable_known = true },
+  },
+})
+clock = clock + 5.0
+check(grind.decide(strandedUnknown).reason ~= "quest_hub",
+  "a quest missing from the generated table walks nowhere")
+
+grind.set_quest_hubs({})
+
 -- Loot: item objectives are only satisfied by taking the drop.
 local corpse = unit(920, 2.0, 2, { is_dead = true, health = 0 })
 local function lootView(nodes, extra)
@@ -461,6 +746,17 @@ for _ = 1, 10 do grind.decide(lootView({})) end
 local afterLoot = grind.decide(lootView({}))
 check(afterLoot.reason ~= "loot_settling" and afterLoot.reason ~= "loot_corpse",
   "gives the corpse up once the window stays empty")
+
+-- The kill feed is the retained combat-log ring, so the same death line
+-- replays every frame; a corpse armed once must not re-arm and reset the
+-- loot clock (that pinned a live seat on one unresolving money slot forever).
+local replay = grind.decide(lootView({}, {
+  player_guid = 77,
+  units = { unit(920, 2.0, 2, { is_dead = true, death_known = true }) },
+  combat_kill_events = { { source_guid = 77, target_guid = 920 } },
+}))
+check(replay.reason ~= "loot_corpse" and replay.reason ~= "loot_settling",
+  "a replayed kill line does not re-arm a finished loot")
 
 -- Someone else's kill is not ours to loot. (Runs with no settling holds
 -- pending, so the kill feed really is what decides.)
