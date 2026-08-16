@@ -6,6 +6,7 @@ Management server for the wow-shadow-army: one Nim binary, many interfaces.
 |---|---|---|
 | Army tab | `GET /` / `GET /army` | roster (offline-safe) |
 | Murist tab | `GET /murist` | human seat metrics + Murist events |
+| Inventory tab | `GET /inventory` | realm-wide bags, item-centric (characters DB) |
 | Advisor tab | `GET /advisor` | addon event tail + reload |
 | Admin tab | `GET /admin` | realm Start/Stop + ops buttons |
 | Traverse tab | `GET /traverse` | Kalimdor telemetry + PoL + hosted replays |
@@ -15,6 +16,7 @@ Management server for the wow-shadow-army: one Nim binary, many interfaces.
 
 | Seat watch partial | `GET /seats` | htmx fragment (seat babysitter panel) |
 | Bags partial | `GET /murist/inventory` | htmx fragment (Murist inventory panel) |
+| Inventory partial | `GET /inventory/all` | htmx fragment (Inventory tab body; `?force=1` skips the 30s cache) |
 | Roster partial | `GET /roster` | htmx fragment (roster table rows) |
 | Events partial | `GET /events` | htmx fragment (addon event rows) |
 | Server partial | `GET /server` | htmx fragment (realm status + Start/Stop buttons) |
@@ -29,6 +31,7 @@ Management server for the wow-shadow-army: one Nim binary, many interfaces.
 | MCP | `POST /mcp` | MCPort JSON-RPC tools (see below) |
 | Health | `GET /healthz` | process liveness |
 | Info | `GET /server-info` | MCP metadata |
+| Inventory JSON | `GET /inventory.json` | realm bags as JSON (items + per-character); `?force=1` skips the 30s cache |
 
 MCP tools (same dispatch procs as the dashboard):
 
@@ -98,6 +101,7 @@ Tabs in the header: **Army** | **Murist** | **Advisor** | **Admin**.
 - **Army** (`GET /army`) — roster only (hides foundation `Bot*` / Nightsun / Cowcam). Order: Murist → Shadowfel → Igris → Tusk → Beru, then others. Columns: name · level · XP · **HP/MP** · class · **zone** · **pos** · gold · **life** · **seat** · **bot** Start/Stop. Panel head shows army strip (`N online · alive/ghost/dead · ctrl k/n`). Polls `GET /roster` every few seconds via htmx. MCP `list_characters` still accepts `include_foundation=true` for the full realm.
 - **Army → Seat watch** — babysitter row per home seat, **whole fleet**: the four dedicated seats first, then every row of `tools/data/home_army_roster.tsv`. Light (green live / amber starting / grey stopped / **red wedged**), heartbeat age, auto-restarts this hour, last action, wedge evidence file. Panel head counts `N/M live · X wedged`. Polls `GET /seats`; a seat that burned its restart budget shows a persistent red alert banner. See "Seat babysitter" below.
 - **Murist** (`GET /murist`) — human seat snapshot (level, class, race, gold, zone, pos, XP, vitals, life/online) + **quest log** (unrewarded: complete/active/failed + objective progress) + **bags** (chat-bus inventory: item, id, qty, vendor sell/value, data age) + Murist-only addon events. Polls `GET /murist/status`, `GET /murist/quests`, `GET /murist/inventory`, `GET /murist/events`.
+- **Inventory** (`GET /inventory`) — realm-wide bags from the characters DB. Primary table: item · total · stacks · holders · id, quality-coloured, quality desc then total desc. Summary strip: characters · item types · items · realm gold (per-character tooltip). Secondary **By character** collapsible. Manual Refresh (no poll) with a 30s server cache the Refresh button bypasses.
 - **Advisor** (`GET /advisor`) — live ring of parsed `<SA>` / `<ShadowArmy>` lines from Chat.log. Table body polls `GET /events`. **Reload addon** posts to `POST /reload`.
 - **Admin** (`GET /admin`) — **Realm** panel (start/stop) + ops buttons (respawn army, tele party to Murist). Local ops only; not fair-play recovery. Realm start/stop runs as a **detached user unit** (`wow-realm-op` via `systemd-run --user`), not as a child of `wow-system`, so restarting the dashboard does not kill a multi-minute image build. Progress is mirrored in `local_data/realm-op.json` + `local_data/realm-op.log`.
 
