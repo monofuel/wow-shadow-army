@@ -35,10 +35,25 @@ local r = model.build({
   pos = { x = 45, y = 70 },
 })
 check(#r.list == 1, "Tauren quest remains listed across subzone header")
-check(#r.list[1].objs == 1 and r.list[1].objs[1].text == "Plainstrider Feather: 2/7",
+check(#r.list[1].objs == 2 and r.list[1].objs[1].text == "Plainstrider Feather: 2/7",
   "live objective text is authoritative")
-check(r.list[1].objs[1].dist ~= nil and #r.candidates == 1,
+check(r.list[1].objs[1].dist ~= nil and #r.candidates == 2,
   "Mulgore parent-zone waypoint enriches Red Cloud Mesa quest")
+-- r54: an in-progress quest also gets its delivery row + pin, marked pending
+-- so it can never take the route line off a live objective.
+check(r.list[1].objs[2].turnIn and r.list[1].objs[2].delivery
+  and r.list[1].objs[2].text == "Deliver: Grull Hawkwind",
+  "in-progress quest carries a delivery row for its ender")
+check(r.list[1].objs[2].dist ~= nil,
+  "same-zone delivery of an in-progress quest is measured")
+local pend = nil
+for _, c in ipairs(r.candidates) do if c.delivery then pend = c end end
+check(pend and pend.pending and pend.turnIn,
+  "delivery candidate of an unfinished quest is marked pending")
+check(r.list[1].minDist == r.list[1].objs[1].dist,
+  "a pending delivery never lowers the checklist sort distance")
+check(r.list[1].objs[2].pending == true,
+  "the delivery ROW is flagged pending too (the 210px panel skips those)")
 
 r = model.build({
   quests = {
@@ -396,5 +411,115 @@ r = model.build({
 })
 check(r.list[1].objs[1].text == "Turn in: Stormwind Quartermaster",
   "and a Gnome to the Alliance one")
+
+
+-- ------------------------------------------------- r54: monofuel's log ---
+-- The exact quest log that produced "2 days of map paths being broken"
+-- (2026-08-16, guid 1000007, standing in Brill): two same-zone Tirisfal
+-- quests, one Silverpine delivery, one Orgrimmar delivery. Driven against the
+-- REAL shipped QuestData so the regression is about the data we actually
+-- ship, not a hand-built fixture that agrees with the code.
+dofile("addons/ShadowArmy/QuestData.lua")
+
+local brill = model.build({
+  quests = {
+    { key = 1, title = "Speak with Sevren", header = "Tirisfal Glades",
+      objectives = {} },
+    { key = 2, title = "At War With The Scarlet Crusade",
+      header = "Tirisfal Glades",
+      objectives = { { text = "Captain Melrache slain: 0/1", have = 0, need = 1 } } },
+    { key = 3, title = "Delivery to Silverpine Forest", header = "Tirisfal Glades",
+      objectives = {} },
+    { key = 4, title = "The Horde Needs Your Help!", header = "Orgrimmar",
+      objectives = {} },
+  },
+  data = ShadowArmyQuestData, zoneNames = ShadowArmyQuestZones,
+  currentZone = "Tirisfal Glades", pos = { x = 61.0, y = 52.0 },
+})
+
+check(#brill.list == 4, "all four of monofuel's quests are listed")
+
+local byTitle = {}
+for _, c in ipairs(brill.candidates) do
+  byTitle[c.title] = byTitle[c.title] or {}
+  table.insert(byTitle[c.title], c)
+end
+
+local function delivery(title)
+  for _, c in ipairs(byTitle[title] or {}) do
+    if c.delivery then return c end
+  end
+  return nil
+end
+
+check(delivery("Speak with Sevren"),
+  "355 Speak with Sevren gets a same-zone delivery pin (Magistrate Sevren)")
+check(delivery("At War With The Scarlet Crusade"),
+  "372 At War With The Scarlet Crusade gets a delivery pin (Executor Zygand)")
+check(delivery("Speak with Sevren").pending == false,
+  "an objective-less delivery is actionable, not pending")
+check(delivery("At War With The Scarlet Crusade").pending == true,
+  "a delivery behind unfinished objectives is pending")
+check(not delivery("Delivery to Silverpine Forest"),
+  "445 invents no Tirisfal coordinate for its Silverpine ender")
+check(not delivery("The Horde Needs Your Help!"),
+  "8792 invents no Tirisfal coordinate for its Orgrimmar ender")
+
+local target = model.pickTarget(brill.list, brill.candidates)
+check(target ~= nil, "the Brill log routes somewhere (r53 drew nothing here)")
+check(target.title == brill.list[1].title,
+  "the route serves the top quest of the checklist")
+check(target.pending ~= true, "the route never serves a pending delivery")
+
+local away = model.awayRows(brill.list, "Tirisfal Glades")
+check(#away == 2, "exactly the two cross-zone quests get breadcrumbs")
+local dest = {}
+for _, a in ipairs(away) do dest[a.title] = a end
+check(dest["Delivery to Silverpine Forest"]
+  and dest["Delivery to Silverpine Forest"].zoneName == "Silverpine Forest"
+  and dest["Delivery to Silverpine Forest"].turnIn,
+  "445 breadcrumbs to Silverpine Forest")
+check(dest["The Horde Needs Your Help!"]
+  and dest["The Horde Needs Your Help!"].zoneName == "Orgrimmar",
+  "8792 breadcrumbs to Orgrimmar")
+check(dest["The Horde Needs Your Help!"].label == "Warlord Gorchuk",
+  "the breadcrumb names the ender it read from the data")
+check(not dest["Speak with Sevren"] and not dest["At War With The Scarlet Crusade"],
+  "quests that DO have local pins are not also breadcrumbed")
+
+-- ------------------------------------------------ r54: pickTarget rules ---
+-- Pure ordering rules, independent of any data file. Candidates arrive
+-- distance-sorted, so index order is nearest-first here too.
+local list = { { title = "top" }, { title = "second" } }
+check(model.pickTarget(list, {}) == nil, "no candidates means no target")
+
+local cands = {
+  { title = "second", dist = 10 },
+  { title = "top", dist = 40 },
+}
+check(model.pickTarget(list, cands).title == "top",
+  "the top quest wins even when another quest is nearer")
+
+cands = { { title = "second", dist = 10 }, { title = "third", dist = 40 } }
+check(model.pickTarget(list, cands).title == "second",
+  "a top quest with no waypoint falls back to the nearest quest that has one")
+
+cands = {
+  { title = "top", dist = 5, pending = true },
+  { title = "second", dist = 40 },
+}
+check(model.pickTarget(list, cands).title == "second",
+  "a live objective outranks the top quest's pending delivery")
+
+cands = {
+  { title = "second", dist = 40, pending = true },
+  { title = "top", dist = 50, pending = true },
+}
+check(model.pickTarget(list, cands).title == "top",
+  "when everything is pending the top quest still wins")
+
+cands = { { title = "third", dist = 40, pending = true } }
+check(model.pickTarget(list, cands).title == "third",
+  "a pending delivery beats drawing nothing at all")
 
 print("test_advisor_quest_model: " .. passed .. " checks passed")

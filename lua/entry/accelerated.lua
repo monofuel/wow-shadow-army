@@ -29,6 +29,13 @@ local QUEST_LOG_LIMIT = 20
 -- QUESTS flag, which the scored lanes keep off, so the trade here is the home
 -- lane's alone: quests finished beats kills per minute.
 local QUESTGIVER_YARDS = 120.0
+-- Rank-2 scout (unmarked friendly) is only for NPCs we can already talk to.
+-- Walking 90yd to a Deathguard (Bellion, 2026-08-16) wedges on a guard that
+-- never has a quest; real givers are reached via generated starters.
+local SCOUT_YARDS = 35.0
+-- Empty-log walk to a generated starter. Sarvis is ~141yd from the
+-- Deathknell zombie field; keep this above that and below a zone hop.
+local STARTER_HUB_YARDS = 220.0
 -- A giver that will not open its dialog is worth less than the mobs we are
 -- not killing while we stand there.
 local QUESTGIVER_PATIENCE = 75.0
@@ -45,6 +52,10 @@ local HUB_ARRIVE_YARDS = 25.0
 local HUB_BUDGET_SECONDS = 120.0
 -- Long enough that a failed walk does not immediately retry the same hub.
 local HUB_COOLDOWN_SECONDS = 240.0
+-- A reward that cannot be granted (full bags) is refused server-side and the
+-- panel simply re-opens, so the press can never succeed. Give a real turn-in
+-- a few frames of grace, then stop paying for it.
+local REWARD_COMPLETE_ATTEMPTS = 12
 -- Stop close enough that /interact can open the panel (default nav stop is wider).
 local QUEST_INTERACT_STOP = 3.5
 -- Inside this range /interact needs no route; beyond it a giver the route
@@ -94,24 +105,57 @@ local LOOT_OPEN_SECONDS = 6.0
 -- so an empty frame is not proof the corpse is empty.
 local LOOT_EMPTY_FRAMES = 8
 
--- Opening nuke per class, highest rank first.
+-- Per-class ability on the attack intent, highest rank first. Casters open
+-- with this; melee uses it as an in-melee filler after the host closes.
 local NUKES_BY_CLASS = {
   [11] = { 5177, 5176 }, -- druid: Wrath r2/r1
   [7] = { 529, 403 },    -- shaman: Lightning Bolt r2/r1
   [9] = { 695, 686 },    -- warlock: Shadow Bolt r2/r1
   [5] = { 591, 585 },    -- priest: Smite r2/r1
-  [8] = { 143, 133 },    -- mage: Fireball r2/r1
+  [8] = { 2136, 145, 143, 133 }, -- mage: Fire Blast r1, Fireball r3/r2/r1
+  [1] = { 285, 284, 78 },   -- warrior: Heroic Strike r3/r2/r1
+  [4] = { 1758, 1757, 1752 }, -- rogue: Sinister Strike r3/r2/r1
 }
+
+-- Gap closer, not a filler: 0 rage, out of combat, 8-25 yd. Bypasses the
+-- mana/rage floor so a fresh warrior pull is a Charge, not a walk.
+local CHARGE_BY_CLASS = {
+  [1] = { 11578, 6178, 100 }, -- warrior: Charge r3/r2/r1
+}
+local CHARGE_MIN_YARDS = 8.0
+local CHARGE_MAX_YARDS = 25.0
 
 -- Buff once per life: cheap, and a level 1 character has almost no stats.
 -- Tables are highest rank first; first usable on the action bar wins.
 local BUFFS_BY_CLASS = {
   [11] = { 1126 },       -- druid: Mark of the Wild
   [9] = { 696, 687 },    -- warlock: Demon Skin r2/r1
+  [8] = { 7302, 168 },   -- mage: Ice Armor r1, Frost Armor r1
+  [1] = { 6673 },        -- warrior: Battle Shout r1
+}
+
+-- Casters stand at spell range. Fireball (35yd) cannot start while the
+-- host is walking to ENGAGE_YARDS (movement_inhibits_cast_start), so a
+-- 4yd stop turns a mage into a staff-swinging corpse.
+local CASTER_STOP_YARDS = 22.0
+local CASTER_CLASS = {
+  [5] = true, [7] = true, [8] = true, [9] = true, [11] = true,
 }
 
 local ENGAGE_YARDS = 4.0
 local SEARCH_YARDS = 40.0        -- a starting field is sparser than a road
+-- Item-drop quests (The Damned, A New Plague) report entry=0. Their
+-- droppers sit past a starting-field SEARCH, so the seat never leaves
+-- leftover trash (Kamish, 376 0/6 0/6 while grinding churchyard zombies).
+local OBJECTIVE_SEARCH_YARDS = 100.0
+-- Name fragment of the creature that drops the quest item. entry is 0 on
+-- those objective rows, so the creature-id match never fires.
+local ITEM_DROPPER = {
+  [3265] = "Scavenger", -- Scavenger Paws (376)
+  [3264] = "Duskbat",   -- Duskbat Wings (376)
+  [2858] = "Darkhound", -- Darkhound Blood (367)
+  [2834] = "Gnoll",     -- Embalming Ichor (Rot Hide)
+}
 local ROAM_YARDS = 70.0          -- a leg long enough to reach new spawns
 local CORPSE_STOP_YARDS = 30.0   -- the reclaim radius is 39; stop short of it
 local STALL_SECONDS = 8.0
@@ -174,6 +218,18 @@ local questHubs = {}
 local hubGuid = nil
 local hubSince = nil
 local hubCooldown = {}
+-- Consecutive Complete presses on the same reward panel that did not close it.
+local rewardAttempts = 0
+local rewardQuestId = nil
+local rewardNpcGuid = nil
+-- After a refused reward (live: "Inventory is full"), consume a use-item
+-- stack from the action bar so the next Complete can store the reward.
+-- The lua view does not project bags, so the action bar is the only lever.
+local needBagSlot = false
+local bagUseSettleUntil = nil
+local bagBlockedNpc = nil
+local bagBlockedQuest = nil
+local BAG_USE_SETTLE_SECONDS = 1.2
 
 -- Generated quest-giver world positions, lazily loaded and injectable.
 --
@@ -261,7 +317,7 @@ end
 
 -- Mirrors upstream's actionable-target rule: the mobs that are safe to fight
 -- and actually pay us.
-local function huntable(view, unit, freshPull)
+local function huntable(view, unit, freshPull, reach)
   if not unit.player_can_attack then return false end
   if unit.death_known and unit.is_dead then return false end
   if unit.health_known and unit.health <= 0 then return false end
@@ -269,7 +325,7 @@ local function huntable(view, unit, freshPull)
   if unit.creature_type_known and unit.creature_type == 8 then return false end
   if unit.is_tapped and not unit.tapped_by_player then return false end
   if unit.summoner_guid and unit.summoner_guid ~= 0 then return false end
-  if unit_distance(unit) > SEARCH_YARDS then return false end
+  if unit_distance(unit) > (reach or SEARCH_YARDS) then return false end
   if unit.level_known then
     local ceiling = (view.level or 1) + (freshPull and 2 or 5)
     if unit.level > ceiling then return false end
@@ -294,9 +350,15 @@ end
 local function credits_objective(view, unit)
   for i = 1, #(view.quest_objectives or {}) do
     local objective = view.quest_objectives[i]
-    if not objective.complete and objective.entry ~= 0 and
-        objective.entry == unit.entry then
+    if objective.complete then
+    elseif objective.entry ~= 0 and objective.entry == unit.entry then
       return true
+    elseif (objective.item_id or 0) ~= 0 then
+      local needle = ITEM_DROPPER[objective.item_id]
+      local name = unit.name or ""
+      if needle and name:find(needle, 1, true) then
+        return true
+      end
     end
   end
   return false
@@ -304,20 +366,26 @@ end
 
 local function pick_target(view, freshPull)
   local best, bestScore = nil, nil
+  local credit, creditScore = nil, nil
   for i = 1, #(view.units or {}) do
     local unit = view.units[i]
-    if huntable(view, unit, freshPull) then
-      -- Distance decides, but a mob on an active objective is worth a walk.
+    local pays = QUESTS and credits_objective(view, unit)
+    local reach = pays and OBJECTIVE_SEARCH_YARDS or SEARCH_YARDS
+    if huntable(view, unit, freshPull, reach) then
       local score = unit_distance(unit)
-      if QUESTS and credits_objective(view, unit) then
-        score = score - 25.0
-      end
-      if not bestScore or score < bestScore then
+      if pays then
+        if not creditScore or score < creditScore then
+          credit, creditScore = unit, score
+        end
+      elseif not bestScore or score < bestScore then
         best, bestScore = unit, score
       end
     end
   end
-  return best
+  -- A dropper on an unfinished item/kill row outranks leftover trash even
+  -- when the trash is in melee. The old 25yd bonus still lost to a 1yd
+  -- zombie against an 80yd scavenger.
+  return credit or best
 end
 
 local function usable_spell(view, spellId)
@@ -337,6 +405,29 @@ local function pick_nuke(view)
   if not prio then return nil end
   for i = 1, #prio do
     if usable_spell(view, prio[i]) then return prio[i] end
+  end
+  return nil
+end
+
+local function pick_charge(view, target)
+  if view.in_combat then return nil end
+  local prio = CHARGE_BY_CLASS[view.class_id or 0]
+  if not prio or not target then return nil end
+  local dist = unit_distance(target)
+  for i = 1, #prio do
+    local id = prio[i]
+    for j = 1, #(view.action_buttons or {}) do
+      local button = view.action_buttons[j]
+      if button.spell_id == id then
+        if button.usable_known and not button.usable then break end
+        if button.not_enough_mana then break end
+        if button.in_range_known and not button.in_range then break end
+        local rmin = button.range_min or CHARGE_MIN_YARDS
+        local rmax = button.range_max or CHARGE_MAX_YARDS
+        if dist >= rmin and dist <= rmax then return id end
+        break
+      end
+    end
   end
   return nil
 end
@@ -466,6 +557,68 @@ local function reward_choice_reference(view)
   return nil
 end
 
+local function use_item_button(view)
+  for i = 1, #(view.action_buttons or {}) do
+    local button = view.action_buttons[i]
+    local slot = button.slot or 0
+    if button.kind == "use-item" and slot >= 1 and slot <= 12 and
+        (button.spell_id or 0) ~= 8690 then
+      return button
+    end
+  end
+  return nil
+end
+
+local function bag_slot_cleared()
+  if bagBlockedNpc then
+    exhausted[bagBlockedNpc] = nil
+    hubCooldown[bagBlockedNpc] = nil
+  end
+  if bagBlockedQuest and bagBlockedQuest ~= 0 then
+    hubCooldown["quest:" .. bagBlockedQuest] = nil
+  end
+  needBagSlot = false
+  bagUseSettleUntil = nil
+  bagBlockedNpc = nil
+  bagBlockedQuest = nil
+end
+
+-- Reward Complete that does not close the panel is almost always a full bag
+-- (Legia, quest 376, "The Damned failed: Inventory is full."). Consume one
+-- action-bar use-item stack to free a slot, then un-exhaust the giver.
+local function bag_slot_step(view)
+  if not needBagSlot then return nil end
+  if dialog_open(view) then
+    local frame = view.quest_frame or {}
+    local q = frame.quest_id or 0
+    if frame.open and frame.panel == "reward" and
+        bagBlockedQuest and q ~= 0 and q ~= bagBlockedQuest then
+      bag_slot_cleared()
+      return nil
+    end
+    return { kind = "ui_press", control = "QuestFrameCancelButton",
+      reason = "reward_blocked" }
+  end
+  if view.eating or view.drinking then
+    return { kind = "hold", reason = "bag_slot_consume" }
+  end
+  local button = use_item_button(view)
+  if not button then
+    bag_slot_cleared()
+    return nil
+  end
+  local now = wow.time()
+  if bagUseSettleUntil and now < bagUseSettleUntil then
+    return { kind = "hold", reason = "bag_slot_settle" }
+  end
+  bagUseSettleUntil = now + BAG_USE_SETTLE_SECONDS
+  return {
+    kind = "ui_press",
+    control = "ActionButton" .. tostring(button.slot),
+    reason = "bag_slot_use",
+  }
+end
+
 -- Answer whatever dialog is open, then (optionally) look for a giver to walk to.
 -- The two travel gates are separate on purpose: a turn-in is finished work
 -- waiting to be banked (XP, log space, the chain successor), so it outranks
@@ -482,6 +635,9 @@ end
 -- nearest untried NPC is the only way to find work.
 local function quest_step(view, allowTurnInTravel, allowAcceptTravel, allowScout)
   local frame = view.quest_frame or {}
+  if not (frame.open and frame.panel == "reward") then
+    rewardAttempts, rewardQuestId, rewardNpcGuid = 0, nil, nil
+  end
   if frame.open then
     questBudgetSince = nil
     -- Dialog answers go by BUTTON, never by slash command: the /quest*
@@ -495,6 +651,44 @@ local function quest_step(view, allowTurnInTravel, allowAcceptTravel, allowScout
       if choice then
         return { kind = "ui_press", reference = choice, reason = "reward_choice" }
       end
+      -- Choice buttons are not in every snapshot. Complete without a valid
+      -- selection is refused ("You must choose a reward.") and the panel
+      -- stays open, so hold until the next frame presents the control.
+      local choices = frame.choice_items or {}
+      local selected = frame.selected_choice or 0
+      local needsChoice = #choices > 0 and not (selected >= 1 and selected <= #choices)
+      if needsChoice then
+        return { kind = "hold", reason = "reward_choice_wait" }
+      end
+      local questId = frame.quest_id or 0
+      local npcGuid = frame.npc_guid or 0
+      if rewardQuestId ~= questId or rewardNpcGuid ~= npcGuid then
+        rewardAttempts, rewardQuestId, rewardNpcGuid = 0, questId, npcGuid
+      end
+      if rewardAttempts >= REWARD_COMPLETE_ATTEMPTS then
+        wow.log(string.format(
+          "reward refused %d times for quest %s - likely full bags; closing panel and moving on",
+          rewardAttempts, tostring(questId)))
+        local now = wow.time()
+        if npcGuid ~= 0 then
+          hubCooldown[npcGuid] = now + HUB_COOLDOWN_SECONDS
+        end
+        if questId ~= 0 then
+          hubCooldown["quest:" .. questId] = now + HUB_COOLDOWN_SECONDS
+        end
+        if hubGuid == npcGuid or
+            (questId ~= 0 and hubGuid == "quest:" .. questId) then
+          hubGuid, hubSince = nil, nil
+        end
+        exhausted[npcGuid] = true
+        needBagSlot = true
+        bagBlockedNpc = npcGuid
+        bagBlockedQuest = questId
+        bagUseSettleUntil = nil
+        return { kind = "ui_press", control = "QuestFrameCancelButton",
+          reason = "reward_blocked" }
+      end
+      rewardAttempts = rewardAttempts + 1
       return { kind = "ui_press", control = "QuestFrameCompleteQuestButton",
         reason = "turn_in" }
     end
@@ -567,7 +761,8 @@ local function quest_step(view, allowTurnInTravel, allowAcceptTravel, allowScout
     if rank and not exhausted[unit.guid] and
         not (unit.death_known and unit.is_dead) then
       local d = unit_distance(unit)
-      if d <= QUESTGIVER_YARDS and
+      local maxD = rank == 2 and SCOUT_YARDS or QUESTGIVER_YARDS
+      if d <= maxD and
           (not best or rank < bestRank or (rank == bestRank and d < bestDistance)) then
         best, bestDistance, bestRank = unit, d, rank
       end
@@ -814,10 +1009,23 @@ local function remember_hubs(view)
   end
 end
 
--- True when something we are carrying is finished and only needs handing in.
+-- True when at least one accepted quest is finished and only needs handing
+-- in. A single finished counter (376 wings 6/6, paws still 2/6) is field
+-- work, not banked work.
 local function objective_complete(view)
+  local byQuest = {}
   for i = 1, #(view.quest_objectives or {}) do
-    if view.quest_objectives[i].complete then return true end
+    local o = view.quest_objectives[i]
+    local q = o.quest_id or 0
+    local st = byQuest[q]
+    if not st then
+      st = { all = true }
+      byQuest[q] = st
+    end
+    if not o.complete then st.all = false end
+  end
+  for _, st in pairs(byQuest) do
+    if st.all then return true end
   end
   return false
 end
@@ -887,6 +1095,50 @@ local function generated_hub_step(view, pos, now)
   return nil
 end
 
+-- Empty log, no remembered giver: walk to the nearest generated starter
+-- on this map. Rank-2 scout only covers NPCs already in SCOUT_YARDS, so
+-- without this a Deathknell seat grinds the zombie field forever and never
+-- reaches Sarvis (Bellion, 2026-08-16, accepted=0, 141yd from the chapel).
+local function generated_starter_step(view, pos, now)
+  if #(view.accepted_quests or {}) > 0 then return nil end
+  local data = quest_hub_data()
+  if not data then return nil end
+  local map = math.floor(view.location.map_id or 0)
+  local done = {}
+  for i = 1, #(view.completed_quest_ids or {}) do
+    done[view.completed_quest_ids[i]] = true
+  end
+  for i = 1, #(view.rewarded_quest_ids or {}) do
+    done[view.rewarded_quest_ids[i]] = true
+  end
+  local best, bestD, bestKey, bestName = nil, nil, nil, nil
+  for questId, hub in pairs(data) do
+    local starter = hub and hub.starter
+    if starter and not done[questId] and math.floor(starter[1] or 0) == map then
+      local d = distance2d(pos.x, pos.y, starter[2], starter[3])
+      if d > HUB_ARRIVE_YARDS and d <= STARTER_HUB_YARDS then
+        local key = string.format("start:%.0f:%.0f", starter[2], starter[3])
+        if not (hubCooldown[key] and now < hubCooldown[key]) then
+          if not bestD or d < bestD then
+            best, bestD, bestKey, bestName = starter, d, key, starter[5]
+          end
+        end
+      end
+    end
+  end
+  if not best then return nil end
+  if hubGuid ~= bestKey then hubGuid, hubSince = bestKey, now end
+  wow.set_status("walking to starter " .. tostring(bestName or "?"))
+  return {
+    kind = "navigate",
+    x = best[2], y = best[3], z = best[4],
+    map_id = map,
+    stop_distance = HUB_ARRIVE_YARDS,
+    route_profile = "safe_ground",
+    reason = "quest_hub",
+  }
+end
+
 -- True when nothing in the log still needs field work: an empty log, or one
 -- where every objective is finished. Grinding in that state is wasted XP, so
 -- quest travel (and scouting for unmarked givers) outranks the next pull —
@@ -932,6 +1184,8 @@ local function hub_step(view, pos)
     -- turn-in in the generated table, even though we have never seen it.
     local generated = generated_hub_step(view, pos, now)
     if generated then return generated end
+    generated = generated_starter_step(view, pos, now)
+    if generated then return generated end
     hubGuid, hubSince = nil, nil
     return nil
   end
@@ -957,6 +1211,16 @@ local function progress_status(view)
     health_pct = math.floor(health_pct(view)),
     mana_pct = math.floor(mana_pct(view)),
   }
+end
+
+function M.reset()
+  rewardAttempts = 0
+  rewardQuestId = nil
+  rewardNpcGuid = nil
+  needBagSlot = false
+  bagUseSettleUntil = nil
+  bagBlockedNpc = nil
+  bagBlockedQuest = nil
 end
 
 function M.decide(view)
@@ -1127,20 +1391,23 @@ function M.decide(view)
         loot.status = progress_status(view)
         return loot
       end
+      local bagStep = bag_slot_step(view)
+      if bagStep then
+        bagStep.status = progress_status(view)
+        return bagStep
+      end
       -- Always finish an open dialog (free XP / log space). Walking to a new
       -- accept still yields to a nearby pull — unless the log is idle, when
       -- the next pull is the thing being overvalued; banking a turn-in never
       -- yields. Scouting (rank 2) only ever runs on an idle log.
       local nearbyHunt = pick_target(view, true)
       local idleLog = quest_log_idle(view)
-      -- Banked work also overrides the hunt gate: the ender of a completed
-      -- quest is usually unmarked (no giver-status query, ticket 0065), so a
-      -- bot carrying finished work travels and scouts even in a mob field —
-      -- the same "finished work outranks the next pull" rule as turn-ins.
-      local banked = objective_complete(view)
+      -- Banked work still walks to turn-in markers (allowTurnInTravel) and
+      -- generated hubs. Rank-1 accepts do not: one finished talk-quest must
+      -- not pull us onto a new giver while unfinished work has a hunt.
       local allowAccept = (view.level or 1) >= QUEST_TRAVEL_MIN_LEVEL and
-        (idleLog or banked or not nearbyHunt)
-      local allowScout = allowAccept and (idleLog or banked)
+        (idleLog or not nearbyHunt)
+      local allowScout = allowAccept and idleLog
       local step = quest_step(view, true, allowAccept, allowScout)
       if step then
         step.status = progress_status(view)
@@ -1225,9 +1492,15 @@ function M.decide(view)
   end
 
   if target then
-    local spell = nil
-    if mana >= NUKE_MANA_FLOOR_PCT then
+    local spell = pick_charge(view, target)
+    local stop = ENGAGE_YARDS
+    if spell then
+      stop = CHARGE_MAX_YARDS
+    elseif mana >= NUKE_MANA_FLOOR_PCT then
       spell = pick_nuke(view)
+      if spell and CASTER_CLASS[view.class_id or 0] then
+        stop = CASTER_STOP_YARDS
+      end
     end
     wow.set_status(string.format(
       "attack %s lvl %d (%.0fyd) %d%% hp",
@@ -1238,9 +1511,9 @@ function M.decide(view)
       kind = "attack",
       guid = target.guid,
       spell = spell,
-      stop_distance = ENGAGE_YARDS,
+      stop_distance = stop,
       route_profile = "prefer_ground",
-      reason = "grind",
+      reason = spell and stop == CHARGE_MAX_YARDS and "charge" or "grind",
       status = progress_status(view),
     }
   end
