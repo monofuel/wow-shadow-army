@@ -2,6 +2,7 @@
 ##
 ## One Nim binary, HTTP + MCP interfaces on one mummy server:
 ##   HTTP dashboard (htmx)  GET /  GET /army  GET /murist  GET /advisor
+##                          GET /inventory  GET /inventory/all
 ##                          GET /traverse  GET /admin
 ##                          GET /roster  GET /murist/status  GET /murist/quests
 ##                          GET /murist/events  GET /traverse/status
@@ -17,6 +18,7 @@
 ## Critical design rule: one dispatch path. Each capability is one data/action
 ## proc; the htmx handlers render it and the MCP tools serialize it.
 ##   listCharacters()           — roster (SELECT via docker exec)
+##   realmInventory()        — every character's bags from the characters DB
 ##   traverseStatus()        — Kalimdor Traverse telemetry (DB + live godview)
 ##   startTraversePol()/startTraverseWatch() — detached PoL + live observer
 ##   traverseReplays()       — hosted league episodes (version + replay links)
@@ -27,7 +29,8 @@
 ##   serverStatus()          — realm container up/down + lifecycle op state
 ##   startServer()/stopServer() — queue operator `up`/`down` (async worker)
 ##
-## Tabs: Army (roster), Murist (human seat), Advisor (events + reload),
+## Tabs: Army (roster), Murist (human seat), Inventory (realm-wide bags),
+## Advisor (events + reload),
 ## Traverse (league telemetry + PoL/observer + hosted replays), Admin.
 ## The dashboard stays useful with the realm DOWN: roster/Murist degrade to
 ## offline notes; Admin's Server panel offers Start/Stop. The human only runs
@@ -155,6 +158,19 @@ COALESCE(NULLIF(a.name, ''), CONCAT('Zone#', c.zone))
 FROM characters c
 LEFT JOIN mangos.area_template a ON a.entry = c.zone
 WHERE c.name='Northbound'"""
+  ## Realm-wide bags for the Inventory tab: every character × item template
+  ## with real stack totals. `character_inventory.item_guid` points at an
+  ## `item_instance` row (the instance carries `count`); `item_id` is the
+  ## template entry. Slot taxonomy is deliberately ignored — equipped, bag
+  ## slots and backpack all roll into one total. LEFT JOINs keep characters
+  ## with empty bags (they emit a single item-id 0 row).
+  RealmInventorySql = """SELECT c.guid, c.name, c.level, c.class, c.money, c.online,
+COALESCE(ii.item_id, 0), COALESCE(SUM(ii.count), 0), COUNT(ii.guid)
+FROM characters c
+LEFT JOIN character_inventory ci ON ci.guid = c.guid
+LEFT JOIN item_instance ii ON ii.guid = ci.item_guid
+GROUP BY c.guid, COALESCE(ii.item_id, 0)
+ORDER BY c.name, ii.item_id"""
   ## Active quest log for one character (unrewarded only).
   ## VMaNGOS status: 1=complete (turn-in ready), 3=incomplete/active, 5=failed.
   ## quest_template is multi-patch — take MAX(patch) per entry for Title/reqs.
@@ -1750,6 +1766,176 @@ proc inventoryToJson*(inv: CharacterInventory, info: Table[int, ItemInfo]): Json
     "parts_seen": inv.partsSeen.len,
     "parts_total": inv.partsTotal,
     "complete": inv.complete
+  }
+
+# ---------------------------------------------------------------------------
+# Realm inventory (Inventory tab)
+#
+# The chat-bus inventory above only speaks for characters running the addon
+# while they are online. This reads `characters` + `character_inventory` +
+# `item_instance` straight from the realm DB, so every character counts —
+# offline seats included. Read-only SELECT, one round trip, cached.
+# ---------------------------------------------------------------------------
+
+const
+  RealmInvCacheSec = 30.0
+    ## Server-side TTL. The tab (and the Refresh button) can be hit as often
+    ## as the human likes; the realm DB is read at most once per window.
+
+type
+  RealmInvStack* = object
+    ## One item template rolled up across all of a character's slots.
+    itemId*: int
+    count*: int ## summed item_instance.count (true stack sizes)
+    stacks*: int ## how many item_instance rows folded into `count`
+  RealmInvCharacter* = object
+    ## One character's DB-authoritative bags.
+    guid*: int
+    name*: string
+    level*: int
+    classId*: int
+    money*: int
+    online*: bool
+    itemTotal*: int ## sum of every stack count
+    stackTotal*: int ## number of occupied item_instance rows
+    items*: seq[RealmInvStack]
+  RealmInventory* = object
+    ## Snapshot plus honesty fields: `error` is set when the last refresh
+    ## failed, and `characters` may still carry the previous good read.
+    characters*: seq[RealmInvCharacter]
+    fetchedAt*: float ## epochTime of the newest *successful* read
+    error*: string
+
+var
+  gRealmInvLock: Lock
+  gRealmInv: RealmInventory ## last good snapshot (empty until the first read)
+  gRealmInvTriedAt: float ## last attempt, good or bad — this is the TTL clock
+  gRealmInvError: string
+
+initLock(gRealmInvLock)
+
+proc parseRealmInventoryTsv*(tsv: string): seq[RealmInvCharacter] =
+  ## Parse realm inventory TSV rows:
+  ##   guid name level class money online item_id count stacks
+  ## One row per character × item template, grouped by character (ORDER BY
+  ## name). item_id 0 marks a character whose bags are empty. Malformed rows
+  ## are skipped — a bad row never costs us the whole realm.
+  result = @[]
+  var idx = initTable[int, int]()
+  for rawLine in tsv.splitLines():
+    let line = rawLine.strip(leading = false)
+    if line.len == 0:
+      continue
+    let cols = line.split('\t')
+    if cols.len < 9:
+      continue
+    let guid = parseIntOr(cols[0].strip())
+    if guid <= 0:
+      continue
+    if not idx.hasKey(guid):
+      idx[guid] = result.len
+      result.add(RealmInvCharacter(
+        guid: guid,
+        name: cols[1].strip(),
+        level: parseIntOr(cols[2].strip()),
+        classId: parseIntOr(cols[3].strip()),
+        money: parseIntOr(cols[4].strip()),
+        online: parseIntOr(cols[5].strip()) != 0,
+        items: @[]
+      ))
+    let itemId = parseIntOr(cols[6].strip())
+    if itemId <= 0:
+      continue # empty-bags placeholder row
+    let count = parseIntOr(cols[7].strip())
+    if count <= 0:
+      continue
+    let stacks = max(parseIntOr(cols[8].strip()), 1)
+    let at = idx[guid]
+    result[at].items.add(RealmInvStack(
+      itemId: itemId, count: count, stacks: stacks))
+    result[at].itemTotal += count
+    result[at].stackTotal += stacks
+
+proc fetchRealmInventory*(): RealmInventory =
+  ## One SELECT → the whole realm's bags. Never raises: a DB that is down
+  ## comes back as an `error` string, not an exception through the router.
+  result = RealmInventory(characters: @[], fetchedAt: epochTime(), error: "")
+  try:
+    result.characters =
+      parseRealmInventoryTsv(dockerMariadbSelect(RealmInventorySql))
+  except CatchableError as e:
+    result.error = e.msg
+    result.fetchedAt = 0.0
+
+proc realmInventory*(force = false): RealmInventory =
+  ## Cached realm inventory (30s TTL). A failed refresh keeps the last good
+  ## rows and reports the error next to them, and still burns the TTL, so a
+  ## down realm is never hammered once per poll.
+  let now = epochTime()
+  withLock gRealmInvLock:
+    if not force and gRealmInvTriedAt > 0 and
+        now - gRealmInvTriedAt < RealmInvCacheSec:
+      result = gRealmInv
+      result.error = gRealmInvError
+      return
+  let fresh = fetchRealmInventory()
+  withLock gRealmInvLock:
+    gRealmInvTriedAt = now
+    gRealmInvError = fresh.error
+    if fresh.error.len == 0:
+      gRealmInv = fresh
+    result = gRealmInv
+    result.error = fresh.error
+
+proc realmInvItemIds*(inv: RealmInventory): seq[int] =
+  ## Distinct template ids across the realm, for one world-DB name join.
+  result = @[]
+  var seen = initTable[int, bool]()
+  for c in inv.characters:
+    for it in c.items:
+      if not seen.hasKey(it.itemId):
+        seen[it.itemId] = true
+        result.add(it.itemId)
+
+proc realmInventoryToJson*(
+    inv: RealmInventory, info: Table[int, ItemInfo]
+): JsonNode =
+  ## Serialize the realm inventory (JSON API / MCP share this shape).
+  var chars = %*[]
+  var itemTotal = 0
+  var moneyTotal = 0
+  for c in inv.characters:
+    itemTotal += c.itemTotal
+    moneyTotal += c.money
+    var items = %*[]
+    for it in c.items:
+      let known = info.hasKey(it.itemId)
+      items.add(%*{
+        "item_id": it.itemId,
+        "count": it.count,
+        "stacks": it.stacks,
+        "name": if known: info[it.itemId].name else: "",
+        "quality": if known: info[it.itemId].quality else: 0
+      })
+    chars.add(%*{
+      "guid": c.guid,
+      "name": c.name,
+      "level": c.level,
+      "class": className(c.classId),
+      "money_copper": c.money,
+      "gold": formatGold(c.money),
+      "online": c.online,
+      "item_total": c.itemTotal,
+      "stack_total": c.stackTotal,
+      "items": items
+    })
+  result = %*{
+    "characters": chars,
+    "character_count": inv.characters.len,
+    "item_total": itemTotal,
+    "money_copper_total": moneyTotal,
+    "age_sec": (if inv.fetchedAt > 0: epochTime() - inv.fetchedAt else: -1.0),
+    "error": inv.error
   }
 
 proc isAdminRequester*(name: string): bool =
@@ -4858,6 +5044,160 @@ proc inventoryPanelFor*(name: string): string =
     ids.add(item.itemId)
   result = renderInventoryPanelBody(inv, lookupItemInfo(ids))
 
+proc itemQualityClass*(quality: int): string =
+  ## Classic item quality → CSS colour class (unknown reads as common).
+  case quality
+  of 0: "q0"
+  of 2: "q2"
+  of 3: "q3"
+  of 4: "q4"
+  of 5: "q5"
+  of 6: "q6"
+  else: "q1"
+
+proc itemQualityLabel*(quality: int): string =
+  ## Classic item quality → word (tooltip / title text).
+  case quality
+  of 0: "poor"
+  of 2: "uncommon"
+  of 3: "rare"
+  of 4: "epic"
+  of 5: "legendary"
+  of 6: "artifact"
+  else: "common"
+
+proc sortRealmInvStacks*(
+    items: seq[RealmInvStack], info: Table[int, ItemInfo]
+): seq[RealmInvStack] =
+  ## Quality descending, then item name ascending. Unknown items sort last
+  ## under their raw id. "Unknown" is a missing NAME, not a missing key:
+  ## lookupItemInfo negative-caches a miss as an entry with an empty name and
+  ## quality 0, so keying off hasKey alone would file every unnamed id in with
+  ## the genuinely poor-quality loot.
+  result = items
+  proc qualityOf(id: int): int =
+    if info.hasKey(id) and info[id].name.len > 0: info[id].quality else: -1
+  proc nameOf(id: int): string =
+    if info.hasKey(id) and info[id].name.len > 0:
+      info[id].name.toLowerAscii()
+    else:
+      $id
+  result.sort(proc (a, b: RealmInvStack): int =
+    let qa = qualityOf(a.itemId)
+    let qb = qualityOf(b.itemId)
+    if qa != qb:
+      return cmp(qb, qa)
+    let na = nameOf(a.itemId)
+    let nb = nameOf(b.itemId)
+    if na != nb:
+      return cmp(na, nb)
+    return cmp(a.itemId, b.itemId)
+  )
+
+proc renderRealmInvCharacter*(
+    c: RealmInvCharacter, info: Table[int, ItemInfo]
+): string =
+  ## One collapsible character block: summary line + quality-sorted stacks.
+  let onlinePill =
+    if c.online:
+      """<span class="pill"><span class="dot on"></span> online</span>"""
+    else:
+      """<span class="pill"><span class="dot off"></span> offline</span>"""
+  var rows = ""
+  for it in sortRealmInvStacks(c.items, info):
+    # A negative-cached miss (empty name, quality 0) is unknown, not poor:
+    # colour it common rather than lying about grey vendor trash.
+    let known = info.hasKey(it.itemId) and info[it.itemId].name.len > 0
+    let quality = if known: info[it.itemId].quality else: 1
+    let name = if known: info[it.itemId].name else: &"Item#{it.itemId}"
+    let stackNote =
+      if it.stacks > 1: &"""<span class="meta"> ×{it.stacks}</span>"""
+      else: ""
+    rows.add(&"""
+          <tr>
+            <td class="name {itemQualityClass(quality)}"
+                title="{escapeHtml(itemQualityLabel(quality))}">{escapeHtml(name)}</td>
+            <td class="lvl">{it.count}{stackNote}</td>
+            <td class="conn">{it.itemId}</td>
+          </tr>
+""")
+  if rows.len == 0:
+    rows = """<tr><td colspan="3" class="empty">Bags empty.</td></tr>"""
+  result = &"""
+      <details class="inv-char">
+        <summary>
+          <span class="inv-name">{escapeHtml(c.name)}</span>
+          <span class="meta">lvl {c.level} {escapeHtml(className(c.classId))}</span>
+          <span class="gold">{escapeHtml(formatGold(c.money))}</span>
+          <span class="army-summary">{c.itemTotal} items · {c.stackTotal} stacks</span>
+          {onlinePill}
+        </summary>
+        <div class="inv-body">
+        <div class="table-scroll">
+        <table>
+          <thead>
+            <tr>
+              <th>Item</th>
+              <th>Qty</th>
+              <th>Id</th>
+            </tr>
+          </thead>
+          <tbody>
+{rows}
+          </tbody>
+        </table>
+        </div>
+        </div>
+      </details>
+"""
+
+proc renderRealmInventoryBody*(
+    inv: RealmInventory, info: Table[int, ItemInfo]
+): string =
+  ## Inventory tab body: realm totals + one block per character.
+  ## Degrades honestly — a DB error is a note, never a blank tab or a 500.
+  var errNote = ""
+  if inv.error.len > 0:
+    let firstLine = inv.error.splitLines()[0]
+    let stale =
+      if inv.characters.len > 0: " — showing the last good read"
+      else: ""
+    errNote = &"""
+      <p class="admin-err">Realm DB unavailable{stale}: {escapeHtml(firstLine)}</p>"""
+  if inv.characters.len == 0:
+    let empty =
+      if inv.error.len > 0:
+        """
+      <p class="empty">No inventory yet — start the realm on <a href="/admin">Admin</a>.</p>"""
+      else:
+        """
+      <p class="empty">No characters on this realm.</p>"""
+    return errNote & empty
+  var itemTotal = 0
+  var moneyTotal = 0
+  var blocks = ""
+  for c in inv.characters:
+    itemTotal += c.itemTotal
+    moneyTotal += c.money
+    blocks.add(renderRealmInvCharacter(c, info))
+  let age = if inv.fetchedAt > 0: epochTime() - inv.fetchedAt else: -1.0
+  let ageCls =
+    if age >= 0 and age <= RealmInvCacheSec * 2: "army-summary"
+    else: "army-summary stale"
+  result = &"""
+      <div class="panel-actions" style="margin-bottom:0.7rem">
+        <span class="army-summary">{inv.characters.len} characters · {itemTotal} items</span>
+        <span class="army-summary">{escapeHtml(formatGold(moneyTotal))} on the realm</span>
+        <span class="{ageCls}">read {formatAgeSec(age)} ago</span>
+      </div>
+{errNote}
+{blocks}"""
+
+proc realmInventoryPanel*(): string =
+  ## Single dispatch for the Inventory tab body: cached DB read + name join.
+  let inv = realmInventory()
+  result = renderRealmInventoryBody(inv, lookupItemInfo(realmInvItemIds(inv)))
+
 proc renderRosterOfflineRow*(): string =
   ## Roster body when the realm is down: friendly nudge, not a red error.
   result = """<tr><td colspan="11" class="empty">Realm offline — <a href="/admin">Admin</a> to start.</td></tr>"""
@@ -5136,6 +5476,31 @@ const DashboardCss = """
       margin-top: 0.75rem; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
       font-size: 0.8rem; color: var(--muted); white-space: pre-wrap;
     }
+    details.inv-char {
+      border: 1px solid var(--border); border-radius: 10px;
+      background: var(--panel2); margin-bottom: 0.5rem;
+    }
+    details.inv-char > summary {
+      cursor: pointer; padding: 0.55rem 0.85rem; list-style: none;
+      display: flex; flex-wrap: wrap; gap: 0.4rem 0.9rem; align-items: center;
+    }
+    details.inv-char > summary::-webkit-details-marker { display: none; }
+    details.inv-char > summary::before { content: "\25B8"; color: var(--muted); }
+    details.inv-char[open] > summary::before { content: "\25BE"; color: var(--accent); }
+    details.inv-char > summary:hover { background: rgba(108,182,255,0.06); }
+    .inv-name { font-weight: 650; font-size: 0.95rem; }
+    .inv-body { padding: 0 0.85rem 0.75rem; }
+    /* the roster styles gold as td.gold; the summary line is a span. */
+    .inv-char > summary .gold {
+      color: var(--accent); font-variant-numeric: tabular-nums; font-weight: 650;
+    }
+    .q0 { color: #9d9d9d; }
+    .q1 { color: var(--text); }
+    .q2 { color: #4ade4a; }
+    .q3 { color: #4d9bff; }
+    .q4 { color: #b76bf0; }
+    .q5 { color: #ff9a2e; }
+    .q6 { color: #e6cc80; }
 """
 
 proc navTabClass(active, tab: string): string =
@@ -5143,9 +5508,10 @@ proc navTabClass(active, tab: string): string =
   if active == tab: " class=\"active\"" else: ""
 
 proc renderNav*(active: string): string =
-  ## Tab strip: Army | Murist | Advisor | Traverse | Admin.
+  ## Tab strip: Army | Murist | Inventory | Advisor | Traverse | Admin.
   let army = navTabClass(active, "army")
   let murist = navTabClass(active, "murist")
+  let inventory = navTabClass(active, "inventory")
   let advisor = navTabClass(active, "advisor")
   let traverse = navTabClass(active, "traverse")
   let admin = navTabClass(active, "admin")
@@ -5153,6 +5519,7 @@ proc renderNav*(active: string): string =
 <nav class="tabs" role="tablist">
   <a{army} href="/army" role="tab">Army</a>
   <a{murist} href="/murist" role="tab">Murist</a>
+  <a{inventory} href="/inventory" role="tab">Inventory</a>
   <a{advisor} href="/advisor" role="tab">Advisor</a>
   <a{traverse} href="/traverse" role="tab">Traverse</a>
   <a{admin} href="/admin" role="tab">Admin</a>
@@ -5241,6 +5608,29 @@ proc renderArmyPage*(
       </div>
     </section>"""
   result = renderDashboard("Army", "army", body)
+
+proc renderInventoryPage*(inventoryBody: string): string =
+  ## Inventory tab: every character on the realm and what they are carrying.
+  ## Refresh is a button, not a poll: a background swap would snap every
+  ## expanded character shut under the human's cursor, and bags move slowly
+  ## enough that a 30s server cache is the freshness that matters.
+  let body = &"""
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Realm inventory</h2>
+        <div class="panel-actions">
+          <span class="badge accent">characters DB</span>
+          <button class="btn"
+                  hx-get="/inventory/all"
+                  hx-target="#realm-inventory"
+                  hx-swap="innerHTML settle:0s swap:0s">Refresh</button>
+        </div>
+      </div>
+      <div class="panel-body" id="realm-inventory">
+{inventoryBody}
+      </div>
+    </section>"""
+  result = renderDashboard("Inventory", "inventory", body)
 
 proc filterEventsByName*(events: seq[AddonEvent], name: string): seq[AddonEvent] =
   ## Keep events for one character name (case-sensitive DB/chat name).
@@ -5940,6 +6330,29 @@ proc muristInventoryHandler(request: Request) {.gcsafe.} =
     request.respond(500, htmlHeaders(),
       &"""<p class="empty">error: {escapeHtml(e.msg)}</p>""")
 
+proc inventoryPageHandler(request: Request) {.gcsafe.} =
+  ## GET /inventory — Inventory tab: realm-wide bags from the characters DB.
+  try:
+    var body = ""
+    {.gcsafe.}:
+      body = realmInventoryPanel()
+    request.respond(200, htmlHeaders(), renderInventoryPage(body))
+  except Exception as e:
+    # A dead DB is already handled inside the panel; this is the last net.
+    request.respond(200, htmlHeaders(), renderInventoryPage(
+      &"""<p class="admin-err">inventory unavailable: {escapeHtml(e.msg)}</p>"""))
+
+proc inventoryAllHandler(request: Request) {.gcsafe.} =
+  ## GET /inventory/all — htmx fragment: the Inventory tab body.
+  try:
+    var body = ""
+    {.gcsafe.}:
+      body = realmInventoryPanel()
+    request.respond(200, htmlHeaders(), body)
+  except Exception as e:
+    request.respond(200, htmlHeaders(),
+      &"""<p class="admin-err">inventory unavailable: {escapeHtml(e.msg)}</p>""")
+
 proc seatsPartialHandler(request: Request) {.gcsafe.} =
   ## GET /seats — htmx fragment: seat babysitter panel body.
   try:
@@ -6245,6 +6658,8 @@ proc serverInfoHandler(request: Request) {.gcsafe.} =
       "endpoints": {
         "army": "/army",
         "murist": "/murist",
+        "inventory": "/inventory",
+        "inventory_all": "/inventory/all",
         "advisor": "/advisor",
         "traverse": "/traverse",
         "admin": "/admin",
@@ -6743,6 +7158,8 @@ proc main() =
   router.get("/murist/quests", muristQuestsHandler)
   router.get("/murist/events", muristEventsHandler)
   router.get("/murist/inventory", muristInventoryHandler)
+  router.get("/inventory", inventoryPageHandler)
+  router.get("/inventory/all", inventoryAllHandler)
   router.get("/seats", seatsPartialHandler)
   router.get("/advisor", advisorPageHandler)
   router.get("/traverse", traversePageHandler)
@@ -6774,6 +7191,7 @@ proc main() =
   echo &"{ServerName} v{Version} listening on http://127.0.0.1:{port}"
   echo &"  Army:        GET  http://127.0.0.1:{port}/army"
   echo &"  Murist:      GET  http://127.0.0.1:{port}/murist"
+  echo &"  Inventory:   GET  http://127.0.0.1:{port}/inventory (/inventory/all fragment)"
   echo &"  Advisor:     GET  http://127.0.0.1:{port}/advisor"
   echo &"  Traverse:    GET  http://127.0.0.1:{port}/traverse"
   echo &"  Traverse ops POST /traverse/pol/start|/stop  /traverse/watch/start|/stop"
