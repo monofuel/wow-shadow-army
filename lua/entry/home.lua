@@ -6,6 +6,7 @@ local solo = require("accelerated")
 -- repo's lua/ and lua/entry/, so a bare "road_route" does not resolve at
 -- runtime even though the test harness puts lua/tools on LUA_PATH.
 local road_route = require("tools.road_route")
+local disposition = require("tools.item_disposition")
 -- Home is the dogfood pen, not a scored league: run the soft-quest path here
 -- so the new quest stack gets exercised where monofuel can watch. Scored
 -- leagues stay grind-only until a rerun A/B beats the 4.791 baseline.
@@ -57,6 +58,7 @@ local STUCK_GAP_SECONDS = 2.0
 
 local CLASS_WARRIOR = 1
 local CLASS_PRIEST = 5
+local CLASS_MAGE = 8
 local CLASS_WARLOCK = 9
 
 -- Life Tap paid out of combat to fund a pet summon. Higher floor than the
@@ -112,6 +114,9 @@ local AURA_FAMILIES = {
   ["power word fortitude"] = { 1243, 1244, 1245, 2791, 10937, 10938 },
   ["inner fire"] = { 588, 7128, 602, 1006, 10951, 10952 },
   ["shadow word pain"] = { 589, 594, 970, 992, 2767, 10892, 10893, 10894 },
+  ["frost armor"] = { 168, 7300, 7301 },
+  ["ice armor"] = { 7302, 7320, 10219, 10220 },
+  ["mage armor"] = { 6117, 22782, 22783 },
 }
 
 local function lower(value)
@@ -604,6 +609,232 @@ local function loot_roll_step(view)
   return nil
 end
 
+-- Vendor sell (monofuel, 2026-08-16: "if our bot has gear that it can't
+-- equip, it should sell"). The disposition table is pure and lives in
+-- lua/tools/item_disposition.lua; this is only the WHEN and the throttle.
+--
+-- FEATURE-DETECTED, AND TODAY IT DETECTS NOTHING. The fork's Observation
+-- carries every fact this needs — inventory_items rows with class/subclass/
+-- quality/container_slots, equipment_items with the four carried-bag slots,
+-- merchant_open/merchant_guid — but bots/lua_bot/view.nim projects none of
+-- them into the Lua view, and the ui_press intent only ever left-clicks
+-- (selling a bag item is a RIGHT click: environment/client/ui/
+-- inventory_item_button.nim:352). So a live seat takes the first `return nil`
+-- below every time and this costs one table lookup per tick. Ticket
+-- tickets/open/0073 is the fork half. Same idiom as view.chat_send_supported:
+-- a host that cannot carry the verb simply leaves the flag unset.
+--
+-- The middle state is the useful one while 0073 is open: as soon as the view
+-- carries the rows, the seat LOGS the shortlist it would sell at every vendor
+-- it opens, so monofuel can read the policy's judgement out of wow.log before
+-- any item actually moves.
+local VENDOR_SELL_GAP_SECONDS = 0.6
+local vendor_last_sell_at = nil
+local vendor_merchant = nil
+local vendor_sold = {}
+local vendor_reported = false
+local vendor_gap_logged = false
+
+local function vendor_forget()
+  vendor_merchant = nil
+  vendor_sold = {}
+  vendor_reported = false
+end
+
+local function vendor_sell_step(view, now)
+  if not view.merchant_open then
+    vendor_forget()
+    return nil
+  end
+  local merchant = tostring(view.merchant_guid or "0")
+  if merchant ~= vendor_merchant then
+    vendor_merchant = merchant
+    vendor_sold = {}
+    vendor_reported = false
+  end
+
+  local items = view.inventory_items
+  if type(items) ~= "table" then
+    if not vendor_gap_logged then
+      vendor_gap_logged = true
+      wow.log("vendor: bags not projected into the lua view " ..
+        "(fork gap, tickets/open/0073) — nothing to sell from here")
+    end
+    return nil
+  end
+
+  local plan = disposition.evaluate({
+    items = items,
+    equipment = view.equipment_items,
+    player = { class_id = view.class_id, level = view.level },
+  })
+
+  if not vendor_reported then
+    vendor_reported = true
+    local names = {}
+    for i = 1, #plan.sell do
+      names[i] = string.format("%s(%s)", tostring(plan.sell[i].name),
+        tostring(plan.sell[i].reason))
+    end
+    wow.log(string.format("vendor: %d/%d bag items to sell for %dc — %s",
+      #plan.sell, #plan.items, plan.sell_copper,
+      #names > 0 and table.concat(names, ", ") or "nothing"))
+  end
+
+  -- Everything above is observation and is safe on any host. Only this last
+  -- step moves an item, and only a host that says it can.
+  if not view.sell_supported then return nil end
+  if vendor_last_sell_at and now - vendor_last_sell_at < VENDOR_SELL_GAP_SECONDS then
+    return nil
+  end
+  for i = 1, #plan.sell do
+    local row = plan.sell[i]
+    local guid = tostring(row.item_guid or "0")
+    if guid ~= "0" and not vendor_sold[guid] then
+      vendor_sold[guid] = true
+      vendor_last_sell_at = now
+      wow.log(string.format("vendor: selling %s x%d — %s",
+        tostring(row.name), row.count, row.reason))
+      return { kind = "sell_item", guid = view.merchant_guid,
+        item_guid = row.item_guid, count = row.count,
+        reason = "vendor_sell_" .. tostring(row.tag):lower() }
+    end
+  end
+  return nil
+end
+
+-- Equip carried bags (tickets/open/0073's own closing note: "the *first* order
+-- fix there is EQUIP, not sell"). This is the half that actually unwedges a
+-- full-bag seat, and unlike selling it needs no vendor, no travel, and no
+-- money: the seat is already carrying the pouches, it just never wore them.
+-- Full bags hard-block quest turn-ins — vanilla refuses an item reward with
+-- zero free slots — so every tick a spare bag stays in the backpack is a
+-- turn-in the seat cannot complete.
+--
+-- Deliberately narrow. It ONLY fills an EMPTY carried-bag slot (equipment
+-- slots 19..22). Swapping a worn bag for a roomier one means moving the
+-- contents of the old bag first, which nothing here can do, and getting it
+-- wrong drops items on the floor. `item_disposition` already draws the same
+-- line from the other side: with a free slot it refuses to sell any bag
+-- ("free bag slot — equip it"), and it only starts selling spares once all
+-- four slots are full. The two halves meet exactly, with no window where a
+-- bag is both equip-able and sell-able.
+--
+-- FEATURE-DETECTED like the sell half: a host that cannot carry the verb
+-- leaves `equip_supported` unset and this costs one table lookup per tick.
+local EQUIP_GAP_SECONDS = 3.0
+local equip_last_at = nil
+local equip_tried = {}
+
+local function equip_bags_step(view, now)
+  if not view.equip_supported then return nil end
+  -- The verb rejects in combat host-side (bots/lua_bot/pilot.nim), and a
+  -- corpse cannot rummage through its own backpack. Refusing here keeps the
+  -- rejection out of the status line.
+  if view.in_combat or view.is_dead or view.is_ghost then return nil end
+  local items = view.inventory_items
+  if type(items) ~= "table" then return nil end
+
+  -- An empty carried-bag slot is the whole precondition. `equipped_bags`
+  -- counts the filled ones; four means there is nothing to fill and the
+  -- spare is the sell path's problem, not ours.
+  local bags = disposition.equipped_bags(view.equipment_items)
+  if bags.count >= disposition.BAG_SLOT_COUNT then return nil end
+
+  if equip_last_at and now - equip_last_at < EQUIP_GAP_SECONDS then
+    return nil
+  end
+
+  -- Largest first: with N free slots and more bags than that, the seat should
+  -- end up wearing the roomiest ones. Ties break on the row order the
+  -- Observation gave us, so the choice is stable across ticks.
+  local best, best_slots = nil, 0
+  for i = 1, #items do
+    local row = items[i] or {}
+    local guid = tostring(row.item_guid or "0")
+    local slots = tonumber(row.container_slots) or 0
+    if guid ~= "0" and not equip_tried[guid] and
+        tonumber(row.item_class_id) == disposition.CLASS_CONTAINER and
+        slots > 0 and row.definition_known ~= false and
+        not disposition.NEVER_SELL_ITEM_IDS[tonumber(row.item_id) or 0] and
+        -- A bag with something in it is someone else's decision: equipping it
+        -- is safe, but the seat has no way to know why it is packed.
+        (tonumber(row.container_item_count) or 0) == 0 then
+      if slots > best_slots then best, best_slots = row, slots end
+    end
+  end
+  if not best then return nil end
+
+  local guid = tostring(best.item_guid)
+  equip_tried[guid] = true
+  equip_last_at = now
+  wow.log(string.format(
+    "bags: equipping %s (%d slots) into free bag slot %d/%d",
+    tostring(best.name), best_slots, bags.count + 1,
+    disposition.BAG_SLOT_COUNT))
+  return { kind = "equip_item", item_guid = best.item_guid,
+    reason = "equip_bag" }
+end
+
+-- Sell only works with an open merchant. A solo seat with 0 free slots and
+-- a backpack of grey junk never opens one, so turn-ins stay refused forever
+-- (Legia, quest 376, 2026-08-16). Walk to the nearest unit advertising
+-- vendor and interact; vendor_sell_step takes the next ticks.
+local VENDOR_SEEK_FREE_SLOTS = 2
+local VENDOR_INTERACT_STOP = 3.5
+
+local function unit_has_service(unit, name)
+  for i = 1, #(unit.services or {}) do
+    if unit.services[i] == name then return true end
+  end
+  return false
+end
+
+local function nearest_vendor(view)
+  local best, best_d = nil, nil
+  for _, unit in ipairs(view.units or {}) do
+    if unit_has_service(unit, "vendor") and
+        not (unit.death_known and unit.is_dead) and
+        unit.object_kind ~= "player" then
+      local d = tonumber(unit.distance) or 1e9
+      if not best_d or d < best_d then best, best_d = unit, d end
+    end
+  end
+  return best, best_d
+end
+
+local function vendor_seek_step(view)
+  if view.in_combat or view.is_dead or view.is_ghost then return nil end
+  if view.merchant_open then return nil end
+  if not view.sell_supported then return nil end
+  if party_member(view, MURIST) then return nil end
+  if not view.bag_space_known then return nil end
+  local free = tonumber(view.free_bag_slots)
+  if free == nil or free > VENDOR_SEEK_FREE_SLOTS then return nil end
+  local items = view.inventory_items
+  if type(items) ~= "table" then return nil end
+  local plan = disposition.evaluate({
+    items = items,
+    equipment = view.equipment_items,
+    player = { class_id = view.class_id, level = view.level },
+  })
+  if #plan.sell == 0 then return nil end
+  local vendor = nearest_vendor(view)
+  if not vendor then return nil end
+  if (view.quest_frame or {}).open or view.gossip_open then
+    if free > 0 then return nil end
+    return { kind = "ui_press", control = "QuestFrameCancelButton",
+      reason = "vendor_clear_dialog" }
+  end
+  return {
+    kind = "interact",
+    guid = vendor.guid,
+    stop_distance = VENDOR_INTERACT_STOP,
+    route_profile = "prefer_ground",
+    reason = "open_vendor",
+  }
+end
+
 local function role_for(view)
   if view.class_id == CLASS_WARRIOR then return "tank" end
   if view.class_id == CLASS_PRIEST then return "healer" end
@@ -845,6 +1076,15 @@ local function warrior_action(view, target)
         stop_distance = 4.0, reason = "tank_taunt_party_attacker" }
     end
   end
+  if not view.in_combat then
+    local d = target.combat_distance_known and target.combat_distance
+      or target.distance
+    local charge = pick_spell(view, { "Charge" })
+    if charge and d and d >= 8.0 and d <= 25.0 then
+      return { kind = "attack", guid = target.guid, spell = charge.spell_id,
+        stop_distance = 25.0, reason = "warrior_charge" }
+    end
+  end
   local threat = pick_spell(view, {
     "Sunder Armor", "Revenge", "Heroic Strike", "Thunder Clap",
     "Demoralizing Shout", "Battle Shout",
@@ -869,9 +1109,23 @@ local function priest_damage(view, target)
     reason = spell and "priest_damage" or "priest_melee" }
 end
 
+local function mage_action(view, target)
+  local blast = pick_spell(view, { "Fire Blast" })
+  if blast then
+    return { kind = "attack", guid = target.guid, spell = blast.spell_id,
+      stop_distance = 22.0, reason = "mage_fire_blast" }
+  end
+  local filler = pick_spell(view, { "Fireball", "Frostbolt", "Shoot" })
+  return { kind = "attack", guid = target.guid,
+    spell = filler and filler.spell_id or nil,
+    stop_distance = filler and 22.0 or 4.0,
+    reason = filler and "mage_nuke" or "mage_melee_fallback" }
+end
+
 local function self_buff(view, role)
   local priorities = role == "tank" and { "Battle Shout" }
     or role == "healer" and { "Inner Fire" }
+    or view.class_id == CLASS_MAGE and { "Ice Armor", "Frost Armor", "Mage Armor" }
     or { "Demon Armor", "Demon Skin" }
   for _, name in ipairs(priorities) do
     local spell, family = pick_spell(view, { name })
@@ -1001,8 +1255,20 @@ local function chat_step(view, now)
     chat_last_sent_at = now
     return nil
   end
+  -- 0066 transport: the chat intent goes straight to the command queue and
+  -- the edit box NEVER opens, so "saw the box close" can't complete a send —
+  -- waiting for it re-queued every line until the timeout, ~2 sends per
+  -- banter (rollout executor's finding). One emission IS the send now: the
+  -- pilot's queue + 0.6s floor own delivery. The box-watch path stays only
+  -- for a pre-0066 host, where the box still appears.
   if view.chat_input_visible then chat_pending.saw_box = true end
-  local finished = chat_pending.saw_box and not view.chat_input_visible
+  if not chat_pending.emitted then
+    chat_pending.emitted = true
+    return { kind = "chat", channel = "party", text = chat_pending.text,
+      reason = "party_banter" }
+  end
+  local finished = (chat_pending.saw_box and not view.chat_input_visible)
+    or not view.chat_input_visible
   local expired = now - chat_pending.started_at > CHAT_SEND_TIMEOUT
   if finished or expired then
     wow.log("chat: " .. (finished and "sent " or "gave up on ") ..
@@ -1025,6 +1291,10 @@ function M.reset()
   chat_last_poll_at = nil
   chat_last_sent_at = nil
   chat_pending = nil
+  vendor_forget()
+  vendor_last_sell_at = nil
+  equip_last_at = nil
+  equip_tried = {}
 end
 
 function M.decide(view)
@@ -1036,6 +1306,24 @@ function M.decide(view)
   -- corpse run or a follow leg loses nothing by resuming next tick.
   local roll = loot_roll_step(view)
   if roll then return finish(roll, view, "loot_roll", role) end
+
+  -- Standing at an open merchant is the only moment a sale is possible, and
+  -- it ends the instant anything else moves the seat — so it runs before the
+  -- escort, the same way the loot roll does. Inert until the fork projects
+  -- bags into the view (tickets/open/0073).
+  local sale = vendor_sell_step(view, now)
+  if sale then return finish(sale, view, "vendor", role) end
+
+  -- Wearing a carried bag costs one tick and needs no vendor, so it runs
+  -- right behind the sale and ahead of the escort: a seat with zero free
+  -- slots cannot accept a quest reward, and every bag it is carrying instead
+  -- of wearing is six slots it already owns. Self-limiting — at most four
+  -- bags exist to equip, and the step goes quiet once the slots are full.
+  local wear = equip_bags_step(view, now)
+  if wear then return finish(wear, view, "vendor", role) end
+
+  local seek = vendor_seek_step(view)
+  if seek then return finish(seek, view, "vendor", role) end
 
   -- Flush a STRANDED chat box before any state machine runs — recovery
   -- included, since /reclaim is itself chat-driven and types into the same
@@ -1198,6 +1486,7 @@ function M.decide(view)
   if target then
     local action = role == "tank" and warrior_action(view, target)
       or role == "healer" and priest_damage(view, target)
+      or view.class_id == CLASS_MAGE and mage_action(view, target)
       or warlock_action(view, target)
     return finish(action, view, "escort", role, leader, target)
   end
