@@ -67,8 +67,8 @@ ShadowArmyQuestData = {
   ("anyone"), so a reader must treat a missing field as "no gate" and never as
   "matches nothing". They ride on the primary entry *and* on every `alts`
   variant, because their whole reason for existing is telling variants apart
-  (see title collisions below). 1221 of 4394 emitted variants carry at least
-  one; the other 3173 are open to everybody.
+  (see title collisions below). 1091 of 4121 emitted variants carry at least
+  one; the other 3030 are open to everybody.
 - `from` names who to hunt for an item objective — the densest in-zone
   sources (up to 4, selected by spawn-point count, NOT drop rate), emitted
   alphabetically for a stable file; do not read `from[1]` as "best".
@@ -190,7 +190,7 @@ filters on it, and templates with several patch rows resolve to the highest
   zone-normalized space the addon uses. ~830 item objectives and ~79 mob/GO
   objectives are instance-only. A future rev could fall back to the *dungeon
   entrance* coordinates.
-- **Title collisions.** The quest log gives titles, not ids, and 1344 locatable
+- **Title collisions.** The quest log gives titles, not ids, and 1075 locatable
   quests share a title with an earlier one (faction mirrors, "Wanted!" bounty
   boards, chain steps like Fields of Grief 365→407, class quests keyed by
   race). The lower-level quest is the primary entry and every other variant is
@@ -234,13 +234,31 @@ filters on it, and templates with several patch rows resolve to the highest
 
   This file only **emits** the masks. Choosing a variant with them is
   `QuestModel.resolve`'s job in the addon.
-- **Same entry emitted twice.** `quest_template` is patch-ranged like every
-  other template table, and unlike `item_template` the quest read does not
-  collapse a quest's rows to the highest `patch <= 10` — it takes them all. So
-  a quest with two patch rows appears twice in its own `alts` list (visible as
-  the duplicated `id@Llevel` pairs in the ambiguity audit). Harmless to the
-  label resolver, since duplicates agree on everything, but it inflates the
-  variant counts above and it is the obvious next cleanup.
+
+  **The ambiguity numbers in this bullet — 590 / 503 / 240 and the identity
+  table — were measured before the 0059 patch collapse and have not been
+  re-run.** They are an upper bound now: the collapse removed 127 alts blocks
+  and every duplicate id inside them, so the true counts are lower. Re-running
+  the audit is the honest next step; the shape of the argument (identity masks
+  help, the reputation-gated cloth donations resist) does not depend on it.
+- ~~**Same entry emitted twice.**~~ **Fixed (ticket 0059).** `quest_template`
+  is patch-ranged like every other template table, and the quest read used to
+  take *all* a quest's rows instead of collapsing to the highest `patch <= 10`
+  the way `load_template` does for items. 4433 quests arrived as 4727 rows, so
+  a patched quest was two separate quests all the way through and — sharing a
+  Title — listed itself twice in its own `alts`. Measured on the emitted file:
+  **35 of 590 alts blocks carried duplicate quest ids; now 0 of 463.** Title
+  collisions fall 1344 → 1075 and the file shrinks 1.64 → 1.53 MiB.
+
+  It was not as harmless as this entry used to claim. **12 entries change
+  their `Title` between patches**, because VMaNGOS reuses a retired quest's
+  entry id for new content, and taking every row meant emitting quests the
+  realm does not serve. Entry 171 is "Four-legged Menaces" at patch 0 and
+  **"A Warden of the Alliance" at patch 8** — on a `WowPatch = 10` realm only
+  the latter exists. Four titles leave the file for this reason and none of
+  them should have been in it: *Four-legged Menaces*, *Ambushed In The Forest*,
+  *Escaping the Hive*, *Arathi Basin Resources!*. Emitted unique titles go
+  3050 → 3046; that is the whole of the loss, and it is a correction.
 - **Items with no locatable source** (~1103 objectives): crafted, vendor-bought,
   handed out by scripts/spells, or produced by quest-object interactions that
   do not go through a loot template.

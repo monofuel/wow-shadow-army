@@ -12,6 +12,8 @@ world->zone converter from tools/gen_quest_data.py and re-emit them per zone.
 Reads (read-only, never writes):
   * tools/data/road_waypoints_azeroth.jsonl, road_waypoints_kalimdor.jsonl
   * WorldMapArea.dbc + AreaTable.dbc, via gen_quest_data.MapAreas
+  * the extracted terrain grids (maps/*.map), for the per-cell area ids that
+    arbitrate which zone a point is really in -- see TerrainAreas
 
 No DB, no realm, no network — the artifacts and the DBCs are the whole input.
 
@@ -33,6 +35,7 @@ import argparse
 import json
 import math
 import os
+import struct
 import sys
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
@@ -45,6 +48,9 @@ from gen_quest_data import DEFAULT_DBC_DIR, MapAreas  # noqa: E402
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_OUT = os.path.join(_REPO, "addons", "ShadowArmy", "RoadData.lua")
 DEFAULT_DATA_DIR = os.path.join(_REPO, "tools", "data")
+# The terrain grids sit next to the DBCs in the same extracted-data tree, so
+# the default tracks --dbc-dir instead of hardcoding a second path.
+DEFAULT_MAP_DIR = os.path.join(os.path.dirname(DEFAULT_DBC_DIR), "maps")
 
 # Continent artifacts in emit order. map_id comes from each file's meta line
 # (roads.nim defaults it to 1), these are only the filenames.
@@ -177,7 +183,173 @@ def load_segments(path: str) -> Tuple[int, List[List[Tuple[float, float, float]]
     return map_id, out
 
 
+# --- ground-truth zone footprints (ticket 0059) ----------------------------
+# WorldMapArea boxes are axis-aligned rectangles over zones that are not
+# rectangles, so outdoor boxes overlap outdoor boxes: Western Plaguelands' box
+# reaches west past Tirisfal x~57.9 and swallows Brill, and the smallest-box
+# rule then files the whole Brill corridor under zone 28. 0050 fixed the
+# capital case with a containment rule; nothing about containment helps when
+# two peer boxes simply overlap, and WorldMapOverlay.dbc was measured as an
+# arbiter and rejected (its rects sprawl too, re-filing 1858-2854 points
+# including obvious bulk mistakes).
+#
+# The client does not use boxes to answer "what zone am I in" -- it reads the
+# terrain. vmangos' extractor bakes exactly that into maps/*.map: a per-cell
+# AreaTable.exploreFlag grid, 16x16 cells over each 533.33-unit terrain grid,
+# which is the zone footprint at its real shape rather than its bounding box.
+# Walking that area id up AreaTable.parentAreaId gives the zone the client
+# itself would name. That is ground truth, so it arbitrates; the box rule stays
+# as the fallback for cells the grids do not answer for.
+#
+# File format, verified against this build's files and
+# local_data/reference/vmangos-core/src/game/Maps/GridMapDefines.h:
+#   header  : 'MAPS', 'z1.4', then 8 uint32 offset/size pairs (40 bytes)
+#   at areaMapOffset: 'AREA', uint16 flags, uint16 gridArea
+#     flags & MAP_AREA_NO_AREA -> the whole grid is gridArea, no table follows
+#     otherwise                -> uint16[16*16] cell table
+# Both magics are checked before any offset is trusted.
+MAP_MAGIC = b"MAPS"
+MAP_VERSION_MAGIC = b"z1.4"
+MAP_AREA_MAGIC = b"AREA"
+MAP_AREA_NO_AREA = 0x0001
+# GridDefines.h SIZE_OF_GRIDS; 64x64 grids of 16x16 area cells per continent.
+SIZE_OF_GRIDS = 533.33333
+_MAP_HEADER = struct.Struct("<4s4s8I")
+_AREA_HEADER = struct.Struct("<4sHH")
+_AREA_CELLS = struct.Struct("<256H")
+
+
+class TerrainAreas:
+    """world (map, x, y) -> AreaTable id, from the extracted terrain grids.
+
+    Indexing is vmangos' own, not a re-derivation (GridMap.cpp
+    TerrainInfo::GetGrid + GridMap::getArea): the grid file for a point is
+    `%03u%02u%02u.map` % (mapId, int(32 - worldX/SIZE), int(32 - worldY/SIZE)),
+    and inside it the cell is `[lx * 16 + ly]` with lx from worldX and ly from
+    worldY. Note the axis pairing is the same swap the addon's map percent
+    uses, and for the same reason -- it is left alone here too.
+
+    Grids are memoised on first touch, and a miss is cached too so a road along
+    an unbuilt tile does not re-stat it per point. This bake's 10211 points
+    touch 285 tiles, all of them readable, so the working set is ~145 KiB of
+    uint16.
+    """
+
+    def __init__(self, map_dir: str) -> None:
+        self.map_dir = map_dir
+        # (map, tileA, tileB) -> (flat area, cell table or None); None == no file
+        self._grids: Dict[Tuple[int, int, int], Optional[Tuple[int, Optional[Sequence[int]]]]] = {}
+        self.bad_files: List[str] = []
+
+    def available(self) -> bool:
+        return os.path.isdir(self.map_dir)
+
+    def _grid(self, map_id: int, ta: int, tb: int
+              ) -> Optional[Tuple[int, Optional[Sequence[int]]]]:
+        key = (map_id, ta, tb)
+        if key in self._grids:
+            return self._grids[key]
+        path = os.path.join(self.map_dir, "%03u%02u%02u.map" % (map_id, ta, tb))
+        grid: Optional[Tuple[int, Optional[Sequence[int]]]] = None
+        try:
+            with open(path, "rb") as fh:
+                blob = fh.read()
+        except IOError:
+            blob = b""  # ocean and unbuilt tiles simply have no file
+        if len(blob) >= _MAP_HEADER.size:
+            fields = _MAP_HEADER.unpack_from(blob, 0)
+            if fields[0] != MAP_MAGIC or fields[1] != MAP_VERSION_MAGIC:
+                self.bad_files.append(path)
+            else:
+                off = fields[2]  # areaMapOffset
+                if off and len(blob) >= off + _AREA_HEADER.size:
+                    fourcc, flags, grid_area = _AREA_HEADER.unpack_from(blob, off)
+                    if fourcc != MAP_AREA_MAGIC:
+                        self.bad_files.append(path)
+                    elif flags & MAP_AREA_NO_AREA:
+                        grid = (grid_area, None)
+                    elif len(blob) >= off + _AREA_HEADER.size + _AREA_CELLS.size:
+                        cells = _AREA_CELLS.unpack_from(
+                            blob, off + _AREA_HEADER.size)
+                        grid = (grid_area, cells)
+                    else:
+                        self.bad_files.append(path)
+        self._grids[key] = grid
+        return grid
+
+    def explore_flag(self, map_id: int, wx: float, wy: float) -> int:
+        """AreaTable.exploreFlag under this point, or 0 if the grid has none."""
+        gx = 32.0 - wx / SIZE_OF_GRIDS
+        gy = 32.0 - wy / SIZE_OF_GRIDS
+        if not (0.0 <= gx < 64.0 and 0.0 <= gy < 64.0):
+            return 0
+        grid = self._grid(map_id, int(gx), int(gy))
+        if grid is None:
+            return 0
+        flat, cells = grid
+        if cells is None:
+            return flat
+        return cells[(int(16.0 * gx) & 15) * 16 + (int(16.0 * gy) & 15)]
+
+    def zone(self, map_id: int, wx: float, wy: float, areas: MapAreas) -> int:
+        """The mappable zone the terrain says owns this point, or 0."""
+        flag = self.explore_flag(map_id, wx, wy)
+        if not flag:
+            return 0  # cell never assigned an area; the box rule still gets a say
+        area = areas.area_by_flag.get((map_id, flag), 0)
+        if not area:
+            return 0
+        return areas.zone_of_area(area)
+
+
 Hit = Optional[Tuple[int, float, float]]
+
+
+def locate_points(world: Sequence[Tuple[float, float, float]], map_id: int,
+                  areas: MapAreas, terrain: Optional[TerrainAreas],
+                  moves: Optional[Dict[Tuple[int, int], int]] = None
+                  ) -> Tuple[List[Hit], int, int]:
+    """Zone-locate every point of one polyline, terrain first, boxes second.
+
+    The box rule runs for every point regardless, because the answer still has
+    to be expressed in some zone's map percent and only a box can do that. What
+    the terrain decides is WHICH zone gets to do the projecting:
+
+      * terrain names a zone and that zone's box covers the point -> terrain
+        wins, and the point is projected into that zone's percent space;
+      * terrain names a zone whose box does NOT reach the point -> the box rule
+        keeps it. This is the honest edge: a WorldMapArea box can be slightly
+        tighter than the terrain it describes, and a percent outside 0..100 is
+        not a coordinate the addon can draw. Counted as `stranded`.
+      * terrain says nothing (unbuilt tile, unassigned cell) -> box rule.
+
+    Returns (hits, points the terrain moved, points stranded off their box).
+    `moves`, if given, tallies (box zone -> terrain zone) so the generator can
+    show which overlaps the arbiter is actually correcting.
+    """
+    hits: List[Hit] = []
+    moved = stranded = 0
+    for wx, wy, _z in world:
+        box_hit = areas.locate(map_id, wx, wy)
+        if terrain is None:
+            hits.append(box_hit)
+            continue
+        gz = terrain.zone(map_id, wx, wy, areas)
+        if not gz or (box_hit is not None and box_hit[0] == gz):
+            hits.append(box_hit)
+            continue
+        pct = areas.project(gz, wx, wy)
+        if pct is None:
+            if box_hit is not None:
+                stranded += 1
+            hits.append(box_hit)
+            continue
+        hits.append((gz, pct[0], pct[1]))
+        moved += 1
+        if moves is not None:
+            key = (box_hit[0] if box_hit else 0, gz)
+            moves[key] = moves.get(key, 0) + 1
+    return hits, moved, stranded
 
 
 def resurface_capitals(world: Sequence[Tuple[float, float, float]],
@@ -234,8 +406,11 @@ def resurface_capitals(world: Sequence[Tuple[float, float, float]],
 
 def split_by_zone(world: Sequence[Tuple[float, float, float]], map_id: int,
                   areas: MapAreas, capitals: Optional[Set[int]] = None,
-                  z_band: float = CAPITAL_Z_BAND
-                  ) -> Tuple[List[Tuple[int, List[Tuple[float, float]]]], int]:
+                  z_band: float = CAPITAL_Z_BAND,
+                  terrain: Optional[TerrainAreas] = None,
+                  moves: Optional[Dict[Tuple[int, int], int]] = None
+                  ) -> Tuple[List[Tuple[int, List[Tuple[float, float]]]], int,
+                             int, int]:
     """Cut one world polyline into runs of consecutive same-zone points.
 
     A continent road crosses zone boundaries constantly and the addon's map
@@ -243,9 +418,14 @@ def split_by_zone(world: Sequence[Tuple[float, float, float]], map_id: int,
     another coordinate system. Points with no zone map at all (open sea, the
     handful of unmapped strips between zones) end the current run.
 
-    Returns (runs, points re-filed out of a capital box).
+    The capital pass still runs after the terrain arbiter, because it answers a
+    question the terrain cannot: it is driven by the polyline's own continuity
+    and so it also covers points the grids have no area for.
+
+    Returns (runs, capital re-files, terrain re-files, terrain strandings).
     """
-    hits: List[Hit] = [areas.locate(map_id, wx, wy) for wx, wy, _ in world]
+    hits, arbitrated, stranded = locate_points(world, map_id, areas, terrain,
+                                               moves)
     moved = resurface_capitals(world, hits, map_id, areas, capitals or set(),
                                z_band)
     runs: List[Tuple[int, List[Tuple[float, float]]]] = []
@@ -265,7 +445,7 @@ def split_by_zone(world: Sequence[Tuple[float, float, float]], map_id: int,
         current.append((mx, my))
     if len(current) >= MIN_SEGMENT_POINTS:
         runs.append((zone, current))
-    return runs, moved
+    return runs, moved, arbitrated, stranded
 
 
 def decimate(points: Sequence[Tuple[float, float]],
@@ -523,6 +703,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--dbc-dir", default=DEFAULT_DBC_DIR)
     ap.add_argument("--data-dir", default=DEFAULT_DATA_DIR)
+    ap.add_argument("--map-dir", default=None,
+                    help="extracted terrain grids (maps/*.map) used to arbitrate"
+                         " overlapping zone boxes; defaults to the maps/ dir"
+                         " beside --dbc-dir")
+    ap.add_argument("--no-terrain", action="store_true",
+                    help="skip the terrain arbiter and file points by the"
+                         " smallest containing WorldMapArea box alone")
     ap.add_argument("--out", default=DEFAULT_OUT)
     ap.add_argument("--min-gap", type=float, default=MIN_POINT_GAP,
                     help="minimum spacing between emitted points, in percent")
@@ -551,10 +738,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     areas = MapAreas(args.dbc_dir)
     capitals = areas.capital_zones
 
+    map_dir = args.map_dir
+    if map_dir is None:
+        map_dir = os.path.join(os.path.dirname(os.path.abspath(args.dbc_dir)),
+                               "maps")
+    terrain: Optional[TerrainAreas] = None
+    if not args.no_terrain:
+        terrain = TerrainAreas(map_dir)
+        if not terrain.available():
+            # Loud, not fatal: the box rule alone still produces a usable file,
+            # and the header records that the arbiter did not run.
+            print("warn: no terrain grids at %s; falling back to the"
+                  " smallest-box rule alone" % map_dir, file=sys.stderr)
+            terrain = None
+
     by_zone: Dict[int, List[List[Tuple[float, float]]]] = {}
     in_segments = in_points = 0
     dropped = 0
     resurfaced = 0
+    arbitrated = stranded = 0
+    moves: Dict[Tuple[int, int], int] = {}
     for name in ROAD_FILES:
         map_id, segments = load_segments(os.path.join(args.data_dir, name))
         if not segments:
@@ -562,9 +765,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         for world in segments:
             in_segments += 1
             in_points += len(world)
-            runs, moved = split_by_zone(world, map_id, areas, capitals,
-                                        args.capital_z_band)
+            runs, moved, arb, strand = split_by_zone(
+                world, map_id, areas, capitals, args.capital_z_band, terrain,
+                moves)
             resurfaced += moved
+            arbitrated += arb
+            stranded += strand
             for zone, pts in runs:
                 kept = decimate(pts, args.min_gap)
                 if len(kept) < MIN_SEGMENT_POINTS:
@@ -616,9 +822,33 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     out_segments = sum(len(segs) for segs in by_zone.values())
     out_points = sum(len(seg) for segs in by_zone.values() for seg in segs)
     nz = len(by_zone) or 1
+    # Which overlaps the arbiter actually corrected, biggest first. Ties break
+    # on the zone ids so the header stays byte-identical across runs.
+    top_moves = sorted(moves.items(), key=lambda kv: (-kv[1], kv[0]))[:5]
+    if terrain is None:
+        arbiter_lines = [
+            "terrain arbiter OFF: zone per point is the smallest containing"
+            " WorldMapArea box,",
+            "which overlaps its neighbours -- see docs/road-data.md",
+        ]
+    else:
+        arbiter_lines = [
+            "zone per point is the terrain's own area id (maps/*.map per-cell"
+            " exploreFlag,",
+            "walked up the AreaTable parent chain), because outdoor"
+            " WorldMapArea boxes",
+            "overlap and terrain does not. The arbiter re-filed %d points."
+            % arbitrated,
+            "Biggest moves (box zone -> terrain zone): %s"
+            % (", ".join("%d->%d x%d" % (a, b, n) for (a, b), n in top_moves)
+               or "none"),
+            "%d points kept the box answer because the terrain's zone has a"
+            % stranded,
+            "map box that does not reach them; boxes still do every projection",
+        ]
     header = [
         "source: tools/data/road_waypoints_{azeroth,kalimdor}.jsonl"
-        " (world coords) + WorldMapArea.dbc",
+        " (world coords) + WorldMapArea.dbc + maps/*.map area grids",
         "in : %d segments / %d points" % (in_segments, in_points),
         "out: %d segments / %d points across %d zones"
         % (out_segments, out_points, len(by_zone)),
@@ -626,6 +856,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         % args.min_gap,
         "coords are zone-normalized percent (GetPlayerMapPosition * 100),"
         " flat x,y pairs",
+    ] + arbiter_lines + [
         "re-filed %d points out of the %d capital map boxes and into the"
         % (resurfaced, len(capitals)),
         "outdoor zone each box overlays: a baked run that stays within %s"
@@ -658,6 +889,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     print("  out segments/points : %d / %d" % (out_segments, out_points))
     print("  zones               : %d" % len(by_zone))
     print("  runs too short      : %d" % dropped)
+    print("  terrain arbiter     : %s"
+          % ("off" if terrain is None else "%d points re-filed, %d stranded"
+             % (arbitrated, stranded)))
+    if terrain is not None and terrain.bad_files:
+        print("  UNREADABLE grids    : %d (e.g. %s)"
+              % (len(terrain.bad_files), os.path.basename(terrain.bad_files[0])))
     print("  capital -> outdoors : %d points" % resurfaced)
     print("  bridges added       : %d" % bridges_total)
     print("  orphan points cut   : %d" % orphan_nodes)

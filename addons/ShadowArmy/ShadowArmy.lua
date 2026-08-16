@@ -1923,7 +1923,7 @@ local F = {}
 
 -- Bump on every edit. The System watches Chat.log for "<SA> loaded rev=..."
 -- after sending a reload — a new rev proves the edit actually loaded.
-local REV = "r51"
+local REV = "r53"
 
 -- Log window (r16): every F.say()/F.emit() line also lands here with a
 -- timestamp, so errors survive chat scroll-off and can be reviewed in-game.
@@ -2710,7 +2710,9 @@ combatFrame:SetMovable(true)
 combatFrame:RegisterForDrag("LeftButton")
 combatFrame:SetScript("OnDragStart", function() combatFrame:StartMoving() end)
 combatFrame:SetScript("OnDragStop", function() combatFrame:StopMovingOrSizing() end)
-combatFrame:Hide()
+-- r53: open by default (monofuel 2026-08-16) — the coach is the point of the
+-- addon during combat. Escape (UISpecialFrames) and /sa combat still close it;
+-- the ~4 Hz refresher populates it as soon as it has anything to say.
 tinsert(UISpecialFrames, "ShadowArmyCombatFrame")
 
 local combatTitle = combatFrame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
@@ -5972,6 +5974,15 @@ do
   local ROUTE_TARGET_MOVE = 1.0  -- % target drift before the route is recomputed
   local ROUTE_PLAYER_MOVE = 2.0  -- % player drift before the route is recomputed
   local ROUTE_LEAD = 1.0         -- % lookahead for the "go" bearing
+  -- Straight-guide look (r52). Same dot pool, deliberately weaker ink: the gap
+  -- is wide enough to read as dashes, the swatch is pulled halfway to grey, and
+  -- the dots are a pixel smaller than a road trail's. Road = follow this;
+  -- straight = there is nothing to follow, walk it. Still a step ABOVE the r48
+  -- road layer's field (3 px, 0.40) — guidance must outrank scenery.
+  local ROUTE_STRAIGHT_GAP = 2.0  -- % of map between straight-guide dots
+  local ROUTE_STRAIGHT_SIZE = 4   -- px; the road trail is 5
+  local ROUTE_STRAIGHT_MIX = 0.45 -- 0 = quest colour, 1 = flat grey
+  local ROUTE_STRAIGHT_A = 0.42   -- alpha; the road trail is 0.55
 
   local route = {
     zone = nil,        -- AreaTable id the cached graph was built for
@@ -5980,7 +5991,9 @@ do
     zoneIds = nil,     -- zone NAME -> AreaTable id, reversed from QuestZones
     points = {},       -- RouteModel waypoints, percent
     n = 0,
-    straight = true,   -- true = no road involved; draw nothing, bear as before
+    straight = true,   -- true = no road involved; dotted guide, bear as before
+    reason = nil,      -- RouteModel meta.reason, verbatim, for the panel line
+    noData = false,    -- no RoadData / no graph for this zone at all
     have = false,      -- a route has been computed for tx,ty from px,py
     tx = 0, ty = 0,
     px = 0, py = 0,
@@ -6023,6 +6036,7 @@ do
 
   function F.routeClear()
     route.points, route.n, route.straight, route.have = {}, 0, true, false
+    route.reason, route.noData = nil, false
   end
 
   function F.routeDrift(ax, ay, bx, by)
@@ -6056,7 +6070,10 @@ do
         and F.routeDrift(route.px, route.py, quest.px, quest.py) <= ROUTE_PLAYER_MOVE then
       return
     end
-    local ok, pts, meta = pcall(model.route, F.routeGraph(),
+    -- Held in a local so the panel can say "no data" (nothing to route ON)
+    -- instead of blaming the router for a bail it never got to make.
+    local graph = F.routeGraph()
+    local ok, pts, meta = pcall(model.route, graph,
       { x = quest.px, y = quest.py }, { x = t.x, y = t.y })
     if not ok or not pts then
       F.routeClear()
@@ -6066,6 +6083,8 @@ do
     route.n = table.getn(pts)
     route.straight = true
     if meta and not meta.straight then route.straight = false end
+    route.reason = meta and meta.reason or nil
+    route.noData = (graph == nil)
     route.have = true
     route.tx, route.ty = t.x, t.y
     route.px, route.py = quest.px, quest.py
@@ -6080,6 +6099,31 @@ do
     local wx, wy = model.nextPoint(route.points, quest.px, quest.py, ROUTE_LEAD)
     if not wx then return nil end
     return wx - quest.px, wy - quest.py
+  end
+
+  -- r52 (ticket 0059 fallout): monofuel reported "zero path guidance" in
+  -- Tirisfal. The router was working — it bailed with "straight-cheaper" — but
+  -- a silent bail is indistinguishable from a dead addon. So the panel always
+  -- says which of the three answers it gave. nil only when there is no route
+  -- at all (no target / no model), where the caller prints nothing.
+  -- Short display labels (r53): the raw router reasons overhang the panel's
+  -- ~35-char line budget — "straight-cheaper" is 38 with the indent (r52
+  -- review LOW-1). Unmapped reasons fall through verbatim.
+  local ROUTE_REASON_SHORT = {
+    ["straight-cheaper"] = "road slower",
+    ["disconnected"] = "no road link",
+    ["short-hop"] = "too close",
+    ["no-roads"] = "no roads",
+    ["no-path"] = "no path",
+    ["budget"] = "too far",
+  }
+
+  function F.routeVerdict()
+    if not route.have then return nil end
+    if route.noData then return "route: no data" end
+    if not route.straight then return "route: road" end
+    local reason = route.reason or "?"
+    return "route: straight (" .. (ROUTE_REASON_SHORT[reason] or reason) .. ")"
   end
 
   local routeDots = {}
@@ -6098,46 +6142,88 @@ do
     return t
   end
 
+  -- Where the dots go this frame, in percent. Reused across calls so a repaint
+  -- allocates nothing: this runs on every WORLD_MAP_UPDATE while the map is
+  -- open, and 40 fresh tables a frame is exactly the garbage 1.12 hates.
+  local drawX, drawY = {}, {}
+
   -- Same guards as F.questDrawMarkers: quest.posOK is the oracle for "the map is
   -- showing the player's own zone", so the trail can never decorate a zone the
   -- human is merely browsing.
+  --
+  -- r52: BOTH answers get drawn. A road route samples its waypoints; a
+  -- straight/bailed route gets an evenly dotted line from the player to the
+  -- target. Drawing nothing on a bail was the whole "zero path guidance"
+  -- report — and with the Brill corridor still missing from RoadData (ticket
+  -- 0059) bails are the common case in Tirisfal, not the exception.
   function F.routeDrawMarkers()
     if not WorldMapDetailFrame then return end
-    local show = quest.markersEnabled and quest.posOK
-      and (not route.straight) and route.n >= 2
+    local show = quest.markersEnabled and quest.posOK and route.n >= 2
       and WorldMapFrame and WorldMapFrame:IsVisible()
     local w = WorldMapDetailFrame:GetWidth()
     local h = WorldMapDetailFrame:GetHeight()
+    local straight = route.straight
+    local np = 0
 
-    -- A long route outruns the dot pool, so sample it evenly and always keep the
-    -- last point: the trail must end at the pin it is pointing at.
-    local pick, np = {}, 0
-    if show then
+    if show and not straight then
+      -- A long route outruns the dot pool, so sample it evenly and always keep
+      -- the last point: the trail must end at the pin it is pointing at.
       local step = 1
       if route.n > ROUTE_MAX_DOTS then
         step = math.ceil((route.n - 1) / (ROUTE_MAX_DOTS - 1))
       end
       local idx = 1
       while idx < route.n and np < ROUTE_MAX_DOTS - 1 do
+        local p = route.points[idx]
         np = np + 1
-        pick[np] = idx
+        drawX[np], drawY[np] = p.x, p.y
         idx = idx + step
       end
+      local last = route.points[route.n]
       np = np + 1
-      pick[np] = route.n
+      drawX[np], drawY[np] = last.x, last.y
+    elseif show then
+      -- The bailed route IS the two-point straight line, so its own endpoints
+      -- are the player and the target — no second read of quest.target needed,
+      -- and they are the same (possibly one tick stale) numbers the road trail
+      -- would have used.
+      local a, b = route.points[1], route.points[route.n]
+      if a and b and a.x and a.y and b.x and b.y then
+        local dx, dy = b.x - a.x, b.y - a.y
+        local want = math.floor(math.sqrt(dx * dx + dy * dy) / ROUTE_STRAIGHT_GAP) + 1
+        if want < 2 then want = 2 end
+        if want > ROUTE_MAX_DOTS then want = ROUTE_MAX_DOTS end
+        while np < want do
+          local f = np / (want - 1)
+          np = np + 1
+          drawX[np], drawY[np] = a.x + dx * f, a.y + dy * f
+        end
+      end
+    end
+
+    -- Quest colour, but smaller and dimmer than an objective pin: the trail is
+    -- context, the pins are the answer. The straight guide steps down again on
+    -- all three axes so the two kinds never read alike at a glance.
+    local size, alpha = 5, 0.55
+    local cr, cg, cb = route.r, route.g, route.b
+    if straight then
+      size, alpha = ROUTE_STRAIGHT_SIZE, ROUTE_STRAIGHT_A
+      local keep = 1 - ROUTE_STRAIGHT_MIX
+      cr = cr * keep + 0.5 * ROUTE_STRAIGHT_MIX
+      cg = cg * keep + 0.5 * ROUTE_STRAIGHT_MIX
+      cb = cb * keep + 0.5 * ROUTE_STRAIGHT_MIX
     end
 
     local i = 1
     while i <= ROUTE_MAX_DOTS do
       local t = F.routeDot(i)
-      local p = pick[i] and route.points[pick[i]] or nil
-      if p then
+      if i <= np then
         t:ClearAllPoints() -- SetPoint ACCUMULATES anchors in 1.12
+        t:SetWidth(size)
+        t:SetHeight(size)
         t:SetPoint("CENTER", WorldMapDetailFrame, "TOPLEFT",
-          p.x / 100 * w, -(p.y / 100 * h))
-        -- Quest colour, but smaller and dimmer than an objective pin: the trail
-        -- is context, the pins are the answer.
-        t:SetTexture(route.r, route.g, route.b, 0.55)
+          drawX[i] / 100 * w, -(drawY[i] / 100 * h))
+        t:SetTexture(cr, cg, cb, alpha)
         t:Show()
       else
         t:Hide()
@@ -6388,6 +6474,19 @@ function F.questChecklistRows()
         nr = nr + 1
         rows[nr] = string.format("|c%s  %s%s|r", hex, mark,
           F.questShort(o.text or o.label, 20))
+      end
+      -- r52: the "go" row's compass is either steering along a road or flying
+      -- the crow line, and only the router knows which. One dim sub-line says
+      -- so, right under the bearing it explains — "route: straight" is a real
+      -- answer, and reading it beats guessing the addon died.
+      if isGo and nr < QUEST_PANEL_LINES then
+        local verdict = F.routeVerdict()
+        if verdict then
+          nr = nr + 1
+          -- 4 spaces, not the hint line's 6: the longest verdict
+          -- ("straight (straight-cheaper)") already runs a panel width.
+          rows[nr] = "|cFF777777    " .. verdict .. "|r"
+        end
       end
       -- r47 (ticket 0047): "Notched Rib 0/5" with no mention of Cracked Skull
       -- Soldier was a live complaint — monofuel reads objectives HERE, not in
