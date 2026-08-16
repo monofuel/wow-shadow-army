@@ -4,7 +4,7 @@
 ## journals state so a crash resumes instead of forgetting.
 
 import
-  std/[json, os, strutils],
+  std/[algorithm, json, os, sequtils, strutils],
   scriptorium/git_ops,
   ./agents,
   ./cfg,
@@ -109,12 +109,38 @@ proc runGateBranch*(cfgAll: ConductorConfig,
     return TickResult(outcome: toParked, ticketId: ticketId,
       detail: staticTestCmd() & " failed: " &
         outTests[max(0, outTests.len - 200) .. ^1])
-  echo "conductor: gate-branch full-course eval (several minutes)"
-  let eval = runEval(worktree, lc, ticketId & "-gatebranch",
-    @[forkClientVar(root)])
-  if eval.outcome != evalOk:
-    return TickResult(outcome: toBusy, ticketId: ticketId,
-      detail: $eval.outcome & ": " & eval.detail)
+  # Variance discipline (playbooks/goal-loop.md, binding): "ONE run
+  # proves nothing in either direction. Pace/score claims: median of
+  # 3." The champion is likewise defined by its median eval. Roll up to
+  # three valid evals and gate on the median-northing report. Opt out
+  # with CONDUCTOR_GATE_MEDIAN3=0 for quick probes.
+  let median3 = getEnv("CONDUCTOR_GATE_MEDIAN3", "1") != "0"
+  let rollTarget = if median3: 3 else: 1
+  var reports: seq[JsonNode] = @[]
+  var rollIdx = 0
+  while reports.len < rollTarget:
+    inc rollIdx
+    echo "conductor: gate-branch full-course eval (roll ", reports.len + 1,
+      "/", rollTarget, ", several minutes)"
+    let eval = runEval(worktree, lc,
+      ticketId & "-gatebranch-r" & $rollIdx, @[forkClientVar(root)])
+    if eval.outcome != evalOk:
+      if reports.len == 0:
+        return TickResult(outcome: toBusy, ticketId: ticketId,
+          detail: $eval.outcome & ": " & eval.detail)
+      # keep already-banked rolls; retry the slot a bounded number of times
+      if rollIdx >= rollTarget + 4:
+        return TickResult(outcome: toBusy, ticketId: ticketId,
+          detail: "eval slot lost mid-series: " & eval.detail)
+      continue
+    reports.add(eval.report)
+  proc northing(r: JsonNode): float =
+    if r.isNil: 0.0 else: r{"max_northing"}.getFloat(0.0)
+  reports.sort(proc(a, b: JsonNode): int = cmp(northing(a), northing(b)))
+  let eval = EvalResult(outcome: evalOk, report: reports[reports.len div 2],
+    detail: "median of " & $reports.len & " rolls: " &
+      reports.mapIt($it{"max_northing"}.getFloat(0.0).int).join("/"))
+  echo "conductor: gate-branch ", eval.detail
   let champ = champion(ledgerPath(laneDirPath, leagueName))
   let gate = runGate(eval.report,
     (if champ.isNil: nil else: champ{"report"}), lc)
