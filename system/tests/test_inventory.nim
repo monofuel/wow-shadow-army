@@ -6,7 +6,7 @@
 ## No network, no docker, no realm — pure functions on fixture strings.
 
 import
-  std/[options, strutils, tables, times, unittest],
+  std/[json, options, strutils, tables, times, unittest],
   ../system_server
 
 const
@@ -218,6 +218,12 @@ const
 1000024	Ashborn	2	5	0	0	159	2	1
 1000099	Emptyguy	1	1	0	0	0	0	0
 """
+  RealmInvSharedTsv = """
+1000007	Murist	11	9	4623	1	2589	12	2
+1000024	Ashborn	2	5	100	0	2589	3	1
+1000031	Igris	5	1	0	0	2589	5	1
+1000031	Igris	5	1	0	0	7073	1	1
+"""
 
 suite "parseRealmInventoryTsv — realm bags from the characters DB":
   test "rows group into characters and stack counts sum":
@@ -330,3 +336,225 @@ suite "item quality helpers":
     check itemQualityClass(99) == "q1"
     check itemQualityLabel(5) == "legendary"
     check itemQualityLabel(1) == "common"
+
+suite "realmInvItems — realm-wide aggregation":
+  test "the same item across three characters sums into one row":
+    let inv = RealmInventory(characters: parseRealmInventoryTsv(RealmInvSharedTsv))
+    let items = realmInvItems(inv)
+    check items.len == 2
+    var linen: RealmInvItem
+    for it in items:
+      if it.itemId == 2589:
+        linen = it
+    check linen.total == 20
+    check linen.stacks == 4
+    check linen.holders.len == 3
+
+  test "holders are richest first, then by name":
+    let inv = RealmInventory(characters: parseRealmInventoryTsv(RealmInvSharedTsv))
+    var linen: RealmInvItem
+    for it in realmInvItems(inv):
+      if it.itemId == 2589:
+        linen = it
+    check linen.holders[0].name == "Murist"
+    check linen.holders[0].count == 12
+    check linen.holders[1].name == "Igris"
+    check linen.holders[1].count == 5
+    check linen.holders[2].name == "Ashborn"
+    check linen.holders[2].count == 3
+
+  test "distinct item types counted once":
+    let inv = RealmInventory(characters: parseRealmInventoryTsv(RealmInvSharedTsv))
+    check realmInvItemCount(inv) == 2
+
+suite "sortRealmInvItems — quality desc, then total desc, then name":
+  test "epic outranks a bigger pile of common":
+    var info = initTable[int, ItemInfo]()
+    info[1] = ItemInfo(itemId: 1, name: "Tiny Epic", sellPrice: 0, quality: 4)
+    info[2] = ItemInfo(itemId: 2, name: "Huge Common", sellPrice: 0, quality: 1)
+    let sorted = sortRealmInvItems(@[
+      RealmInvItem(itemId: 2, total: 99, stacks: 5),
+      RealmInvItem(itemId: 1, total: 1, stacks: 1)
+    ], info)
+    check sorted[0].itemId == 1
+    check sorted[1].itemId == 2
+
+  test "equal quality falls back to the bigger pile":
+    var info = initTable[int, ItemInfo]()
+    info[1] = ItemInfo(itemId: 1, name: "Alpha", sellPrice: 0, quality: 1)
+    info[2] = ItemInfo(itemId: 2, name: "Beta", sellPrice: 0, quality: 1)
+    let sorted = sortRealmInvItems(@[
+      RealmInvItem(itemId: 1, total: 3, stacks: 1),
+      RealmInvItem(itemId: 2, total: 10, stacks: 2)
+    ], info)
+    check sorted[0].itemId == 2
+    check sorted[1].itemId == 1
+
+  test "unknown items sort last under their id":
+    var info = initTable[int, ItemInfo]()
+    info[2] = ItemInfo(itemId: 2, name: "Linen Cloth", sellPrice: 0, quality: 1)
+    # Negative-cache miss: key present, empty name, quality 0.
+    info[99] = ItemInfo(itemId: 99, name: "", sellPrice: 0, quality: 0)
+    let sorted = sortRealmInvItems(@[
+      RealmInvItem(itemId: 99, total: 50, stacks: 1),
+      RealmInvItem(itemId: 2, total: 1, stacks: 1)
+    ], info)
+    check sorted[0].itemId == 2
+    check sorted[1].itemId == 99
+
+suite "renderRealmInvItemTable — the army's pool":
+  test "one row per item with total, stacks and holders":
+    var info = initTable[int, ItemInfo]()
+    info[2589] = ItemInfo(itemId: 2589, name: "Linen Cloth", sellPrice: 13, quality: 1)
+    info[7073] = ItemInfo(itemId: 7073, name: "Broken Fang", sellPrice: 1, quality: 4)
+    let inv = RealmInventory(characters: parseRealmInventoryTsv(RealmInvSharedTsv))
+    let html = renderRealmInvItemTable(realmInvItems(inv), info)
+    check "Linen Cloth" in html
+    check "Broken Fang" in html
+    check "Murist ×12" in html
+    check "Igris ×5" in html
+    check "Ashborn ×3" in html
+    check """<td class="lvl">20</td>""" in html
+    check """<td class="lvl">4</td>""" in html
+
+  test "holder names are HTML escaped":
+    let it = RealmInvItem(
+      itemId: 1, total: 1, stacks: 1,
+      holders: @[RealmInvHolder(name: "<script>alert(1)</script>", count: 1)]
+    )
+    let html = renderRealmInvItemTable(@[it], initTable[int, ItemInfo]())
+    check "&lt;script&gt;" in html
+    check "<script>" notin html
+
+  test "more than three holders collapse to a count with a full tooltip":
+    let it = RealmInvItem(
+      itemId: 1, total: 15, stacks: 5,
+      holders: @[
+        RealmInvHolder(name: "Murist", count: 5),
+        RealmInvHolder(name: "Igris", count: 4),
+        RealmInvHolder(name: "Beru", count: 3),
+        RealmInvHolder(name: "Tusk", count: 2),
+        RealmInvHolder(name: "Kaisel", count: 1)
+      ]
+    )
+    let html = renderRealmInvItemTable(@[it], initTable[int, ItemInfo]())
+    # The cell body shows the top three and a count; the title carries all five.
+    check """title="Murist ×5, Igris ×4, Beru ×3, Tusk ×2, Kaisel ×1"""" in html
+    check "+2 more" in html
+    let visible = html[html.find("""×1">""") + 4 .. ^1]
+    check "Tusk" notin visible
+    check "Kaisel" notin visible
+
+  test "an empty pool says so":
+    let html = renderRealmInvItemTable(@[], initTable[int, ItemInfo]())
+    check "The army is carrying nothing." in html
+
+  test "an unnamed item renders as its id in common white, not as poor":
+    var info = initTable[int, ItemInfo]()
+    # Negative-cache miss: key present, empty name, quality 0.
+    info[4242] = ItemInfo(itemId: 4242, name: "", sellPrice: 0, quality: 0)
+    let html = renderRealmInvItemTable(@[
+      RealmInvItem(itemId: 4242, total: 3, stacks: 1,
+        holders: @[RealmInvHolder(name: "Igris", count: 3)])
+    ], info)
+    check "Item#4242" in html
+    check "q1" in html
+    check "q0" notin html
+
+suite "realmInvHoldersText — tooltip source":
+  test "holders join as plain text, richest first, empty stays empty":
+    check realmInvHoldersText(@[]) == ""
+    check realmInvHoldersText(@[
+      RealmInvHolder(name: "Murist", count: 12),
+      RealmInvHolder(name: "Igris", count: 3)
+    ]) == "Murist ×12, Igris ×3"
+
+suite "renderRealmInventoryBody — item-centric tab":
+  test "the item table leads and the per-character view is secondary":
+    var info = initTable[int, ItemInfo]()
+    info[2589] = ItemInfo(itemId: 2589, name: "Linen Cloth", sellPrice: 13, quality: 1)
+    info[7073] = ItemInfo(itemId: 7073, name: "Broken Fang", sellPrice: 1, quality: 4)
+    info[159] = ItemInfo(itemId: 159, name: "Refreshing Spring Water", sellPrice: 1, quality: 1)
+    let inv = RealmInventory(
+      characters: parseRealmInventoryTsv(RealmInvTsv),
+      fetchedAt: epochTime(), error: "")
+    let body = renderRealmInventoryBody(inv, info)
+    check body.find("<th>Holders</th>") < body.find("By character")
+
+  test "summary strip counts item types and totals gold":
+    let inv = RealmInventory(
+      characters: parseRealmInventoryTsv(RealmInvTsv),
+      fetchedAt: epochTime(), error: "")
+    let body = renderRealmInventoryBody(inv, initTable[int, ItemInfo]())
+    check "item types" in body
+    check "0g 46s 23c" in body
+
+  test "gold tooltip lists characters richest first":
+    let inv = RealmInventory(
+      characters: parseRealmInventoryTsv(RealmInvSharedTsv),
+      fetchedAt: epochTime(), error: "")
+    let body = renderRealmInventoryBody(inv, initTable[int, ItemInfo]())
+    let goldTitle = "Murist 0g 46s 23c, Ashborn 0g 1s 0c"
+    check goldTitle in body
+    check body.find("Murist 0g 46s 23c") < body.find("Ashborn 0g 1s 0c")
+
+  test "an item held by three characters shows all three holders":
+    var info = initTable[int, ItemInfo]()
+    info[2589] = ItemInfo(itemId: 2589, name: "Linen Cloth", sellPrice: 13, quality: 1)
+    let inv = RealmInventory(
+      characters: parseRealmInventoryTsv(RealmInvSharedTsv),
+      fetchedAt: epochTime(), error: "")
+    let body = renderRealmInventoryBody(inv, info)
+    check "Murist ×12" in body
+    check "Igris ×5" in body
+    check "Ashborn ×3" in body
+
+suite "isTruthyParam — Refresh force flag":
+  test "1 / true / yes are yes, empty and junk are no":
+    check isTruthyParam("1")
+    check isTruthyParam("true")
+    check isTruthyParam("yes")
+    check isTruthyParam("on")
+    check isTruthyParam("TRUE")
+    check isTruthyParam(" Yes ")
+    check not isTruthyParam("")
+    check not isTruthyParam("0")
+    check not isTruthyParam("no")
+    check not isTruthyParam("junk")
+
+suite "realmInventoryToJson — items and characters":
+  test "top level carries the aggregated items array":
+    var info = initTable[int, ItemInfo]()
+    info[2589] = ItemInfo(itemId: 2589, name: "Linen Cloth", sellPrice: 13, quality: 1)
+    info[7073] = ItemInfo(itemId: 7073, name: "Broken Fang", sellPrice: 1, quality: 4)
+    let inv = RealmInventory(
+      characters: parseRealmInventoryTsv(RealmInvSharedTsv),
+      fetchedAt: epochTime(), error: "")
+    let j = realmInventoryToJson(inv, info)
+    check j["item_type_count"].getInt == 2
+    check j["items"].len == 2
+    check j["items"][0].hasKey("item_id")
+    check j["items"][0].hasKey("total")
+    check j["items"][0].hasKey("stacks")
+    check j["items"][0].hasKey("holders")
+    check j["items"][0].hasKey("name")
+    check j["items"][0].hasKey("quality")
+    var linen: JsonNode
+    for it in j["items"]:
+      if it["item_id"].getInt == 2589:
+        linen = it
+    check linen["total"].getInt == 20
+    check linen["stacks"].getInt == 4
+    check linen["holders"].len == 3
+    check linen["holders"][0]["name"].getStr == "Murist"
+    check linen["holders"][0]["count"].getInt == 12
+    check j.hasKey("characters")
+    check j["character_count"].getInt == 3
+    check j["characters"][0].hasKey("guid")
+    check j["characters"][0].hasKey("name")
+    check j["characters"][0].hasKey("items")
+    check j["characters"][0].hasKey("money_copper")
+    check j.hasKey("item_total")
+    check j.hasKey("money_copper_total")
+    check j.hasKey("age_sec")
+    check j.hasKey("error")
