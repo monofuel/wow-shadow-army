@@ -109,50 +109,19 @@ proc cmdBaseline(cfgAll: ConductorConfig, leagueName, root: string) =
   echo "conductor: baseline eval of ", lc.laneBranch, " HEAD (",
     headSha(lane), ") — this takes several minutes"
   # Same variance discipline as gate-branch (goal-loop.md): the champion
-  # row is "SHAs + median eval". Three rolls, keep the median report.
+  # row is "SHAs + median eval". Exactly rollTarget valid reports or
+  # abort — never seed a short series. runEvalSeries releases slots
+  # before it returns, so the quits below cannot leak leases.
   let median3 = median3Enabled()
   let rollTarget = if median3: 3 else: 1
-  var reports: seq[JsonNode] = @[]
-  var res = EvalResult(outcome: evalFailed, detail: "no roll ran")
-  var held: seq[int] = @[]
-  defer:
-    releaseEvalSlots(root, held)
-  if median3:
-    if not waitForQuietBox():
-      res = EvalResult(outcome: evalBusy,
-        detail: "box load stayed over the eval cap for 30 min — not rolling")
+  let noVars: seq[(string, string)] = @[]
+  let res =
+    if median3:
+      runEvalSeries(lane, root, lc, "baseline", noVars, rollTarget, "baseline")
     else:
-      held = claimEvalSlots(root, rollTarget, "baseline")
-      if held.len == 0:
-        res = EvalResult(outcome: evalBusy, detail: "no eval slot free")
-  if res.outcome != evalBusy:
-    if median3 and held.len >= 2:
-      var slugs: seq[string] = @[]
-      for i, slot in held:
-        slugs.add("baseline-r" & $(i + 1))
-      echo "conductor: baseline concurrent rolls on slots ",
-        held.mapIt($it).join(",")
-      let batch = runConcurrentEvals(lane, lc, slugs, held)
-      for item in batch:
-        if item.outcome == evalOk:
-          reports.add(item.report)
-        else:
-          res = item
-    else:
-      let serialSlot = if held.len == 1: held[0] else: 0
-      var rollIdx = 0
-      while reports.len < rollTarget and rollIdx < rollTarget + 4:
-        inc rollIdx
-        echo "conductor: baseline roll ", reports.len + 1, "/", rollTarget
-        res = runEval(lane, lc, "baseline-r" & $rollIdx, slot = serialSlot)
-        if res.outcome == evalOk:
-          reports.add(res.report)
-  if reports.len > 0:
-    res = EvalResult(outcome: evalOk, report: pickMedianReport(reports),
-      detail: "median of " & $reports.len)
-    echo "conductor: baseline rolls ",
-      reports.mapIt($reportNorthing(it).int).join("/"),
-      " — median kept"
+      runEval(lane, lc, "baseline-r1")
+  if res.outcome == evalOk:
+    echo "conductor: baseline ", res.detail, " — median kept"
   case res.outcome
   of evalBusy:
     quit "conductor: eval slot busy — " & res.detail
@@ -365,8 +334,9 @@ proc main() =
       quit "conductor: no in-flight worktree in state — nothing to gate"
     let lc = cfgAll.league(leagueName)
     echo "conductor: fresh eval of in-flight candidate ", st.branch
-    let res = runEval(st.worktree, lc, st.ticketId & "-regate",
-      @[("FORK_CLIENT", root / "monofuel-vanilla-wow")])
+    let res = runEvalSeries(st.worktree, root, lc, st.ticketId & "-regate",
+      @[("FORK_CLIENT", root / "monofuel-vanilla-wow")], 1,
+      st.ticketId & "-regate")
     if res.outcome != evalOk:
       quit "conductor: eval " & $res.outcome & " — " & res.detail
     let champ = champion(ledgerPath(root / lc.laneCheckout, leagueName))

@@ -3,7 +3,7 @@
 ## FLIGHT log for the northing parser.
 ## Run: nim r --hints:off --warnings:off tools/tests/test_conductor_gate.nim
 
-import std/[json, options, os, sequtils, sets, strutils, tables]
+import std/[json, options, os, sequtils, sets, strutils, tables, times]
 import ../../src/conductor/cfg
 import ../../src/conductor/evalgate
 import ../../src/conductor/ledger
@@ -341,24 +341,123 @@ check(pickMedianReport(@[rHigh, rLow, rMid]){"max_northing"}.getFloat() == 5000.
   "median of 3 concurrent rolls is the middle northing")
 check(pickMedianReport(@[rHigh, rLow, rMid]){"eval_slot"}.getInt() == 2,
   "median keeps the middle report object, not a copy of the number")
-check(pickMedianReport(@[rHigh, rLow]){"max_northing"}.getFloat() == 9000.0,
-  "median of 2 (two slots free) is the upper middle")
 check(pickMedianReport(@[rMid]){"max_northing"}.getFloat() == 5000.0,
   "median of 1 is the only report")
 check(reportNorthing(rHigh) == 9000.0, "reportNorthing reads max_northing")
 check(reportNorthing(nil) == 0.0, "reportNorthing of nil is 0")
 check(reportNorthing(%*{"ok": true}) == 0.0, "missing northing reads as 0")
 
-# lease CLI missing: claim nothing, release is a no-op (never slot 0)
+# Exactly rollTarget valid reports or toBusy — never gate on a short series.
+check(seriesHasFullReports(3, 3), "exactly rollTarget reports is required")
+check(not seriesHasFullReports(2, 3),
+  "two valid rolls is toBusy, not a median-of-2 gate")
+check(not seriesHasFullReports(1, 3), "one valid roll is not a median-of-3")
+check(not seriesHasFullReports(0, 3), "zero reports is toBusy")
+check(seriesHasFullReports(1, 1), "single-roll target is satisfied by one report")
+check(seriesAttemptsExhausted(7, 3), "budget is rollTarget+4")
+check(not seriesAttemptsExhausted(6, 3), "one more attempt remains at 6 of 7")
+check(seriesOutcome(3, 3, false, false) == evalOk, "full series is evalOk")
+check(seriesOutcome(2, 3, true, false) == evalBusy,
+  "short series is evalBusy even with valid rolls")
+check(seriesOutcome(0, 3, true, false) == evalFailed,
+  "all-fail harness series stays evalFailed")
+check(seriesOutcome(0, 3, false, true) == evalBusy, "all-busy series is evalBusy")
+check(seriesOutcome(0, 1, true, false) == evalFailed,
+  "single-roll harness fail is evalFailed")
+check(joinEvalDetails(@[
+    EvalResult(outcome: evalFailed, detail: "zero FLIGHT"),
+    EvalResult(outcome: evalBusy, detail: "flock"),
+  ]) == "evalFailed: zero FLIGHT; evalBusy: flock",
+  "all-fail report joins every roll's detail")
+
+# lease CLI missing: unusable (degrade), not busy
 check(claimEvalSlots(tmp, 3).len == 0, "missing lease CLI claims no slots")
 check(claimEvalSlot(tmp) == 0, "missing lease CLI returns slot 0 (none)")
+let missClaim = acquireEvalSlots(tmp, 3)
+check(missClaim.status == claimUnusable,
+  "missing lease CLI is unusable, not busy")
+check(missClaim.slots.len == 0, "unusable claim holds no slots")
+check(not leaseCliUsable(tmp), "missing lease CLI is not usable")
 releaseEvalSlot(tmp, 0)
 releaseEvalSlot(tmp, 1)
 releaseEvalSlots(tmp, @[1, 2, 3])
 check(EvalSlotMin == 1 and EvalSlotMax == 3, "agent slots are 1..3")
 check(EvalSlotTtlMinutes == 45, "lease crash-net TTL is 45 minutes")
-check("evalslot-0" notin "evalslot-1 evalslot-2 evalslot-3",
-  "slot 0 is not an agent lease resource")
+check(EvalSeriesRetryBudget == 4, "series retry budget is 4 extra attempts")
+
+# CLI present but every claim denied → busy, not unusable
+let stubRoot = tmp / "lease-stub"
+createDir(stubRoot / "monofuel-vanilla-wow" / "agents")
+let stubCli = stubRoot / "monofuel-vanilla-wow" / "agents" / "agent_lease.py"
+writeFile(stubCli, "#!/usr/bin/env python3\nimport sys\n" &
+  "if '--help' in sys.argv:\n    sys.exit(0)\nsys.exit(1)\n")
+inclFilePermissions(stubCli, {fpUserExec})
+check(leaseCliUsable(stubRoot), "stub --help means the CLI is usable")
+let busyClaim = acquireEvalSlots(stubRoot, 3)
+check(busyClaim.status == claimBusy, "CLI present but no grant is slots-busy")
+check(busyClaim.slots.len == 0, "busy claim holds no slots")
+
+# --- collectEvalResult fixtures ---
+let evRoot = tmp / "eval-fix"
+createDir(evRoot)
+let oldTime = fromUnix(0)
+
+proc writeFlightLog(path: string, x = -4000.0) =
+  createDir(path.parentDir)
+  writeFile(path, "FLIGHT {\"t\":1.0,\"x\":" & $x & ",\"y\":0.0,\"hp\":100}\n")
+
+proc writeSegment(path, body: string) =
+  createDir(path.parentDir)
+  writeFile(path, body)
+
+var ev = collectEvalResult(evRoot, "flock", 0, 2,
+  "error: another live Traverse run owns the flock", oldTime)
+check(ev.outcome == evalBusy, "flock string -> evalBusy")
+check(ev.detail.contains("flock"), "flock busy names the flock")
+
+writeFlightLog(evRoot / runLogRelPath(0))
+let staleBefore = getLastModificationTime(evRoot / runLogRelPath(0))
+ev = collectEvalResult(evRoot, "stale", 0, 0, "", staleBefore)
+check(ev.outcome == evalBusy, "stale mtime -> evalBusy")
+check(ev.detail.contains("not refreshed"), "stale mtime names the race")
+
+writeFile(evRoot / runLogRelPath(0), "no telemetry here\n")
+ev = collectEvalResult(evRoot, "zero", 0, 0, "", oldTime)
+check(ev.outcome == evalFailed, "zero FLIGHT -> evalFailed")
+check(ev.detail.contains("zero FLIGHT"), "zero FLIGHT names the fault")
+
+writeFlightLog(evRoot / runLogRelPath(0))
+writeSegment(evRoot / segmentResultRelPath(0), "not-json{")
+ev = collectEvalResult(evRoot, "badseg", 0, 0, "", oldTime)
+check(ev.outcome == evalFailed, "unparseable segment -> evalFailed")
+check(ev.detail.contains("no parseable"), "unparseable names the file")
+
+writeFlightLog(evRoot / runLogRelPath(0), -8000.0)
+writeSegment(evRoot / segmentResultRelPath(0),
+  """{"ok": true, "deaths": 1, "from": "slot0"}""")
+writeFlightLog(evRoot / runLogRelPath(2), -1081.4)
+writeSegment(evRoot / segmentResultRelPath(2),
+  """{"ok": true, "deaths": 0, "from": "slot2"}""")
+ev = collectEvalResult(evRoot, "slotread", 2, 0, "", oldTime)
+check(ev.outcome == evalOk, "per-slot valid run -> evalOk")
+check(ev.report{"from"}.getStr() == "slot2", "reads slot 2 segment, not slot 0")
+check(ev.report{"deaths"}.getInt() == 0, "slot 2 deaths, not slot 0")
+check(ev.report{"eval_slot"}.getInt() == 2, "eval_slot stamped")
+check(abs(ev.report{"max_northing"}.getFloat() - 8105.6) < 0.1,
+  "northing from slot 2 log")
+let archived = ev.report{"archived_log"}.getStr()
+check("local_data/traverse-status/archive" in archived, "shared archive dir")
+check(archived.contains("-s2.log"), "archive name has -sN")
+check(fileExists(archived), "archive file exists")
+
+writeFlightLog(evRoot / runLogRelPath(0), -1081.4)
+writeSegment(evRoot / segmentResultRelPath(0),
+  """{"ok": true, "deaths": 0}""")
+ev = collectEvalResult(evRoot, "legacy", 0, 0, "", oldTime)
+check(ev.outcome == evalOk, "slot 0 valid run -> evalOk")
+check(not ev.report.hasKey("eval_slot"), "slot 0 omits eval_slot")
+check(not ev.report{"archived_log"}.getStr().contains("-s0"),
+  "slot 0 archive has no -sN")
 
 removeDir(tmp)
 

@@ -4,7 +4,7 @@
 ## journals state so a crash resumes instead of forgetting.
 
 import
-  std/[json, os, sequtils, strutils],
+  std/[json, os, strutils],
   scriptorium/git_ops,
   ./agents,
   ./cfg,
@@ -111,61 +111,21 @@ proc runGateBranch*(cfgAll: ConductorConfig,
         outTests[max(0, outTests.len - 200) .. ^1])
   # Variance discipline (playbooks/goal-loop.md, binding): "ONE run
   # proves nothing in either direction. Pace/score claims: median of
-  # 3." The champion is likewise defined by its median eval. Roll up to
-  # three valid evals and gate on the median-northing report. Opt out
-  # with CONDUCTOR_GATE_MEDIAN3=0 for quick probes.
+  # 3." The champion is likewise defined by its median eval. Exactly
+  # rollTarget valid reports or toBusy — never gate on a short series.
+  # Opt out with CONDUCTOR_GATE_MEDIAN3=0 for quick probes (legacy slot 0).
   let median3 = median3Enabled()
   let rollTarget = if median3: 3 else: 1
-  var reports: seq[JsonNode] = @[]
-  var held: seq[int] = @[]
-  defer:
-    releaseEvalSlots(root, held)
-  if median3:
-    if not waitForQuietBox():
-      return TickResult(outcome: toBusy, ticketId: ticketId,
-        detail: "evalBusy: box load stayed over the eval cap for 30 min — not rolling")
-    held = claimEvalSlots(root, rollTarget, ticketId & "-gatebranch")
-    if held.len == 0:
-      return TickResult(outcome: toBusy, ticketId: ticketId,
-        detail: "evalBusy: no eval slot free")
-  if median3 and held.len >= 2:
-    var slugs: seq[string] = @[]
-    for i, slot in held:
-      slugs.add(ticketId & "-gatebranch-r" & $(i + 1))
-    echo "conductor: gate-branch concurrent evals on slots ",
-      held.mapIt($it).join(",")
-    let batch = runConcurrentEvals(worktree, lc, slugs, held,
-      @[forkClientVar(root)])
-    for item in batch:
-      if item.outcome == evalOk:
-        reports.add(item.report)
-    if reports.len == 0:
-      let first = batch[0]
-      return TickResult(outcome: toBusy, ticketId: ticketId,
-        detail: $first.outcome & ": " & first.detail)
-  else:
-    let serialSlot = if held.len == 1: held[0] else: 0
-    var rollIdx = 0
-    while reports.len < rollTarget:
-      inc rollIdx
-      echo "conductor: gate-branch full-course eval (roll ", reports.len + 1,
-        "/", rollTarget, ", several minutes)"
-      let eval = runEval(worktree, lc,
-        ticketId & "-gatebranch-r" & $rollIdx, @[forkClientVar(root)],
-        serialSlot)
-      if eval.outcome != evalOk:
-        if reports.len == 0:
-          return TickResult(outcome: toBusy, ticketId: ticketId,
-            detail: $eval.outcome & ": " & eval.detail)
-        # keep already-banked rolls; retry the slot a bounded number of times
-        if rollIdx >= rollTarget + 4:
-          return TickResult(outcome: toBusy, ticketId: ticketId,
-            detail: "eval slot lost mid-series: " & eval.detail)
-        continue
-      reports.add(eval.report)
-  let eval = EvalResult(outcome: evalOk, report: pickMedianReport(reports),
-    detail: "median of " & $reports.len & " rolls: " &
-      reports.mapIt($reportNorthing(it).int).join("/"))
+  let eval =
+    if median3:
+      runEvalSeries(worktree, root, lc, ticketId & "-gatebranch",
+        @[forkClientVar(root)], rollTarget, ticketId & "-gatebranch")
+    else:
+      runEval(worktree, lc, ticketId & "-gatebranch-r1",
+        @[forkClientVar(root)])
+  if eval.outcome != evalOk:
+    return TickResult(outcome: toBusy, ticketId: ticketId,
+      detail: $eval.outcome & ": " & eval.detail)
   echo "conductor: gate-branch ", eval.detail
   let champ = champion(ledgerPath(laneDirPath, leagueName))
   let gate = runGate(eval.report,
@@ -332,8 +292,8 @@ proc runTick*(cfgAll: ConductorConfig, leagueName, repo, root: string): TickResu
     let reproVars = parseRepro(ticket.content)
     if reproVars.len > 0:
       echo "conductor: repro bracket ", ticket.content.parseTicketField("Repro")
-      let repro = runEval(worktree, lc, ticket.id & "-repro",
-        reproVars & @[forkClientVar(root)])
+      let repro = runEvalSeries(worktree, root, lc, ticket.id & "-repro",
+        reproVars & @[forkClientVar(root)], 1, ticket.id & "-repro")
       case repro.outcome
       of evalBusy:
         unclaim(root, inProgressPath, "eval slot busy at repro: " & repro.detail)
@@ -352,7 +312,8 @@ proc runTick*(cfgAll: ConductorConfig, leagueName, repo, root: string): TickResu
             repro.report{"reason"}.getStr("no reason"), repro.report,
             cfgAll.maxAttemptsPerTicket)
     echo "conductor: full-course eval (several minutes)"
-    let eval = runEval(worktree, lc, ticket.id, @[forkClientVar(root)])
+    let eval = runEvalSeries(worktree, root, lc, ticket.id,
+      @[forkClientVar(root)], 1, ticket.id & "-gate")
     case eval.outcome
     of evalBusy:
       unclaim(root, inProgressPath, "eval slot busy: " & eval.detail)
