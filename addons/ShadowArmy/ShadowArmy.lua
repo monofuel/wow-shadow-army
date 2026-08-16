@@ -427,9 +427,51 @@ function QuestModel.build(opts)
         entry.objs[bi] = obj
         bi = bi + 1
       end
+      -- r54 (monofuel's Brill log, 2026-08-16): the ender is a map answer for
+      -- EVERY accepted quest, not only the ones the client has already flagged
+      -- complete. Two of his four quests ("Speak with Sevren", "Delivery to
+      -- Silverpine Forest") carry no objectives at all, so the loop above had
+      -- nothing to emit and the map came up empty while the turn-in NPC sat
+      -- 40 yards away in QuestData. Silence there was a choice, not a limit.
+      local w = q and q.turnIn
+      local delivered = false
+      if w and not entry.failed then
+        local dobj = {
+          label = w.label or "Turn in",
+          text = "Deliver: " .. (w.label or "Turn in"),
+          turnIn = true, delivery = true, done = false,
+        }
+        dobj.zoneName = zoneNames and w.zone and zoneNames[w.zone] or nil
+        -- `pending` = objectives are still open, so this pin means "this is
+        -- where it ends up", not "go here now". It draws; it never takes the
+        -- route line off a live objective (see QuestModel.pickTarget), and the
+        -- 8-line panel leaves it to the map.
+        local pending = nBoards > 0
+        dobj.pending = pending
+        if pos and w.x and w.y
+            and questZoneHere(q, w.zone, lq.header or "", currentZone, zoneNames) then
+          dobj.dist, dobj.dx, dobj.dy = questDistance(
+            w.x, w.y, pos.x, pos.y, yardsX, yardsY)
+          seq = seq + 1
+          candidates[questGetn(candidates) + 1] = {
+            questKey = entry.key, title = entry.title, label = dobj.label,
+            x = w.x, y = w.y, dx = dobj.dx, dy = dobj.dy, dist = dobj.dist,
+            turnIn = true, delivery = true, pending = pending,
+            tracked = entry.tracked, seq = seq,
+          }
+          -- Only a quest with nothing else to do sorts by its delivery: a
+          -- half-finished kill list must not jump the checklist just because
+          -- the turn-in NPC happens to be standing underfoot.
+          if (not pending) and dobj.dist < entry.minDist then
+            entry.minDist = dobj.dist
+          end
+        end
+        entry.objs[nBoards + 1] = dobj
+        delivered = true
+      end
       if entry.failed then
         entry.status = "Failed"
-      elseif nBoards == 0 then
+      elseif nBoards == 0 and not delivered then
         entry.status = "In progress"
       end
     end
@@ -459,6 +501,84 @@ function QuestModel.build(opts)
   end
   if questGetn(kept) > 1 then table.sort(kept, questModelCandCmp) end
   return { list = list, candidates = kept }
+end
+
+-- Which waypoint the route line and the ">>" row serve (r54). Candidates
+-- arrive sorted by distance, so "first" always means "nearest".
+--
+-- Rule: the TOP of the checklist wins when it has a waypoint at all;
+-- otherwise the nearest quest that does. The old rule was "first tracked
+-- candidate, else candidates[1]" — which is nil the moment the quests that
+-- COULD be routed produce no candidate, and nil is exactly what wiped
+-- monofuel's map: cross-zone quests contribute nothing, so a log can look
+-- full and route to nowhere. A pending delivery is the last resort: it is a
+-- pin, not a destination.
+function QuestModel.pickTarget(list, cands, n)
+  cands = cands or {}
+  n = n or questGetn(cands)
+  local topTitle = list and list[1] and list[1].title or nil
+  local firstOpen, firstPending, topPending = nil, nil, nil
+  local i = 1
+  while i <= n do
+    local c = cands[i]
+    if c then
+      if c.pending then
+        if not firstPending then firstPending = c end
+        if topTitle and c.title == topTitle and not topPending then
+          topPending = c
+        end
+      else
+        if topTitle and c.title == topTitle then return c end
+        if not firstOpen then firstOpen = c end
+      end
+    end
+    i = i + 1
+  end
+  if firstOpen then return firstOpen end
+  if topPending then return topPending end
+  return firstPending
+end
+
+-- Cross-zone honesty (r54). A quest whose known waypoints all live in another
+-- zone gets no pin — correctly: we will not invent a coordinate for a map we
+-- are not looking at. But drawing nothing reads as "the advisor lost my
+-- quest", which is the half of monofuel's report the pins alone cannot fix.
+-- So the destination ZONE NAME, straight out of the data, gets said out loud.
+QuestModel.awayMax = 6
+
+function QuestModel.awayRows(list, currentZone, maxN)
+  local out = {}
+  maxN = maxN or QuestModel.awayMax
+  local nList = questGetn(list or {})
+  local qi = 1
+  while qi <= nList and questGetn(out) < maxN do
+    local e = list[qi]
+    local objs = e.objs or {}
+    local nObj = questGetn(objs)
+    local here, away = false, nil
+    local oi = 1
+    while oi <= nObj do
+      local o = objs[oi]
+      -- A distance exists only for a waypoint in the zone we are standing in,
+      -- so one is enough to make this quest a map quest, not a breadcrumb.
+      if o.dist then here = true end
+      if o.zoneName and o.zoneName ~= currentZone then
+        -- The ender is the better breadcrumb than an objective: it is where
+        -- the quest ENDS, which is what "deliver in X" has to mean.
+        if (not away) or o.turnIn then away = o end
+      end
+      oi = oi + 1
+    end
+    if (not here) and away then
+      out[questGetn(out) + 1] = {
+        num = e.num, title = e.title, zoneName = away.zoneName,
+        label = away.label, turnIn = away.turnIn and true or false,
+        r = e.r, g = e.g, b = e.b,
+      }
+    end
+    qi = qi + 1
+  end
+  return out
 end
 
 -- "who do I hunt for this item" hint (ticket 0047). The window has room to
@@ -926,6 +1046,229 @@ do
 end
 
 --------------------------------------------------------------------------
+-- Pure HUD-guidance model (r56): the geometry behind the on-screen arrow.
+--
+-- Why this exists: every navigation surface the advisor had drew on the
+-- FULLSCREEN WORLD MAP (dots, pins, the route trail). monofuel plays in the
+-- 3D world with the map CLOSED, so from where he sits the addon had no
+-- pathing at all — three revisions of routing he never saw. This model is
+-- the half of the fix that can be tested without a client: percent-delta in,
+-- screen-space arrow out.
+--
+-- Two 1.12 questions had to be settled against the CLIENT, not the docs. Both
+-- were answered by reading build 5875 itself (WoW.exe method tables + the
+-- extracted FrameXML), and both answers are recorded in
+-- docs/vanilla-addons/client-quirks.md:
+--
+-- 1. ROTATION: `Texture:SetRotation` does NOT exist on 5875 (it is a
+--    DressUpModel method there) — but the 8-argument SetTexCoord DOES. The
+--    engine's own usage string spells the arbitrary-quad form out, and stock
+--    FrameXML rotates with it in TaxiFrame.lua's DrawRouteLine (the flight-
+--    path line). So HudModel.texCoords does the standard UV rotation and the
+--    arrowhead is a real, smoothly rotating picture — no spritesheet needed.
+--    The shaft is still a line of square pips positioned with SetPoint,
+--    because pips cannot be silently ignored: if the art ever fails to load
+--    the direction is still unmistakable on screen.
+--
+-- 2. FACING: there is none. `GetPlayerFacing` is absent from the 5875 binary,
+--    the Minimap widget has no facing/rotation method, `MiniMapCompassRing`
+--    is a post-1.12 frame that does not exist here, and the string
+--    `rotateMinimap` appears nowhere in the client — vanilla's minimap is
+--    unconditionally north-up, so there is no compass model to read a facing
+--    off either. The arrow is therefore NORTH-UP: a compass, not a
+--    windshield. That is still fully usable — it is exactly how the minimap
+--    blips have always read — and it is the honest answer for this build.
+--    The ladder in HudModel.facingSource still probes for a facing API first,
+--    because this is a private-server FORK and a core may add one; the day it
+--    does, the arrow rotates into player space with no other change.
+--
+-- Screen space here is SetPoint space: +x right, +y UP. Map space is +x east,
+-- +y SOUTH, in percent of a zone that is not square in yards — so both
+-- conversions happen in aim() or the arrow points somewhere plausible and
+-- wrong, which is the one failure mode a guidance arrow may not have.
+--------------------------------------------------------------------------
+
+do
+  local HudModel = {}
+
+  -- 16-point compass. Decided by comparing the two legs against tangents
+  -- rather than calling atan2, for the same reason F.questBearing does it:
+  -- one less assumption about the 5.0 math library this client ships.
+  local HUD_TAN1125 = 0.19891  -- tan(11.25 deg)
+  local HUD_TAN3375 = 0.66818  -- tan(33.75 deg)
+
+  -- dx, dy are MAP percent deltas (target minus player), so dy < 0 is north.
+  -- The yard scales matter: a percent step north is not a percent step east.
+  function HudModel.bearing(dx, dy, yardsX, yardsY)
+    local e = dx / 100 * (yardsX or 100)
+    local n = -(dy / 100 * (yardsY or 100))
+    local ae = e >= 0 and e or -e
+    local an = n >= 0 and n or -n
+    if ae == 0 and an == 0 then return nil end
+    local ns = (n >= 0) and "N" or "S"
+    local ew = (e >= 0) and "E" or "W"
+    if ae <= an * HUD_TAN1125 then return ns end
+    if an <= ae * HUD_TAN1125 then return ew end
+    if ae <= an * HUD_TAN3375 then return ns .. ns .. ew end
+    if an <= ae * HUD_TAN3375 then return ew .. ns .. ew end
+    return ns .. ew
+  end
+
+  -- The arrow's direction as a UNIT vector in screen space, or nil when the
+  -- player is standing on the target (no direction exists, and inventing one
+  -- would spin the needle at 4 Hz).
+  --
+  -- facing: radians CLOCKWISE from north, or nil for a north-up arrow.
+  -- sign:   +1 / -1. The two facing sources below disagree about which way
+  --         their angle grows and neither is documented for this build, so
+  --         the sign is data, flippable live (/sa arrow flip) instead of a
+  --         constant we would have to guess right on the first try.
+  function HudModel.aim(dx, dy, yardsX, yardsY, facing, sign)
+    local e = dx / 100 * (yardsX or 100)
+    local n = -(dy / 100 * (yardsY or 100))
+    local m = math.sqrt(e * e + n * n)
+    if not (m > 0) then return nil end
+    local ux, uy = e / m, n / m
+    if facing then
+      local f = facing * (sign or 1)
+      local c, s = math.cos(f), math.sin(f)
+      -- Rotate the world vector INTO player space: a target at angle t
+      -- clockwise from north must appear at t - f from screen-up.
+      ux, uy = ux * c - uy * s, ux * s + uy * c
+    end
+    return ux, uy
+  end
+
+  -- Player-space plain English. Only meaningful once aim() has rotated, so
+  -- the live half calls it in player mode only.
+  local HUD_AHEAD = 0.7071  -- cos(45 deg): the four quadrants, evenly split
+  function HudModel.relative(ux, uy)
+    if not ux then return nil end
+    if uy >= HUD_AHEAD then return "ahead" end
+    if uy <= -HUD_AHEAD then return "behind" end
+    if ux >= 0 then return "right" end
+    return "left"
+  end
+
+  -- Needle shape. Radii are pixels from the frame centre; the taper (small
+  -- pips at the tail, fat ones near the head) is what makes a dotted line
+  -- read as an arrow instead of as a string of beads.
+  --
+  -- Default preset: shaft ONLY. The rotating arrow texture is the head, and a
+  -- pip arrowhead underneath it would just be clutter. `tip`/`barbR` are nil
+  -- here and honoured when present — that is the `noArt` preset below, which
+  -- /sa arrow art switches to so the needle can stand entirely on its own.
+  HudModel.needle = {
+    shaft = 8,      -- pips along the shaft
+    r0 = 9,         -- first shaft pip, px from centre
+    r1 = 30,        -- last shaft pip
+    size0 = 3,      -- px, tail
+    size1 = 5.5,    -- px, shaft end
+    glyph = 44,     -- where the arrow TEXTURE is centred, px from centre
+    glyphSize = 34, -- px; the art is a triangle inside a padded 32x32 square
+  }
+
+  HudModel.needleNoArt = {
+    shaft = 9,
+    r0 = 9,
+    r1 = 36,
+    size0 = 3,
+    size1 = 5,
+    tip = 45,       -- head pip radius
+    tipSize = 8,
+    barbR = 33,     -- the two barbs sit BEHIND the head, off to each side
+    barbOff = 9,
+    barbSize = 5,
+  }
+
+  -- Returns pips, count. Each pip is { x, y, size, head }, x/y in screen
+  -- offsets from the arrow's centre. Allocation happens per call; the caller
+  -- runs this at 4 Hz on a dozen pips, which is nothing next to the quest
+  -- scan it already runs at 2 Hz.
+  function HudModel.needlePips(ux, uy, cfg)
+    if not ux then return {}, 0 end
+    cfg = cfg or HudModel.needle
+    local out, n = {}, 0
+    local shaft = cfg.shaft
+    local i = 1
+    while i <= shaft do
+      local t = 0
+      if shaft > 1 then t = (i - 1) / (shaft - 1) end
+      local r = cfg.r0 + (cfg.r1 - cfg.r0) * t
+      n = n + 1
+      out[n] = {
+        x = ux * r, y = uy * r,
+        size = cfg.size0 + (cfg.size1 - cfg.size0) * t,
+        head = false,
+      }
+      i = i + 1
+    end
+    if cfg.tip then
+      n = n + 1
+      out[n] = { x = ux * cfg.tip, y = uy * cfg.tip,
+                 size = cfg.tipSize, head = true }
+    end
+    if cfg.barbR then
+      -- Perpendicular in screen space (left of the direction of travel).
+      local px, py = -uy, ux
+      n = n + 1
+      out[n] = { x = ux * cfg.barbR + px * cfg.barbOff,
+                 y = uy * cfg.barbR + py * cfg.barbOff,
+                 size = cfg.barbSize, head = true }
+      n = n + 1
+      out[n] = { x = ux * cfg.barbR - px * cfg.barbOff,
+                 y = uy * cfg.barbR - py * cfg.barbOff,
+                 size = cfg.barbSize, head = true }
+    end
+    return out, n
+  end
+
+  -- UV rotation for the arrowhead, in the 8-argument SetTexCoord order
+  -- (ULx, ULy, LLx, LLy, URx, URy, LRx, LRy). Stock art points UP in the
+  -- texture, so the mapping is: screen offset s of a quad corner samples
+  -- texture offset R(-angle)*s, converted to UV space where v grows DOWN.
+  -- Written in terms of the unit vector rather than an angle, so no atan2
+  -- and no second trig call — (ux, uy) already IS (sin, cos) of the heading.
+  --
+  -- The corners run to 0.707 from centre at 45 degrees, i.e. outside [0,1].
+  -- That is deliberate and safe HERE: ROTATING-MINIMAPARROW.blp is a 32x32
+  -- triangle whose ink stops at radius ~12 of 16, so every out-of-range
+  -- sample lands in the transparent border. Cropping the quad to the
+  -- inscribed square instead (the TaxiFrame trick) would clip the arrow's
+  -- own point, which is the one pixel that has to be there.
+  function HudModel.texCoords(ux, uy)
+    if not ux then return 0, 0, 0, 1, 1, 0, 1, 1 end
+    local ax, ay = 0.5 * ux, 0.5 * uy
+    -- corner(sx, sy) with sx/sy in {-1, +1}, screen y UP.
+    local ULx, ULy = 0.5 - ay - ax, 0.5 - ay + ax
+    local LLx, LLy = 0.5 - ay + ax, 0.5 + ay + ax
+    local URx, URy = 0.5 + ay - ax, 0.5 - ay - ax
+    local LRx, LRy = 0.5 + ay + ax, 0.5 + ay - ax
+    return ULx, ULy, LLx, LLy, URx, URy, LRx, LRy
+  end
+
+  -- The facing ladder, as a pure decision so it can be tested without a
+  -- client. env is what the live half found on the globals table:
+  --   api     a facing function exists and returned a number. Not stock 5875
+  --           (verified absent from the binary) — this rung is here because
+  --           the server is a fork and a core CAN add one.
+  --   model   a Model widget was handed to us that reports a live facing.
+  --           Kept as a rung because Model:GetFacing IS in the 5875 method
+  --           table; what 1.12 lacks is any STOCK model the client spins with
+  --           the player (no compass ring, no minimap rotation), so nothing
+  --           fills it today.
+  --   none    north-up. The honest answer on a stock 5875 client.
+  function HudModel.facingSource(env)
+    env = env or {}
+    if env.api then return "api" end
+    if env.model then return "model" end
+    return "none"
+  end
+
+  ShadowArmy.hudModel = HudModel
+end
+
+--------------------------------------------------------------------------
 -- Pure combat-coach model. Like QuestModel, this stays above the WoW UI
 -- guard so ordinary Lua tests can exercise priorities and error handling.
 -- The live adapter below supplies only facts exposed by the 1.12 API.
@@ -1334,12 +1677,25 @@ function PassiveModel.evaluate(snapshot)
     end
     i = i + 1
   end
+  -- r55 (monofuel live, Murist): the summon used to be suppressed by
+  -- `not snapshot.inCombat`, and THAT is the "buffs stuck on OK" latch.
+  -- The imp dies in a fight — the one moment a warlock needs the button —
+  -- and the model answers with nothing pending, so `result.ok` goes true and
+  -- the section paints "buffs OK" over a dead minion until combat drops.
+  -- Suppressing the BUTTON was never the right way to express "this is a
+  -- 10s cast you probably do not want mid-pull": the panel's job is to
+  -- report state honestly, and pressing it is the human's call. So the
+  -- button always appears when the minion is genuinely gone, and combat
+  -- degrades to a flag the tooltip explains (same shape as r49's `auto`).
   local summon = PassiveModel.summons[snapshot.classToken or ""]
-  if summon and not snapshot.hasPet and not snapshot.inCombat
+  if summon and not snapshot.hasPet
       and not snapshot.dead
       and snapshot.known and snapshot.known[string.lower(summon)] then
     nb = nb + 1
-    result.buttons[nb] = { id = "summon", label = summon, spell = summon }
+    result.buttons[nb] = {
+      id = "summon", label = summon, spell = summon,
+      inCombat = snapshot.inCombat and true or false,
+    }
   end
   result.ok = (nb == 0 and nn == 0)
   return result
@@ -1923,7 +2279,7 @@ local F = {}
 
 -- Bump on every edit. The System watches Chat.log for "<SA> loaded rev=..."
 -- after sending a reload — a new rev proves the edit actually loaded.
-local REV = "r53"
+local REV = "r56"
 
 -- Log window (r16): every F.say()/F.emit() line also lands here with a
 -- timestamp, so errors survive chat scroll-off and can be reviewed in-game.
@@ -2170,6 +2526,12 @@ while _pbi <= PASSIVE_MAX_BUTTONS do
     -- things working on the same buff.
     if this.passiveAuto then
       GameTooltip:AddLine("autocast armed - click to force", 0.55, 0.75, 1.0)
+    end
+    -- r55: the button no longer hides itself in combat, so it says out loud
+    -- that the timing is the human's decision rather than pretending the
+    -- upkeep is fine (which is what hiding it amounted to).
+    if this.passiveCombat then
+      GameTooltip:AddLine("in combat - your call", 1.0, 0.82, 0.0)
     end
     GameTooltip:Show()
   end)
@@ -2713,7 +3075,48 @@ combatFrame:SetScript("OnDragStop", function() combatFrame:StopMovingOrSizing() 
 -- r53: open by default (monofuel 2026-08-16) — the coach is the point of the
 -- addon during combat. Escape (UISpecialFrames) and /sa combat still close it;
 -- the ~4 Hz refresher populates it as soon as it has anything to say.
+--
+-- r54 (monofuel, third report of "still not open"): r53 delivered that by
+-- DELETING the combatFrame:Hide() and leaning on CreateFrame's implicit shown
+-- state — an invisible guarantee that any later Hide(), any load-order change,
+-- and any restored UI state silently wins. Say it out loud instead, in three
+-- places that cannot all be missed: here at creation, at the end of the load
+-- (F.combatOpen below the event handler), and once on PLAYER_ENTERING_WORLD.
+--
+-- r56 — THE ACTUAL HIDER, found in the client's own FrameXML instead of
+-- guessed at for a fourth time. `tinsert(UISpecialFrames, ...)` on the line
+-- below is not just "Escape closes it". Stock UIParent.lua walks
+-- UISpecialFrames in CloseWindows() and hides EVERY visible entry, and
+-- CloseAllWindows() is called from:
+--
+--   * ShowUIPanel() for any panel with area == "full" — and
+--     UIPanelWindows["WorldMapFrame"] = { area = "full" } (UIParent.lua:30).
+--     OPENING THE WORLD MAP CLOSES THE COACH. That is the loop monofuel has
+--     been living in: he opens the map to look for the route the advisor kept
+--     claiming to draw, and the map takes the coach out on the way in.
+--   * PLAYER_DEAD (UIParent.lua:239)
+--   * PLAYER_CONTROL_LOST (UIParent.lua:478) — every fear, charm and mind
+--     control, which for a levelling warlock is most fights
+--   * ToggleGameMenu / Escape (UIParent.lua:1476, 1491)
+--
+-- None of those is "the human closed the coach", and r53/r54 both re-asserted
+-- the OPEN state at load and at login where none of them had fired yet. So
+-- r56 keeps the state instead of asserting it: a Hide the addon did not ask
+-- for arms a restore (F.coachGuard, driven at 4 Hz), while the close button
+-- and /sa combat set ShadowArmy.coachClosed and are obeyed for the session.
+-- Escape now bounces — it shares CloseAllWindows with the map and cannot be
+-- told apart from it — which is why the close button is the documented way
+-- to put the coach away.
+combatFrame:SetFrameStrata("HIGH") -- parity with every other advisor window
+combatFrame:Show()
 tinsert(UISpecialFrames, "ShadowArmyCombatFrame")
+
+-- Fires for the human's close button, for Escape, and for CloseAllWindows
+-- alike. Only the first sets coachClosed, so only the first sticks.
+combatFrame:SetScript("OnHide", function()
+  if ShadowArmy.coachClosed then return end
+  ShadowArmy.coachRestore = true
+end)
 
 local combatTitle = combatFrame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
 combatTitle:SetPoint("TOP", combatFrame, "TOP", 0, -8)
@@ -2856,11 +3259,85 @@ function F.combatRefresh()
 end
 
 function F.combatToggle()
-  if combatFrame:IsShown() then combatFrame:Hide()
-  else combatFrame:Show(); F.combatRefresh() end
+  if combatFrame:IsShown() then
+    -- Deliberate. This is the one close that outlives the next world map.
+    ShadowArmy.coachClosed = true
+    combatFrame:Hide()
+  else
+    ShadowArmy.coachClosed = false
+    ShadowArmy.coachRestore = false
+    combatFrame:Show()
+    F.combatRefresh()
+  end
 end
 
-combatClose:SetScript("OnClick", function() combatFrame:Hide() end)
+-- r56: the coach's own watchdog, run from the 4 Hz driver. A Hide that the
+-- addon did not ask for (world map, death, fear, Escape — see the note at the
+-- frame) armed coachRestore; this puts the window back the moment nothing
+-- fullscreen is claiming the screen. A fullscreen taker is respected WHILE it
+-- is up: the coach reappearing on top of the world map would be its own bug.
+function F.coachGuard()
+  if ShadowArmy.coachClosed then return end
+  if not ShadowArmy.coachRestore then return end
+  if combatFrame:IsShown() then
+    ShadowArmy.coachRestore = false
+    return
+  end
+  if WorldMapFrame and WorldMapFrame:IsVisible() then return end
+  if GameMenuFrame and GameMenuFrame:IsVisible() then return end
+  ShadowArmy.coachRestore = false
+  combatFrame:Show()
+  pcall(F.combatRefresh)
+  if not ShadowArmy.coachSaid then
+    ShadowArmy.coachSaid = true
+    F.emit("coach", "restored after CloseAllWindows() (world map / death / "
+      .. "control loss / escape all call it) — close button or /sa combat to "
+      .. "put it away for good")
+  end
+  F.dtrace("coach restored")
+end
+
+-- One-shot state dump ~10 s after login, so "the coach is not open" stops
+-- being a report and becomes a reading. shown vs visible separates "we hid
+-- it" from "a parent is hidden"; the centre and the UIParent size together
+-- say whether it is simply off HIS screen.
+function F.coachProbe()
+  local cx, cy = combatFrame:GetCenter()
+  local uw, uh = UIParent:GetWidth(), UIParent:GetHeight()
+  F.emit("coach", "shown=" .. (combatFrame:IsShown() and "1" or "0")
+    .. " visible=" .. (combatFrame:IsVisible() and "1" or "0")
+    .. " parentshown=" .. (UIParent:IsShown() and "1" or "0")
+    .. " x=" .. math.floor((cx or -1) + 0.5)
+    .. " y=" .. math.floor((cy or -1) + 0.5)
+    .. " ui=" .. math.floor((uw or 0) + 0.5) .. "x" .. math.floor((uh or 0) + 0.5)
+    .. " alpha=" .. string.format("%.2f", combatFrame:GetAlpha() or 1)
+    .. " strata=" .. tostring(combatFrame:GetFrameStrata())
+    .. " closed=" .. (ShadowArmy.coachClosed and "1" or "0")
+    .. " map=" .. ((WorldMapFrame and WorldMapFrame:IsVisible()) and "1" or "0"))
+end
+
+-- r54: every reload and every login opens the coach, whatever preceded it.
+-- Escape, the close button and "/sa combat" still close it for the rest of
+-- THIS session — the guarantee is about how a session STARTS, not about
+-- overriding a human who closed it on purpose.
+function F.combatOpen()
+  ShadowArmy.coachClosed = false
+  ShadowArmy.coachRestore = false
+  combatFrame:Show()
+  -- Called at LOAD time as well as on login, where the unit APIs the snapshot
+  -- reads may not answer yet — so the refresh is protected, and so is the
+  -- complaint about it. A failure here costs one frame of content: the 4 Hz
+  -- refresher fills the window in as soon as the world exists.
+  local ok, err = pcall(F.combatRefresh)
+  if not ok then pcall(F.emit, "err", "combatRefresh: " .. tostring(err)) end
+end
+
+-- The close button is the DELIBERATE close (Escape no longer is — it shares
+-- CloseAllWindows with the world map). It sticks for the session.
+combatClose:SetScript("OnClick", function()
+  ShadowArmy.coachClosed = true
+  combatFrame:Hide()
+end)
 
 local combatBtn = CreateFrame("Button", "ShadowArmyCombatBtn", panel, "UIPanelButtonTemplate")
 combatBtn:SetWidth(118)
@@ -3319,11 +3796,13 @@ function F.passiveLine()
       btn.passiveLabel = want.label
       btn.passiveRank = book and book.rank or nil
       btn.passiveAuto = want.auto and true or nil
+      btn.passiveCombat = want.inCombat and true or nil
       btn.icon:SetTexture((book and book.texture) or PASSIVE_ICON_FALLBACK)
       btn:Show()
     else
       btn.passiveSpell = nil
       btn.passiveAuto = nil
+      btn.passiveCombat = nil
       btn:Hide()
     end
     i = i + 1
@@ -3340,6 +3819,14 @@ function F.passiveLine()
   if text then return text end
   if shown > 0 then return "" end
   return "|cFF44FF44buffs OK|r"
+end
+
+-- r55: the whole passive section in one call, so exactly one clock owns it.
+-- F.passiveLine already does the button/height work as a side effect; this
+-- wrapper exists so the driver's OnUpdate has something to pcall that also
+-- paints the line, and so the panel handler no longer has to.
+function F.passiveRefresh()
+  line5:SetText(F.passiveLine())
 end
 
 --------------------------------------------------------------------------
@@ -5199,6 +5686,7 @@ local quest = {
   logSig = "",          -- change detector for the debug-only log trace
   target = nil,         -- nearest "go here" waypoint (tracked wins)
   spots = {},           -- drawable waypoints (blip-priority order)
+  away = {},            -- r54: quests whose only waypoints are in other zones
   list = {},            -- complete live checklist from QuestModel
   status = nil,         -- idle/error reason string when list is empty
   zoneName = "",
@@ -5790,7 +6278,7 @@ function F.questScan()
   local live, sig = F.questReadLiveLog()
   local model = ShadowArmy and ShadowArmy.questModel
   if not model then
-    quest.spots, quest.target, quest.list = {}, nil, {}
+    quest.spots, quest.target, quest.list, quest.away = {}, nil, {}, {}
     quest.status = "quests: model unavailable"
     return
   end
@@ -5819,14 +6307,10 @@ function F.questScan()
 
   quest.list = built.list
   quest.spots = F.questPickSpots(cand, nc, QUEST_MAX_MARKERS)
-  local pick = nil
-  i = 1
-  while i <= nc do
-    if cand[i].tracked then pick = cand[i]; break end
-    i = i + 1
-  end
-  if not pick then pick = cand[1] end
-  quest.target = pick
+  -- r54: top-of-checklist first, nearest routable quest as the fallback, and
+  -- a pending delivery only when nothing else is offered. See pickTarget.
+  quest.target = model.pickTarget(built.list, cand, nc)
+  quest.away = model.awayRows(built.list, zone)
   quest.status = table.getn(quest.list) == 0 and "quests: none accepted" or nil
 
   if sig ~= quest.logSig then
@@ -5884,6 +6368,9 @@ function F.questDrawBlips()
       t:SetWidth(sz)
       t:SetHeight(sz)
       local a = s.turnIn and 1.0 or 0.92
+      -- r54: a delivery pin for a quest whose objectives are still open is
+      -- "where this ends", not "go here" — dimmer than anything actionable.
+      if s.pending then a = 0.55 end
       t:SetTexture(s.r or 1, s.g or 0.82, s.b or 0, a)
       t:Show()
     else
@@ -5935,7 +6422,9 @@ function F.questDrawMarkers()
       local sz = go and 14 or (s.turnIn and 12 or 10)
       t:SetWidth(sz)
       t:SetHeight(sz)
-      t:SetTexture(s.r or 1, s.g or 0.82, s.b or 0, 0.95)
+      -- r54: same rule as the minimap blips — an unfinished quest's delivery
+      -- pin is context, so it reads below its own objectives.
+      t:SetTexture(s.r or 1, s.g or 0.82, s.b or 0, s.pending and 0.6 or 0.95)
       t:Show()
       if fs then
         fs:ClearAllPoints()
@@ -5949,6 +6438,66 @@ function F.questDrawMarkers()
       if fs then fs:Hide() end
     end
     i = i + 1
+  end
+end
+
+--------------------------------------------------------------------------
+-- AWAY LIST (r54): the quests THIS zone cannot pin. QuestData knows the
+-- ending zone of a cross-zone quest ("Delivery to Silverpine Forest" ends at
+-- Apothecary Renferrel in Silverpine, id 130) but it has no coordinate that
+-- means anything on the map currently under the cursor — so no pin gets
+-- invented. What gets said instead is the one true fact we hold: the zone.
+--
+-- Same guards as the pins: quest.posOK is the oracle for "the map is showing
+-- the player's own zone", so this list can never annotate a zone the human is
+-- merely browsing, and the markers toggle turns it off with everything else.
+--
+-- Scoped in do..end for the Lua 5.0 200-local budget, like ROUTE and ROAD.
+--------------------------------------------------------------------------
+do
+  local AWAY_MAX_LINES = 6 -- QuestModel.awayMax; the pool is created once
+
+  local awayLines = {}
+  function F.questAwayLine(i)
+    local fs = awayLines[i]
+    if fs then return fs end
+    fs = WorldMapDetailFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    fs:SetJustifyH("LEFT")
+    fs:SetText("")
+    fs:Hide()
+    awayLines[i] = fs
+    return fs
+  end
+
+  function F.questDrawAway()
+    if not WorldMapDetailFrame then return end
+    local show = quest.markersEnabled and quest.posOK
+      and WorldMapFrame and WorldMapFrame:IsVisible()
+    local rows = show and quest.away or nil
+    local n = rows and table.getn(rows) or 0
+    if n > AWAY_MAX_LINES then n = AWAY_MAX_LINES end
+    local i = 1
+    while i <= AWAY_MAX_LINES do
+      local fs = F.questAwayLine(i)
+      local row = i <= n and rows[i] or nil
+      if row then
+        local what = row.turnIn and ". deliver in " or ". objectives in "
+        local text = tostring(row.num) .. what .. (row.zoneName or "?")
+        if row.turnIn and row.label then
+          text = text .. " |cFF999999(" .. row.label .. ")|r"
+        end
+        fs:ClearAllPoints() -- SetPoint ACCUMULATES anchors in 1.12
+        -- Bottom-left of the map art, stacked upward so row 1 reads first.
+        fs:SetPoint("BOTTOMLEFT", WorldMapDetailFrame, "BOTTOMLEFT",
+          14, 14 + (n - i) * 13)
+        fs:SetText(text)
+        fs:SetTextColor(row.r or 1, row.g or 0.82, row.b or 0)
+        fs:Show()
+      else
+        fs:Hide()
+      end
+      i = i + 1
+    end
   end
 end
 
@@ -6118,12 +6667,21 @@ do
     ["budget"] = "too far",
   }
 
+  -- r54: the verdict also names WHICH quest the line serves. With the target
+  -- now falling back past cross-zone quests, "the route is drawn" and "the
+  -- route is drawn for the quest you think" are two different questions, and
+  -- the checklist number answers the second one in three characters.
   function F.routeVerdict()
     if not route.have then return nil end
-    if route.noData then return "route: no data" end
-    if not route.straight then return "route: road" end
+    local who = ""
+    if quest.target and quest.target.qNum then
+      who = " #" .. quest.target.qNum
+    end
+    if route.noData then return "route" .. who .. ": no data" end
+    if not route.straight then return "route" .. who .. ": road" end
     local reason = route.reason or "?"
-    return "route: straight (" .. (ROUTE_REASON_SHORT[reason] or reason) .. ")"
+    return "route" .. who .. ": straight ("
+      .. (ROUTE_REASON_SHORT[reason] or reason) .. ")"
   end
 
   local routeDots = {}
@@ -6229,6 +6787,370 @@ do
         t:Hide()
       end
       i = i + 1
+    end
+  end
+end
+
+--------------------------------------------------------------------------
+-- HUD GUIDANCE ARROW (r56): pathing you can see WITHOUT opening the map.
+--
+-- Everything above this section paints on the world map. monofuel plays with
+-- the map closed, so for two days "pathing is not implemented" was a true
+-- statement about his screen while three revisions of routing were shipping.
+-- This is the same answer — QuestModel.pickTarget's target, RouteModel's next
+-- waypoint — drawn where he is actually looking.
+--
+-- The arrow is a real rotating arrowhead — stock ROTATING-MINIMAPARROW art,
+-- turned with the 8-argument SetTexCoord that build 5875's own TaxiFrame
+-- rotates flight-path lines with (see HudModel for the evidence) — riding on
+-- a shaft of square pips positioned with SetPoint. The pips are not
+-- decoration: SetPoint cannot be silently ignored and a colour texture cannot
+-- 404, so even if the art layer ever failed to draw, the direction on screen
+-- would still be unmistakable. /sa arrow art proves that half on demand.
+--
+-- Mouse is OFF by default. An always-visible frame with EnableMouse(true)
+-- sitting in the top middle of the screen eats world clicks — it would steal
+-- targeting from the human it is trying to help. `/sa arrow move` unlocks it
+-- for dragging and locks it again after.
+--
+-- Scoped in a do-block for the Lua 5.0 200-local budget, like the route and
+-- road blocks below and above it.
+--------------------------------------------------------------------------
+
+do
+  local HUD_W, HUD_H = 190, 164
+  local HUD_TOP_Y = -140       -- default: under the buff bar, above the fray
+  local HUD_PIP_MAX = 16       -- pool; the presets need 8 (art) and 12 (no art)
+  local HUD_NORTH_R = 56       -- the "N" tick's radius, px
+
+  local HUD_ARROW_ART = "Interface\\Minimap\\ROTATING-MINIMAPARROW"
+
+  local hud = {
+    on = true,
+    mode = "auto",     -- "auto" = use a facing source when one exists
+    sign = 1,          -- flippable: see HudModel.aim
+    art = true,        -- draw the rotating arrowhead texture
+    unlocked = false,  -- mouse enabled for dragging
+    src = "none",      -- last facing source (HudModel.facingSource)
+    facing = nil,      -- last raw facing value, for /sa arrow status
+    reason = nil,      -- why the needle is not drawn; nil = it IS drawn
+    probed = false,
+  }
+
+  local hudFrame = CreateFrame("Frame", "ShadowArmyHudFrame", UIParent)
+  hudFrame:SetWidth(HUD_W)
+  hudFrame:SetHeight(HUD_H)
+  hudFrame:SetPoint("TOP", UIParent, "TOP", 0, HUD_TOP_Y)
+  hudFrame:SetFrameStrata("MEDIUM")
+  hudFrame:EnableMouse(false)
+  hudFrame:SetMovable(true)
+  hudFrame:RegisterForDrag("LeftButton")
+  hudFrame:SetScript("OnDragStart", function() hudFrame:StartMoving() end)
+  hudFrame:SetScript("OnDragStop", function() hudFrame:StopMovingOrSizing() end)
+  hudFrame:Show()
+
+  -- The needle's origin. Sits above centre so the three text rows below it
+  -- clear the tip even when the arrow points straight down.
+  local HUD_CX, HUD_CY = 0, 14
+
+  local hudPips = {}
+  local function hudPip(i)
+    local t = hudPips[i]
+    if t then return t end
+    t = hudFrame:CreateTexture(nil, "OVERLAY")
+    t:Hide()
+    hudPips[i] = t
+    return t
+  end
+
+  -- The rotating arrowhead. ARTWORK so the pips (OVERLAY) stay readable over
+  -- it if the two ever overlap.
+  local hudArrow = hudFrame:CreateTexture(nil, "ARTWORK")
+  hudArrow:SetTexture(HUD_ARROW_ART)
+  hudArrow:Hide()
+
+  local hudNorth = hudFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+  hudNorth:SetText("|cFF8888AAN|r")
+  hudNorth:Hide()
+
+  local hudQuestText = hudFrame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+  hudQuestText:SetPoint("BOTTOM", hudFrame, "BOTTOM", 0, 34)
+  hudQuestText:SetJustifyH("CENTER")
+
+  local hudDistText = hudFrame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+  hudDistText:SetPoint("BOTTOM", hudFrame, "BOTTOM", 0, 18)
+  hudDistText:SetJustifyH("CENTER")
+
+  local hudNoteText = hudFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+  hudNoteText:SetPoint("BOTTOM", hudFrame, "BOTTOM", 0, 4)
+  hudNoteText:SetJustifyH("CENTER")
+
+  -- Scratch texture for the capability probe below: never shown, never a pip,
+  -- so a client that DOES honour 8-arg SetTexCoord cannot leave a real pip
+  -- wearing a test quad.
+  local hudProbeTex = hudFrame:CreateTexture(nil, "BACKGROUND")
+  hudProbeTex:Hide()
+
+  -- Locked = click-through. The backdrop only exists while unlocked, because
+  -- "where do I grab it" is a question you only ask while moving it.
+  function F.hudLock(unlocked)
+    hud.unlocked = unlocked and true or false
+    hudFrame:EnableMouse(hud.unlocked)
+    if hud.unlocked then
+      hudFrame:SetBackdrop({
+        bgFile = "Interface\\Tooltips\\UI-Tooltip-Background",
+        edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+        tile = true, tileSize = 16, edgeSize = 16,
+        insets = { left = 4, right = 4, top = 4, bottom = 4 },
+      })
+      hudFrame:SetBackdropColor(0.05, 0.02, 0.10, 0.75)
+    else
+      hudFrame:SetBackdrop(nil)
+    end
+  end
+
+  function F.hudReset()
+    hudFrame:ClearAllPoints()
+    hudFrame:SetPoint("TOP", UIParent, "TOP", 0, HUD_TOP_Y)
+    hudFrame:Show()
+  end
+
+  -- Why the needle is not on screen right now, or nil while it is. The panel
+  -- prints this: an arrow that vanishes without a word is the exact failure
+  -- that cost two days.
+  function F.hudReason()
+    return hud.reason
+  end
+
+  -- One line to Chat.log the first time the arrow runs, recording what this
+  -- client actually offers. The offline read of build 5875 says: no facing
+  -- API, no compass ring, 8-arg SetTexCoord supported. This line is the same
+  -- claim made by the RUNNING client, which is the only kind that belongs in
+  -- docs/vanilla-addons/client-quirks.md.
+  function F.hudProbe()
+    if hud.probed then return end
+    hud.probed = true
+    local tc = "rejected"
+    local ok = pcall(hudProbeTex.SetTexCoord, hudProbeTex,
+      0, 0, 0, 1, 1, 0, 1, 1)
+    if ok then tc = "accepted" end
+    pcall(hudProbeTex.SetTexCoord, hudProbeTex, 0, 1, 0, 1)
+    F.emit("hud", "arrow src=" .. tostring(hud.src)
+      .. " getPlayerFacing=" .. (GetPlayerFacing and "yes" or "no")
+      .. " setRotation=" .. (hudProbeTex.SetRotation and "yes" or "no")
+      .. " texcoord8=" .. tc)
+  end
+
+  -- Radians clockwise from north, or nil for a north-up arrow. Reads the
+  -- environment every call (so /sa arrow status is never stale) even in north
+  -- mode, where it returns nil regardless.
+  --
+  -- On stock 5875 this always lands on "none": GetPlayerFacing is not in the
+  -- binary, the Minimap widget has no facing method, and there is no stock
+  -- Model the client turns with the player. The rungs cost two nil checks and
+  -- mean a core that adds a facing API flips the arrow to player-relative
+  -- with no code change at all.
+  function F.hudFacing()
+    local model = ShadowArmy and ShadowArmy.hudModel
+    local api, raw = nil, nil
+    if GetPlayerFacing then
+      local ok, v = pcall(GetPlayerFacing)
+      if ok and type(v) == "number" then api, raw = true, v end
+    end
+    hud.src = model and model.facingSource({ api = api }) or "none"
+    hud.facing = raw
+    if hud.mode == "north" then return nil end
+    if hud.src == "none" then return nil end
+    return raw
+  end
+
+  local function hudBlank(reason)
+    hud.reason = reason
+    local i = 1
+    while i <= HUD_PIP_MAX do
+      if hudPips[i] then hudPips[i]:Hide() end
+      i = i + 1
+    end
+    hudArrow:Hide()
+    hudNorth:Hide()
+    hudQuestText:SetText("")
+    hudDistText:SetText("")
+    -- Deliberately NOT silent: the one dim line is the whole point of r56's
+    -- diagnostic rule. /sa arrow off removes the frame entirely.
+    hudNoteText:SetText("|cFF777777" .. (reason or "no guidance") .. "|r")
+  end
+
+  -- Places the "N" tick, so player-relative rotation is visible rather than
+  -- merely claimed: in player mode this letter walks around the needle as you
+  -- turn, and in north-up mode it sits still at the top.
+  local function hudPlaceNorth(facing)
+    local nx, ny = 0, 1
+    if facing then
+      -- World north (0,1) put through the same rotation aim() applies, so
+      -- the letter and the needle can never disagree.
+      local f = facing * hud.sign
+      local c, s = math.cos(f), math.sin(f)
+      nx, ny = -s, c
+    end
+    hudNorth:ClearAllPoints()
+    hudNorth:SetPoint("CENTER", hudFrame, "CENTER",
+      HUD_CX + nx * HUD_NORTH_R, HUD_CY + ny * HUD_NORTH_R)
+    hudNorth:Show()
+  end
+
+  function F.hudRefresh()
+    if not hud.on then
+      hud.reason = "off — /sa arrow to bring it back"
+      hudFrame:Hide()
+      return
+    end
+    hudFrame:Show()
+    local model = ShadowArmy and ShadowArmy.hudModel
+    if not model then
+      hudBlank("hud model unavailable")
+      return
+    end
+    -- The arrow samples position on ITS clock (4 Hz) rather than inheriting
+    -- the quest scan's 2 Hz: this is the one readout a running human watches
+    -- continuously, and F.questPosition is a map-position read with its own
+    -- throttled SetMapToCurrentZone repair inside it.
+    F.questPosition()
+    local facing = F.hudFacing()
+    F.hudProbe()
+    if not quest.posOK then
+      hudBlank("no position — world map showing another zone?")
+      return
+    end
+    local t = quest.target
+    if not t then
+      -- r54 taught this one: a log full of CROSS-ZONE quests produces no
+      -- target at all, and "no target" on a full quest log reads as a broken
+      -- addon. The away list already knows where those quests actually are,
+      -- so the arrow says the zone name instead of shrugging.
+      local a = quest.away and quest.away[1]
+      if a and a.zoneName then
+        hudBlank("#" .. tostring(a.num) .. " is in " .. a.zoneName)
+      else
+        hudBlank(quest.status or "no quest waypoint in this zone")
+      end
+      return
+    end
+    -- Distance is the honest crow-flies number to the OBJECTIVE; the needle
+    -- may be steering at the next road waypoint instead. Same split the "go"
+    -- row on the panel has used since r52, and "via road" is what explains it.
+    local tdx, tdy = t.x - quest.px, t.y - quest.py
+    local dx, dy = tdx, tdy
+    local viaRoad = false
+    local rdx, rdy = F.routeNextDelta()
+    if rdx then dx, dy, viaRoad = rdx, rdy, true end
+    local ux, uy = model.aim(dx, dy, QUEST_ZONE_YARDS_X, QUEST_ZONE_YARDS_Y,
+      facing, hud.sign)
+    if not ux then
+      hudBlank("standing on the objective")
+      return
+    end
+    hud.reason = nil
+    local cfg = hud.art and model.needle or model.needleNoArt
+    local pips, np = model.needlePips(ux, uy, cfg)
+    local r, g, b = t.r or 1, t.g or 0.82, t.b or 0
+    local i = 1
+    while i <= HUD_PIP_MAX do
+      local p = (i <= np) and pips[i] or nil
+      local tex = hudPip(i)
+      if p then
+        tex:SetWidth(p.size)
+        tex:SetHeight(p.size)
+        tex:ClearAllPoints() -- SetPoint ACCUMULATES anchors in 1.12
+        tex:SetPoint("CENTER", hudFrame, "CENTER", HUD_CX + p.x, HUD_CY + p.y)
+        if p.head then
+          -- Head pulled halfway to white so the point of the arrow reads as
+          -- the point of the arrow at a glance, in any quest colour.
+          tex:SetTexture(r + (1 - r) * 0.5, g + (1 - g) * 0.5,
+            b + (1 - b) * 0.5, 1.0)
+        else
+          tex:SetTexture(r, g, b, 0.9)
+        end
+        tex:Show()
+      else
+        tex:Hide()
+      end
+      i = i + 1
+    end
+    if hud.art and cfg.glyph then
+      hudArrow:SetWidth(cfg.glyphSize)
+      hudArrow:SetHeight(cfg.glyphSize)
+      hudArrow:ClearAllPoints()
+      hudArrow:SetPoint("CENTER", hudFrame, "CENTER",
+        HUD_CX + ux * cfg.glyph, HUD_CY + uy * cfg.glyph)
+      hudArrow:SetVertexColor(r, g, b, 1.0)
+      -- The one call this whole section was researched for.
+      pcall(hudArrow.SetTexCoord, hudArrow, model.texCoords(ux, uy))
+      hudArrow:Show()
+    else
+      hudArrow:Hide()
+    end
+    hudPlaceNorth(facing)
+
+    local hex = F.questHex(r, g, b)
+    local mark = t.turnIn and (QUEST_MARK_TURNIN .. " ") or ""
+    hudQuestText:SetText(string.format("|c%s%s%d. %s|r", hex, mark,
+      t.qNum or 0, F.questShort(t.title or "?", 24)))
+
+    local yards = math.floor(F.questYards(tdx, tdy) + 0.5)
+    -- Bearing describes the way the NEEDLE points (world-north relative even
+    -- in player mode), which is what makes "SSW" and the arrow agree.
+    local bear = model.bearing(dx, dy, QUEST_ZONE_YARDS_X, QUEST_ZONE_YARDS_Y)
+      or "--"
+    local road = viaRoad and "  |cFF66DD66via road|r" or ""
+    hudDistText:SetText(string.format("|cFFFFFFFF%dy|r  |cFFAAAAAA%s|r%s",
+      yards, bear, road))
+
+    -- North-up is not a caveat to bury: the human has to know the arrow is a
+    -- COMPASS (up = north) and not a windshield (up = where you are running),
+    -- or he will trust it while facing south and walk the wrong way.
+    local note = "north up"
+    -- ASCII only in the HUD strings: this text is on screen every second of
+    -- play, and a font that cannot draw a glyph draws a box forever.
+    if facing then note = (model.relative(ux, uy) or "?") .. " - you-up" end
+    hudNoteText:SetText("|cFF777777" .. note .. "|r")
+  end
+
+  -- /sa arrow …  — every knob the arrow has, because the first live minute
+  -- decides whether the mode and the art are right, and a reload to change
+  -- either of them is a minute of running the wrong way.
+  function F.hudCommand(rest)
+    if rest == "status" then
+      F.say("arrow " .. (hud.on and "ON" or "OFF")
+        .. " mode=" .. hud.mode .. " src=" .. tostring(hud.src)
+        .. " sign=" .. hud.sign
+        .. " art=" .. (hud.art and "on" or "off")
+        .. " facing=" .. tostring(hud.facing))
+      F.say("  " .. (hud.reason and ("hidden: " .. hud.reason) or "pointing"))
+    elseif rest == "art" then
+      hud.art = not hud.art
+      F.say("arrow head: " .. (hud.art and "rotating texture"
+        or "pips only (no art)"))
+    elseif rest == "north" then
+      hud.mode = "north"
+      F.say("arrow: north-up (up = north, always)")
+    elseif rest == "auto" then
+      hud.mode = "auto"
+      F.say("arrow: auto (player-relative whenever a facing source exists)")
+    elseif rest == "flip" then
+      hud.sign = -hud.sign
+      F.say("arrow facing sign = " .. hud.sign)
+    elseif rest == "move" then
+      F.hudLock(not hud.unlocked)
+      F.say("arrow " .. (hud.unlocked and "UNLOCKED — drag it, /sa arrow move to lock"
+        or "locked (click-through again)"))
+    elseif rest == "reset" then
+      F.hudReset()
+      F.say("arrow position reset")
+    else
+      hud.on = not hud.on
+      if not hud.on then hudFrame:Hide() else F.hudReset() end
+      F.say("arrow " .. (hud.on and "ON" or "OFF")
+        .. " — /sa arrow status | move | art | north | auto | flip | reset")
     end
   end
 end
@@ -6403,16 +7325,31 @@ function F.questPaintLines(rows)
   end
 end
 
+-- r56: the on-screen arrow's silence always has a reason, and the panel says
+-- it out loud. "Nothing is showing" cost two days once; it does not get to be
+-- a silent state again. nil reason = the arrow is up and pointing, and this
+-- row does not exist.
+function F.questArrowRow(rows, nr)
+  local why = F.hudReason and F.hudReason()
+  if not why then return nr end
+  if nr >= QUEST_PANEL_LINES then return nr end
+  nr = nr + 1
+  rows[nr] = "|cFF777777arrow: " .. F.questShort(why, 30) .. "|r"
+  return nr
+end
+
 function F.questChecklistRows()
   local rows, nr = {}, 0
   if quest.status then
     rows[1] = "|cFF777777" .. quest.status .. "|r"
+    F.questArrowRow(rows, 1)
     return rows
   end
   local list = quest.list
   local nList = table.getn(list)
   if nList == 0 then
     rows[1] = "|cFF777777quests: none accepted|r"
+    F.questArrowRow(rows, 1)
     return rows
   end
   local goTitle = quest.target and quest.target.title
@@ -6453,7 +7390,12 @@ function F.questChecklistRows()
         prog = string.format(" %d/%d", o.have or 0, o.need)
       end
       local lab = F.questShort(o.label, 16)
-      if o.turnIn and yards then
+      if o.delivery and o.pending and not isGo then
+        -- r54: the map pin already says where this quest ends up, and the
+        -- objectives above it are what you actually do next. The 210px panel
+        -- keeps its 8 lines for those; the checklist WINDOW still lists the
+        -- delivery row for every quest.
+      elseif o.turnIn and yards then
         -- mark is >>/<< only for the active "go" row; otherwise a space.
         local prefix = isGo and QUEST_MARK_TURNIN or ("  " .. QUEST_MARK_TURNIN)
         nr = nr + 1
@@ -6466,9 +7408,19 @@ function F.questChecklistRows()
           "|c%s  %s%s%s|r |cFFAAAAAA~%dy %s|r",
           hex, isGo and (QUEST_MARK_GO .. " ") or "  ", lab, prog, yards, dir)
       elseif o.turnIn then
+        -- r54: no distance on a turn-in row means the ender is in ANOTHER
+        -- zone (or is unmapped). The zone name is the only honest answer and
+        -- it is also the useful one — "in Silverpine Forest" beats an NPC
+        -- name you cannot walk to from here.
+        local dest = o.zoneName
         nr = nr + 1
-        rows[nr] = string.format("|c%s  %s %s|r", hex,
-          QUEST_MARK_TURNIN, F.questShort(o.label or "Ready to turn in", 18))
+        if dest and dest ~= quest.zoneName then
+          rows[nr] = string.format("|c%s  %s %s|r", hex, QUEST_MARK_TURNIN,
+            F.questShort("in " .. dest, 20))
+        else
+          rows[nr] = string.format("|c%s  %s %s|r", hex,
+            QUEST_MARK_TURNIN, F.questShort(o.label or "Ready to turn in", 18))
+        end
       else
         local mark = o.done and "[x] " or ""
         nr = nr + 1
@@ -6506,6 +7458,7 @@ function F.questChecklistRows()
     end
     qi = qi + 1
   end
+  nr = F.questArrowRow(rows, nr)
   return rows
 end
 
@@ -6656,6 +7609,7 @@ function F.questSetMarkers(on)
   else
     pcall(F.questDrawBlips)
     pcall(F.questDrawMarkers)
+    pcall(F.questDrawAway)
     pcall(F.routeDrawMarkers)
   end
 end
@@ -6673,6 +7627,7 @@ function F.questTick()
   F.routeUpdate()
   F.questDrawBlips()
   F.questDrawMarkers()
+  F.questDrawAway()
   F.routeDrawMarkers()
   F.roadDrawLayer()
   F.questRefreshWindow()
@@ -6710,6 +7665,8 @@ questEvents:SetScript("OnEvent", function()
   quest.nextMarkerAt = now + QUEST_MARKER_EVERY
   local ok, err = pcall(F.questDrawMarkers)
   if not ok then F.emit("err", "questMarkers: " .. tostring(err)) end
+  local aok, aerr = pcall(F.questDrawAway)
+  if not aok then F.emit("err", "questAway: " .. tostring(aerr)) end
   local rok, rerr = pcall(F.routeDrawMarkers)
   if not rok then F.emit("err", "routeMarkers: " .. tostring(rerr)) end
   local dok, derr = pcall(F.roadDrawLayer)
@@ -7016,6 +7973,35 @@ driver:SetScript("OnUpdate", function()
     local cok, cerr = pcall(F.crewTick)
     if not cok then F.emit("err", "crewTick: " .. tostring(cerr)) end
   end
+  -- r55: passive upkeep refresh (~4 Hz, ALWAYS — combat included). This is
+  -- the section's only driver now; see the note in the panel's OnUpdate.
+  -- No IsShown() gate: the model's answer also decides what key 2 casts, so
+  -- it must stay current even with the panel toggled off, and the row's
+  -- Show/Hide on a hidden panel is free. Uses auto.passiveAcc rather than a
+  -- new file-scope local — Lua 5.0 caps a chunk at 200 locals.
+  auto.passiveAcc = (auto.passiveAcc or 0) + (arg1 or 0)
+  if auto.passiveAcc >= 0.25 then
+    auto.passiveAcc = 0
+    local ppok, pperr = pcall(F.passiveRefresh)
+    if not ppok then F.emit("err", "passiveRefresh: " .. tostring(pperr)) end
+    -- r56: the on-screen guidance arrow shares this 4 Hz slot. It is the one
+    -- readout a RUNNING human watches continuously, so it gets the fast clock
+    -- and its own position sample rather than the quest scan's 2 Hz — and it
+    -- is pcall'd here for the same reason the passive row moved: an unguarded
+    -- throw upstream must not be able to freeze it mid-turn.
+    local hdok, hderr = pcall(F.hudRefresh)
+    if not hdok then F.emit("err", "hudRefresh: " .. tostring(hderr)) end
+    -- r56: the coach's watchdog and its one-shot state dump share this slot.
+    -- Both live on ShadowArmy.* rather than new file-scope locals (Lua 5.0
+    -- caps a chunk at 200) — same reason auto.passiveAcc above does.
+    local cgok, cgerr = pcall(F.coachGuard)
+    if not cgok then F.emit("err", "coachGuard: " .. tostring(cgerr)) end
+    if ShadowArmy.coachProbeAt and GetTime() >= ShadowArmy.coachProbeAt then
+      ShadowArmy.coachProbeAt = nil
+      local cpok, cperr = pcall(F.coachProbe)
+      if not cpok then F.emit("err", "coachProbe: " .. tostring(cperr)) end
+    end
+  end
   -- r35: combat coach panel refresh (~4 Hz when open). Display only.
   if combatFrame:IsShown() then
     combatAcc = combatAcc + (arg1 or 0)
@@ -7057,7 +8043,15 @@ panel:SetScript("OnUpdate", function()
   local t1, t2 = F.targetSummary()
   line3:SetText(t1)
   line4:SetText(t2)
-  line5:SetText(F.passiveLine())
+  -- r55: line5 (buff watch / passive row) is NO LONGER refreshed from here.
+  -- It moved to the driver's own 4 Hz slot below F.passiveRefresh, for two
+  -- reasons. (1) Cadence: the coach re-reads at 4 Hz and the upkeep section
+  -- is the other thing a human reacts to mid-fight, so it gets the same
+  -- clock instead of this panel's 2 Hz. (2) Independence: everything above
+  -- this comment runs UNPROTECTED, so one throw out of F.grindStats or
+  -- F.targetSummary aborted the handler before line5 was ever assigned and
+  -- left the section frozen on its last text — the exact failure mode
+  -- monofuel described. On the driver it is pcall'd and cannot be starved.
   -- r32: multi-line quest checklist (corpse compass overrides while ghosting).
   local ok, err = pcall(F.questRefreshPanel)
   if not ok then
@@ -7132,6 +8126,18 @@ frame:SetScript("OnEvent", function()
     -- fanfare mute didn't take (music still played), so this is the next
     -- single-variable test. Re-enable only after turn-ins are proven safe.
     F.panelShowReset()
+    -- r54: the coach opens once per session, on the first entering-world.
+    -- Guarded by a flag so a later loading screen (instance, boat, hearth)
+    -- cannot re-open a window the human closed on purpose.
+    if not ShadowArmy.combatOpened then
+      ShadowArmy.combatOpened = true
+      F.combatOpen()
+    end
+    -- r56: report the coach's REAL state ten seconds in, once per login. By
+    -- then every load-order effect, every restored frame and the first
+    -- CloseAllWindows caller have all had their turn — which is exactly the
+    -- window in which three revisions of "it should be open" went wrong.
+    ShadowArmy.coachProbeAt = GetTime() + 10
     F.barSweepRequest()
     F.say("ARISE. Advisor online for " .. UnitName("player") .. " — /sa help (rev=" .. REV .. ")")
     F.emit("loaded", "rev=" .. REV)
@@ -7267,6 +8273,8 @@ function F.saHelp()
   F.say("  /sa quests     toggle the complete quest window")
   F.say("  /sa crew       toggle party + corpse map blips")
   F.say("  /sa roads      toggle the zone road layer on the world map")
+  F.say("  /sa arrow      toggle the on-screen guidance arrow")
+  F.say("    arrow move|art|north|auto|flip|reset|status")
   F.say("  /sa reload     ReloadUI() — pick up disk edits")
 end
 
@@ -7318,6 +8326,13 @@ SlashCmdList["SHADOWARMY"] = function(msg)
     F.roadToggle()
     return
   end
+  -- r56: "arrow" plus an optional word. Prefix-matched rather than listed
+  -- verb by verb so a new knob is one branch in F.hudCommand.
+  if msg == "arrow" or string.sub(msg, 1, 6) == "arrow " then
+    local rest = string.gsub(string.sub(msg, 7), "^%s+", "")
+    F.hudCommand(rest)
+    return
+  end
   if msg == "log" then
     if logFrame:IsVisible() then logFrame:Hide() else logFrame:Show() end
     return
@@ -7353,3 +8368,9 @@ SlashCmdList["SHADOWARMY"] = function(msg)
     F.panelShowReset()
   end
 end
+
+-- r54: last statement of the load. Nothing created above can leave the combat
+-- coach hidden after this line, and a ReloadUI runs the whole file again — so
+-- "the coach is open when the addon comes up" is now a property of the file's
+-- final instruction rather than of a frame's default state.
+F.combatOpen()

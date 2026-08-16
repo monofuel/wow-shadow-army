@@ -113,6 +113,72 @@ local engaged = grind.decide(engagedView)
 check(engaged.kind == "attack" and engaged.guid == 51, "stays on the engaged mob")
 check(engaged.spell == nil, "no nuke below the mana floor")
 
+-- Melee fillers: the host closes first, then presses the bar button.
+local warrior = grind.decide(view({ unit(81, 5.0, 3) }, {
+  class_id = 1,
+  action_buttons = {
+    { slot = 1, spell_id = 78, usable = true, usable_known = true },
+  },
+}))
+check(warrior.kind == "attack" and warrior.spell == 78,
+  "warrior fills with Heroic Strike")
+
+local charged = grind.decide(view({ unit(84, 15.0, 3) }, {
+  class_id = 1,
+  action_buttons = {
+    { slot = 1, spell_id = 100, usable = true, usable_known = true,
+      in_range = true, in_range_known = true, range_min = 8, range_max = 25 },
+    { slot = 2, spell_id = 78, usable = true, usable_known = true },
+  },
+}))
+check(charged.kind == "attack" and charged.spell == 100 and
+  charged.reason == "charge",
+  "warrior Charges from mid range")
+check(charged.stop_distance == 25.0, "Charge stop stays at Charge max range")
+
+local meleeCharge = grind.decide(view({ unit(85, 3.0, 3) }, {
+  class_id = 1,
+  in_combat = true,
+  auto_attack_guid = 85,
+  action_buttons = {
+    { slot = 1, spell_id = 100, usable = true, usable_known = true },
+    { slot = 2, spell_id = 78, usable = true, usable_known = true },
+  },
+}))
+check(meleeCharge.kind == "attack" and meleeCharge.spell == 78,
+  "warrior does not Charge in melee; fills with Heroic Strike")
+
+local mageNoCharge = grind.decide(view({ unit(86, 15.0, 3) }, {
+  class_id = 8,
+  action_buttons = {
+    { slot = 1, spell_id = 100, usable = true, usable_known = true,
+      in_range = true, in_range_known = true },
+    { slot = 2, spell_id = 133, usable = true, usable_known = true },
+  },
+}))
+check(mageNoCharge.spell ~= 100, "non-warrior does not Charge")
+check(mageNoCharge.spell == 133 and mageNoCharge.stop_distance == 22.0,
+  "mage stands at Fireball range instead of walking into melee")
+
+local rogue = grind.decide(view({ unit(82, 5.0, 3) }, {
+  class_id = 4,
+  action_buttons = {
+    { slot = 1, spell_id = 1752, usable = true, usable_known = true },
+  },
+}))
+check(rogue.kind == "attack" and rogue.spell == 1752,
+  "rogue fills with Sinister Strike")
+
+local starved = grind.decide(view({ unit(83, 5.0, 3) }, {
+  class_id = 4,
+  action_buttons = {
+    { slot = 1, spell_id = 1752, usable = true, usable_known = true,
+      not_enough_mana = true },
+  },
+}))
+check(starved.kind == "attack" and starved.spell == nil,
+  "rogue auto-attacks when energy-starved")
+
 -- Losing badly: break off, unless the mob is nearly dead.
 local losing = grind.decide(view({ unit(61, 3.0, 3) },
   { auto_attack_guid = 61, in_combat = true, health = 10 }))
@@ -329,6 +395,156 @@ clock = clock + 10.0
 check(grind.decide(busyNoScout).kind ~= "interact",
   "busy log: does not scout unmarked NPCs")
 
+-- One banked objective (Encrypted Scroll) must not arm the rank-2 vendor
+-- crawl while another accepted quest still needs field work (The Damned).
+local mixedBankedNoScout = view({
+  giver(910, 20.0, "Deathguard"),
+  unit(911, 8.0, 3),
+}, {
+  level = 3,
+  quest_markers = {},
+  quest_frame = { open = false },
+  accepted_quests = { 3096, 376 },
+  quest_objectives = {
+    { quest_id = 3096, complete = true, entry = 0, item_id = 9559 },
+    { quest_id = 376, complete = false, entry = 0, item_id = 3265 },
+  },
+  completed_quest_ids = {},
+  ui_nodes = {},
+  action_buttons = {
+    { slot = 1, spell_id = 5176, usable = true, usable_known = true },
+  },
+})
+clock = clock + 10.0
+local mixedStep = grind.decide(mixedBankedNoScout)
+check(mixedStep.kind == "attack" and mixedStep.guid == 911,
+  "mixed log: banked talk-quest does not scout; unfinished work grinds")
+
+-- Same mixed log, but the chapel has a live ! marker. Banked 3096 used to
+-- override the hunt gate for rank-1 accepts and park on Sarvis.
+local mixedNoNewAccept = view({
+  unit(911, 8.0, 3),
+  giver(900, 10.0, "Sarvis"),
+}, {
+  level = 3,
+  quest_markers = { { questgiver_guid = 900, status = 5 } },
+  quest_frame = { open = false },
+  accepted_quests = { 3096, 376 },
+  quest_objectives = {
+    { quest_id = 3096, complete = true, entry = 0, item_id = 9559 },
+    { quest_id = 376, complete = false, entry = 0, item_id = 3265 },
+  },
+  completed_quest_ids = {},
+  ui_nodes = {},
+  action_buttons = {
+    { slot = 1, spell_id = 5176, usable = true, usable_known = true },
+  },
+})
+clock = clock + 10.0
+local mixedHunt = grind.decide(mixedNoNewAccept)
+check(mixedHunt.kind == "attack" and mixedHunt.guid == 911,
+  "mixed log: unfinished field work outranks a new accept")
+
+-- Item-drop objectives report entry=0. A close leftover zombie must not
+-- beat a visible scavenger/duskbat while The Damned still needs paws/wings.
+do
+  local zombie = unit(1501, 8.0, 1, { name = "Mindless Zombie", entry = 1501 })
+  local scavenger = unit(1508, 85.0, 2, { name = "Young Scavenger", entry = 1508 })
+  local duskbat = unit(1513, 90.0, 4, { name = "Mangy Duskbat", entry = 1513 })
+  local damned = view({ zombie, scavenger, duskbat }, {
+    level = 4,
+    class_id = 4,
+    quest_markers = {},
+    quest_frame = { open = false },
+    accepted_quests = { 376 },
+    quest_objectives = {
+      { quest_id = 376, complete = false, entry = 0, item_id = 3265 },
+      { quest_id = 376, complete = false, entry = 0, item_id = 3264 },
+    },
+    completed_quest_ids = {},
+    ui_nodes = {},
+    action_buttons = {
+      { slot = 1, spell_id = 1752, usable = true, usable_known = true },
+    },
+  })
+  clock = clock + 10.0
+  local pick = grind.decide(damned)
+  check(pick.kind == "attack" and pick.guid == 1508,
+    "376 item-drop: prefers Young Scavenger at 85yd over a 8yd zombie")
+
+  damned.quest_objectives[1].complete = true
+  clock = clock + 10.0
+  local wings = grind.decide(damned)
+  check(wings.kind == "attack" and wings.guid == 1513,
+    "376 item-drop: paws done prefers Mangy Duskbat over leftover zombie")
+
+  local grindOnly = view({ zombie, scavenger }, {
+    level = 4,
+    quest_markers = {},
+    quest_frame = { open = false },
+    accepted_quests = {},
+    quest_objectives = {},
+    completed_quest_ids = { 376 },
+    ui_nodes = {},
+    action_buttons = {
+      { slot = 1, spell_id = 5176, usable = true, usable_known = true },
+    },
+  })
+  clock = clock + 10.0
+  local trash = grind.decide(grindOnly)
+  check(trash.kind == "attack" and trash.guid == 1501,
+    "no item-drop work: far scavenger stays outside SEARCH_YARDS")
+end
+
+-- One finished counter on an unfinished quest is not banked work.
+-- 376 wings 6/6 + paws 2/6 must not walk a remembered hub past a hunt.
+do
+  local seeGiver = view({
+    giver(925, 10.0, "HubGiver"),
+  }, {
+    level = 6,
+    quest_markers = { { questgiver_guid = 925, status = 5 } },
+    quest_frame = { open = false },
+    accepted_quests = { 364, 376 },
+    quest_objectives = {
+      { quest_id = 364, complete = false, entry = 1501 },
+      { quest_id = 376, complete = false, entry = 0 },
+    },
+    completed_quest_ids = {},
+    ui_nodes = {},
+    action_buttons = {
+      { slot = 1, spell_id = 5176, usable = true, usable_known = true },
+    },
+  })
+  seeGiver.units[1].location = { map_id = 1,
+    position = { x = 500.0, y = 500.0, z = 50.0 } }
+  clock = clock + 10.0
+  grind.decide(seeGiver)
+  local partial = view({
+    unit(926, 8.0, 3),
+  }, {
+    level = 6,
+    quest_markers = {},
+    quest_frame = { open = false },
+    accepted_quests = { 364, 376 },
+    quest_objectives = {
+      { quest_id = 364, complete = false, entry = 1501 },
+      { quest_id = 364, complete = false, entry = 1502 },
+      { quest_id = 376, complete = false, entry = 0, item_id = 3265 },
+      { quest_id = 376, complete = true, entry = 0, item_id = 3264 },
+    },
+    completed_quest_ids = {},
+    ui_nodes = {},
+    action_buttons = {
+      { slot = 1, spell_id = 5176, usable = true, usable_known = true },
+    },
+  })
+  clock = clock + 10.0
+  local stay = grind.decide(partial)
+  check(stay.kind == "attack" and stay.guid == 926,
+    "partial objective: one finished counter does not hub-walk past a hunt")
+end
+
 -- An empty greeting exhausts the NPC, so the scout rank moves on instead of
 -- bouncing off the same guard forever.
 local emptyGreeting = view({
@@ -511,23 +727,129 @@ local chooseReward = grind.decide(rewardView({
   choice_items = { { item_id = 3270, count = 1 }, { item_id = 3273, count = 1 } },
 }, rewardChoiceNodes))
 check(chooseReward.kind == "ui_press" and
-  chooseReward.reference == "quest-reward:1",
+  chooseReward.reference == "quest-reward:1" and
+  chooseReward.reason == "reward_choice",
   "selects a reward choice before turning in")
+
+-- The choice buttons are not in every snapshot. Pressing Complete while a
+-- choice is still required is refused and wedges the panel; hold instead.
+local waitReward = grind.decide(rewardView({
+  open = true, panel = "reward", selected_choice = 0,
+  choice_items = { { item_id = 3270, count = 1 }, { item_id = 3273, count = 1 } },
+}))
+check(waitReward.kind == "hold" and waitReward.reason == "reward_choice_wait",
+  "holds for a missing reward-choice control instead of a refused Complete")
 
 local takeReward = grind.decide(rewardView({
   open = true, panel = "reward", selected_choice = 1,
   choice_items = { { item_id = 3270, count = 1 }, { item_id = 3273, count = 1 } },
 }, rewardChoiceNodes))
 check(takeReward.kind == "ui_press" and
-  takeReward.control == "QuestFrameCompleteQuestButton",
+  takeReward.control == "QuestFrameCompleteQuestButton" and
+  takeReward.reason == "turn_in",
   "turns in by button once a choice is selected")
 
 local noChoiceReward = grind.decide(rewardView({
   open = true, panel = "reward", selected_choice = 0, choice_items = {},
 }))
 check(noChoiceReward.kind == "ui_press" and
-  noChoiceReward.control == "QuestFrameCompleteQuestButton",
+  noChoiceReward.control == "QuestFrameCompleteQuestButton" and
+  noChoiceReward.reason == "turn_in",
   "turns in by button when the quest offers no choice")
+
+-- A reward that cannot complete (full bags) is pressed a bounded number of
+-- times, then closed so the seat can grind instead of looping forever.
+local function stuckRewardView(questId)
+  return rewardView({
+    open = true, panel = "reward", selected_choice = 0, choice_items = {},
+    quest_id = questId or 9991, npc_guid = 1661,
+  })
+end
+local REWARD_COMPLETE_ATTEMPTS = 12
+for i = 1, REWARD_COMPLETE_ATTEMPTS do
+  local press = grind.decide(stuckRewardView())
+  check(press.kind == "ui_press" and
+    press.control == "QuestFrameCompleteQuestButton" and
+    press.reason == "turn_in",
+    "tries Complete honestly before giving up (" .. i .. ")")
+end
+local blocked = grind.decide(stuckRewardView())
+check(blocked.kind == "ui_press" and
+  blocked.control == "QuestFrameCancelButton" and
+  blocked.reason == "reward_blocked",
+  "closes a refused reward panel after the attempt budget")
+
+-- Closing the panel (or changing the quest) resets the budget so a later
+-- legitimate turn-in still gets its full quota of attempts.
+grind.decide(rewardView({ open = false }))
+local afterClose = grind.decide(stuckRewardView())
+check(afterClose.kind == "ui_press" and
+  afterClose.control == "QuestFrameCompleteQuestButton" and
+  afterClose.reason == "turn_in",
+  "a later turn-in gets a fresh attempt budget after the panel closes")
+
+grind.reset()
+for _ = 1, REWARD_COMPLETE_ATTEMPTS do
+  grind.decide(stuckRewardView(9991))
+end
+check(grind.decide(stuckRewardView(9991)).reason == "reward_blocked",
+  "same quest is still blocked after the budget")
+local otherQuest = grind.decide(stuckRewardView(9992))
+check(otherQuest.kind == "ui_press" and
+  otherQuest.control == "QuestFrameCompleteQuestButton" and
+  otherQuest.reason == "turn_in",
+  "a different quest gets a fresh attempt budget")
+
+-- After the Complete budget, consume an action-bar use-item stack so the
+-- next Complete can store the reward, then walk back to the same giver.
+grind.reset()
+for _ = 1, REWARD_COMPLETE_ATTEMPTS do
+  grind.decide(stuckRewardView(376))
+end
+check(grind.decide(stuckRewardView(376)).reason == "reward_blocked",
+  "full-bag turn-in still closes the panel")
+local eatView = view({}, {
+  level = 3,
+  quest_frame = { open = false },
+  accepted_quests = { 376 }, quest_objectives = {}, completed_quest_ids = {},
+  ui_nodes = {
+    { source_name = "ActionButton12", enabled = true, hit_testable = true },
+  },
+  action_buttons = {
+    { slot = 1, spell_id = 5176, usable = true, usable_known = true },
+    { slot = 12, kind = "use-item", spell_id = 433, usable = true,
+      usable_known = true },
+  },
+})
+local eat = grind.decide(eatView)
+check(eat.kind == "ui_press" and eat.control == "ActionButton12" and
+  eat.reason == "bag_slot_use",
+  "uses an action-bar consumable to free a bag slot")
+eatView.eating = true
+local chew = grind.decide(eatView)
+check(chew.kind == "hold" and chew.reason == "bag_slot_consume",
+  "waits out the eat before clicking again")
+eatView.eating = false
+clock = clock + 2.0
+local eatAgain = grind.decide(eatView)
+check(eatAgain.reason == "bag_slot_use",
+  "clicks the consumable again after the eat settles")
+local cleared = view({
+  giver(1661, 5.0, "Elreth"),
+}, {
+  level = 3,
+  quest_markers = { { questgiver_guid = 1661, status = 6 } },
+  quest_frame = { open = false },
+  accepted_quests = { 376 }, quest_objectives = {}, completed_quest_ids = {},
+  ui_nodes = {},
+  action_buttons = {
+    { slot = 1, spell_id = 5176, usable = true, usable_known = true },
+  },
+})
+local resume = grind.decide(cleared)
+check(resume.kind == "interact" and resume.guid == 1661,
+  "returns to the turn-in once a bag slot is free")
+grind.reset()
 
 -- Banking a turn-in outranks the next pull. Every Deathknell giver has mobs
 -- inside the hunt radius, so a shared gate stranded finished quests forever.
@@ -654,6 +976,54 @@ check(math.abs(generated.x - 1843.3) < 1.0 and
 check(generated.stop_distance == 25.0 and
   generated.route_profile == "safe_ground",
   "generated leg uses the same arrive distance and route profile as a hub walk")
+
+-- Empty log in a mob field: walk to the generated starter, do not scout a
+-- 96yd guard and do not grind (Bellion, Deathknell, 2026-08-16).
+local emptyField = view({
+  unit(88, 8.0, 1),
+  giver(920, 96.0, "Deathguard Randolph"),
+}, {
+  level = 3,
+  class_id = 8,
+  quest_markers = {},
+  quest_frame = { open = false },
+  accepted_quests = {},
+  quest_objectives = {},
+  completed_quest_ids = {},
+  ui_nodes = {},
+  location = { map_id = 0, position = { x = 1981.0, y = 1611.0, z = 82.3, o = 0 } },
+  action_buttons = {
+    { slot = 1, spell_id = 133, usable = true, usable_known = true },
+  },
+})
+clock = clock + 5.0
+local starterWalk = grind.decide(emptyField)
+check(starterWalk.reason == "quest_hub",
+  "empty log walks to a generated starter instead of grinding or scouting a guard")
+check(math.abs(starterWalk.x - 1857.9) < 1.0 and
+  math.abs(starterWalk.y - 1600.9) < 1.0,
+  "empty-log walk aims at the generated starter")
+
+-- Rank-2 scout is last-yards only. A far unmarked NPC is not a walk target.
+local farGuard = view({
+  giver(921, 96.0, "Deathguard Randolph"),
+}, {
+  level = 3,
+  quest_markers = {},
+  quest_frame = { open = false },
+  accepted_quests = { 1 },
+  quest_objectives = { { quest_id = 1, complete = false, entry = 0 } },
+  completed_quest_ids = {},
+  ui_nodes = {},
+  location = { map_id = 0, position = { x = 1981.0, y = 1611.0, z = 82.3, o = 0 } },
+  action_buttons = {
+    { slot = 1, spell_id = 133, usable = true, usable_known = true },
+  },
+})
+clock = clock + 5.0
+local farScout = grind.decide(farGuard)
+check(farScout.reason ~= "scout_npc" and farScout.reason ~= "scout_walk",
+  "does not scout an unmarked NPC beyond SCOUT_YARDS")
 
 -- Unfinished work in that same quest is field work, not a walk to the ender.
 local strandedBusy = view({}, {

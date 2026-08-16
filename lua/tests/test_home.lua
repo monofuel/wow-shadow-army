@@ -837,4 +837,606 @@ for t = 100, 109, 1 do
 end
 check(not saw_unstick, "a hard-leash escort in combat never unsticks")
 
+-- Vendor sell. Everything here is stubbed at the SHAPE the fork's Observation
+-- already publishes (environment/contract/observation_types.nim) but that
+-- bots/lua_bot/view.nim does not yet project into the Lua view — see
+-- tickets/open/0073. The `sell_supported` flag is the same host-capability
+-- idiom as chat_send_supported: absent means the seat only watches.
+local logged = {}
+local realLog = wow.log
+wow.log = function(msg) logged[#logged + 1] = tostring(msg) end
+
+local function logs_matching(needle)
+  for i = 1, #logged do
+    if string.find(logged[i], needle, 1, true) then return logged[i] end
+  end
+  return nil
+end
+
+local function bag_row(guid, id, name, class, sub, quality, price, extra)
+  local row = {
+    item_guid = guid, item_id = id, name = name, count = 1,
+    definition_known = true, item_class_id = class, item_subclass_id = sub,
+    quality = quality, sell_price = price, inventory_type = 0,
+    container_slots = 0, container_item_count = 0, item_level = 1,
+  }
+  for k, val in pairs(extra or {}) do row[k] = val end
+  return row
+end
+
+local function vendor_frame()
+  local vf = frame(9) -- warlock
+  vf.merchant_open = true
+  vf.merchant_guid = 4242
+  vf.equipment_items = {
+    { equipment_slot = 19, item_id = 4496, container_slots = 6,
+      inventory_type = 18, item_level = 1 },
+    { equipment_slot = 20, item_id = 4496, container_slots = 6,
+      inventory_type = 18, item_level = 1 },
+    { equipment_slot = 21, item_id = 4496, container_slots = 6,
+      inventory_type = 18, item_level = 1 },
+    { equipment_slot = 22, item_id = 4496, container_slots = 6,
+      inventory_type = 18, item_level = 1 },
+  }
+  vf.inventory_items = {
+    bag_row(11, 6948, "Hearthstone", 15, 0, 1, 0),
+    bag_row(12, 1234, "Chain Bracers", 4, 3, 1, 55),
+    bag_row(13, 4496, "Small Brown Pouch", 1, 0, 1, 25,
+      { container_slots = 6 }),
+    bag_row(14, 2589, "Linen Cloth", 7, 0, 1, 1, { count = 5 }),
+  }
+  return vf
+end
+
+-- 1. No merchant window, no vendor work — and no logging noise either.
+home.reset()
+logged = {}
+v = frame()
+v.inventory_items = vendor_frame().inventory_items
+r = home.decide(v)
+check(r.kind ~= "sell_item" and r.status.mode ~= "vendor",
+  "a closed merchant window never sells")
+
+-- 2. The live shape today: merchant open, bags invisible to the view. The
+--    seat must NOT invent an action, and must say why exactly once.
+home.reset()
+logged = {}
+v = frame()
+v.merchant_open = true
+v.merchant_guid = 4242
+r = home.decide(v)
+check(r.kind ~= "sell_item", "no bag projection means no sale")
+check(logs_matching("0073") ~= nil,
+  "the missing bag projection names its ticket in the log")
+
+-- 3. Bags visible, host cannot sell: report the shortlist, move nothing.
+home.reset()
+logged = {}
+v = vendor_frame()
+r = home.decide(v)
+check(r.kind ~= "sell_item", "a host without sell support never sells")
+local report = logs_matching("bag items to sell")
+check(report ~= nil, "a vendor visit reports its sell shortlist")
+check(string.find(report, "Chain Bracers", 1, true) ~= nil,
+  "the shortlist names the mail a warlock cannot wear")
+check(string.find(report, "Small Brown Pouch", 1, true) ~= nil,
+  "the shortlist names the spare six-slot bag")
+check(string.find(report, "Linen Cloth", 1, true) == nil,
+  "the shortlist leaves white trade goods alone")
+check(string.find(report, "Hearthstone", 1, true) == nil,
+  "the shortlist never touches the Hearthstone")
+r = home.decide(v)
+check(logs_matching("bag items to sell") == report and #logged <= 2,
+  "the shortlist is reported once per merchant, not once per tick")
+
+-- 4. Host CAN sell: one item per tick, rate limited, never the same twice.
+home.reset()
+logged = {}
+v = vendor_frame()
+v.sell_supported = true
+r = home.decide(v)
+check(r.kind == "sell_item" and r.guid == 4242 and r.item_guid == 12,
+  "an open merchant sells the unwearable mail first")
+check(r.status.mode == "vendor", "a sale reports vendor mode")
+r = home.decide(v)
+check(r.kind ~= "sell_item", "sales are rate limited inside the gap")
+v.simulation_time = 102
+r = home.decide(v)
+check(r.kind == "sell_item" and r.item_guid == 13,
+  "the next tick sells the next item, not the same one again")
+v.simulation_time = 104
+r = home.decide(v)
+check(r.kind ~= "sell_item", "nothing left to sell ends the vendor step")
+
+-- 5. A warrior at the same vendor keeps the mail: warriors learn it at 40, so
+--    "cannot use yet" is never a sale.
+home.reset()
+logged = {}
+v = vendor_frame()
+v.class_id = 1
+v.sell_supported = true
+r = home.decide(v)
+check(r.kind == "sell_item" and r.item_guid == 13,
+  "a warrior sells the spare bag but keeps the mail")
+
+-- 6. Bags: the equip half (ticket 0073's "first order fix is EQUIP, not
+--    sell"). A seat carrying pouches with an empty carried-bag slot wears
+--    the roomiest one, out of combat, one per tick.
+local function bagless_frame()
+  local bf = frame(9) -- warlock
+  bf.equip_supported = true
+  bf.equipment_items = {} -- zero bags equipped: the live home-seat shape
+  bf.inventory_items = {
+    bag_row(21, 4496, "Small Brown Pouch", 1, 0, 1, 25,
+      { container_slots = 6 }),
+    bag_row(22, 4500, "Large Knapsack", 1, 0, 1, 90,
+      { container_slots = 10 }),
+    bag_row(23, 6948, "Hearthstone", 15, 0, 1, 0),
+    bag_row(24, 1234, "Chain Bracers", 4, 3, 1, 55),
+  }
+  return bf
+end
+
+home.reset()
+logged = {}
+v = bagless_frame()
+r = home.decide(v)
+check(r.kind == "equip_item" and r.item_guid == 22,
+  "a free bag slot equips the largest carried bag first")
+check(logs_matching("bags: equipping") ~= nil,
+  "an equip names the bag and the slot in the log")
+r = home.decide(v)
+check(r.kind ~= "equip_item", "equips are rate limited inside the gap")
+v.simulation_time = 104
+r = home.decide(v)
+check(r.kind == "equip_item" and r.item_guid == 21,
+  "the next tick equips the next bag, not the same one again")
+
+-- The fork accepts equip_item for a bag but the bag never lands (measured
+-- 2026-08-16). An unbounded retry would burn a tick every 3s forever, so the
+-- seat stands down after a fixed budget of attempts that changed nothing.
+home.reset()
+logged = {}
+v = bagless_frame()
+-- Four spares, so the attempt budget is what stops the seat rather than
+-- simply running out of distinct bags to try.
+v.inventory_items = {
+  bag_row(31, 4496, "Small Brown Pouch", 1, 0, 1, 25, { container_slots = 6 }),
+  bag_row(32, 4497, "Small Green Pouch", 1, 0, 1, 25, { container_slots = 6 }),
+  bag_row(33, 4498, "Small Blue Pouch", 1, 0, 1, 25, { container_slots = 6 }),
+  bag_row(34, 4499, "Small Black Pouch", 1, 0, 1, 25, { container_slots = 6 }),
+}
+local attempts, t = 0, 100
+for _ = 1, 12 do
+  v.simulation_time = t
+  r = home.decide(v)
+  if r.kind == "equip_item" then attempts = attempts + 1 end
+  t = t + 4
+end
+check(attempts == 3,
+  "a host that accepts equip_item but never lands the bag is tried 3 times")
+check(logs_matching("standing down") ~= nil,
+  "standing down says why, once")
+
+-- Never the Hearthstone, never armour: only class-1 rows with real capacity.
+home.reset()
+logged = {}
+v = bagless_frame()
+v.inventory_items = {
+  bag_row(23, 6948, "Hearthstone", 15, 0, 1, 0),
+  bag_row(24, 1234, "Chain Bracers", 4, 3, 1, 55),
+}
+r = home.decide(v)
+check(r.kind ~= "equip_item", "nothing but a container is ever equipped here")
+
+-- A packed bag is left alone: the seat cannot know why it is packed.
+home.reset()
+logged = {}
+v = bagless_frame()
+v.inventory_items = {
+  bag_row(25, 4496, "Small Brown Pouch", 1, 0, 1, 25,
+    { container_slots = 6, container_item_count = 3 }),
+}
+r = home.decide(v)
+check(r.kind ~= "equip_item", "a bag with contents in it is not equipped")
+
+-- All four slots full: that is the sell path's job, not this one. This is the
+-- seam that keeps the two halves from fighting over the same bag.
+home.reset()
+logged = {}
+v = bagless_frame()
+v.equipment_items = vendor_frame().equipment_items -- four 6-slot bags worn
+r = home.decide(v)
+check(r.kind ~= "equip_item",
+  "no free bag slot means no equip — the spare is the sell path's problem")
+
+-- Unsupported host and combat both refuse, the same way the sell half does.
+home.reset()
+logged = {}
+v = bagless_frame()
+v.equip_supported = false
+r = home.decide(v)
+check(r.kind ~= "equip_item", "a host without equip support never equips")
+
+home.reset()
+logged = {}
+v = bagless_frame()
+v.in_combat = true
+r = home.decide(v)
+check(r.kind ~= "equip_item", "a seat in combat never stops to equip a bag")
+
+home.reset()
+logged = {}
+v = bagless_frame()
+v.is_dead = true
+r = home.decide(v)
+check(r.kind ~= "equip_item", "a corpse never equips a bag")
+
+-- 7. Solo seat, bags full, junk in the backpack, vendor in view: walk over
+--    and open the window. Equip already ran (no spare bag here), sell needs
+--    merchant_open, so this is the missing third verb.
+local function solo_full_bags()
+  local sf = frame(9)
+  sf.party = { in_group = false, members = {} }
+  sf.equip_supported = true
+  sf.sell_supported = true
+  sf.bag_space_known = true
+  sf.free_bag_slots = 0
+  sf.equipment_items = vendor_frame().equipment_items
+  sf.inventory_items = {
+    bag_row(12, 1234, "Chain Bracers", 4, 3, 1, 55),
+    bag_row(13, 4865, "Ruined Pelt", 15, 0, 0, 5),
+  }
+  sf.units = {
+    {
+      guid = 2115, name = "Joshua Kien", object_kind = "unit",
+      services = { "questgiver", "vendor" }, distance = 40,
+      death_known = true, is_dead = false, player_can_attack = false,
+      location = { map_id = 0, position = { x = 40, y = 0, z = 0 } },
+    },
+  }
+  return sf
+end
+
+home.reset()
+logged = {}
+v = solo_full_bags()
+r = home.decide(v)
+check(r.kind == "interact" and r.guid == 2115 and r.reason == "open_vendor",
+  "a solo seat with full bags walks to the nearest vendor")
+check(r.status.mode == "vendor", "vendor seek reports vendor mode")
+
+v.quest_frame = { open = true, panel = "reward" }
+r = home.decide(v)
+check(r.kind == "ui_press" and r.control == "QuestFrameCancelButton" and
+  r.reason == "vendor_clear_dialog",
+  "a full-bag reward panel is closed so the seat can reach the vendor")
+
+v.quest_frame = { open = false }
+v.free_bag_slots = 5
+r = home.decide(v)
+check(r.reason ~= "open_vendor", "roomy bags do not walk to a vendor")
+
+v.free_bag_slots = 0
+v.units = {}
+r = home.decide(v)
+check(r.reason ~= "open_vendor", "no vendor in view means no seek")
+
+home.reset()
+v = solo_full_bags()
+v.party = frame().party
+v.units = { leader_unit(3, false), solo_full_bags().units[1] }
+r = home.decide(v)
+check(r.reason ~= "open_vendor",
+  "an escort with Murist does not walk off to a vendor")
+
+home.reset()
+v = solo_full_bags()
+v.in_combat = true
+r = home.decide(v)
+check(r.reason ~= "open_vendor", "combat never seeks a vendor")
+
+-- A questgiver-vendor opens quest, not merchant. Prefer the pure vendor.
+home.reset()
+v = solo_full_bags()
+v.units = {
+  solo_full_bags().units[1], -- Joshua, questgiver+vendor @40
+  {
+    guid = 2113, name = "Archibald Kava", object_kind = "unit",
+    services = { "vendor", "repair" }, distance = 50,
+    death_known = true, is_dead = false, player_can_attack = false,
+    location = { map_id = 0, position = { x = 50, y = 0, z = 0 } },
+  },
+}
+r = home.decide(v)
+check(r.kind == "interact" and r.guid == 2113 and r.reason == "open_vendor",
+  "a full-bag seat prefers a pure vendor over a questgiver-vendor")
+
+-- Routed interact wedges at nav=planning; steer the last yards instead.
+local old_nav = wow.nav_progress
+wow.nav_progress = function() return { state = "planning" } end
+home.reset()
+v = solo_full_bags()
+r = home.decide(v)
+check(r.kind == "navigate" and r.navigation_mode == "local_steer" and
+  r.reason == "open_vendor_walk",
+  "a planning nav steers the last yards to the vendor")
+wow.nav_progress = function() return { state = "unavailable" } end
+r = home.decide(v)
+check(r.kind == "navigate" and r.reason == "open_vendor_walk",
+  "an unavailable route also steers to the vendor")
+
+-- Same displacement watchdog as corpse/rejoin: a 90yd local_steer that
+-- stops displacing must hop, not freeze on open_vendor_walk forever.
+home.reset()
+v = solo_full_bags()
+wow.nav_progress = function() return { state = "planning" } end
+r = nil
+for t = 100, 109, 1 do
+  v.simulation_time = t
+  r = home.decide(v)
+end
+check(r.kind == "navigate" and r.reason == "vendor_unstick" and
+  r.navigation_mode == "local_steer" and r.allow_jump == true,
+  "a wedged vendor walk escapes with a vendor unstick")
+wow.nav_progress = old_nav
+
+-- Escort warrior Charges to close; other classes never do.
+home.reset()
+v = frame(1)
+v.action_buttons = {
+  { slot = 1, kind = "spell", spell_id = 100, spell_name = "Charge",
+    usable_known = true, usable = true, cooldown_ms = 0 },
+  { slot = 2, kind = "spell", spell_id = 78, spell_name = "Heroic Strike",
+    usable_known = true, usable = true, cooldown_ms = 0 },
+}
+local far = hostile(400, 100)
+far.distance = 15
+far.combat_distance = 15
+far.location.position.x = 15
+v.units = { leader_unit(3, true, 400), far }
+r = home.decide(v)
+check(r.kind == "attack" and r.spell == 100 and r.reason == "warrior_charge",
+  "escort warrior Charges from mid range")
+check(r.stop_distance == 25.0, "escort Charge stop stays at Charge max range")
+v.in_combat = true
+r = home.decide(v)
+check(r.spell ~= 100, "escort warrior does not Charge once in combat")
+
+-- Escort mage: Frost Armor out of combat, Fireball at caster range in a fight.
+home.reset()
+v = frame(8)
+v.action_buttons = {
+  { slot = 1, kind = "spell", spell_id = 168, spell_name = "Frost Armor",
+    usable_known = true, usable = true, cooldown_ms = 0 },
+  { slot = 2, kind = "spell", spell_id = 133, spell_name = "Fireball",
+    usable_known = true, usable = true, cooldown_ms = 0 },
+}
+r = home.decide(v)
+check(r.kind == "cast_spell" and r.spell == 168 and r.reason == "self_buff",
+  "escort mage buffs Frost Armor before standing in formation")
+v.units = { leader_unit(3, true, 400), hostile(400, 100) }
+v.in_combat = true
+r = home.decide(v)
+check(r.kind == "attack" and r.spell == 133 and r.reason == "mage_nuke",
+  "escort mage opens with Fireball")
+check(r.stop_distance == 22.0, "escort mage stops at caster range")
+
+-- === tank and healer rotations (Tusk / Beru, 2026-08-16) ================
+-- The live bars ARE the kit. bots/lua_bot/view.nim never exports spell_facts
+-- at all and only exports the 12 buttons of the ACTIVE bar page, so every
+-- case below drives the action-bar path the seats actually run.
+local function bar(id, name)
+  return { slot = 1, kind = "spell", spell_id = id, spell_name = name,
+    usable_known = true, usable = true, cooldown_ms = 0,
+    not_enough_mana = false }
+end
+
+-- Charge is the opener: out of combat in the 8-25yd band it closes the gap
+-- AND arrives with the rage the tank otherwise stands around waiting for.
+home.reset()
+v = frame(1)
+v.party.members[1].name = "Tusk"
+local far_mob = hostile(300, 100)
+far_mob.distance = 15
+far_mob.combat_distance = 15
+far_mob.location = { map_id = 0, position = { x = 15, y = 0, z = 0 } }
+v.units = { leader_unit(3, true, 300), far_mob }
+v.action_buttons = { bar(100, "Charge"), bar(78, "Heroic Strike") }
+r = home.decide(v)
+check(r.kind == "attack" and r.spell == 100 and r.reason == "warrior_charge",
+  "tank charges the opener from range")
+
+-- In combat the charge is gone and the filler takes over: Sunder builds the
+-- threat, Heroic Strike is only the dump for rage left over.
+v.in_combat = true
+v.action_buttons = { bar(78, "Heroic Strike"), bar(7386, "Sunder Armor") }
+r = home.decide(v)
+check(r.kind == "attack" and r.spell == 7386,
+  "tank sunders before dumping rage into Heroic Strike")
+
+-- Heroic Strike is queued on the NEXT swing and the client reports the queue
+-- as an active button; pressing it again cancels the queue. A level 8 tank
+-- whose only ability is Heroic Strike spends the whole fight doing that.
+v.action_buttons = { bar(78, "Heroic Strike") }
+v.action_buttons[1].active = true
+r = home.decide(v)
+check(r.kind == "attack" and r.spell == nil and r.reason == "tank_swing_queued",
+  "a queued Heroic Strike is never re-pressed")
+
+-- Battle Shout falls off mid-pull, so it is upkeep IN combat -- aura-gated,
+-- or a tank who cannot afford anything else turns it into the rage sink.
+home.reset()
+v.action_buttons = { bar(6673, "Battle Shout"), bar(78, "Heroic Strike") }
+r = home.decide(v)
+check(r.kind == "cast_spell" and r.spell == 6673 and
+  r.reason == "tank_battle_shout", "tank keeps Battle Shout up in combat")
+v.active_aura_spell_ids = { 6673 }
+r = home.decide(v)
+check(r.spell == 78, "a shouting tank goes straight back to building threat")
+
+-- Taunt is one mob's worth of threat on a 30s cooldown. A mob already
+-- chewing on the tank is exactly where a tank wants it.
+home.reset()
+v = frame(1)
+v.party.members[1].name = "Tusk"
+local on_me = hostile(300, 200)
+v.units = { leader_unit(3, true, 300), on_me }
+v.in_combat = true
+v.action_buttons = { bar(355, "Taunt"), bar(7386, "Sunder Armor") }
+r = home.decide(v)
+check(r.kind == "attack" and r.spell == 7386,
+  "tank does not waste Taunt on a mob already on him")
+on_me.target_guid = 100
+r = home.decide(v)
+check(r.kind == "attack" and r.spell == 355 and
+  r.reason == "tank_taunt_party_attacker",
+  "tank taunts a mob that peeled onto a party member")
+
+-- Beru outranks Murist's own target. A level 8 priest in cloth dies to two
+-- hits from anything Murist is willing to pull, and the healer that dies ends
+-- the fight for everybody.
+home.reset()
+v = frame(1)
+v.party.members[1].name = "Tusk"
+v.party.members[#v.party.members + 1] = member(700, "Beru", 100, 8)
+local on_beru = hostile(400, 700)
+on_beru.distance = 12
+on_beru.combat_distance = 12
+on_beru.location = { map_id = 0, position = { x = 12, y = 0, z = 0 } }
+local on_murist = hostile(500, 100)
+v.units = { leader_unit(3, true, 500), on_murist, on_beru }
+v.in_combat = true
+v.action_buttons = { bar(78, "Heroic Strike") }
+r = home.decide(v)
+check(r.kind == "attack" and r.guid == 400,
+  "tank peels the mob off Beru instead of assisting Murist's target")
+check(r.status.target_guid == 400, "the peel is what status reports")
+
+-- Two adds on the healer trade places in the distance sort every tick, and a
+-- tank that re-selects on every tie never lands a swing.
+v.auto_attack_guid = 400
+local also_on_beru = hostile(600, 700)
+also_on_beru.distance = 3
+also_on_beru.combat_distance = 3
+v.units = { leader_unit(3, true, 500), on_murist, on_beru, also_on_beru }
+r = home.decide(v)
+check(r.guid == 400, "the tank holds its peel against an equal-rank add")
+
+-- A mob already on the tank is a peel that WORKED. Handing it back to go
+-- fetch one off Murist is how the mob ends up on Beru again.
+on_beru.target_guid = 200
+v.units = { leader_unit(3, true, 500), on_murist, on_beru }
+r = home.decide(v)
+check(r.guid == 400, "the tank keeps the mob it already pulled off Beru")
+
+-- ...but a fresh mob ON the healer still outranks the one in hand.
+local new_on_beru = hostile(800, 700)
+new_on_beru.distance = 6
+new_on_beru.combat_distance = 6
+v.units = { leader_unit(3, true, 500), on_murist, on_beru, new_on_beru }
+r = home.decide(v)
+check(r.guid == 800, "a fresh mob on Beru outranks an established pull")
+
+-- Beru's whole live bar is Attack + Smite + Lesser Heal + Shoot, and Smite is
+-- 15 mana a cast against a pool of about 250.
+local function beru_frame(mana)
+  local f = frame(5)
+  f.party.members[1].name = "Beru"
+  f.powers = { mana or 100, 0, 0, 0, 0 }
+  f.max_powers = { 100, 0, 0, 0, 0 }
+  f.in_combat = true
+  f.units = { leader_unit(3, true, 300), hostile(300, 100) }
+  f.action_buttons = { bar(585, "Smite"), bar(2050, "Lesser Heal"),
+    bar(5019, "Shoot") }
+  return f
+end
+
+home.reset()
+v = beru_frame(100)
+r = home.decide(v)
+check(r.kind == "attack" and r.spell == 585 and r.reason == "priest_damage",
+  "a full-mana healer still spends it on Smite")
+
+home.reset()
+v = beru_frame(50)
+r = home.decide(v)
+check(r.kind == "attack" and r.spell == 5019 and r.reason == "healer_wand",
+  "a healer past the wand floor shoots for free instead of Smiting")
+
+-- Shoot is an auto-repeat TOGGLE: pressing it while the wand is firing
+-- cancels it, and the pilot presses whatever the intent names on a 0.4s
+-- throttle with no guard of its own.
+r = home.decide(v)
+check(r.kind == "attack" and r.spell == nil and r.reason == "healer_wanding",
+  "a wand we just started is never re-pressed")
+v.action_buttons[3].active = true
+v.simulation_time = 130
+r = home.decide(v)
+check(r.spell == nil and r.reason == "healer_wanding",
+  "the client's own auto-repeat flag keeps the finger off the button")
+v.action_buttons[3].active = false
+r = home.decide(v)
+check(r.spell == 5019, "a wand the client reports idle is re-pressed")
+
+-- Under the conserve floor the healer stops PRESSING entirely: a press is the
+-- one thing that can toggle a running wand off, and free wand damage is the
+-- whole point of conserving.
+home.reset()
+v = beru_frame(15)
+r = home.decide(v)
+check(r.kind == "attack" and r.spell == nil and
+  r.reason == "healer_conserve_mana",
+  "a nearly-empty healer presses nothing and banks the rest for heals")
+check(r.status.conserving == true, "conserving mana is visible in /status")
+
+home.reset()
+v = beru_frame(50)
+r = home.decide(v)
+check(r.status.conserving == false,
+  "a healer with mana to spend is not flagged conserving")
+
+-- Proactive mitigation. A shield has to be UP before the swing lands, so it
+-- goes on the tank at 60% rather than racing the hit that takes him to 35.
+home.reset()
+v = beru_frame(100)
+v.party.members[#v.party.members + 1] = member(700, "Tusk", 55, 8)
+v.action_buttons = { bar(17, "Power Word: Shield"), bar(139, "Renew"),
+  bar(2050, "Lesser Heal"), bar(585, "Smite") }
+r = home.decide(v)
+check(r.kind == "cast_spell" and r.spell == 17 and r.target_guid == 700 and
+  r.reason == "shield_tank",
+  "healer shields the tank before he falls into emergency range")
+
+-- Shielded and still being hit: Renew is upkeep, not a top-off.
+v.party.members[3].active_aura_spell_ids = { 17 }
+r = home.decide(v)
+check(r.kind == "cast_spell" and r.spell == 139 and r.target_guid == 700 and
+  r.reason == "renew_tank", "healer keeps Renew ticking on the tank")
+
+-- Somebody actually falling still outranks proactive tank upkeep.
+v.party.members[2].health = 25
+r = home.decide(v)
+check(r.kind == "cast_spell" and r.target_guid == 100,
+  "a member actually falling outranks proactive tank upkeep")
+
+-- Fortitude is idle-window work and it has a RANGE: an unbuffed member across
+-- the zone used to eat every idle tick as a cast into nothing.
+home.reset()
+v = frame(5)
+v.party.members[1].name = "Beru"
+v.party.members[1].active_aura_spell_ids = { 1243 }
+v.active_aura_spell_ids = { 1243 }
+v.party.members[2].location = { map_id = 0, x = 400, y = 0, z = 0 }
+v.action_buttons = { bar(1243, "Power Word: Fortitude") }
+r = home.decide(v)
+check(not (r.kind == "cast_spell" and r.spell == 1243),
+  "fortitude is not cast at a member across the zone")
+v.party.members[2].location = { map_id = 0, x = 6, y = 0, z = 0 }
+r = home.decide(v)
+check(r.kind == "cast_spell" and r.spell == 1243 and r.target_guid == 100,
+  "fortitude buffs the member standing next to the healer")
+
+wow.log = realLog
+
 print("test_home: " .. checks .. " checks passed")

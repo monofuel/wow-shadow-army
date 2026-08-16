@@ -200,4 +200,22 @@ check(zN == 0 and #zPts == 0, "no road data means no dots")
 zPts, zN = model.sample(elbow, 0)
 check(zN == 0 and #zPts == 0, "a zero budget draws nothing")
 
+-- ------------------------------------------- r54: monofuel's Brill route ---
+-- Two days of "no path on the map" in Tirisfal, and the router was never the
+-- reason: every bail above still hands back a drawable two-point line. The
+-- ROUTE HAD NO TARGET (see test_advisor_quest_model's Brill log). Now that a
+-- delivery waypoint exists, assert the last mile with the real shipped road
+-- network and his real endpoints: player in Brill, Magistrate Sevren's spot.
+dofile("addons/ShadowArmy/RoadData.lua")
+check(ShadowArmyRoadData and ShadowArmyRoadData[85],
+  "RoadData ships a Tirisfal Glades (id 85) network")
+
+local brillPts, brillMeta = model.route(model.build(ShadowArmyRoadData[85]),
+  { x = 61.0, y = 52.0 }, { x = 61.3, y = 50.8 })
+check(#brillPts >= 2,
+  "Brill -> Magistrate Sevren always yields a drawable line ("
+    .. tostring(brillMeta.reason) .. ")")
+check(brillPts[1].x == 61.0 and brillPts[#brillPts].x == 61.3,
+  "that line starts under the player and ends on the turn-in pin")
+
 print("test_advisor_route_model: " .. passed .. " checks passed")

@@ -49,8 +49,54 @@ check(not r.ok, "a pending button clears the ok flag")
 r = model.evaluate(snapshot({ hasPet = true }))
 check(button(r, "summon") == nil, "an active minion hides the summon button")
 
+-- r55 DELIBERATELY REPLACES the r42 expectation "combat hides the summon
+-- button", the same way r49 replaced "an auto-cast buff never becomes a
+-- button". Live report (monofuel, warlock Murist): the buffs section "stays
+-- stuck on 'buffs ok' and does not show shadow armor or summon imp" while
+-- attacking. Hiding the summon in combat did not just hide a button — with
+-- nothing else pending it drove nb == 0 and nn == 0, so `ok` went true and
+-- the section painted "buffs OK" over a DEAD IMP for the whole fight. The
+-- panel reports state; pressing a 10s summon mid-pull is the human's call,
+-- and the tooltip now carries that caveat instead of the model swallowing it.
 r = model.evaluate(snapshot({ inCombat = true }))
-check(button(r, "summon") == nil, "combat hides the summon button")
+check(button(r, "summon") ~= nil, "combat no longer hides the summon button (r55)")
+check(button(r, "summon").spell == "Summon Imp",
+  "the in-combat summon button is the real spell button, not a placeholder")
+check(button(r, "summon").inCombat,
+  "the summon button carries the combat flag so the tooltip can caveat it")
+check(not r.ok, "a missing minion in combat is NOT a quiet 'buffs OK' state")
+
+r = model.evaluate(snapshot({ hasPet = true, inCombat = true }))
+check(button(r, "summon") == nil, "a LIVING minion still hides the summon, in combat too")
+check(r.ok, "live minion plus healthy buffs is 'buffs OK' even mid-fight")
+
+-- The dead-imp case is the one monofuel actually hit: F.passiveSnapshot's
+-- pet guard (UnitExists and not UnitIsDeadOrGhost and health > 0) reports
+-- hasPet=false over a corpse, and resummoning over a corpse is legal.
+r = model.evaluate(snapshot({ hasPet = false, inCombat = true }))
+check(button(r, "summon") ~= nil, "an imp that died mid-fight offers the summon immediately")
+
+-- Buff upkeep was never combat-gated and must stay that way: armor dropping
+-- mid-fight yields the button on the same evaluation pass.
+r = model.evaluate(snapshot({ hasPet = true, inCombat = true, buffs = { armor() } }))
+check(button(r, "buff:armor") ~= nil, "armor missing mid-fight still becomes a cast button")
+check(button(r, "buff:armor").spell == "Demon Skin",
+  "the mid-fight armor button casts the trained rank")
+check(not r.ok, "missing armor in combat is not 'buffs OK'")
+
+r = model.evaluate(snapshot({ hasPet = true, inCombat = true,
+  buffs = { armor({ spell = "Demon Armor", auto = true }) } }))
+check(button(r, "buff:armor").spell == "Demon Armor",
+  "Demon Armor supersedes Demon Skin mid-fight and the button follows it")
+
+-- Both gone at once, in combat: armor first (key 2 fires it), summon behind.
+r = model.evaluate(snapshot({ inCombat = true, buffs = { armor() } }))
+check(#r.buttons == 2 and r.buttons[1].id == "buff:armor" and r.buttons[2].id == "summon",
+  "armor down AND imp down mid-fight shows both buttons, upkeep first")
+
+-- Death still wins over everything: a corpse gets no cast buttons at all.
+r = model.evaluate(snapshot({ inCombat = true, dead = true }))
+check(#r.buttons == 0, "a dead player gets no summon button, in combat or out")
 
 r = model.evaluate(snapshot({ dead = true }))
 check(button(r, "summon") == nil, "a dead player gets no summon button")
