@@ -2,6 +2,10 @@
 -- Runs in the fork's embedded lua-bot against the raw Observation mirror.
 
 local solo = require("accelerated")
+-- Dotted, like traverse's config.* requires: the lua-bot's package.path is the
+-- repo's lua/ and lua/entry/, so a bare "road_route" does not resolve at
+-- runtime even though the test harness puts lua/tools on LUA_PATH.
+local road_route = require("tools.road_route")
 -- Home is the dogfood pen, not a scored league: run the soft-quest path here
 -- so the new quest stack gets exercised where monofuel can watch. Scored
 -- leagues stay grind-only until a rerun A/B beats the 4.791 baseline.
@@ -16,12 +20,84 @@ local HEAL_RANGE_YARDS = 30.0
 local RES_WAIT_SECONDS = 20.0
 local PROMOTE_RETRY_SECONDS = 5.0
 
+-- Long rejoins go by ROAD. Under this the crow line is the right answer: the
+-- detour to reach pavement costs more than the walk it saves, and the router
+-- says so itself (short-hop). Over it, a straight line through open country is
+-- an aggro chain and a corpse run, and the road is a freeway.
+local ROAD_MIN_YARDS = 80.0
+-- Walk at the route point this far ahead rather than at the leader, so the
+-- pilot's own navmesh routing stays ON the road between waypoints. About one
+-- decimation step of lua/data/bot_roads.lua.
+local ROAD_LOOKAHEAD_YARDS = 20.0
+-- Waypoints are handholds, not destinations: stop short and the next decide()
+-- has already moved the target up the road.
+local ROAD_WAYPOINT_STOP = 10.0
+
+-- Wedge escape for the long legs the escort walks blind: the corpse run and
+-- the off-screen rejoin. Both hand a far goal to the route engine and then
+-- trust nav_progress, which happily reports "following" while the seat grinds
+-- a cliff face for minutes (Igris, ghost at Undercity 1780,221 with his corpse
+-- 440yd north, zero displacement, 2026-08-16). The solo brain has had this
+-- watchdog since the Deathknell church wedge; recovery and rejoin never ran
+-- it, because decide() returns out of those branches before solo.decide is
+-- ever reached. Same shape as accelerated's unstick_step: short local_steer
+-- legs, jump allowed (upstream only arms the slide/jump reflex for
+-- local_steer goals), a fresh bearing per attempt.
+local STUCK_STILL_SECONDS = 8.0
+local STUCK_YARDS = 3.0
+-- Wall-clock alone is not evidence: decide runs at simulation cadence (~12 Hz
+-- on the home seats), so a wedge is only real when several consecutive frames
+-- also saw no displacement.
+local STUCK_STILL_FRAMES = 4
+local STUCK_LEG_YARDS = 22.0
+local STUCK_SECONDS = 6.0
+-- A gap this long between watchdog calls means the seat left the recovery or
+-- rejoin leg entirely; the old anchor is stale and must not be resumed.
+local STUCK_GAP_SECONDS = 2.0
+
 local CLASS_WARRIOR = 1
 local CLASS_PRIEST = 5
 local CLASS_WARLOCK = 9
 
+-- Life Tap paid out of combat to fund a pet summon. Higher floor than the
+-- in-combat tap (18% mana / 40% health) because nothing is threatening us
+-- here and the health has to survive the leader's next pull.
+local SUMMON_LIFE_TAP_MIN_HEALTH_PCT = 65.0
+
+-- Stranded chat box (the 0057 Failure-4 gap): every lifecycle verb —
+-- /reclaim, /acceptgroup, /interact — drives the chat edit box, and an
+-- interrupted sequence leaves it open eating every later keypress. The solo
+-- brain has had this flush since 0057; the party brain did NOT, which is how
+-- Igris stood on his corpse looping a /reclaim that never landed.
+local CHAT_STUCK_SECONDS = 4.0
+
+-- Party banter. The line itself is written host-side by the local LLM and
+-- left in the seat's outbox; the brain only decides WHEN a seat may speak.
+-- Speaking is an idle-only luxury: it borrows the same edit box every
+-- lifecycle verb needs, so it never starts while there is a fight to run.
+local CHAT_POLL_SECONDS = 1.0
+local CHAT_MIN_GAP_SECONDS = 20.0
+-- Under the stranded-box flush window, so a sequence that cannot finish is
+-- abandoned by its owner rather than swept up as wreckage.
+local CHAT_SEND_TIMEOUT = 3.0
+local CHAT_MAX_TEXT = 120
+-- A seat that was away answers nothing: the mailbox survives a reload and a
+-- relaunch, and a reply to a question asked an hour ago reads as a ghost.
+local CHAT_STALE_SECONDS = 60.0
+
 local dead_since = nil
 local last_promote_at = nil
+local stuckAnchor = nil
+local stuckSince = nil
+local stuckFrames = 0
+local stuckSeenAt = nil
+local stuckUntil = nil
+local stuckBearing = 0
+local chatOpenSince = nil
+local chat_outbox = nil
+local chat_last_poll_at = nil
+local chat_last_sent_at = nil
+local chat_pending = nil
 
 local AURA_FAMILIES = {
   ["curse of agony"] = { 980, 1014, 6217, 11711, 11712, 11713 },
@@ -91,6 +167,254 @@ local function distance(a, b)
   return math.sqrt(dx * dx + dy * dy + dz * dz)
 end
 
+-- The intent boundary has no follow or assist verb (intent.nim knows
+-- navigate/attack/interact/...); emitting one parked the seat in bad_intent
+-- holds while mobs beat on it. Following IS navigating to where the leader
+-- stands, at formation distance, steering locally so town navmesh gaps
+-- cannot stall the escort.
+local function follow_leader(leader, reason)
+  local p = point(leader)
+  if not p then return { kind = "hold", reason = "leader_position_unknown" } end
+  -- No allow_jump: local_steer reads it as a license to hop continuously
+  -- while closing, and a formation follow on open ground never needs it.
+  -- Route by default — bare local_steer walks a straight line and wedges on
+  -- terrain at hard-leash range (Tusk, 69yd, 2026-08-16); steer directly
+  -- only when the router reports it has no answer from here.
+  local intent = {
+    kind = "navigate",
+    x = p.x, y = p.y, z = p.z,
+    stop_distance = NEAR_YARDS * 0.75,
+    route_profile = "prefer_ground",
+    reason = reason,
+  }
+  if leader.location and leader.location.map_id then
+    intent.map_id = math.floor(leader.location.map_id)
+  end
+  if wow.nav_progress().state == "unavailable" then
+    intent.route_profile = nil
+    intent.navigation_mode = "local_steer"
+  end
+  return intent
+end
+
+-- Roster rows carry a flat WorldPoint ({map_id,x,y,z,o}) precisely so the
+-- group stays locatable when the member's player object is not in `units` —
+-- the escort used to go solo the moment Murist left visual range, which read
+-- as "the bots refuse to come to me".
+local function member_point(member)
+  if member and member.location_known and member.location then
+    return member.location
+  end
+  return nil
+end
+
+-- Road network, lazily loaded and injectable. The generated table is a plain
+-- module (tools/gen_bot_road_data.py), but a seat whose deploy is missing it
+-- must still walk, so the require is guarded: no data simply means every
+-- rejoin is the crow line it was before.
+local road_segments = nil
+local road_loaded = false
+local road_graphs = {}
+
+-- nil restores the generated file; a table (including {}) replaces it. Tests
+-- inject synthetic maps this way so they never depend on a baked artifact.
+function M.set_roads(segments)
+  road_segments = segments
+  road_loaded = segments ~= nil
+  road_graphs = {}
+end
+
+local function road_data()
+  if not road_loaded then
+    road_loaded = true
+    local ok, data = pcall(require, "data.bot_roads")
+    if ok and type(data) == "table" then
+      road_segments = data
+    else
+      road_segments = nil
+      wow.log("road data unavailable: " .. tostring(data))
+    end
+  end
+  return road_segments
+end
+
+-- One graph per continent map, built once and kept: the build is the only
+-- expensive call in road_route (~10 ms for a continent), a route over it is
+-- half a millisecond, so the per-tick cost of re-routing is noise.
+local function road_graph(map_id)
+  local data = road_data()
+  if not data then return nil end
+  local segments = data[map_id]
+  if not segments then return nil end
+  local graph = road_graphs[map_id]
+  if not graph then
+    graph = road_route.build(segments)
+    road_graphs[map_id] = graph
+  end
+  return graph
+end
+
+-- The world point to actually walk at for a long rejoin, or nil to keep
+-- walking at the leader. nil covers every road bail (no data, a hole in the
+-- bake, a road that would not help) AND the last leg, where the next route
+-- point IS the leader and the plain rejoin intent already says it better.
+local function road_waypoint(mine, goal, map_id)
+  local graph = road_graph(map_id)
+  if not graph then return nil end
+  local pts, meta = road_route.route(graph, mine, goal)
+  if meta.straight then return nil end
+  local x, y, z, i = road_route.nextPoint(pts, mine.x, mine.y,
+    ROAD_LOOKAHEAD_YARDS)
+  if not x or not i or i >= #pts then return nil end
+  return { x = x, y = y, z = z }
+end
+
+-- Height is not evidence of progress here: a seat wedged against the
+-- Undercity entrance ramp slides up and down it while going nowhere.
+local function distance2d(a, b)
+  if not a or not b then return nil end
+  local dx = (a.x or 0) - (b.x or 0)
+  local dy = (a.y or 0) - (b.y or 0)
+  return math.sqrt(dx * dx + dy * dy)
+end
+
+local function forget_stuck()
+  stuckAnchor, stuckSince, stuckFrames, stuckUntil = nil, nil, 0, nil
+end
+
+-- True while something is holding the seat still on purpose. Cancelling those
+-- to "escape" is how an escape reflex starts eating its own loot.
+local function rejoin_busy(view)
+  if view.in_combat then return true end
+  if view.chat_input_visible then return true end
+  if (view.quest_frame or {}).open or view.gossip_open then return true end
+  if (view.active_cast_spell_id or 0) ~= 0 then return true end
+  if (view.active_channel_spell_id or 0) ~= 0 then return true end
+  for _, node in ipairs(view.ui_nodes or {}) do
+    local reference = tostring(node.reference or "")
+    if reference:sub(1, 10) == "loot-slot:" or
+        reference:sub(1, 11) == "loot-money:" then
+      return true
+    end
+  end
+  return false
+end
+
+-- Returns an escape leg when a recovery or rejoin walk has stopped displacing,
+-- and nil otherwise. Anchor bookkeeping happens here so each call site has one
+-- call. `busy` is always false on the ghost path: a ghost cannot be attacked,
+-- looted or talked to, so nothing can legitimately pin it.
+local function stuck_step(view, now, busy, reason)
+  local pos = view_point(view)
+  if not pos or not view.location then
+    forget_stuck()
+    stuckSeenAt = now
+    return nil
+  end
+  -- A leg the seat was not walking last tick says nothing about this one.
+  if stuckSeenAt and now - stuckSeenAt > STUCK_GAP_SECONDS then forget_stuck() end
+  stuckSeenAt = now
+
+  local pinned = view.movement_allowed == false or view.rooted
+  if busy or pinned then
+    stuckAnchor, stuckSince, stuckFrames = { x = pos.x, y = pos.y }, now, 0
+    if stuckUntil and now >= stuckUntil then stuckUntil = nil end
+    return nil
+  end
+  if not stuckAnchor or not stuckSince then
+    stuckAnchor, stuckSince, stuckFrames = { x = pos.x, y = pos.y }, now, 0
+    return nil
+  end
+  if distance2d(pos, stuckAnchor) >= STUCK_YARDS then
+    -- Real displacement: the leg is working, and any open escape window is
+    -- over the moment it did its job.
+    stuckAnchor, stuckSince, stuckFrames = { x = pos.x, y = pos.y }, now, 0
+    stuckUntil = nil
+    return nil
+  end
+  stuckFrames = stuckFrames + 1
+
+  if stuckUntil and now < stuckUntil then
+    -- keep the current bearing until the window closes
+  elseif now - stuckSince > STUCK_STILL_SECONDS and
+      stuckFrames >= STUCK_STILL_FRAMES then
+    stuckBearing = (stuckBearing + 1) % 8
+    stuckUntil = now + STUCK_SECONDS
+    wow.log(string.format(
+      "unstick %s bearing %d at %.1f,%.1f allowed=%s rooted=%s nav=%s",
+      tostring(reason), stuckBearing, pos.x, pos.y,
+      tostring(view.movement_allowed), tostring(view.rooted),
+      tostring(wow.nav_progress().state)))
+  else
+    return nil
+  end
+
+  local angle = stuckBearing * math.pi / 4.0
+  return {
+    kind = "navigate",
+    x = pos.x + math.cos(angle) * STUCK_LEG_YARDS,
+    y = pos.y + math.sin(angle) * STUCK_LEG_YARDS,
+    z = pos.z,
+    map_id = math.floor(view.location.map_id or 0),
+    stop_distance = NEAR_YARDS,
+    navigation_mode = "local_steer",
+    allow_jump = true,
+    reason = reason or "unstick",
+  }
+end
+
+local function rejoin_leader(view, member)
+  local p = member_point(member)
+  if not p then return nil end
+  local mine = view_point(view)
+  if mine and view.location and p.map_id and
+      math.floor(view.location.map_id or -1) ~= math.floor(p.map_id) then
+    return nil -- cross-map rejoin is a taxi problem, not a walk
+  end
+  -- Off-screen roster rows carry NO height: vanilla writes
+  -- GROUP_UPDATE_FLAG_POSITION as int16 x + int16 y only, so the projection
+  -- fills z = 0.0 and says so with elevation_known = false. Taken literally
+  -- that walks the seat at a point tens of yards under the world — the router
+  -- re-plans every tick and the seat crawls (Igris, 1.1 yd/s vs 4 yd/s on a
+  -- corpse run with a real z, 2026-08-16) until something kills it. Our own
+  -- z is the best ground guess available, and the leash has to be flat or
+  -- our own height alone can exceed it while we stand on the leader.
+  local flat = member.elevation_known ~= true
+  if flat and mine then
+    p = { map_id = p.map_id, x = p.x, y = p.y, z = mine.z }
+  end
+  local d = flat and distance2d(mine, p) or distance(mine, p)
+  if not d or d <= HARD_LEASH_YARDS then return nil end
+  local intent = {
+    kind = "navigate",
+    x = p.x, y = p.y, z = p.z,
+    stop_distance = NEAR_YARDS,
+    route_profile = "safe_ground",
+    reason = "rejoin_murist_far",
+  }
+  intent.map_id = math.floor(p.map_id)
+  -- Roads are freeways. Past ROAD_MIN_YARDS the crow line is a tour of every
+  -- mob field between here and the leader, so hand the walk to the road router
+  -- and chase the next waypoint instead; the leader keeps moving, so this is
+  -- re-decided from scratch every tick rather than committed to a plan.
+  if d > ROAD_MIN_YARDS and mine then
+    local wp = road_waypoint(mine, p, intent.map_id)
+    if wp then
+      intent.x, intent.y, intent.z = wp.x, wp.y, wp.z
+      intent.stop_distance = ROAD_WAYPOINT_STOP
+      intent.reason = "rejoin_murist_road"
+    end
+  end
+  -- Same story as the quest pursuits: town navmesh holes report
+  -- "unavailable", and a stalled route beats no movement not at all —
+  -- steer at the position directly until the router has an answer.
+  if wow.nav_progress().state == "unavailable" then
+    intent.route_profile = nil
+    intent.navigation_mode = "local_steer"
+  end
+  return intent
+end
+
 local function party_member(view, name)
   local wanted = lower(name)
   for _, member in ipairs((view.party and view.party.members) or {}) do
@@ -144,11 +468,58 @@ local function spell_ready(spell)
   return true
 end
 
+-- spell_facts arrives EMPTY on live seats (the spellbook fact pipeline needs
+-- catalog definitions the embedded client never requests — 2026-08-16, found
+-- when every escort cast fell through to melee). The action bars carry the
+-- same fields for everything placed on them, which for a rolled seat is its
+-- whole kit; facts win whenever they do exist.
+local function spell_candidates(view)
+  local facts = view.spell_facts or {}
+  if #facts > 0 then return facts end
+  local out = {}
+  for _, button in ipairs(view.action_buttons or {}) do
+    if (button.spell_id or 0) ~= 0 then
+      out[#out + 1] = {
+        spell_id = button.spell_id,
+        name = button.spell_name,
+        name_known = (button.spell_name or "") ~= "",
+        rank = 0,
+        usable_known = button.usable_known,
+        usable = button.usable,
+        not_enough_mana = button.not_enough_mana,
+        cooldown_ms = button.cooldown_ms,
+        reagents_available = true,
+      }
+    end
+  end
+  return out
+end
+
+-- Same match as pick_spell, but for the one spell that is ready EXCEPT that
+-- the seat cannot pay for it. The client sets notEnoughMana only from
+-- `powers[mana] < powerCost` (fork environment/client/spell_usability.nim
+-- resultFor / SpellInsufficientResource), so this is a real empty bar, not a
+-- projection quirk -- and it drags `usable` false with it, which is why
+-- spell_ready rejects the candidate outright.
+local function mana_blocked_spell(view, wanted)
+  local want = normalized(wanted)
+  for _, spell in ipairs(spell_candidates(view)) do
+    local name = normalized(spell.name)
+    if spell.name_known ~= false and not spell.passive and not spell.from_item and
+        spell.not_enough_mana and (spell.cooldown_ms or 0) <= 0 and
+        spell.reagents_available ~= false and
+        (name == want or name:find(want, 1, true)) then
+      return spell
+    end
+  end
+  return nil
+end
+
 local function pick_spell(view, priorities)
   for _, wanted in ipairs(priorities) do
     local want = normalized(wanted)
     local best = nil
-    for _, spell in ipairs(view.spell_facts or {}) do
+    for _, spell in ipairs(spell_candidates(view)) do
       local name = normalized(spell.name)
       if spell.name_known ~= false and spell_ready(spell) and
           (name == want or name:find(want, 1, true)) and
@@ -169,6 +540,68 @@ local function aura_present(ids, family, selected_spell_id)
     if wanted[id] then return true end
   end
   return false
+end
+
+-- Group loot. A live roll puts a GroupLootFrame1..4 prompt on every seat and
+-- the drop stays locked until all of them answer or the timer runs out, so a
+-- silent bot holds the party's loot hostage for the full window. The three
+-- buttons arrive as presented ui_nodes referenced
+-- "loot-roll:<target>:<slot>:need|greed|pass" (client ui/loot_frame.nim
+-- drawLootRollArtButton), all enabled while the roll is active and the seat's
+-- choice is still unknown. The target is a uint64 the reference spells as
+-- unsigned decimal while Lua sees guids as negative int64, so match on the
+-- prefix and the choice suffix only and never on the guid itself.
+local ROLL_PREFIX = "loot-roll:"
+
+local function roll_reference(view, choice)
+  local suffix = ":" .. choice
+  for i = 1, #(view.ui_nodes or {}) do
+    local node = view.ui_nodes[i]
+    local reference = node.reference_id or ""
+    if node.enabled and node.hit_testable and
+        reference:sub(1, #ROLL_PREFIX) == ROLL_PREFIX and
+        reference:sub(-#suffix) == suffix then
+      return reference
+    end
+  end
+  return nil
+end
+
+-- Greed, or pass when greed is not on offer. Need is never pressed: these
+-- seats exist to escort Murist, not to roll his drops away from him.
+-- TEMP probe (2026-08-16): live rolls are not being answered; show what the
+-- seat actually sees whenever anything roll-shaped is in ui_nodes.
+local rollProbeAt = nil
+
+local function loot_roll_step(view)
+  do
+    local now = tonumber(view.simulation_time) or 0
+    if not rollProbeAt or now - rollProbeAt > 5 then
+      local lines = ""
+      for i = 1, #(view.ui_nodes or {}) do
+        local node = view.ui_nodes[i]
+        local ref = tostring(node.reference_id or "")
+        local src = tostring(node.source_name or "")
+        if ref:find("roll", 1, true) or src:find("GroupLoot", 1, true) then
+          lines = lines .. string.format(" [%s|%s|en=%s|hit=%s]",
+            src, ref, tostring(node.enabled), tostring(node.hit_testable))
+        end
+      end
+      if lines ~= "" then
+        rollProbeAt = now
+        wow.log("roll probe:" .. lines)
+      end
+    end
+  end
+  local reference = roll_reference(view, "greed")
+  if reference then
+    return { kind = "ui_press", reference = reference, reason = "group_loot_greed" }
+  end
+  reference = roll_reference(view, "pass")
+  if reference then
+    return { kind = "ui_press", reference = reference, reason = "group_loot_pass" }
+  end
+  return nil
 end
 
 local function role_for(view)
@@ -219,9 +652,28 @@ local function current_hostile(view)
   local target = visible_unit(view, view.auto_attack_guid)
   if hostile(target) then return target end
   target = visible_unit(view, view.selected_target_guid)
-  if hostile(target) then return target end
+  -- A stale far selection (leashed mob still targeted) keeps escorts fixated forever.
+  if hostile(target) then
+    local d = target.combat_distance_known and target.combat_distance or target.distance or 1e9
+    if d <= 50.0 then return target end
+  end
   if view.in_combat then return nearest_hostile(view) end
   return nil
+end
+
+-- Range to a ROSTER row, which is the same heightless-z trap the long rejoin
+-- walks into: a row the projection has not vouched for carries z = 0.0 and
+-- elevation_known = false, so a 3D distance from any hill is mostly our own
+-- altitude. At z = 26 that quietly shrinks the 30yd heal range to 15yd of
+-- ground, and above z = 30 the healer decides nobody is reachable while
+-- standing on top of them. Flat range is the honest answer until the row
+-- carries a real height.
+local function member_range(view, row)
+  local mine = view_point(view)
+  local p = row and row.location
+  if not mine or not p then return nil end
+  if row.elevation_known ~= true then return distance2d(mine, p) end
+  return distance(mine, { x = p.x, y = p.y, z = p.z })
 end
 
 local function beru_can_resurrect(view)
@@ -229,9 +681,7 @@ local function beru_can_resurrect(view)
   if not beru or not beru.level_known or (beru.level or 0) < 10 then return false end
   if not beru.death_state_known or beru.is_dead or beru.is_ghost then return false end
   if not beru.location_known or not view.location_known then return false end
-  local d = distance(view_point(view), {
-    x = beru.location.x, y = beru.location.y, z = beru.location.z,
-  })
+  local d = member_range(view, beru)
   return d ~= nil and d <= HEAL_RANGE_YARDS
 end
 
@@ -252,7 +702,7 @@ local function death_intent(view, now)
     end
     if view.corpse_known and view.corpse_location and view.corpse_location.position then
       local corpse = view.corpse_location.position
-      return {
+      local intent = {
         kind = "navigate",
         x = corpse.x,
         y = corpse.y,
@@ -261,7 +711,26 @@ local function death_intent(view, now)
         stop_distance = 30.0,
         route_profile = "safe_ground",
         reason = "corpse_run",
-      }, "corpse_run"
+      }
+      -- A ghost run is the longest walk this brain ever does, and a crow line
+      -- from the graveyard finds every cliff between here and the corpse.
+      -- Same layering as the long rejoin: road waypoints past ROAD_MIN_YARDS,
+      -- direct steering only when the router has no answer at all.
+      local mine = view_point(view)
+      local d = distance(mine, corpse)
+      if mine and d and d > ROAD_MIN_YARDS and intent.map_id then
+        local wp = road_waypoint(mine, corpse, math.floor(intent.map_id))
+        if wp then
+          intent.x, intent.y, intent.z = wp.x, wp.y, wp.z
+          intent.stop_distance = ROAD_WAYPOINT_STOP
+          intent.reason = "corpse_run_road"
+        end
+      end
+      if wow.nav_progress().state == "unavailable" then
+        intent.route_profile = nil
+        intent.navigation_mode = "local_steer"
+      end
+      return intent, "corpse_run"
     end
     return { kind = "hold", reason = "ghost_without_known_corpse" }, "corpse_unknown"
   end
@@ -276,9 +745,7 @@ local function heal_candidate(view)
     if row.health_known == false or (row.max_health or 0) <= 0 then return end
     if not is_self then
       if not row.location_known or not view.location_known then return end
-      local d = distance(view_point(view), {
-        x = row.location.x, y = row.location.y, z = row.location.z,
-      })
+      local d = member_range(view, row)
       if not d or d > HEAL_RANGE_YARDS or row.line_of_sight_blocked then return end
     end
     local hp = health_pct(row)
@@ -336,9 +803,7 @@ local function resurrection_action(view)
     if not guid_equal(member.guid, view.player_guid) and member.death_state_known and
         (member.is_dead or member.is_ghost) and member.location_known and
         view.location_known then
-      local d = distance(view_point(view), {
-        x = member.location.x, y = member.location.y, z = member.location.z,
-      })
+      local d = member_range(view, member)
       if d and d <= HEAL_RANGE_YARDS and not member.line_of_sight_blocked then
         candidates[#candidates + 1] = member
       end
@@ -417,6 +882,41 @@ local function self_buff(view, role)
   return nil
 end
 
+-- A petless warlock is half a warlock. Own pet state comes off our own
+-- roster row (pet_guid 0 = nothing summoned); the 10s cast is protected by
+-- the finish_active_cast hold like any other cast.
+local function summon_demon(view, role)
+  if role ~= "dps" or view.class_id ~= CLASS_WARLOCK then return nil end
+  -- The view has no first-person pet field and SMSG_GROUP_LIST rosters only
+  -- the OTHER members, so our own demon is found the way anyone finds it: a
+  -- living unit we are the summoner of. Imps heel, so "not in units" is
+  -- "not summoned" in practice.
+  for _, unit in ipairs(view.units or {}) do
+    if guid_equal(unit.summoner_guid, view.player_guid) and
+        not (unit.death_known and unit.is_dead) then
+      return nil
+    end
+  end
+  local spell = pick_spell(view, { "Summon Imp" })
+  if not spell then
+    -- Measured live on Igris (2026-08-16):
+    --   candidate: "Summon Imp" id=688 ready=false known=true usable=true/false
+    --              mana_short=true cd=0 reagents=true
+    -- The bar name and the cooldown were fine the whole time; the seat simply
+    -- never had the mana. Escort mode chain-pulls behind Murist and has no
+    -- rest step, so passive regen never reaches the summon's cost. Life Tap
+    -- is the warlock's own funding mechanism -- out of combat the health is
+    -- idle capital, so trade it for the imp instead of standing there broke.
+    if not view.in_combat and mana_blocked_spell(view, "Summon Imp") and
+        self_health_pct(view) >= SUMMON_LIFE_TAP_MIN_HEALTH_PCT then
+      local tap = pick_spell(view, { "Life Tap" })
+      if tap then return cast(tap, "life_tap_for_summon") end
+    end
+    return nil
+  end
+  return cast(spell, "summon_imp")
+end
+
 local function fortitude_action(view)
   local spell = pick_spell(view, { "Power Word: Fortitude" })
   if not spell then return nil end
@@ -431,17 +931,149 @@ local function fortitude_action(view)
   return nil
 end
 
+local function chat_outbox_path()
+  if chat_outbox ~= nil then
+    if chat_outbox == false then return nil end
+    return chat_outbox
+  end
+  -- The launcher hands every seat its own control directory; the sibling
+  -- chat directory is this seat's private mailbox from the host.
+  local dir = os.getenv("VANILLA_WOW_LUA_DEBUG_DIR")
+  if not dir or dir == "" then
+    chat_outbox = false
+    return nil
+  end
+  chat_outbox = dir:gsub("[/\\]*$", ""):gsub("[/\\]control$", "") ..
+    "/chat/outbox.json"
+  return chat_outbox
+end
+
+local function chat_silenced()
+  local off = os.getenv("SHADOW_CHAT_QWEN_OFF")
+  return off ~= nil and off ~= "" and off ~= "0"
+end
+
+local function chat_take_line()
+  local path = chat_outbox_path()
+  if not path then return nil end
+  local handle = io.open(path, "r")
+  if not handle then return nil end
+  local body = handle:read("*a") or ""
+  handle:close()
+  -- Consume unconditionally: a line we cannot read is a line we must not
+  -- retry, and the host only refills an empty mailbox.
+  os.remove(path)
+  local written = tonumber(body:match('"created_at_unix_seconds"%s*:%s*([%d%.]+)'))
+  if written and os.time() - written > CHAT_STALE_SECONDS then return nil end
+  local text = body:match('"text"%s*:%s*"([^"]*)"')
+  if not text or text == "" then return nil end
+  if #text > CHAT_MAX_TEXT then return nil end
+  if text:find("[^\32-\126]") then return nil end
+  if text:sub(1, 1) == "/" then return nil end
+  return text
+end
+
+local function chat_poll(view, now)
+  if chat_pending or chat_silenced() then return end
+  if chat_last_sent_at and now - chat_last_sent_at < CHAT_MIN_GAP_SECONDS then
+    return
+  end
+  if chat_last_poll_at and now - chat_last_poll_at < CHAT_POLL_SECONDS then
+    return
+  end
+  chat_last_poll_at = now
+  local text = chat_take_line()
+  if not text then return end
+  chat_pending = { text = text, started_at = now, saw_box = false }
+  wow.log("chat: queued " .. text)
+end
+
+local function chat_step(view, now)
+  -- One in-flight line owns the edit box until the client closes it. Giving
+  -- up mid-sequence is what strands the box for every later verb, so the
+  -- only exits are "the box closed" and "we waited too long".
+  if not chat_pending then return nil end
+  if view.in_combat or view.is_dead or view.is_ghost then
+    -- Banter loses to every emergency. The box, if it is open, belongs to
+    -- the stranded-box flush now.
+    wow.log("chat: dropped " .. chat_pending.text)
+    chat_pending = nil
+    chat_last_sent_at = now
+    return nil
+  end
+  if view.chat_input_visible then chat_pending.saw_box = true end
+  local finished = chat_pending.saw_box and not view.chat_input_visible
+  local expired = now - chat_pending.started_at > CHAT_SEND_TIMEOUT
+  if finished or expired then
+    wow.log("chat: " .. (finished and "sent " or "gave up on ") ..
+      chat_pending.text)
+    chat_pending = nil
+    chat_last_sent_at = now
+    return nil
+  end
+  return { kind = "chat", channel = "party", text = chat_pending.text,
+    reason = "party_banter" }
+end
+
 function M.reset()
   dead_since = nil
   last_promote_at = nil
+  forget_stuck()
+  stuckSeenAt = nil
+  stuckBearing = 0
+  chatOpenSince = nil
+  chat_last_poll_at = nil
+  chat_last_sent_at = nil
+  chat_pending = nil
 end
 
 function M.decide(view)
   view = view or {}
   local now = tonumber(view.simulation_time) or 0
   local role = role_for(view)
+  -- Ahead of everything, including recovery and the solo fallback: the prompt
+  -- shows up on bot-only groups too, one press costs a single frame, and a
+  -- corpse run or a follow leg loses nothing by resuming next tick.
+  local roll = loot_roll_step(view)
+  if roll then return finish(roll, view, "loot_roll", role) end
+
+  -- Flush a STRANDED chat box before any state machine runs — recovery
+  -- included, since /reclaim is itself chat-driven and types into the same
+  -- fouled box. Time-gated exactly like the solo flush so an in-flight
+  -- sequence (2-3 frames) is never cancelled; only when no dialog owns input.
+  if view.chat_input_visible then
+    if not chatOpenSince then chatOpenSince = now end
+    if now - chatOpenSince > CHAT_STUCK_SECONDS and
+        not (view.quest_frame or {}).open and not view.gossip_open then
+      chatOpenSince = now
+      return finish({ kind = "quest_cmd", command = "/gossip",
+        reason = "close_chat_box" }, view, "chat_flush", role)
+    end
+  else
+    chatOpenSince = nil
+  end
+
+  -- A line already being typed finishes before anything else looks at the
+  -- world: the half-typed box is the one state no other verb can survive.
+  if chat_pending then
+    local speak = chat_step(view, now)
+    if speak then return finish(speak, view, "escort", role) end
+  end
+
   local death, recovery = death_intent(view, now)
-  if death then return finish(death, view, "recovery", role, nil, nil, recovery) end
+  if death then
+    -- Only the walking legs of recovery can wedge; a hold or a /reclaim is
+    -- standing still because it was told to.
+    if death.kind == "navigate" then
+      local escape = stuck_step(view, now, false, "corpse_run_unstick")
+      if escape then
+        return finish(escape, view, "recovery", role, nil, nil, recovery)
+      end
+    else
+      forget_stuck()
+    end
+    return finish(death, view, "recovery", role, nil, nil, recovery)
+  end
 
   local party = view.party or {}
   if party.invite_pending and lower(party.invite_from) == MURIST then
@@ -467,6 +1099,16 @@ function M.decide(view)
   end
 
   local leader = murist_member and visible_player_by_name(view, "Murist") or nil
+  if party.in_group and murist_member and not leader then
+    -- Murist is on the roster but not in visual range: walk to where the
+    -- roster says he is instead of shrugging into the solo brain.
+    local rejoin = rejoin_leader(view, murist_member)
+    if rejoin then
+      local escape = stuck_step(view, now, rejoin_busy(view), "rejoin_unstick")
+      if escape then return finish(escape, view, "rejoin", role) end
+      return finish(rejoin, view, "rejoin", role)
+    end
+  end
   if not party.in_group or not murist_member or not leader then
     local intent = solo.decide(view)
     return finish(intent, view, "solo", role)
@@ -483,9 +1125,23 @@ function M.decide(view)
     if emergency then return finish(emergency, view, "escort", role, leader) end
   end
 
+  -- Party kills arm the shared loot machinery (state lives in accelerated;
+  -- lootSeen dedupe makes the extra call idempotent for solo ticks).
+  solo.note_kills(view)
+
   local leader_distance = distance(view_point(view), point(leader))
   if not leader_distance or leader_distance > HARD_LEASH_YARDS then
-    return finish({ kind = "follow", guid = leader.guid, reason = "hard_rejoin_murist" },
+    -- The hard leash is a blind long walk exactly like the corpse run and the
+    -- off-screen rejoin, and it wedges the same way: Tusk parked at
+    -- 2234.4,-17.9 for 90s with nav reporting "following" and the pilot's own
+    -- nav_no_route_escape firing at that spot and failing (2026-08-16). The
+    -- watchdog only ever ran on the recovery and rejoin branches because those
+    -- return before solo.decide; this branch returns before them, so it had no
+    -- escape at all. rejoin_busy keeps a tank that is legitimately holding a
+    -- pull out of leash range from being yanked off it.
+    local escape = stuck_step(view, now, rejoin_busy(view), "escort_unstick")
+    if escape then return finish(escape, view, "escort", role, leader) end
+    return finish(follow_leader(leader, "hard_rejoin_murist"),
       view, "escort", role, leader)
   end
 
@@ -495,6 +1151,42 @@ function M.decide(view)
     if hostile(candidate) then target = candidate end
   end
   if not target then target = current_hostile(view) end
+  if not target then
+    -- Combat flags for OTHER units propagate lazily, so "Murist is being hit
+    -- and Tusk stands there in formation" is real: neither leader.is_in_combat
+    -- nor our own view.in_combat had latched. A hostile whose target IS the
+    -- party — or a party member's summoned pet — is the escort's business
+    -- regardless of any combat flag.
+    local function party_property(guid)
+      if guid_equal(guid, leader.guid) or guid_equal(guid, view.player_guid) or
+          party_member_by_guid(view, guid) then
+        return true
+      end
+      local u = visible_unit(view, guid)
+      if u and (u.summoner_guid or 0) ~= 0 then
+        return guid_equal(u.summoner_guid, leader.guid) or
+          guid_equal(u.summoner_guid, view.player_guid) or
+          party_member_by_guid(view, u.summoner_guid) ~= nil
+      end
+      return false
+    end
+    -- Range-capped and nearest-first: a leashed mob a kilometer away keeps
+    -- its stale party target set (Igris fixated on a Scarlet Zealot at
+    -- 1273yd, never swinging, never idling, never summoning). Beyond
+    -- engageable range it is not our fight, whatever its target field says.
+    local bestThreat, bestThreatD = nil, nil
+    for _, unit in ipairs(view.units or {}) do
+      if hostile(unit) and (unit.target_guid or 0) ~= 0 and
+          party_property(unit.target_guid) then
+        local d = unit.combat_distance_known and unit.combat_distance
+          or unit.distance or 1e9
+        if d <= 50.0 and (not bestThreatD or d < bestThreatD) then
+          bestThreat, bestThreatD = unit, d
+        end
+      end
+    end
+    target = bestThreat
+  end
 
   if role == "healer" then
     local heal = healer_action(view, false)
@@ -511,19 +1203,38 @@ function M.decide(view)
   end
 
   if leader.is_in_combat then
-    return finish({ kind = "assist", guid = leader.guid, reason = "assist_murist" },
+    -- No assist verb either; the useful translation of "assist" with no
+    -- visible hostile is closing on the leader until their target is.
+    return finish(follow_leader(leader, "assist_murist_close"),
       view, "escort", role, leader)
   end
 
   if leader_distance > NEAR_YARDS then
-    return finish({ kind = "follow", guid = leader.guid, reason = "follow_murist" },
+    return finish(follow_leader(leader, "follow_murist"),
       view, "escort", role, leader)
   end
 
   if not view.in_combat then
+    -- Loot the party's corpses before idle work: the window is short-lived
+    -- and standing on the corpse is exactly where the fight ended anyway.
+    local loot = solo.loot_step(view)
+    if loot then return finish(loot, view, "escort", role, leader) end
+    -- Pet before armor. Demon Skin is a cheap 30-minute rebuy, Summon Imp is
+    -- most of a low-level lock's bar, and after every wipe the seat came back
+    -- with a partial pool: buffing first spent exactly the mana the summon
+    -- needed and the imp never arrived (Igris, 2026-08-16).
     local buff = role == "healer" and fortitude_action(view) or nil
+    if not buff then buff = summon_demon(view, role) end
     if not buff then buff = self_buff(view, role) end
     if buff then return finish(buff, view, "escort", role, leader) end
+    -- Formation is the only place a seat opens its mouth: nothing is
+    -- pending, the leash is short, and a host that cannot carry the words
+    -- leaves chat_send_supported unset.
+    if view.chat_send_supported then
+      chat_poll(view, now)
+      local speak = chat_step(view, now)
+      if speak then return finish(speak, view, "escort", role, leader) end
+    end
   end
 
   return finish({ kind = "hold", reason = "in_formation" },

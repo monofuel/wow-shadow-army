@@ -7,6 +7,12 @@ wow = {
 
 local home = require("home")
 
+-- Road routing is fed synthetic maps here, never the baked artifact: a test
+-- that reads lua/data/bot_roads.lua would change its answer every time the
+-- bake does. {} is "this world has no roads", which is the pre-road behaviour
+-- every other case in this file expects.
+home.set_roads({})
+
 local checks = 0
 local function check(ok, label)
   assert(ok, label)
@@ -110,15 +116,144 @@ r = home.decide(v)
 check(r.status.mode == "solo", "unobservable Murist selects solo fallback")
 check(r.kind ~= "accept_party" and r.kind ~= "follow", "solo fallback does not invent party actions")
 
+-- Out-of-sight Murist with a known roster position: rejoin, don't shrug solo.
+home.reset()
+v = frame()
+v.units = {}
+v.party.members[2].location_known = true
+v.party.members[2].location = { map_id = 0, x = 200, y = 0, z = 0, o = 0 }
+r = home.decide(v)
+check(r.kind == "navigate" and r.reason == "rejoin_murist_far" and
+  r.x == 200 and r.map_id == 0,
+  "far roster position drives a long-range rejoin")
+check(r.status.mode == "rejoin", "long-range rejoin reports rejoin mode")
+
+-- Roads are freeways: a long rejoin walks the road rather than crowing
+-- through the mob field between here and the leader. The fixture is the
+-- router's own L-shaped freeway at world scale (lua/tests/test_road_route.lua):
+-- a column up x=0 to y=800, then east along y=800, against a 1131 yd diagonal.
+local function road_seg(pts)
+  local flat = {}
+  for _, p in ipairs(pts) do
+    flat[#flat + 1] = p[1]
+    flat[#flat + 1] = p[2]
+    flat[#flat + 1] = p[3]
+  end
+  return flat
+end
+local elbow_column, elbow_row = {}, {}
+for i = 0, 40 do
+  elbow_column[#elbow_column + 1] = { 0, i * 20, 5 }
+  elbow_row[#elbow_row + 1] = { i * 20, 800, 5 }
+end
+home.set_roads({ [0] = { road_seg(elbow_column), road_seg(elbow_row) } })
+
+home.reset()
+v = frame()
+v.units = {}
+v.party.members[2].location_known = true
+v.party.members[2].location = { map_id = 0, x = 800, y = 800, z = 0, o = 0 }
+r = home.decide(v)
+check(r.kind == "navigate" and r.reason == "rejoin_murist_road",
+  "a long rejoin with usable road takes the road")
+check(r.x == 0 and r.y > 0 and r.y <= 60 and r.z == 5,
+  "the road rejoin walks at the next waypoint up the road, not at Murist")
+check(r.stop_distance == 10 and r.map_id == 0,
+  "road waypoints are handholds: stop short and re-decide next tick")
+check(r.status.mode == "rejoin", "the road rejoin is still a rejoin")
+
+-- Further along the same road: the waypoint advances, it never points back
+-- down the column the seat already walked.
+v = frame()
+v.units = {}
+v.location = { map_id = 0, position = { x = 0, y = 400, z = 5 } }
+v.party.members[2].location_known = true
+v.party.members[2].location = { map_id = 0, x = 800, y = 800, z = 0, o = 0 }
+r = home.decide(v)
+check(r.kind == "navigate" and r.reason == "rejoin_murist_road" and
+  r.y > 400 and r.y <= 460, "the road waypoint advances with the seat")
+
+-- Under the road threshold the crow line is still the right answer.
+v = frame()
+v.units = {}
+v.party.members[2].location_known = true
+v.party.members[2].location = { map_id = 0, x = 0, y = 60, z = 0, o = 0 }
+r = home.decide(v)
+check(r.kind == "navigate" and r.reason == "rejoin_murist_far" and r.y == 60,
+  "a short rejoin does not detour onto the road")
+
+-- A road bail (here: no road on this map at all) is not an error, it is the
+-- straight line the escort walked before roads existed.
+home.set_roads({})
+v = frame()
+v.units = {}
+v.party.members[2].location_known = true
+v.party.members[2].location = { map_id = 0, x = 800, y = 800, z = 0, o = 0 }
+r = home.decide(v)
+check(r.kind == "navigate" and r.reason == "rejoin_murist_far" and
+  r.x == 800 and r.y == 800 and r.route_profile == "safe_ground",
+  "a bailed road route navigates at Murist exactly as before")
+
+-- Off-screen roster rows have no height (vanilla sends int16 x/y only, so the
+-- projection fills z = 0.0 and flags elevation_known = false). Standing on a
+-- ridge, walking at that literal z aims the router tens of yards underground.
+v = frame()
+v.units = {}
+v.location = { map_id = 0, position = { x = 0, y = 0, z = 60 } }
+v.party.members[2].location_known = true
+v.party.members[2].elevation_known = false
+v.party.members[2].location = { map_id = 0, x = 800, y = 800, z = 0, o = 0 }
+r = home.decide(v)
+check(r.kind == "navigate" and r.reason == "rejoin_murist_far" and r.z == 60,
+  "a heightless roster row walks at our own z, never at z = 0")
+
+-- The leash has to be flat too, or our own altitude alone exceeds it while we
+-- stand right on top of the leader, pinning the seat in rejoin forever.
+v = frame()
+v.units = {}
+v.location = { map_id = 0, position = { x = 0, y = 0, z = 60 } }
+v.party.members[2].location_known = true
+v.party.members[2].elevation_known = false
+v.party.members[2].location = { map_id = 0, x = 10, y = 0, z = 0, o = 0 }
+r = home.decide(v)
+check(r.status.mode ~= "rejoin",
+  "own height alone does not trip the rejoin leash on a heightless row")
+
+-- When the projection DOES vouch for the height (leader visible this tick),
+-- the real z is used and the leash is the honest 3D distance again.
+v = frame()
+v.units = {}
+v.location = { map_id = 0, position = { x = 0, y = 0, z = 60 } }
+v.party.members[2].location_known = true
+v.party.members[2].elevation_known = true
+v.party.members[2].location = { map_id = 0, x = 800, y = 800, z = 5, o = 0 }
+r = home.decide(v)
+check(r.kind == "navigate" and r.reason == "rejoin_murist_far" and r.z == 5,
+  "a roster row with a known elevation keeps its real z")
+
+-- Roster position on another map is not walkable: solo, not a doomed walk.
+home.reset()
+v = frame()
+v.units = {}
+v.party.members[2].location_known = true
+v.party.members[2].location = { map_id = 1, x = 200, y = 0, z = 0, o = 0 }
+r = home.decide(v)
+check(r.status.mode == "solo", "cross-map roster position falls back to solo")
+
+-- follow/assist are not intent-boundary verbs (intent.nim); the escort
+-- expresses both as navigate-to-leader, which the pilot actually accepts.
 v = frame()
 v.units = { leader_unit(30, false) }
 r = home.decide(v)
-check(r.kind == "follow" and r.guid == 100, "hard leash follows Murist")
+check(r.kind == "navigate" and r.reason == "hard_rejoin_murist" and
+  r.route_profile == "prefer_ground" and r.stop_distance and r.stop_distance > 0,
+  "hard leash navigates to Murist on a routed path")
 
 v = frame()
 v.units = { leader_unit(3, true) }
 r = home.decide(v)
-check(r.kind == "assist" and r.guid == 100, "assists fighting Murist without known target")
+check(r.kind == "navigate" and r.reason == "assist_murist_close",
+  "closes on fighting Murist without known target")
 
 v = frame(9)
 v.spell_facts = {
@@ -147,6 +282,36 @@ v.spell_facts = {
 r = home.decide(v)
 check(r.kind == "cast_spell" and r.spell == 17 and r.target_guid == 100,
   "healer shields a low party member before formation work")
+
+-- Heal range against a roster row hits the same heightless-z trap as the long
+-- rejoin: a row the projection has not vouched for carries z = 0, so a healer
+-- on a hill measures its OWN altitude and rules the party out of range while
+-- standing on top of them.
+v = frame(5)
+v.party.members[1].name = "Beru"
+v.location = { map_id = 0, position = { x = 0, y = 0, z = 50 } }
+v.party.members[2].health = 30
+v.party.members[2].elevation_known = false
+v.spell_facts = {
+  spell(17, "Power Word: Shield", 1), spell(2050, "Lesser Heal", 1),
+}
+r = home.decide(v)
+check(r.kind == "cast_spell" and r.spell == 17 and r.target_guid == 100,
+  "a healer on a hill still heals through a heightless roster row")
+
+-- A height the projection DOES vouch for is real distance and must still gate
+-- the heal, or the healer burns casts on someone 50 yards below it.
+v = frame(5)
+v.party.members[1].name = "Beru"
+v.location = { map_id = 0, position = { x = 0, y = 0, z = 50 } }
+v.party.members[2].health = 30
+v.party.members[2].elevation_known = true
+v.spell_facts = {
+  spell(17, "Power Word: Shield", 1), spell(2050, "Lesser Heal", 1),
+}
+r = home.decide(v)
+check(r.kind ~= "cast_spell",
+  "a vouched height still puts an out-of-range member out of heal range")
 
 v = frame(5)
 v.party.members[1].name = "Beru"
@@ -181,10 +346,38 @@ v.can_reclaim_corpse = true
 r = home.decide(v)
 check(r.kind == "reclaim", "ghost reclaims only when observed available")
 
+-- A LONG ghost run takes the road like a long rejoin does (same elbow
+-- freeway fixture as the rejoin cases; corpse at the far end of the elbow).
+home.set_roads({ [0] = { road_seg(elbow_column), road_seg(elbow_row) } })
+home.reset()
+v = frame()
+v.is_ghost = true
+v.corpse_known = true
+v.corpse_location = { map_id = 0, position = { x = 800, y = 800, z = 5 } }
+r = home.decide(v)
+check(r.kind == "navigate" and r.reason == "corpse_run_road" and
+  r.x == 0 and r.y > 0 and r.y <= 60,
+  "a long corpse run walks the road, not the crow line")
+home.set_roads({})
+
 v = frame()
 v.resurrect_offer_guid = 999
 r = home.decide(v)
 check(r.kind == "accept_rez", "observed resurrection offer wins recovery")
+
+-- A stranded chat box is flushed AHEAD of recovery: /reclaim is chat-driven
+-- and types into the same fouled box forever otherwise.
+home.reset()
+v = frame()
+v.is_ghost = true
+v.can_reclaim_corpse = true
+v.chat_input_visible = true
+r = home.decide(v)
+check(r.kind == "reclaim", "a fresh open box does not block the reclaim")
+v.simulation_time = 106
+r = home.decide(v)
+check(r.kind == "quest_cmd" and r.reason == "close_chat_box",
+  "a stranded box is flushed before recovery verbs retype into it")
 
 v = frame()
 v.active_cast_spell_id = 686
@@ -192,9 +385,456 @@ r = home.decide(v)
 check(r.kind == "hold" and r.reason == "finish_active_cast",
   "active casts are not interrupted by reorder churn")
 
+-- Live seats have EMPTY spell_facts (spellbook facts need catalog rows the
+-- embedded client never requests); the bars are the real kit. The picker
+-- must find bar spells when facts are absent.
+v = frame(9)
+v.spell_facts = {}
+v.action_buttons = {
+  { slot = 1, kind = "spell", spell_id = 688, spell_name = "Summon Imp",
+    usable_known = true, usable = true, cooldown_ms = 0,
+    not_enough_mana = false },
+}
+r = home.decide(v)
+check(r.kind == "cast_spell" and r.spell == 688,
+  "empty spell_facts falls back to the action bars")
+
+-- A petless warlock summons its imp in the idle window; a warlock whose
+-- summoned unit is visible holds formation as before.
+v = frame(9)
+v.spell_facts = { spell(688, "Summon Imp", 1) }
+r = home.decide(v)
+check(r.kind == "cast_spell" and r.spell == 688,
+  "petless escort warlock summons its imp when idle")
+v.units[#v.units + 1] = {
+  guid = 4242, name = "Imp", summoner_guid = 200,
+  player_can_attack = false, death_known = true, is_dead = false,
+  distance = 2, location = { map_id = 0, position = { x = 1, y = 0, z = 0 } },
+}
+r = home.decide(v)
+check(r.kind ~= "cast_spell", "warlock with a live summoned imp does not resummon")
+
+-- THE gate that kept Igris petless for a whole session (live probe
+-- 2026-08-16): the bar carried 688 with the right name and a zero cooldown,
+-- but IsUsableAction reported usable=false / not_enough_mana=true because
+-- escort mode chain-pulls and never rebuilds the bar. Out of combat with the
+-- health to spare, Life Tap funds the summon instead of holding formation
+-- broke; below the health floor the seat holds and regenerates.
+v = frame(9)
+v.spell_facts = {}
+v.powers = { 5, 0, 0, 0, 0 }
+v.action_buttons = {
+  { slot = 1, kind = "spell", spell_id = 688, spell_name = "Summon Imp",
+    usable_known = true, usable = false, cooldown_ms = 0,
+    not_enough_mana = true },
+  { slot = 2, kind = "spell", spell_id = 1454, spell_name = "Life Tap",
+    usable_known = true, usable = true, cooldown_ms = 0,
+    not_enough_mana = false },
+}
+r = home.decide(v)
+check(r.kind == "cast_spell" and r.spell == 1454 and
+  r.reason == "life_tap_for_summon",
+  "mana-blocked Summon Imp life taps for the mana instead of holding")
+v.health = 20
+r = home.decide(v)
+check(r.kind == "hold" and r.reason == "in_formation",
+  "a hurt warlock does not life tap for a summon")
+v.health = 100
+v.action_buttons[1].usable = true
+v.action_buttons[1].not_enough_mana = false
+r = home.decide(v)
+check(r.kind == "cast_spell" and r.spell == 688,
+  "with the mana back the summon wins over the life tap")
+
+-- Pet before armor: a petless lock with mana for exactly one cast spends it
+-- on the imp, not on Demon Skin.
+v = frame(9)
+v.spell_facts = {}
+v.action_buttons = {
+  { slot = 1, kind = "spell", spell_id = 687, spell_name = "Demon Skin",
+    usable_known = true, usable = true, cooldown_ms = 0,
+    not_enough_mana = false },
+  { slot = 2, kind = "spell", spell_id = 688, spell_name = "Summon Imp",
+    usable_known = true, usable = true, cooldown_ms = 0,
+    not_enough_mana = false },
+}
+r = home.decide(v)
+check(r.kind == "cast_spell" and r.spell == 688,
+  "petless warlock summons before self-buffing")
+v.units[#v.units + 1] = {
+  guid = 4244, name = "Imp", summoner_guid = 200,
+  player_can_attack = false, death_known = true, is_dead = false,
+  distance = 2, location = { map_id = 0, position = { x = 1, y = 0, z = 0 } },
+}
+r = home.decide(v)
+check(r.kind == "cast_spell" and r.spell == 687,
+  "with the imp out the warlock goes back to self-buffing")
+
+-- A mob beating on a party member's PET is party business too.
+v = frame(9)
+v.spell_facts = {
+  spell(172, "Corruption", 1), spell(686, "Shadow Bolt", 1),
+}
+v.units = {
+  leader_unit(3, false),
+  { guid = 4243, name = "Imp", summoner_guid = 100,
+    player_can_attack = false, death_known = true, is_dead = false,
+    distance = 3, location = { map_id = 0, position = { x = 2, y = 0, z = 0 } } },
+  hostile(301, 4243),
+}
+r = home.decide(v)
+check(r.kind == "attack" and r.guid == 301,
+  "escort attacks a hostile beating on the leader's pet")
+
+-- A leashed mob far away keeps a stale party target set; it is not our
+-- fight, and fixating on it starves the idle branch (no swings, no summon).
+v = frame(9)
+v.spell_facts = { spell(686, "Shadow Bolt", 1) }
+v.units = {
+  leader_unit(3, false),
+  { guid = 302, name = "Scarlet Zealot", player_can_attack = true,
+    death_known = true, is_dead = false, health_known = true,
+    health = 82, max_health = 100, target_guid_known = true,
+    target_guid = 100, active_aura_spell_ids = {}, distance = 1273,
+    combat_distance_known = true, combat_distance = 1273,
+    location = { map_id = 0, position = { x = 1273, y = 0, z = 0 } } },
+}
+r = home.decide(v)
+check(r.kind ~= "attack", "a party-targeting hostile beyond range is ignored")
+
+v = frame(9)
+v.spell_facts = { spell(686, "Shadow Bolt", 1) }
+v.units = {
+  leader_unit(3, false),
+  { guid = 302, name = "Scarlet Zealot", player_can_attack = true,
+    death_known = true, is_dead = false, health_known = true,
+    health = 82, max_health = 100, target_guid_known = true,
+    target_guid = 100, active_aura_spell_ids = {}, distance = 1273,
+    combat_distance_known = true, combat_distance = 1273,
+    location = { map_id = 0, position = { x = 1273, y = 0, z = 0 } } },
+}
+v.selected_target_guid = 302
+r = home.decide(v)
+check(r.kind ~= "attack", "a stale far selection does not fixate the escort")
+
+-- A party kill arms the shared loot machinery: the corpse gets interacted
+-- with from the escort's idle window, before buffs.
+v = frame()
+v.player_guid = 200
+v.units[#v.units + 1] = {
+  guid = 950, name = "Duskbat", player_can_attack = true,
+  death_known = true, is_dead = true, health_known = true, health = 0,
+  max_health = 40, distance = 2, active_aura_spell_ids = {},
+  location = { map_id = 0, position = { x = 1, y = 0, z = 0 } },
+}
+v.combat_kill_events = { { source_guid = 200, target_guid = 950 } }
+r = home.decide(v)
+check(r.kind == "interact" and r.reason == "loot_corpse",
+  "escort loots its own party kill when idle")
+
 v = frame()
 r = home.decide(v)
 check(r.kind == "hold" and r.reason == "in_formation",
   "idle escort does not pull unrelated mobs")
+check(r.kind ~= "ui_press", "no roll prompt presses nothing")
+
+-- Group loot rolls. The guid in the reference is an unsigned spelling of a
+-- uint64 the seat would read back as a negative int64: matched by prefix and
+-- choice suffix only, never compared.
+-- Source names and reference spellings come from the client:
+-- GroupLootFrame1RollButton/GreedButton/PassButton (ui/chrome.nim
+-- lootRollButtonSourceName) over "loot-roll:<target>:<slot>:<choice>".
+local function roll_node(suffix, choice, enabled)
+  return {
+    source_name = "GroupLootFrame1" .. suffix,
+    reference_id = "loot-roll:18446744073709551615:3:" .. choice,
+    enabled = enabled ~= false, hit_testable = true, text = "",
+  }
+end
+
+v = frame()
+v.ui_nodes = {
+  roll_node("RollButton", "need"),
+  roll_node("GreedButton", "greed"),
+  roll_node("PassButton", "pass"),
+}
+r = home.decide(v)
+check(r.kind == "ui_press" and r.reason == "group_loot_greed" and
+  r.reference == "loot-roll:18446744073709551615:3:greed",
+  "visible group loot roll is answered with greed")
+check(r.status.mode == "loot_roll", "roll answer reports loot-roll mode")
+
+v = frame()
+v.ui_nodes = {
+  roll_node("RollButton", "need"),
+  roll_node("GreedButton", "greed", false),
+  roll_node("PassButton", "pass"),
+}
+r = home.decide(v)
+check(r.kind == "ui_press" and r.reason == "group_loot_pass" and
+  r.reference == "loot-roll:18446744073709551615:3:pass",
+  "unavailable greed falls through to pass, never to need")
+
+v = frame()
+v.units = {}
+v.ui_nodes = { roll_node("GreedButton", "greed") }
+r = home.decide(v)
+check(r.kind == "ui_press" and r.reason == "group_loot_greed",
+  "roll is answered ahead of the solo fallback")
+
+v = frame()
+v.is_ghost = true
+v.ui_nodes = { roll_node("GreedButton", "greed") }
+r = home.decide(v)
+check(r.kind == "ui_press" and r.reason == "group_loot_greed",
+  "roll is answered ahead of corpse recovery")
+
+-- Party banter. The seat's mailbox is a real file on disk here, because the
+-- consume-once rule is the whole contract between brain and host.
+local chat_dir = os.tmpname()
+os.remove(chat_dir)
+assert(os.execute("mkdir -p '" .. chat_dir .. "/chat'"))
+local chat_off = nil
+local real_getenv = os.getenv
+os.getenv = function(key)
+  if key == "VANILLA_WOW_LUA_DEBUG_DIR" then return chat_dir .. "/control" end
+  if key == "SHADOW_CHAT_QWEN_OFF" then return chat_off end
+  return real_getenv(key)
+end
+
+local function put_line(text, written_at)
+  local handle = assert(io.open(chat_dir .. "/chat/outbox.json", "w"))
+  handle:write('{"protocol":"wow_shadow_army.bot_chat.v1","seat":"Shadowfel",' ..
+    '"channel":"party","text":"' .. text .. '","id":1' ..
+    (written_at and (',"created_at_unix_seconds":' .. written_at) or "") .. "}")
+  handle:close()
+end
+
+local function outbox_present()
+  local handle = io.open(chat_dir .. "/chat/outbox.json", "r")
+  if not handle then return false end
+  handle:close()
+  return true
+end
+
+local function chat_frame(at)
+  local f = frame()
+  f.simulation_time = at
+  f.chat_send_supported = true
+  return f
+end
+
+home.reset()
+put_line("stand ready")
+v = frame()
+v.simulation_time = 200
+r = home.decide(v)
+check(r.kind == "hold" and r.reason == "in_formation",
+  "a host without chat support never reaches the mailbox")
+check(outbox_present(), "an unsupported host leaves the line for a newer one")
+
+home.reset()
+v = chat_frame(300)
+r = home.decide(v)
+check(r.kind == "chat" and r.channel == "party" and r.text == "stand ready",
+  "a queued line is spoken in party from formation")
+check(not outbox_present(), "the mailbox is consumed on read")
+check(r.status.mode == "escort", "banter still reports escort mode")
+
+-- The client opens the box, takes the text, then closes it; the brain must
+-- hold the same intent for every frame in between.
+v = chat_frame(300.2)
+v.chat_input_visible = true
+r = home.decide(v)
+check(r.kind == "chat" and r.text == "stand ready",
+  "an in-flight line repeats while the box is open")
+v = chat_frame(300.4)
+r = home.decide(v)
+check(r.kind == "hold" and r.reason == "in_formation",
+  "the closed box ends the sequence")
+
+put_line("again already")
+v = chat_frame(305)
+r = home.decide(v)
+check(r.kind == "hold" and r.reason == "in_formation",
+  "a second line inside the gap is not spoken")
+v = chat_frame(325)
+r = home.decide(v)
+check(r.kind == "chat" and r.text == "again already",
+  "the next line waits out the gap and then speaks")
+
+home.reset()
+put_line("mid sentence")
+v = chat_frame(400)
+r = home.decide(v)
+check(r.kind == "chat", "line starts from formation")
+v = chat_frame(400.2)
+v.in_combat = true
+v.units = { leader_unit(3, true, 300), hostile(300, 200) }
+r = home.decide(v)
+check(r.kind ~= "chat", "combat drops the line rather than finishing it")
+
+home.reset()
+put_line("waited too long")
+v = chat_frame(500)
+r = home.decide(v)
+check(r.kind == "chat", "line starts")
+v = chat_frame(504)
+v.chat_input_visible = true
+r = home.decide(v)
+check(r.kind ~= "chat",
+  "a line the box never accepts is abandoned inside the flush window")
+
+home.reset()
+put_line("/script evil()")
+v = chat_frame(600)
+r = home.decide(v)
+check(r.kind == "hold" and r.reason == "in_formation",
+  "a line that opens a slash command is refused")
+
+home.reset()
+put_line(string.rep("x", 121))
+v = chat_frame(700)
+r = home.decide(v)
+check(r.kind == "hold" and r.reason == "in_formation",
+  "a line past the length cap is refused")
+
+home.reset()
+put_line("asked an hour ago", string.format("%d", os.time() - 3600))
+v = chat_frame(750)
+r = home.decide(v)
+check(r.kind == "hold" and r.reason == "in_formation",
+  "a line written long before this seat looked is not spoken")
+check(not outbox_present(), "the stale line is still cleared from the mailbox")
+
+home.reset()
+put_line("just now", string.format("%d", os.time()))
+v = chat_frame(760)
+r = home.decide(v)
+check(r.kind == "chat" and r.text == "just now",
+  "a freshly written line is spoken")
+
+home.reset()
+chat_off = "1"
+put_line("silence me")
+v = chat_frame(800)
+r = home.decide(v)
+check(r.kind == "hold" and r.reason == "in_formation",
+  "the kill switch stops the seat speaking")
+check(outbox_present(), "a silenced seat does not even open the mailbox")
+chat_off = nil
+os.execute("rm -rf '" .. chat_dir .. "'")
+
+-- Displacement watchdog: a ghost wedged in place for more than eight seconds
+-- across several frames escapes by a short local-steer leg, then rotates
+-- the bearing once the six-second window closes.
+home.reset()
+v = frame()
+v.is_ghost = true
+v.can_reclaim_corpse = false
+v.corpse_known = true
+v.corpse_location = { map_id = 0, position = { x = 200, y = 0, z = 0 } }
+v.location = { map_id = 0, position = { x = 10, y = 20, z = 1 } }
+r = nil
+for t = 100, 109, 1 do
+  v.simulation_time = t
+  r = home.decide(v)
+end
+check(r.kind == "navigate" and r.reason == "corpse_run_unstick" and
+  r.navigation_mode == "local_steer" and r.allow_jump == true,
+  "wedged ghost escapes with a local-steer corpse-run unstick")
+local first_dx = r.x - v.location.position.x
+local first_dy = r.y - v.location.position.y
+for t = 110, 116, 1 do
+  v.simulation_time = t
+  r = home.decide(v)
+end
+check(r.reason == "corpse_run_unstick" and
+  (first_dx ~= r.x - v.location.position.x or
+    first_dy ~= r.y - v.location.position.y),
+  "the second unstick attempt rotates the bearing")
+
+-- Same ghost setup, but the seat actually moves: the watchdog must not fire.
+home.reset()
+v = frame()
+v.is_ghost = true
+v.can_reclaim_corpse = false
+v.corpse_known = true
+v.corpse_location = { map_id = 0, position = { x = 400, y = 0, z = 0 } }
+local saw_unstick = false
+r = nil
+for t = 100, 109, 1 do
+  v.simulation_time = t
+  v.location = { map_id = 0, position = { x = (t - 100) * 5, y = 0, z = 0 } }
+  r = home.decide(v)
+  if r.reason == "corpse_run_unstick" then saw_unstick = true end
+end
+check(not saw_unstick and
+  (r.reason == "corpse_run" or r.reason == "corpse_run_road"),
+  "a moving ghost stays on the corpse run")
+
+-- Off-screen Murist past the hard leash, seat glued to one tile: rejoin unstick.
+home.reset()
+v = frame()
+v.units = {}
+v.party.members[2].location_known = true
+v.party.members[2].location = { map_id = 0, x = 200, y = 0, z = 0, o = 0 }
+r = nil
+for t = 100, 109, 1 do
+  v.simulation_time = t
+  r = home.decide(v)
+end
+check(r.kind == "navigate" and r.reason == "rejoin_unstick",
+  "wedged rejoin escapes with a rejoin unstick")
+
+-- Combat is a legitimate pin: the same wedged rejoin must keep walking Murist.
+home.reset()
+v = frame()
+v.in_combat = true
+v.units = {}
+v.party.members[2].location_known = true
+v.party.members[2].location = { map_id = 0, x = 200, y = 0, z = 0, o = 0 }
+saw_unstick = false
+r = nil
+for t = 100, 109, 1 do
+  v.simulation_time = t
+  r = home.decide(v)
+  if r.reason == "rejoin_unstick" then saw_unstick = true end
+end
+check(not saw_unstick and
+  (r.reason == "rejoin_murist_far" or r.reason == "rejoin_murist_road"),
+  "a busy seat never unsticks")
+
+-- Murist VISIBLE but past the hard leash is a third blind walk, and it wedges
+-- like the other two: Tusk sat at 2234.4,-17.9 for 90s with nav reporting
+-- "following" while the pilot's own escape reflex failed on the spot. This
+-- branch returns before the rejoin and recovery branches, so it never reached
+-- their watchdog.
+home.reset()
+v = frame()
+v.units = { leader_unit(30, false) }
+r = nil
+for t = 100, 109, 1 do
+  v.simulation_time = t
+  r = home.decide(v)
+end
+check(r.kind == "navigate" and r.reason == "escort_unstick" and
+  r.navigation_mode == "local_steer" and r.allow_jump == true,
+  "a wedged hard-leash escort escapes with an escort unstick")
+
+-- A tank legitimately holding a pull out past the leash is not wedged, and
+-- yanking it 22 yards off the mob would be worse than the stall.
+home.reset()
+v = frame()
+v.in_combat = true
+v.units = { leader_unit(30, false) }
+saw_unstick = false
+r = nil
+for t = 100, 109, 1 do
+  v.simulation_time = t
+  r = home.decide(v)
+  if r.reason == "escort_unstick" then saw_unstick = true end
+end
+check(not saw_unstick, "a hard-leash escort in combat never unsticks")
 
 print("test_home: " .. checks .. " checks passed")

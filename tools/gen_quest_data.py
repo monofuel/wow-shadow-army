@@ -114,6 +114,12 @@ WMA_LEFT, WMA_RIGHT, WMA_TOP, WMA_BOTTOM = 4, 5, 6, 7
 #   0 id  1 mapId  2 parentAreaId  3 exploreFlag  4 flags  ...
 #   11 areaName(str, enUS)
 AT_ID, AT_MAP, AT_PARENT, AT_FLAGS, AT_NAME = 0, 1, 2, 4, 11
+# exploreFlag is the id the extracted terrain grids actually store: vmangos'
+# .map files hold AreaTable.exploreFlag per cell, and the core resolves it back
+# with GetByAreaFlagAndMap(flag, mapId) (src/game/Maps/GridMap.cpp
+# TerrainInfo::GetAreaFlag -> TerrainManager::GetAreaIdByAreaFlag). The pair is
+# the key because exploreFlag is only unique within one map.
+AT_EXPLORE = 3
 
 # AreaTable flag bit that marks a capital city. In this build it partitions the
 # 49 zone maps exactly: every outdoor zone is 0x40/0x41, the battlegrounds are
@@ -143,11 +149,18 @@ class MapAreas:
         self.area_name: Dict[int, str] = {}
         self.area_parent: Dict[int, int] = {}
         self.area_flags: Dict[int, int] = {}
+        # (mapId, exploreFlag) -> area id, the lookup the extracted terrain
+        # grids need; see AT_EXPLORE. First row wins a tie, which never comes
+        # up on the two continents (0 collisions across maps 0 and 1 in this
+        # build) -- flag 0 is the "no explore flag" filler and callers must
+        # treat it as unknown rather than look it up.
+        self.area_by_flag: Dict[Tuple[int, int], int] = {}
         for i in range(at.count):
             v = at.ints(i)
             self.area_name[v[AT_ID]] = at.string(v[AT_NAME])
             self.area_parent[v[AT_ID]] = v[AT_PARENT]
             self.area_flags[v[AT_ID]] = v[AT_FLAGS]
+            self.area_by_flag.setdefault((v[AT_MAP], v[AT_EXPLORE]), v[AT_ID])
 
         # per continent map id -> list of zone boxes, smallest first so the
         # first containing box wins (city maps nest inside their zone's box).
@@ -221,15 +234,15 @@ class MapAreas:
             return mx, my
         return None
 
-    def zone_of_sort(self, zone_or_sort: int) -> int:
-        """quest_template.ZoneOrSort -> a zone that has a world map.
+    def zone_of_area(self, area_id: int) -> int:
+        """AreaTable id -> the zone above it that owns a world map, or 0.
 
-        Positive values are AreaTable ids, but they are sometimes sub-areas
-        (quest 363 "Rude Awakening" sorts to 154 Deathknell, not 85 Tirisfal),
-        so walk up parents until a mappable zone appears. Negative values are
-        sort buckets (class/profession/dungeon) and have no zone at all.
+        Sub-areas (154 Deathknell, 159 Brill) carry the parent zone in
+        AreaTable.parentAreaId; a row whose parent is 0 already is a zone. Walk
+        up until a mappable zone appears, because not every level of the chain
+        has a WorldMapArea row.
         """
-        area = zone_or_sort
+        area = area_id
         seen: Set[int] = set()
         while area > 0 and area not in seen:
             if area in self.zone_ids:
@@ -237,6 +250,17 @@ class MapAreas:
             seen.add(area)
             area = self.area_parent.get(area, 0)
         return 0
+
+    def zone_of_sort(self, zone_or_sort: int) -> int:
+        """quest_template.ZoneOrSort -> a zone that has a world map.
+
+        Positive values are AreaTable ids, but they are sometimes sub-areas
+        (quest 363 "Rude Awakening" sorts to 154 Deathknell, not 85 Tirisfal),
+        so walk up parents. Negative values are sort buckets
+        (class/profession/dungeon) and have no zone at all -- the walk rejects
+        them because it only follows positive ids.
+        """
+        return self.zone_of_area(zone_or_sort)
 
     def locate(self, map_id: int, wx: float, wy: float,
                prefer_zone: int = 0,
@@ -831,16 +855,31 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     areas = MapAreas(args.dbc_dir)
     db = World(args.container)
 
-    rows = db.query("SELECT %s FROM quest_template WHERE patch<=%d ORDER BY entry"
-                    % (",".join(QUEST_COLUMNS), WOW_PATCH))
-    quests: List[Dict[str, int]] = []
+    # quest_template is patched like every other template table: one row per
+    # content patch, so 4433 quests arrive as 4727 rows. ORDER BY entry,patch
+    # and keying on entry collapses each quest to its highest patch <= 10 --
+    # the same rule (and the same reason) as load_template above. Without the
+    # collapse a patched quest is two separate quests all the way through:
+    # usually they share a Title, land in one title-collision group, and the
+    # quest lists itself twice in its own `alts` (35 of 590 alts blocks). Worse
+    # for the 12 entries whose Title CHANGES between patches, because VMaNGOS
+    # reuses a retired quest's entry id -- 171 is "Four-legged Menaces" at
+    # patch 0 and "A Warden of the Alliance" at patch 8, and only the latter
+    # exists on a WowPatch 10 realm. Taking every row advertised both.
+    rows = db.query(
+        "SELECT %s FROM quest_template WHERE patch<=%d ORDER BY entry,patch"
+        % (",".join(QUEST_COLUMNS), WOW_PATCH))
+    by_entry: Dict[int, Dict[str, int]] = {}
     for r in rows:
         if len(r) < len(QUEST_COLUMNS):
             continue
         q: Dict[str, int] = {}
         for name, cell in zip(QUEST_COLUMNS, r):
             q[name] = cell if name == "Title" else _i(cell)
-        quests.append(q)
+        by_entry[q["entry"]] = q
+    # Sorted by entry so the emit order does not depend on dict insertion,
+    # matching the ORDER BY the old query relied on.
+    quests: List[Dict[str, int]] = [by_entry[e] for e in sorted(by_entry)]
 
     gen = Generator(db, areas, args.max_spots)
 

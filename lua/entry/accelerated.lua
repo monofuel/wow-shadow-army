@@ -47,6 +47,10 @@ local HUB_BUDGET_SECONDS = 120.0
 local HUB_COOLDOWN_SECONDS = 240.0
 -- Stop close enough that /interact can open the panel (default nav stop is wider).
 local QUEST_INTERACT_STOP = 3.5
+-- Inside this range /interact needs no route; beyond it a giver the route
+-- engine cannot serve (navmesh gaps around town are real, ticket 0048) is
+-- approached with a local-steer leg instead of stalling on "unavailable".
+local QUEST_WALK_FALLBACK_YARDS = 8.0
 -- Do not walk to *new* quests until we have a kill's worth of level progress.
 local QUEST_TRAVEL_MIN_LEVEL = 2
 
@@ -147,17 +151,77 @@ local pursuing = nil
 local pursuingSince = nil
 -- Wall-clock start of the current continuous quest-travel streak (nil = idle).
 local questBudgetSince = nil
+-- When combat interrupted a pursuit (nil = not paused). Fights en route must
+-- not count against the budget: a turn-in 20yd short of Sarvis was abandoned
+-- because two zombies jumped the courier (2026-08-16, live).
+local questPausedAt = nil
 -- Corpse we still owe a loot to, and how the attempt is going.
 local lootGuid = nil
 local lootSince = nil
 local lootOpened = false
 local lootEmptyFrames = 0
+-- Corpses we already armed once. combat_kill_events replays the retained
+-- combat-log ring every frame, so without this the newest death line re-arms
+-- the same corpse each tick, resets the loot clock, and pins the seat on a
+-- loot that will never finish.
+local lootSeen = {}
+local lootSeenCount = 0
 -- Wedge watchdog: where we were, and since when, while out of combat.
 -- Where we have seen questgivers: guid -> { x, y, z, map_id, name }.
 local questHubs = {}
+-- Either a unit guid (a giver we have SEEN) or the string key "quest:<id>"
+-- (a generated turn-in position we have never laid eyes on).
 local hubGuid = nil
 local hubSince = nil
 local hubCooldown = {}
+
+-- Generated quest-giver world positions, lazily loaded and injectable.
+--
+-- questHubs above is memory: it only ever holds givers this seat has stood
+-- next to, and it dies on every reload. A seat that grinds a field with no
+-- NPC in it therefore has nothing to walk back to, and a completed quest sits
+-- unbanked forever (Kargalgan, quest 364, 2026-08-16). The generated table is
+-- the missing half: quest id -> where the starter and ender actually stand.
+--
+-- Fair play: this is the same class of knowledge as RoadData and QuestData —
+-- static world data a player reads off a quest guide before logging in, not
+-- server state the client was never told. The gen_* precedent in AGENTS.md
+-- sanctions host-side generators; the no-Python rule is about the bot
+-- RUNTIME, and what ships here is a plain Lua table.
+--
+-- Runtime require path quirk: modules under lua/data load as "data.<name>"
+-- (same as home.lua's road_data). A deploy missing the file must still play,
+-- so the require is guarded — no data simply means the old seen-givers-only
+-- behavior.
+local questHubData = nil
+local questHubLoaded = false
+
+-- nil restores the generated file; a table (including {}) replaces it. Tests
+-- inject this way so they never depend on a generated artifact.
+function M.set_quest_hubs(data)
+  questHubData = data
+  questHubLoaded = data ~= nil
+end
+
+local function quest_hub_data()
+  if not questHubLoaded then
+    questHubLoaded = true
+    local ok, data = pcall(require, "data.bot_quest_hubs")
+    if ok and type(data) == "table" then
+      questHubData = data
+      local n = 0
+      for _ in pairs(data) do n = n + 1 end
+      wow.log("quest hub data loaded: " .. n .. " quests")
+    else
+      questHubData = nil
+      wow.log("quest hub data unavailable: " .. tostring(data))
+    end
+  end
+  return questHubData
+end
+-- TEMP (0065): last emit of the accept-leg telemetry probes.
+local questProbeAt = nil
+local travelProbeAt = nil
 -- When the chat edit box first became visible (nil = closed).
 local chatOpenSince = nil
 local stillAnchor = nil
@@ -409,20 +473,35 @@ end
 -- 2026-08-10 A/B lost on and keeps its "nothing huntable nearby" gate.
 -- Collapsing them is what stranded objective-complete quests: every Deathknell
 -- giver has mobs inside the 40yd hunt radius, so the seat could never walk back.
-local function quest_step(view, allowTurnInTravel, allowAcceptTravel)
+--
+-- allowScout adds a third, lowest rank: friendly NPCs with NO marker. The
+-- stock client paints ! markers by querying giver status for every unit in
+-- view; the nim runtime never sends that query, so a bot's world is
+-- markerless until it opens a dialog (the client synthesizes the marker from
+-- the gossip/greeting rows). With an idle log and nothing marked, asking the
+-- nearest untried NPC is the only way to find work.
+local function quest_step(view, allowTurnInTravel, allowAcceptTravel, allowScout)
   local frame = view.quest_frame or {}
   if frame.open then
     questBudgetSince = nil
+    -- Dialog answers go by BUTTON, never by slash command: the /quest*
+    -- commands are chat-driven, and a bricked edit box (five clients today,
+    -- one of them 3yd from Sarvis with the reward panel open and the choice
+    -- already selected) blocks them forever — while ui_press clicks keep
+    -- working on the same client. The stock panel buttons are presented
+    -- controls (quests/model_and_dialog.nim QuestFramePanelDescriptors).
     if frame.panel == "reward" then
       local choice = reward_choice_reference(view)
       if choice then
         return { kind = "ui_press", reference = choice, reason = "reward_choice" }
       end
-      return { kind = "quest_cmd", command = "/questreward", reason = "turn_in" }
+      return { kind = "ui_press", control = "QuestFrameCompleteQuestButton",
+        reason = "turn_in" }
     end
     if frame.panel == "progress" then
       if frame.can_complete then
-        return { kind = "quest_cmd", command = "/questcomplete", reason = "complete" }
+        return { kind = "ui_press", control = "QuestFrameCompleteButton",
+          reason = "complete" }
       end
       return { kind = "ui_press", control = "QuestFrameGoodbyeButton",
         reason = "unfinished" }
@@ -432,7 +511,8 @@ local function quest_step(view, allowTurnInTravel, allowAcceptTravel)
         return { kind = "ui_press", control = "QuestFrameDeclineButton",
           reason = "log_full" }
       end
-      return { kind = "quest_cmd", command = "/questaccept", reason = "accept" }
+      return { kind = "ui_press", control = "QuestFrameAcceptButton",
+        reason = "accept" }
     end
     if frame.panel == "greeting" then
       local questId = greeting_row(view)
@@ -440,6 +520,9 @@ local function quest_step(view, allowTurnInTravel, allowAcceptTravel)
       if reference then
         return { kind = "ui_press", reference = reference, reason = "greeting_row" }
       end
+      -- An empty greeting leaves no marker behind, so without this the scout
+      -- rank would walk right back to the same NPC forever.
+      exhausted[frame.npc_guid or 0] = true
       return { kind = "ui_press", control = "QuestFrameGreetingGoodbyeButton",
         reason = "nothing_offered" }
     end
@@ -472,6 +555,14 @@ local function quest_step(view, allowTurnInTravel, allowAcceptTravel)
     elseif status == MARKER_AVAILABLE and allowAcceptTravel and
         #(view.accepted_quests or {}) < QUEST_LOG_LIMIT then
       rank = 1
+    elseif allowScout and status == 0 and
+        unit.player_can_attack_known and not unit.player_can_attack and
+        unit.object_kind ~= "player" then
+      -- Players are friendly and markerless too, but they have no dialog to
+      -- give — the army was scouting its own soldiers. NPCs only.
+      -- No log-limit gate here: a full-but-finished log still wants its
+      -- unmarked enders found, and the details panel declines on its own.
+      rank = 2
     end
     if rank and not exhausted[unit.guid] and
         not (unit.death_known and unit.is_dead) then
@@ -480,6 +571,17 @@ local function quest_step(view, allowTurnInTravel, allowAcceptTravel)
           (not best or rank < bestRank or (rank == bestRank and d < bestDistance)) then
         best, bestDistance, bestRank = unit, d, rank
       end
+    end
+  end
+  -- TEMP probe (0065): what the travel scan concluded. Remove with fix.
+  do
+    local now = wow.time()
+    if not travelProbeAt or now - travelProbeAt > 15 then
+      travelProbeAt = now
+      wow.log(string.format("travel best=%s rank=%s tin=%s acc=%s scout=%s",
+        (best and best.name) or "-", tostring(bestRank),
+        tostring(allowTurnInTravel), tostring(allowAcceptTravel),
+        tostring(allowScout)))
     end
   end
   if best then
@@ -500,13 +602,31 @@ local function quest_step(view, allowTurnInTravel, allowAcceptTravel)
       wow.log("gave up on questgiver " .. (best.name or "?"))
       return nil
     end
-    wow.set_status("questgiver " .. (best.name or "?"))
+    local scouting = bestRank == 2
+    wow.set_status((scouting and "scouting " or "questgiver ")
+      .. (best.name or "?"))
+    -- The interact verb needs the route engine to carry it most of the way;
+    -- where routing has no answer, steer at the giver directly and interact
+    -- once the last-yards route is trivial.
+    local position = best.location and best.location.position
+    if position and bestDistance > QUEST_WALK_FALLBACK_YARDS and
+        wow.nav_progress().state == "unavailable" then
+      return {
+        kind = "navigate",
+        x = position.x, y = position.y, z = position.z,
+        map_id = math.floor((best.location.map_id or 0)),
+        stop_distance = QUEST_INTERACT_STOP,
+        navigation_mode = "local_steer",
+        allow_jump = true,
+        reason = scouting and "scout_walk" or "questgiver_walk",
+      }
+    end
     return {
       kind = "interact",
       guid = best.guid,
       stop_distance = QUEST_INTERACT_STOP,
       route_profile = "prefer_ground",
-      reason = "questgiver",
+      reason = scouting and "scout_npc" or "questgiver",
     }
   end
   pursuing, pursuingSince, questBudgetSince = nil, nil, nil
@@ -548,7 +668,15 @@ local function note_kills(view)
   for i = 1, #(view.combat_kill_events or {}) do
     local event = view.combat_kill_events[i]
     local target = event.target_guid or 0
-    if target ~= 0 and (player == nil or event.source_guid == player) then
+    if target ~= 0 and (player == nil or event.source_guid == player) and
+        not lootSeen[target] then
+      lootSeen[target] = true
+      lootSeenCount = lootSeenCount + 1
+      if lootSeenCount > 256 then
+        -- The log ring only retains recent lines; a rare one-time re-arm of
+        -- a long-gone corpse costs one 6s window, unbounded growth costs more.
+        lootSeen, lootSeenCount = { [target] = true }, 1
+      end
       lootGuid, lootSince, lootOpened, lootEmptyFrames = target, nil, false, 0
     end
   end
@@ -694,6 +822,83 @@ local function objective_complete(view)
   return false
 end
 
+-- The quest id of one accepted-quest row. The view hands these out as tables
+-- ({quest_id, title, level, failed} — bots/lua_bot/view.nim); older fixtures
+-- pass bare ids, so both are read.
+local function accepted_quest_id(entry)
+  if type(entry) == "table" then return entry.quest_id end
+  if type(entry) == "number" then return entry end
+  return nil
+end
+
+-- True when THIS quest is finished and only needs handing in: it has
+-- objective rows and every one of them is complete. A quest with no objective
+-- rows at all (pure talk-to-someone) is not claimed either way — nothing in
+-- the view says it is done, so it is left to the ordinary marker path.
+local function quest_banked(view, questId)
+  local seen = false
+  for i = 1, #(view.quest_objectives or {}) do
+    local objective = view.quest_objectives[i]
+    if objective.quest_id == questId then
+      if not objective.complete then return false end
+      seen = true
+    end
+  end
+  return seen
+end
+
+-- Walk to the GENERATED turn-in of a completed quest. This is the fallback
+-- for the case the seen-givers table structurally cannot cover: an ender we
+-- have never had in view. Same intent shape, stop distance, budget and
+-- cooldown as the remembered-hub leg — only the source of the position
+-- differs.
+local function generated_hub_step(view, pos, now)
+  local data = quest_hub_data()
+  if not data then return nil end
+  local map = math.floor(view.location.map_id or 0)
+  -- Log order: the first banked quest we can actually reach wins, and the
+  -- budget/cooldown above retires it to the next one if the walk fails.
+  for i = 1, #(view.accepted_quests or {}) do
+    local questId = accepted_quest_id(view.accepted_quests[i])
+    local hub = questId and data[questId]
+    local ender = hub and hub.ender
+    if ender and questId and quest_banked(view, questId) then
+      local key = "quest:" .. questId
+      if math.floor(ender[1] or 0) == map and
+          not (hubCooldown[key] and now < hubCooldown[key]) then
+        local d = distance2d(pos.x, pos.y, ender[2], ender[3])
+        -- Inside QUESTGIVER_YARDS the visible-marker path already owns this.
+        if d > QUESTGIVER_YARDS then
+          if hubGuid ~= key then hubGuid, hubSince = key, now end
+          wow.set_status(string.format("walking to turn-in %s (quest %d)",
+            tostring(ender[5] or "?"), questId))
+          return {
+            kind = "navigate",
+            x = ender[2], y = ender[3], z = ender[4],
+            map_id = map,
+            stop_distance = HUB_ARRIVE_YARDS,
+            route_profile = "safe_ground",
+            reason = "quest_hub",
+          }
+        end
+      end
+    end
+  end
+  return nil
+end
+
+-- True when nothing in the log still needs field work: an empty log, or one
+-- where every objective is finished. Grinding in that state is wasted XP, so
+-- quest travel (and scouting for unmarked givers) outranks the next pull —
+-- the same rationale that made turn-in travel unconditional.
+local function quest_log_idle(view)
+  if #(view.accepted_quests or {}) == 0 then return true end
+  for i = 1, #(view.quest_objectives or {}) do
+    if not view.quest_objectives[i].complete then return false end
+  end
+  return true
+end
+
 -- Walk back to a remembered giver when there is business to do there and none
 -- is in sight: a finished objective to bank, or an empty quest log to fill.
 local function hub_step(view, pos)
@@ -706,7 +911,8 @@ local function hub_step(view, pos)
   local now = wow.time()
   if hubGuid and hubSince and now - hubSince > HUB_BUDGET_SECONDS then
     hubCooldown[hubGuid] = now + HUB_COOLDOWN_SECONDS
-    wow.log("gave up walking to hub " .. (questHubs[hubGuid] or {}).name)
+    wow.log("gave up walking to hub " ..
+      tostring((questHubs[hubGuid] or {}).name or hubGuid))
     hubGuid, hubSince = nil, nil
   end
 
@@ -722,6 +928,10 @@ local function hub_step(view, pos)
     end
   end
   if not best then
+    -- Nothing remembered is reachable. A banked quest still has a known
+    -- turn-in in the generated table, even though we have never seen it.
+    local generated = generated_hub_step(view, pos, now)
+    if generated then return generated end
     hubGuid, hubSince = nil, nil
     return nil
   end
@@ -847,6 +1057,54 @@ function M.decide(view)
 
   if QUESTS then
     remember_hubs(view)
+    -- TEMP probe (0065): one line every 15s on why the accept leg did or
+    -- did not arm. Surfaces in status.json logs + /status. Remove with fix.
+    do
+      local now = wow.time()
+      if not questProbeAt or now - questProbeAt > 15 then
+        questProbeAt = now
+        local units, markers, availName, availD = 0, 0, nil, nil
+        for i = 1, #(view.units or {}) do
+          local unit = view.units[i]
+          units = units + 1
+          local st = marker_status(view, unit.guid)
+          if st ~= 0 then markers = markers + 1 end
+          if st == MARKER_AVAILABLE then
+            local d = unit_distance(unit)
+            if not availD or d < availD then
+              availName, availD = unit.name or "?", d
+            end
+          end
+        end
+        local hunt = pick_target(view, true)
+        local hubs = 0
+        for _ in pairs(questHubs) do hubs = hubs + 1 end
+        local npcs = ""
+        local npcCount = 0
+        for i = 1, #(view.units or {}) do
+          local unit = view.units[i]
+          if unit.player_can_attack_known and not unit.player_can_attack and
+              not (unit.death_known and unit.is_dead) then
+            npcCount = npcCount + 1
+            if npcCount <= 3 then
+              npcs = npcs .. string.format(" %s@%d",
+                unit.name or "?", math.floor(unit_distance(unit)))
+            end
+          end
+        end
+        local frame = view.quest_frame or {}
+        wow.log(string.format(
+          "probe units=%d markers=%d avail=%s@%d hunt=%s accepted=%d hubs=%d npcs=%d%s eng=%s cbt=%s chat=%s/%q dlg=%s/%s gossip=%s",
+          units, markers, availName or "-", math.floor(availD or -1),
+          (hunt and hunt.name) or "-",
+          #(view.accepted_quests or {}), hubs, npcCount, npcs,
+          engaged and "y" or "n", view.in_combat and "y" or "n",
+          view.chat_input_visible and "y" or "n",
+          tostring(view.chat_input_text or ""),
+          frame.open and "y" or "n", tostring(frame.panel or "-"),
+          view.gossip_open and "y" or "n"))
+      end
+    end
     local signature = quest_signature(view)
     if signature ~= questSignature then
       -- Our quest state moved, so a giver we gave up on may have new work.
@@ -854,6 +1112,14 @@ function M.decide(view)
       questSignature = signature
     end
     if not engaged and not view.in_combat then
+      -- Combat time was not travel time: shift the pursuit clocks forward by
+      -- however long the fight held the quest block hostage.
+      if questPausedAt then
+        local pause = wow.time() - questPausedAt
+        if pursuingSince then pursuingSince = pursuingSince + pause end
+        if questBudgetSince then questBudgetSince = questBudgetSince + pause end
+        questPausedAt = nil
+      end
       -- Loot before anything else: the window is open on the corpse we are
       -- standing on, and a new pull or a walk to a giver abandons it.
       local loot = loot_step(view)
@@ -862,24 +1128,39 @@ function M.decide(view)
         return loot
       end
       -- Always finish an open dialog (free XP / log space). Walking to a new
-      -- accept still yields to a nearby pull; banking a turn-in never does.
+      -- accept still yields to a nearby pull — unless the log is idle, when
+      -- the next pull is the thing being overvalued; banking a turn-in never
+      -- yields. Scouting (rank 2) only ever runs on an idle log.
       local nearbyHunt = pick_target(view, true)
+      local idleLog = quest_log_idle(view)
+      -- Banked work also overrides the hunt gate: the ender of a completed
+      -- quest is usually unmarked (no giver-status query, ticket 0065), so a
+      -- bot carrying finished work travels and scouts even in a mob field —
+      -- the same "finished work outranks the next pull" rule as turn-ins.
+      local banked = objective_complete(view)
       local allowAccept = (view.level or 1) >= QUEST_TRAVEL_MIN_LEVEL and
-        not nearbyHunt
-      local step = quest_step(view, true, allowAccept)
+        (idleLog or banked or not nearbyHunt)
+      local allowScout = allowAccept and (idleLog or banked)
+      local step = quest_step(view, true, allowAccept, allowScout)
       if step then
         step.status = progress_status(view)
         return step
       end
       -- Nothing in sight. If there is business waiting at a giver we have
       -- stood next to before, walking back beats another random roam leg.
-      if not nearbyHunt then
+      -- Banked work outranks the next pull (the Failure-2 rule), and that
+      -- applies to the WALK BACK too: a completed quest in the log arms the
+      -- hub return even in a mob field, or 364 sits finished-unbanked until
+      -- every other quest drains (Kargalgan, 2026-08-16).
+      if idleLog or objective_complete(view) or not nearbyHunt then
         local hub = hub_step(view, pos)
         if hub then
           hub.status = progress_status(view)
           return hub
         end
       end
+    elseif pursuing then
+      questPausedAt = questPausedAt or wow.time()
     end
   end
 
@@ -976,5 +1257,11 @@ function M.decide(view)
     status = progress_status(view),
   }
 end
+
+-- Loot machinery, exported for the escort brain: party kills deserve the
+-- same corpse handling as solo kills, and sharing the functions keeps ONE
+-- loot state machine (lootGuid/lootSeen live here) instead of two arguing.
+M.note_kills = note_kills
+M.loot_step = loot_step
 
 return M

@@ -22,8 +22,8 @@ re-emit them per zone as `addons/ShadowArmy/RoadData.lua`.
 
 ## How to regenerate
 
-No realm, no DB, no network — the JSONL artifacts and two DBCs are the whole
-input.
+No realm, no DB, no network — the JSONL artifacts, two DBCs and the extracted
+terrain grids are the whole input.
 
 ```sh
 make road-data
@@ -36,7 +36,12 @@ python3 tools/gen_road_data.py \
   --dbc-dir ../coworld-vanilla-wow/local_data/vmangos-5875-data/dbc
 ```
 
-stdlib only, no venv, under a second. Output is **deterministic** — sorted by
+`--map-dir` defaults to `maps/` beside `--dbc-dir`, so pointing `--dbc-dir` at
+either extracted-data tree gives a byte-identical file. `--no-terrain` files
+points by the smallest containing map box alone, which reproduces the pre-0059
+assignment.
+
+stdlib only, no venv, a couple of seconds. Output is **deterministic** — sorted by
 zone and then by the segment's own coordinates, no timestamps — so a rerun
 against unchanged inputs leaves the file byte-identical and the diff stays
 honest.
@@ -83,7 +88,8 @@ general and wrong for the capitals in particular — see the next section.
 ## What the tool actually does
 
 1. Read each JSONL (meta line first for `map_id`, then one segment per line).
-2. Convert every point world→(zone, x%, y%).
+2. Convert every point world→(zone, x%, y%). **Which zone is decided by the
+   terrain**, not by the map boxes — ticket 0059, next section but two.
 3. **Split on zone change.** A continent road crosses zone borders constantly,
    and per-zone percent is a different coordinate system on each side, so a
    crossing is a segment break rather than a very long edge. Points with no
@@ -165,13 +171,104 @@ north past Durotar's — so it falls back to the plain box rule, which puts its
 | Darnassus 1657 | Teldrassil 141 |
 | Orgrimmar 1637 | *(no containing box — falls back)* |
 
-Result: Undercity 1497 and Orgrimmar 1637 leave the file entirely, because
-every road baked inside their boxes was outdoor road. Ironforge keeps 11
-points, Thunder Bluff 148, Darnassus 164 — no capital's interior network
-leaked into a parent zone. Tirisfal gains the southern road as one 32-node
-component running (48.0,82.2) → (61.9,65.2), which reaches to within 1.4% of
-the Undercity entrance. See "Known gaps" for why Brill still cannot route to
-it.
+Result at the time of 0050: Undercity 1497 and Orgrimmar 1637 left the file
+entirely, because every road baked inside their boxes was outdoor road.
+Ironforge kept 11 points, Thunder Bluff 148, Darnassus 164 — no capital's
+interior network leaked into a parent zone. Tirisfal gained the southern road
+as one 32-node component running (48.0,82.2) → (61.9,65.2), reaching to within
+1.4% of the Undercity entrance, but Brill still could not route to it.
+
+0059 then took most of this pass's work off it — see that section for the
+counts as they stand now. The pass is kept because it covers points the terrain
+grids cannot answer for, and because it is the guard against a re-bake walking
+a lift ramp up into a city.
+
+## Real zone footprints beat map boxes (ticket 0059)
+
+0050 fixed the *nested* overlap (a capital's box sitting inside its zone's) and
+in doing so exposed the bigger one: outdoor boxes overlap **each other**.
+`WorldMapArea` rectangles are axis-aligned; zones are not. Western Plaguelands'
+box (12.33M units²) is smaller in area than Tirisfal's (13.6M) and reaches west
+to world Y = 417 — across everything east of Tirisfal x ≈ 57.9, **Brill
+included** — so the smallest-box rule filed the whole Brill corridor under
+zone 28. Containment cannot help here; neither box contains the other.
+
+**The client does not use boxes to answer "what zone is this".** It reads the
+terrain, and vmangos' extractor bakes exactly that into `maps/*.map`: a
+per-cell `AreaTable.exploreFlag` grid, 16×16 cells over each 533.33-unit
+terrain grid. That is the zone footprint at its real shape. Walk the cell's
+area id up `AreaTable.parentAreaId` and you get the zone the client itself
+would name. `TerrainAreas` in `gen_road_data.py` is ~60 lines of `struct` over
+that file, indexed with vmangos' own arithmetic rather than a re-derivation
+(`GridMap.cpp` `TerrainInfo::GetGrid` + `GridMap::getArea`):
+
+```
+file  : maps/%03u%02u%02u.map  % (mapId, int(32 - worldX/533.33), int(32 - worldY/533.33))
+header: 'MAPS','z1.4', then 8 uint32 offset/size pairs   (40 bytes)
+area  : 'AREA', uint16 flags, uint16 gridArea
+          flags & 0x1 -> whole grid is gridArea, no table follows
+          else        -> uint16[16*16], cell [lx*16 + ly], lx from X, ly from Y
+```
+
+Both magics are checked before any offset is trusted, and the local copy of
+the format lives at `local_data/reference/vmangos-core/src/game/Maps/GridMapDefines.h`.
+
+**Terrain arbitrates, boxes still project.** The answer still has to be
+expressed in some zone's percent space and only a box can do that, so the box
+rule runs for every point regardless. What the terrain decides is *which* zone
+gets to do the projecting:
+
+- terrain names a zone whose box covers the point → **terrain wins**;
+- terrain names a zone whose box does *not* reach the point → the box answer
+  stands. A `WorldMapArea` box can be slightly tighter than the terrain it
+  describes, and a percent outside 0–100 is not a coordinate the addon can
+  draw. **12 points** of 10211 land here;
+- terrain resolves to no mappable zone → box rule. **463 points**, all of them
+  Hyjal 616 (293 + 106, no world map in 1.12) and The Maul 3217 inside Dire
+  Maul (57 + 7). Both are genuinely unmapped, and the neighbouring box the road
+  falls back to is the right place to draw it.
+
+**3315 of 10211 points move**, far more than 0050's 78, because the overlap is
+much worse than 0050 assumed. That number is only trustworthy because of what
+the moves *are*: 87 distinct terrain sub-areas drive them, and every one lands
+in its own true parent zone.
+
+| terrain sub-area | → zone | box had said | pts |
+|---|---|---|---|
+| Zul'Gurub 19 | Stranglethorn 33 | Blasted Lands 4 | 296 |
+| Southern Gold Road 1157 | Barrens 17 | Mulgore 215 | 188 |
+| Gold Road 458 | Barrens 17 | Durotar 14 | 133 |
+| Darkwhisper Gorge 2256 | Winterspring 618 | Azshara 16 | 123 |
+| Ruins of Andorhal 193 | W. Plaguelands 28 | Alterac 36 | 114 |
+| Nethergarde Keep 1438 | Blasted Lands 4 | Swamp of Sorrows 8 | 99 |
+| Darkshire 42 | Duskwood 10 | Deadwind Pass 41 | 82 |
+| Jintha'Alor 354 | The Hinterlands 47 | Arathi 45 | 74 |
+| Gates of Ironforge 809 | Dun Morogh 1 | Ironforge 1537 | 22 |
+| **Brill 159** | **Tirisfal 85** | **W. Plaguelands 28** | **33** |
+
+This is the discriminator that killed `WorldMapOverlay.dbc` as an arbiter. The
+overlay rects re-filed a comparable 1858–2854 points, but they included moves
+no sub-area justifies, because a big zone's overlay boxes sprawl over its
+neighbours. Here the *same* Blasted Lands → Stranglethorn move that looked like
+an obvious bulk mistake under overlays turns out to be correct and to have a
+name: those 296 points are in **Zul'Gurub**, in southern Stranglethorn, and
+Blasted Lands' box merely reaches over them.
+
+**0050 still runs, after the arbiter**, because it answers a question terrain
+cannot: it is driven by the polyline's own continuity, so it also covers points
+the grids have no area for. It now finds only **22 points** to move instead of
+78 — the arbiter got to Ruins of Lordaeron, the Gates of Ironforge and the
+Durotar strip first, and by name rather than by height band. Capital interiors
+are unaffected: Thunder Bluff 1638 keeps all 148 of its mesa points and
+Darnassus 1657 keeps 143, while Ironforge 1537, Undercity 1497 and Orgrimmar
+1637 now hold *nothing* — every road baked in their boxes was outdoor road, and
+the terrain says so directly (Ironforge and Undercity have **zero** terrain
+cells at all; they are pure WMO interiors the grids cannot see).
+
+`--no-terrain` reproduces the pre-0059 assignment, and `--map-dir` overrides
+the grid location (it defaults to `maps/` beside `--dbc-dir`). If the grids are
+missing the tool warns and carries on with the box rule; the header always
+records which rule produced the file.
 
 ## Bridging the baker's cuts (ticket 0046)
 
@@ -225,18 +322,28 @@ reproduces the pre-0046 file.
 
 ## Coverage
 
-412 input segments / 10211 points become **558 segments / 4686 points across
-37 zones**, ~51 KiB (102 of those segments are bridges). The zone split is why
-the segment count goes *up*; 0050 is why the zone count came *down* from 39 —
-Undercity and Orgrimmar had nothing of their own.
+412 input segments / 10211 points become **519 segments / 4234 points across
+34 zones**, ~47 KiB (89 of those segments are bridges). The zone split is why
+the segment count goes *up*; 0050 and then 0059 are why the zone count came
+*down* from 39.
+
+Six zones lost every point they had at the 0050 state — Westfall 40 (26 pts),
+Deadwind Pass 41 (127), Stonetalon 406 (84), Ironforge 1537 (13), Desolace 405
+(9), Badlands 3 (4) — and three gained road they never had: **The Barrens 17
+(238)**, Winterspring 618 (54), Darkshore 148 (43). None of that is deletion.
+Those six zones have thousands of terrain cells each and **not one baked road
+point** among them; what they held was their neighbours' road, captured by an
+overlapping box. The file now says so instead of drawing a road in the wrong
+zone. Tirisfal 85 goes 128 → 194 points, Ashenvale 331 128 → 277, Stranglethorn
+33 121 → 263, Dun Morogh 1 94 → 160.
 
 The generated header carries the regression-visible metric, one line per zone,
 sorted by zone id:
 
 ```
 -- coverage (RouteModel junctionDist 1.5%): zones with 3+ components
--- 30 -> 17 of 37; mean largest-component share 51.4% -> 70.5%
--- zone    85: components   6 ->   2, largest  65.8% ->  76.7%, bridges  4
+-- 27 -> 11 of 34; mean largest-component share 54.2% -> 76.6%
+-- zone    85: components   3 ->   2, largest  92.7% ->  97.4%, bridges  1
 ```
 
 `components` and `largest` are counted the way `RouteModel.build` counts them
@@ -274,22 +381,48 @@ and the current one (37 zones × 50 pairs, plus 300 in Tirisfal):
 | Tirisfal 85, road | 18% | 14% |
 | Tirisfal 85, `disconnected` | 0% | 35% |
 
-That is not a bug in the pass, it is the pass telling the truth: Tirisfal now
-holds the southern road it always had, and that road is a second component
-because the piece linking it to Brill is filed under Western Plaguelands (see
-"Known gaps"). Deleting it would restore the metric and re-hide the road; the
-metric is what should move once the link is un-hidden. Nothing on the other end
-of the trade regressed — Deathknell → Brill still returns the same 45-point
-road route it did before.
+That was not a bug in the pass, it was the pass telling the truth: Tirisfal
+held the southern road it always had, and that road was a second component
+because the piece linking it to Brill was filed under Western Plaguelands. The
+metric was what should move once the link was un-hidden, and 0059 is what
+un-hid it.
 
-The surviving capitals are Ironforge 1537, Thunder Bluff 1638 and Darnassus
-1657, and what they hold now is only city interior: the corridors a courier
-wants, with none of the open ground their boxes overlay.
+**What 0059 bought.** Same sampler shape (50 uniform random pairs per zone from
+a fixed seed, so both files are asked the *same* pairs, plus 300 in Tirisfal).
+The zone list changes between the two files, so the honest comparison is both:
+
+| | 0050 state | + 0059 |
+|---|---|---|
+| all zones in that file | 37 zones / 1850 pairs | 34 zones / 1700 pairs |
+| global road-route hit rate | 7.3% | **10.6%** |
+| global `disconnected` bails | 33.7% | **24.9%** |
+| the 31 zones common to both, road | 8.6% | **9.9%** |
+| the 31 zones common to both, `disconnected` | 35.3% | **28.8%** |
+| Tirisfal 85, road (300 pairs) | 12% | 14% |
+| Tirisfal 85, `disconnected` | 36% | **20%** |
+| zones with 3+ components after bridging | 17 / 37 | **11 / 34** |
+| mean largest-component share | 70.5% | **76.6%** |
+
+(These are this pass's own sampler, run over both files; they are not the same
+draws as the 0046/0050 rows above, so compare within a table, not across.)
+
+The named acceptance routes, host-Lua over zone 85:
+
+| route | 0050 state | + 0059 |
+|---|---|---|
+| Murist (60.50,38.79) → Cursed Darkhounds (61.45,53.73) | `straight-cheaper` | **`road`**, 13 waypoints, length 17.94 |
+| Brill (61.7,52.0) → Undercity entrance (63.0,66.0) | `disconnected` | **`road`**, 20 waypoints, length 17.52 |
+| Deathknell (30.0,71.8) → Brill (61.7,52.0) | `road`, 51 waypoints | `road`, 54 waypoints (no regression) |
+
+Zone 85 goes from 128 points with **nothing within 2% of Brill** to 194 points
+with the Brill corridor present, in one 97.4% component.
+
+The surviving capitals are Thunder Bluff 1638 and Darnassus 1657, and what they
+hold is only city interior: the corridors a courier wants, with none of the
+open ground their boxes overlay.
 
 Zones with no row simply have no roads baked, and the addon falls back to the
-straight line it drew before this file existed. **The Barrens (17) is one of
-them** — there is not a single baked road point in it, so no generator pass can
-help that zone; it needs a re-bake.
+straight line it drew before this file existed.
 
 ## How the addon uses it
 
@@ -328,57 +461,60 @@ nothing else.
 - **Only what the bake saw.** These polylines come from road textures and the
   minimap ribbon, not from a road table (vanilla has none). A road hidden
   under a bridge texture, or one the mask scored as too steep/too wide, is not
-  here. `tools/data/README.md` has the bake's thresholds. **The Barrens (17)
-  has no baked road at all**, and it is one of the three zones ticket 0046
-  names, so that ticket cannot close on generator work alone.
-- **Neighbouring zone boxes steal each other's roads — this is now the biggest
-  one.** `WorldMapArea` boxes are axis-aligned rectangles over a round-ish
-  continent, so peer zones overlap each other by a lot, and the smallest-box
-  rule hands the overlap to whichever *map image* happens to be smaller rather
-  than to the zone the player is standing in. Western Plaguelands' box
-  (12.33M units²) is smaller than Tirisfal's (13.6M) and reaches west to world
-  Y = 417, i.e. across everything east of Tirisfal x ≈ 57.9 — **including Brill
-  itself** (61.7,52.0 → world 2271,245). Silverpine's box (11.76M) takes
-  Tirisfal below y ≈ 72. So the road *through* Brill, 31 baked points running
-  Tirisfal (63.3,59.9) → (59.1,51.6), is filed under zone 28, and a player
-  standing on it in Tirisfal cannot see it. Every zone with a smaller-boxed
-  neighbour has some version of this.
-
-  `gen_quest_data.py` does not suffer from it because a quest carries an
-  explicit `ZoneOrSort` hint that wins ties; a road carries no hint. Nor is
-  there an easy substitute. `WorldMapOverlay.dbc` (the client's own sub-area
-  hit-rects, the ground truth that verified the axis convention) is decisive
-  for *this* case — Brill and Undercity both have Tirisfal overlays over the
-  corridor, and no WPL overlay comes within 20% of it — but overlay rects are
-  coarse, and using them as a general arbiter re-files 1858–2854 of the 10211
-  points, including obviously wrong bulk moves like Blasted Lands → Stranglethorn
-  (296) and Mulgore → Barrens (262–571), because a big zone's overlay boxes
-  sprawl over its neighbours. It needs a real per-zone footprint (ADT area ids)
-  and its own ticket, not a heuristic bolted onto this one.
-- **Bridging cannot invent a road that was never baked.** Tirisfal is the worked
-  example. Two named routes still refuse to use the road, both correctly:
-  - **Brill → Agamand Mills** bails `straight-cheaper`. The mills branch is
-    connected (an 11.3% bridge from (43.1,49.2) to (48.8,39.5), 16° off the
-    stub's own heading), but it leaves the main road at x≈43 while Brill is at
-    x≈62, so the road answer is ~31% of map against a 22% crow line — at the
-    1.6× off-road penalty the straight line genuinely wins. The missing piece is
-    the direct Brill→mills path, which the bake never saw.
-  - **Brill → Undercity entrance** bails `disconnected` (it bailed `short-hop`
-    before 0050). The southern road is now correctly in Tirisfal and its far
-    end (61.9,65.2) sits 1.4% from the entrance, so the *exit* leg is fine —
-    what is missing is the link from Brill to it, which is the 31-point stretch
-    filed under Western Plaguelands above. The only bridge candidate that could
-    span the hole, (57.6,51.8)→(57.7,64.6), is 12.8% at 5.7° off heading: just
-    past the 12% ceiling, and deliberately so, because it runs ~5% west of where
-    the real road goes and would cut across the field instead of following the
-    road through the town. The fix is the box-overlap gap, not a wider cone.
+  here. `tools/data/README.md` has the bake's thresholds. 0059 made the *size*
+  of this gap visible for the first time, because the box rule had been
+  papering over it: **Westfall 40, Deadwind Pass 41, Stonetalon 406, Desolace
+  405 and Badlands 3 have no baked road at all** and now correctly hold no row,
+  where before they held their neighbours' road. (The Barrens 17, which earlier
+  revisions of this doc called empty for the same reason, turns out to have
+  987 baked points — they were filed under Mulgore, Durotar and Stonetalon.)
+- **Zone boxes still steal each other's roads where the terrain cannot
+  arbitrate — but that is now 475 points, not thousands.** 0059 replaced the
+  smallest-box rule with the terrain's own per-cell area ids for 3315 of 10211
+  points; the rest either agreed with the boxes already or fell back:
+  - **463 points** whose terrain area has no world map at all — Hyjal 616 and
+    The Maul 3217 (Dire Maul) — keep the box answer. Both are genuinely
+    unmapped in 1.12, so there is nothing better to file them under, and the
+    box they fall back to is a neighbour whose map can at least draw them.
+  - **12 points** whose terrain zone has a `WorldMapArea` box that does not
+    reach them. Boxes are occasionally *tighter* than the terrain they
+    describe, and a percent outside 0–100 is not drawable, so the box answer
+    stands. Small enough to leave alone; it would need per-zone box fudging to
+    fix, which is a worse trade than 12 points.
+  - The arbiter only sees **terrain**. `TerrainAreas` reads the gridmap, where
+    the running client would first consult WMO area info from the vmaps. That
+    matters for indoor space only, and this bake is surface-only, so nothing
+    here depends on it — but a future bake that walks a WMO interior would need
+    the vmap leg too.
+- **`gen_quest_data.py` still files spawns by the box rule.** It does not
+  suffer as badly, because a quest carries an explicit `ZoneOrSort` hint that
+  wins ties where a road carries no hint, but a spawn with no hint sitting in
+  an overlap is mis-filed for exactly the reason 0059 fixed here.
+  `MapAreas.area_by_flag` + `zone_of_area` are the pieces it would need; the
+  `TerrainAreas` reader would move up alongside `MapAreas`. Not done, not
+  measured — its own ticket.
+- **Bridging cannot invent a road that was never baked.** Tirisfal is still the
+  worked example, but only one of its two named routes is left:
+  - **Brill → Undercity entrance** is **fixed** by 0059. It bailed `short-hop`
+    before 0050, `disconnected` after it, and now returns a 20-waypoint road
+    route: the missing link was the Brill stretch filed under Western
+    Plaguelands, and the terrain arbiter put it back. Note nothing was bridged
+    to achieve it — the road was always there, in the wrong zone.
+  - **Brill → Agamand Mills** still bails `straight-cheaper`, unchanged by
+    0059. The mills branch is connected (an 11.3% bridge from (43.1,49.2) to
+    (48.8,39.5), 16° off the stub's own heading), but it leaves the main road
+    at x≈43 while Brill is at x≈62, so the road answer runs long against a
+    ~20% crow line — at the 1.6× off-road penalty the straight line genuinely
+    wins. The missing piece is the direct Brill→mills path, which the bake
+    never saw, so no zone-assignment work can reach it.
 - **Sharpest remaining endpoint gaps** (measured, so the next pass can argue
-  with them rather than guess): globally
-  32% of sampled pairs still bail `disconnected`, concentrated in Darnassus
-  1657 and Dun Morogh 1 (31/50 each), Arathi 45 and Swamp of Sorrows 8 (29),
-  Feralas 357 and Felwood 361 (28), Wetlands 11 (27) — every one of them still
-  shows 3+ components in the header, with the surviving islands too big to
-  prune and too far apart to bridge. Those are bake holes, not junction gaps.
+  with them rather than guess): globally **24.9%** of sampled pairs still bail
+  `disconnected`, down from 33.7%, and it is now concentrated in Duskwood 10
+  (36/50), Dun Morogh 1 (34), Felwood 361 and Western Plaguelands 28 (31),
+  Arathi 45 / Redridge 44 / Darnassus 1657 / Teldrassil 141 (23). Every one of
+  them still shows 3+ components in the header, with the surviving islands too
+  big to prune and too far apart to bridge. Those are bake holes, not junction
+  gaps, and no further zone-assignment work will touch them.
 - **No cross-zone routing.** Segments stop at the border and the graph is
   per-zone, so a route to a target in another zone does not exist — the quest
   model only produces same-zone targets today, so nothing asks for one yet.
