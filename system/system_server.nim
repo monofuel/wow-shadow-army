@@ -5170,6 +5170,42 @@ proc itemQualityLabel*(quality: int): string =
   of 6: "artifact"
   else: "common"
 
+proc itemAbbrev*(name: string): string =
+  ## 2-4 char cell face for an item, WoW-bag style: initials of the
+  ## significant words ("Chipped Claw" -> "CC", "Cracked Sabre of the
+  ## Wilds" -> "CSW"), or the first three letters of a single-word name
+  ## ("Hearthstone" -> "HEA"). Punctuation is a word break; filler words
+  ## and the one-letter crumbs an apostrophe leaves behind ("Advisor's
+  ## Ring" -> "AR", not "ASR") are dropped unless they are all we have.
+  const fillers = ["of", "the", "a", "an", "and", "to", "in"]
+  var words: seq[string] = @[]
+  var current = ""
+  for c in name:
+    if c.isAlphaNumeric:
+      current.add(c)
+    elif current.len > 0:
+      words.add(current)
+      current = ""
+  if current.len > 0:
+    words.add(current)
+  if words.len == 0:
+    return "?"
+  var kept: seq[string] = @[]
+  for w in words:
+    if w.len > 1 and w.toLowerAscii() notin fillers:
+      kept.add(w)
+  if kept.len == 0:
+    kept = words
+  if kept.len >= 2:
+    result = ""
+    for i, w in kept:
+      if i >= 4:
+        break
+      result.add(w[0].toUpperAscii())
+  else:
+    let n = min(3, kept[0].len)
+    result = kept[0][0 ..< n].toUpperAscii()
+
 proc sortRealmInvStacks*(
     items: seq[RealmInvStack], info: Table[int, ItemInfo]
 ): seq[RealmInvStack] =
@@ -5251,6 +5287,51 @@ proc renderRealmInvItemTable*(
         </tbody>
       </table>
       </div>"""
+
+proc renderRealmInvCell*(it: RealmInvItem, info: Table[int, ItemInfo]): string =
+  ## One army-pool bag cell: abbreviation face, count badge, hover tip.
+  let known = info.hasKey(it.itemId) and info[it.itemId].name.len > 0
+  let quality = if known: info[it.itemId].quality else: 1
+  let name = if known: info[it.itemId].name else: &"Item#{it.itemId}"
+  let qualityClass = itemQualityClass(quality)
+  let qualityLabel = itemQualityLabel(quality)
+  let face =
+    if known: itemAbbrev(name)
+    else: $it.itemId
+  let countBadge =
+    if it.total > 1: &"""<span class="cell-count">{it.total}</span>"""
+    else: ""
+  # One holder string feeds both tips; escape once, at the interpolation.
+  let holdersText =
+    if it.holders.len == 0: "no holders"
+    else: realmInvHoldersText(it.holders)
+  let holders = escapeHtml(holdersText)
+  let plainTip = escapeHtml(
+    &"{name} · {qualityLabel} · id {it.itemId} — {it.total} total, {it.stacks} stacks — {holdersText}")
+  result = &"""
+        <div class="inv-cell {qualityClass}" title="{plainTip}">
+          <span class="cell-face">{escapeHtml(face)}</span>
+          {countBadge}
+          <span class="cell-tip">
+            <span class="tip-name {qualityClass}">{escapeHtml(name)}</span>
+            <span class="tip-line">{qualityLabel} · id {it.itemId}</span>
+            <span class="tip-line">{it.total} total · {it.stacks} stacks</span>
+            <span class="tip-line">{holders}</span>
+          </span>
+        </div>
+"""
+
+proc renderRealmInvGrid*(
+    items: seq[RealmInvItem], info: Table[int, ItemInfo]
+): string =
+  ## The army's pool as one giant bag: quality desc, total desc, name asc.
+  var cells = ""
+  for it in sortRealmInvItems(items, info):
+    cells.add(renderRealmInvCell(it, info))
+  if cells.len == 0:
+    return """<p class="empty">The army is carrying nothing.</p>"""
+  result = &"""<div class="inv-grid">
+{cells}      </div>"""
 
 proc renderRealmInvCharacter*(
     c: RealmInvCharacter, info: Table[int, ItemInfo]
@@ -5358,7 +5439,11 @@ proc renderRealmInventoryBody*(
       bits.add(&"{c.name} {formatGold(c.money)}")
     goldTitle = bits.join(", ")
   let itemCount = realmInvItemCount(inv)
-  let itemTable = renderRealmInvItemTable(realmInvItems(inv), info)
+  # Fold the realm into item rows ONCE — the grid and the table view are two
+  # renderings of the same pool, not two reads of it.
+  let pool = realmInvItems(inv)
+  let itemGrid = renderRealmInvGrid(pool, info)
+  let itemTable = renderRealmInvItemTable(pool, info)
   let age = if inv.fetchedAt > 0: epochTime() - inv.fetchedAt else: -1.0
   let ageCls =
     if age >= 0 and age <= RealmInvCacheSec * 2: "army-summary"
@@ -5370,7 +5455,13 @@ proc renderRealmInventoryBody*(
         <span class="{ageCls}">read {formatAgeSec(age)} ago</span>
       </div>
 {errNote}
+{itemGrid}
+      <details class="inv-char inv-astable">
+        <summary><span class="inv-name">As table</span></summary>
+        <div class="inv-body">
 {itemTable}
+        </div>
+      </details>
       <details class="inv-char inv-bychar">
         <summary>
           <span class="inv-name">By character</span>
@@ -5698,6 +5789,59 @@ const DashboardCss = """
     .q4 { color: #b76bf0; }
     .q5 { color: #ff9a2e; }
     .q6 { color: #e6cc80; }
+    .inv-grid {
+      display: grid; gap: 6px; margin: 0.2rem 0 0.4rem;
+      grid-template-columns: repeat(auto-fill, minmax(52px, 1fr));
+    }
+    /* --q is the cell's quality colour; the plain border/background above it
+       is the fallback a browser without color-mix() lands on. */
+    .inv-cell {
+      position: relative; aspect-ratio: 1 / 1; border-radius: 7px;
+      border: 1px solid var(--border); background: var(--panel2);
+      display: flex; align-items: center; justify-content: center;
+      cursor: default;
+      border-color: color-mix(in srgb, var(--q, var(--border)) 55%, transparent);
+      background:
+        linear-gradient(160deg,
+          color-mix(in srgb, var(--q, var(--border)) 14%, var(--panel2)) 0%,
+          var(--panel2) 70%);
+    }
+    .inv-cell.q0 { --q: #9d9d9d; }
+    .inv-cell.q1 { --q: #d8e2f0; }
+    .inv-cell.q2 { --q: #4ade4a; }
+    .inv-cell.q3 { --q: #4d9bff; }
+    .inv-cell.q4 { --q: #b76bf0; }
+    .inv-cell.q5 { --q: #ff9a2e; }
+    .inv-cell.q6 { --q: #e6cc80; }
+    .inv-cell:hover {
+      border-color: var(--q, var(--accent));
+      box-shadow: 0 0 0 1px color-mix(in srgb, var(--q, var(--accent)) 40%, transparent);
+      z-index: 5;
+    }
+    .cell-face {
+      font-weight: 700; font-size: 0.82rem; letter-spacing: 0.02em;
+      color: var(--q, var(--text));
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+    .cell-count {
+      position: absolute; right: 2px; bottom: 1px;
+      font-size: 0.66rem; font-weight: 700; line-height: 1;
+      color: var(--text); font-variant-numeric: tabular-nums;
+      text-shadow: 0 1px 2px var(--ink), 0 0 3px var(--ink);
+    }
+    .cell-tip {
+      display: none; position: absolute; bottom: calc(100% + 6px); left: 50%;
+      transform: translateX(-50%); z-index: 20; width: max-content;
+      max-width: 260px; padding: 0.4rem 0.55rem; text-align: left;
+      border: 1px solid var(--border); border-radius: 8px;
+      background: var(--panel); box-shadow: 0 6px 18px rgba(0,0,0,0.55);
+      font-size: 0.75rem; line-height: 1.35; white-space: normal;
+      pointer-events: none;
+    }
+    .inv-cell:hover .cell-tip { display: block; }
+    .tip-name { display: block; font-weight: 700; font-size: 0.82rem; }
+    .tip-line { display: block; color: var(--muted); }
+    details.inv-astable { margin-top: 0.6rem; }
 """
 
 proc navTabClass(active, tab: string): string =
