@@ -3,7 +3,7 @@
 ## FLIGHT log for the northing parser.
 ## Run: nim r --hints:off --warnings:off tools/tests/test_conductor_gate.nim
 
-import std/[json, options, os, sequtils, sets, strutils]
+import std/[json, options, os, sequtils, sets, strutils, tables]
 import ../../src/conductor/cfg
 import ../../src/conductor/evalgate
 import ../../src/conductor/ledger
@@ -278,6 +278,87 @@ check(oneMinuteLoad("16.55 35.34 39.41 12/12558 4115644") == 16.55,
 check(oneMinuteLoad("") == 0.0, "empty loadavg reads as quiet")
 check(oneMinuteLoad("garbage fields here") == 0.0,
   "unparseable loadavg reads as quiet, never wedges the eval")
+check(DefaultEvalLoadCap == 45.0, "default load cap is 45")
+check(evalLoadCap("45") == 45.0, "explicit 45 parses")
+check(evalLoadCap("20") == 20.0, "CONDUCTOR_EVAL_LOAD_CAP override still honored")
+check(evalLoadCap("nope") == 45.0, "garbage load cap falls back to 45")
+
+# --- slot paths: 0 is legacy, N is local_data/eval-slots/sN/... ---
+check(runLogRelPath(0) == "local_data/traverse-status/run.log",
+  "slot 0 run.log is the legacy path")
+check(runLogRelPath() == "local_data/traverse-status/run.log",
+  "runLogRelPath default is slot 0")
+check(runLogRelPath(1) == "local_data/eval-slots/s1/traverse-status/run.log",
+  "slot 1 run.log")
+check(runLogRelPath(3) == "local_data/eval-slots/s3/traverse-status/run.log",
+  "slot 3 run.log")
+check(segmentResultRelPath(0) == "local_data/traverse-segment-result.json",
+  "slot 0 segment-result is the legacy path")
+check(segmentResultRelPath(2) ==
+  "local_data/eval-slots/s2/traverse-segment-result.json",
+  "slot 2 segment-result")
+check(archiveRelDir(0) == "local_data/traverse-status/archive",
+  "slot 0 archive is the legacy dir")
+check(archiveRelDir(2) == "local_data/traverse-status/archive",
+  "slot N archives into the shared legacy dir")
+check(slotDataPrefix(0) == "local_data", "slot 0 data prefix is local_data")
+check(slotDataPrefix(2) == "local_data/eval-slots/s2", "slot 2 data prefix")
+
+# --- archive naming: -s<n> only on slot runs ---
+check(archiveLogName("baseline-r1", 0, "20260816-120000") ==
+  "run-20260816-120000-baseline-r1.log",
+  "slot 0 archive name has no slot suffix")
+check(archiveLogName("baseline-r1", 2, "20260816-120000") ==
+  "run-20260816-120000-baseline-r1-s2.log",
+  "slot 2 archive name gains -s2")
+check(archiveLogName("0042-gatebranch-r3", 3, "20260816-235959") ==
+  "run-20260816-235959-0042-gatebranch-r3-s3.log",
+  "gate-branch slug keeps -sN suffix")
+
+# --- buildEvalCommand: SLOT= only when slot != 0 ---
+var lcEval = LeagueConfig()
+lcEval.evalMake.target = "traverse"
+lcEval.evalMake.vars["CHECKPOINT"] = "spawn"
+lcEval.evalMake.vars["END_TIMEOUT"] = "420"
+let cmd0 = buildEvalCommand(lcEval)
+check(cmd0.args[0] == "traverse", "eval target is first make arg")
+check(cmd0.wallTimeout == 420, "END_TIMEOUT becomes the wall timeout")
+check(not cmd0.args.anyIt(it.startsWith("SLOT=")),
+  "slot 0 omits SLOT= so make stays on the legacy paths")
+let cmd2 = buildEvalCommand(lcEval, @[("FORK_CLIENT", "/tmp/fork")], 2)
+check("SLOT=2" in cmd2.args, "slot 2 appends SLOT=2")
+check("FORK_CLIENT=/tmp/fork" in cmd2.args, "extraVars still appended")
+check(cmd2.args[^1] == "SLOT=2", "SLOT= is last so it wins over leftover env")
+let cmdForkOnly = buildEvalCommand(lcEval, @[("FORK_CLIENT", "/tmp/fork")])
+check(not cmdForkOnly.args.anyIt(it.startsWith("SLOT=")),
+  "extraVars without slot still omit SLOT=")
+
+# --- median of concurrent-shaped reports (pure; no make) ---
+let rLow = %*{"max_northing": 1000.0, "eval_slot": 1}
+let rMid = %*{"max_northing": 5000.0, "eval_slot": 2}
+let rHigh = %*{"max_northing": 9000.0, "eval_slot": 3}
+check(pickMedianReport(@[rHigh, rLow, rMid]){"max_northing"}.getFloat() == 5000.0,
+  "median of 3 concurrent rolls is the middle northing")
+check(pickMedianReport(@[rHigh, rLow, rMid]){"eval_slot"}.getInt() == 2,
+  "median keeps the middle report object, not a copy of the number")
+check(pickMedianReport(@[rHigh, rLow]){"max_northing"}.getFloat() == 9000.0,
+  "median of 2 (two slots free) is the upper middle")
+check(pickMedianReport(@[rMid]){"max_northing"}.getFloat() == 5000.0,
+  "median of 1 is the only report")
+check(reportNorthing(rHigh) == 9000.0, "reportNorthing reads max_northing")
+check(reportNorthing(nil) == 0.0, "reportNorthing of nil is 0")
+check(reportNorthing(%*{"ok": true}) == 0.0, "missing northing reads as 0")
+
+# lease CLI missing: claim nothing, release is a no-op (never slot 0)
+check(claimEvalSlots(tmp, 3).len == 0, "missing lease CLI claims no slots")
+check(claimEvalSlot(tmp) == 0, "missing lease CLI returns slot 0 (none)")
+releaseEvalSlot(tmp, 0)
+releaseEvalSlot(tmp, 1)
+releaseEvalSlots(tmp, @[1, 2, 3])
+check(EvalSlotMin == 1 and EvalSlotMax == 3, "agent slots are 1..3")
+check(EvalSlotTtlMinutes == 45, "lease crash-net TTL is 45 minutes")
+check("evalslot-0" notin "evalslot-1 evalslot-2 evalslot-3",
+  "slot 0 is not an agent lease resource")
 
 removeDir(tmp)
 

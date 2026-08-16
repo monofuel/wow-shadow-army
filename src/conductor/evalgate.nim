@@ -10,7 +10,7 @@
 ## a reviewer agent may reject earlier, but only this gate can pass.
 
 import
-  std/[json, options, os, sets, strutils, tables, times],
+  std/[algorithm, json, options, os, osproc, sets, strutils, tables, times],
   scriptorium/git_ops,
   ./cfg
 
@@ -18,9 +18,13 @@ const
   # Kalimdor race scoring line (tools/pack_traverse_replay.sh:115).
   GoalX = 6687.333052
   StartX = -9187.0
-  RunLogRelPath = "local_data/traverse-status/run.log"
-  SegmentResultRelPath = "local_data/traverse-segment-result.json"
-  ArchiveRelDir = "local_data/traverse-status/archive"
+  LegacyRunLogRelPath = "local_data/traverse-status/run.log"
+  LegacySegmentResultRelPath = "local_data/traverse-segment-result.json"
+  LegacyArchiveRelDir = "local_data/traverse-status/archive"
+  DefaultEvalLoadCap* = 45.0
+  EvalSlotMin* = 1
+  EvalSlotMax* = 3
+  EvalSlotTtlMinutes* = 45
 
 type
   EvalOutcome* = enum
@@ -32,6 +36,49 @@ type
     outcome*: EvalOutcome
     report*: JsonNode
     detail*: string
+
+  EvalCommand* = object
+    args*: seq[string]
+    wallTimeout*: int
+
+proc slotDataPrefix*(slot = 0): string =
+  ## Checkout-relative root for a slot's run files. Slot 0 is legacy `local_data`.
+  if slot <= 0: "local_data"
+  else: "local_data" / "eval-slots" / ("s" & $slot)
+
+proc runLogRelPath*(slot = 0): string =
+  ## `run.log` for this slot. Slot 0 is the legacy path exactly.
+  if slot <= 0: LegacyRunLogRelPath
+  else: slotDataPrefix(slot) / "traverse-status" / "run.log"
+
+proc segmentResultRelPath*(slot = 0): string =
+  ## Segment-result JSON for this slot. Slot 0 is the legacy path exactly.
+  if slot <= 0: LegacySegmentResultRelPath
+  else: slotDataPrefix(slot) / "traverse-segment-result.json"
+
+proc archiveRelDir*(slot = 0): string =
+  ## Shared legacy archive so downstream tools read one directory.
+  discard slot
+  LegacyArchiveRelDir
+
+proc archiveLogName*(slug: string, slot = 0, stamp = ""): string =
+  ## Archive filename; slot runs gain `-s<n>` before `.log`.
+  let ts = if stamp.len > 0: stamp else: now().utc.format("yyyyMMdd-HHmmss")
+  if slot <= 0:
+    "run-" & ts & "-" & slug & ".log"
+  else:
+    "run-" & ts & "-" & slug & "-s" & $slot & ".log"
+
+proc reportNorthing*(r: JsonNode): float =
+  ## `max_northing` or 0.0 when the report is missing it.
+  if r.isNil: 0.0 else: r{"max_northing"}.getFloat(0.0)
+
+proc pickMedianReport*(reports: seq[JsonNode]): JsonNode =
+  ## Middle report by max_northing (upper median on an even count).
+  doAssert reports.len > 0
+  var ranked = reports
+  ranked.sort(proc(a, b: JsonNode): int = cmp(reportNorthing(a), reportNorthing(b)))
+  ranked[ranked.len div 2]
 
 proc countFlightSamples*(runLogPath: string): int =
   ## Valid FLIGHT lines in the log. Zero on a "fresh" run means the
@@ -99,12 +146,17 @@ proc oneMinuteLoad*(loadavgLine: string): float =
   if fields.len == 0: return 0.0
   try: parseFloat(fields[0]) except ValueError: 0.0
 
-proc waitForQuietBox(capEnv = "CONDUCTOR_EVAL_LOAD_CAP"): bool =
+proc evalLoadCap*(raw = getEnv("CONDUCTOR_EVAL_LOAD_CAP", "45")): float =
+  ## Parse the eval load cap; garbage falls back to DefaultEvalLoadCap.
+  try: parseFloat(raw) except ValueError: DefaultEvalLoadCap
+
+proc waitForQuietBox*(capEnv = "CONDUCTOR_EVAL_LOAD_CAP"): bool =
   ## Scores rolled on a loaded box are noise, not verdicts (0070's 8,380
   ## park and the 0072 park both rolled at load 40+ next to navmesh
   ## bakes). Hold the eval until 1-min load is under the cap, bounded so
   ## a stuck storm degrades to evalBusy (uncharged) instead of wedging.
-  let cap = try: parseFloat(getEnv(capEnv, "20")) except ValueError: 20.0
+  ## The lease is the capacity governor; this cap only guards foreign load.
+  let cap = evalLoadCap(getEnv(capEnv, "45"))
   const waitLimitS = 1800
   var waited = 0
   while waited <= waitLimitS:
@@ -120,50 +172,42 @@ proc waitForQuietBox(capEnv = "CONDUCTOR_EVAL_LOAD_CAP"): bool =
     waited += 60
   false
 
-proc runEval*(checkoutDir: string, lc: LeagueConfig, slug: string,
-    extraVars: openArray[(string, string)] = []): EvalResult =
-  ## One eval run in checkoutDir. Exit code 2 (flock held / bad bracket
-  ## args) and a stale run.log both come back evalBusy — the candidate
-  ## is NOT charged for slot contention.
-  if not waitForQuietBox():
-    return EvalResult(outcome: evalBusy,
-      detail: "box load stayed over the eval cap for 30 min — not rolling")
-  let runLogPath = checkoutDir / RunLogRelPath
-  let beforeMtime =
-    if fileExists(runLogPath): getLastModificationTime(runLogPath)
-    else: fromUnix(0)
+proc median3Enabled*(): bool =
+  ## Median-of-3 is on unless CONDUCTOR_GATE_MEDIAN3=0.
+  getEnv("CONDUCTOR_GATE_MEDIAN3", "1") != "0"
 
-  var args = @[lc.evalMake.target]
-  var wallTimeout = 2700
+proc buildEvalCommand*(lc: LeagueConfig,
+    extraVars: openArray[(string, string)] = [], slot = 0): EvalCommand =
+  ## Make args + wall timeout for one eval. Slot 0 omits SLOT= (legacy).
+  result.wallTimeout = 2700
+  result.args = @[lc.evalMake.target]
   for key, value in lc.evalMake.vars:
-    args.add(key & "=" & value)
+    result.args.add(key & "=" & value)
     if key == "END_TIMEOUT":
-      wallTimeout = try: parseInt(value) except ValueError: 2700
+      result.wallTimeout = try: parseInt(value) except ValueError: 2700
   for (key, value) in extraVars:
-    args.add(key & "=" & value)
+    result.args.add(key & "=" & value)
+  if slot != 0:
+    result.args.add("SLOT=" & $slot)
 
-  let (rc, output) = runCommandCapture(checkoutDir, "make", args,
-    timeoutMs = (wallTimeout + 900) * 1000)
-  # GNU make exits 2 for ANY failing recipe, so the exit code cannot
-  # distinguish "flock held" from "waiter verdict not-ok" (rc=1 inside
-  # the recipe — NORMAL while no run reaches the end checkpoint). Decide
-  # by evidence: the lock message, then run.log freshness.
+proc collectEvalResult*(checkoutDir, slug: string, slot: int,
+    rc: int, output: string, beforeMtime: Time): EvalResult =
+  ## Turn a finished make into an EvalResult. Flock string and mtime
+  ## freshness stay as backstops even when a lease reserved the slot.
   if "another live Traverse run owns" in output:
     return EvalResult(outcome: evalBusy,
       detail: "eval flock held by another live run")
 
+  let runLogPath = checkoutDir / runLogRelPath(slot)
   if not fileExists(runLogPath) or
       getLastModificationTime(runLogPath) <= beforeMtime:
     return EvalResult(outcome: evalBusy,
       detail: "run.log not refreshed — lost the slot race, no fresh run" &
         " (make rc=" & $rc & ")")
 
-  # Archive before anything else can truncate it (ticket 0017). Store
-  # the symlink-resolved path — worktree-relative paths die at teardown.
-  let archiveDir = checkoutDir / ArchiveRelDir
+  let archiveDir = checkoutDir / archiveRelDir(slot)
   createDir(archiveDir)
-  var archived = archiveDir / ("run-" &
-    now().utc.format("yyyyMMdd-HHmmss") & "-" & slug & ".log")
+  var archived = archiveDir / archiveLogName(slug, slot)
   copyFile(runLogPath, archived)
   archived = try: expandFilename(archived) except OSError: archived
 
@@ -172,7 +216,7 @@ proc runEval*(checkoutDir: string, lc: LeagueConfig, slug: string,
       detail: "fresh run produced zero FLIGHT telemetry — client/server " &
         "prep failure, not a candidate result (log: " & archived & ")")
 
-  let segmentPath = checkoutDir / SegmentResultRelPath
+  let segmentPath = checkoutDir / segmentResultRelPath(slot)
   var report: JsonNode
   if fileExists(segmentPath):
     try:
@@ -181,13 +225,141 @@ proc runEval*(checkoutDir: string, lc: LeagueConfig, slug: string,
       report = nil
   if report.isNil or report.kind != JObject:
     return EvalResult(outcome: evalFailed,
-      detail: "fresh run but no parseable " & SegmentResultRelPath &
+      detail: "fresh run but no parseable " & segmentResultRelPath(slot) &
         " (make rc=" & $rc & ")")
 
   report["max_northing"] = %computeMaxNorthing(archived)
   report["archived_log"] = %archived
   report["make_rc"] = %rc
+  if slot != 0:
+    report["eval_slot"] = %slot
   EvalResult(outcome: evalOk, report: report)
+
+proc runLogMtime(path: string): Time =
+  if fileExists(path): getLastModificationTime(path) else: fromUnix(0)
+
+proc runEval*(checkoutDir: string, lc: LeagueConfig, slug: string,
+    extraVars: openArray[(string, string)] = [], slot: int = 0): EvalResult =
+  ## One eval run in checkoutDir. Exit code 2 (flock held / bad bracket
+  ## args) and a stale run.log both come back evalBusy — the candidate
+  ## is NOT charged for slot contention. Slot acquisition is the caller's
+  ## job; slot 0 keeps the legacy make invocation and paths.
+  if not waitForQuietBox():
+    return EvalResult(outcome: evalBusy,
+      detail: "box load stayed over the eval cap for 30 min — not rolling")
+  let cmd = buildEvalCommand(lc, extraVars, slot)
+  let beforeMtime = runLogMtime(checkoutDir / runLogRelPath(slot))
+  let (rc, output) = runCommandCapture(checkoutDir, "make", cmd.args,
+    timeoutMs = (cmd.wallTimeout + 900) * 1000)
+  collectEvalResult(checkoutDir, slug, slot, rc, output, beforeMtime)
+
+proc startEvalProcess(checkoutDir: string, cmd: EvalCommand,
+    outPath: string): Process =
+  createDir(outPath.parentDir)
+  var parts = @[quoteShell("make")]
+  for a in cmd.args:
+    parts.add(quoteShell(a))
+  parts.add(">")
+  parts.add(quoteShell(outPath))
+  parts.add("2>&1")
+  startProcess("/bin/sh", workingDir = checkoutDir,
+    args = ["-c", parts.join(" ")], options = {poUsePath})
+
+proc runConcurrentEvals*(checkoutDir: string, lc: LeagueConfig,
+    slugs: seq[string], slots: seq[int],
+    extraVars: openArray[(string, string)] = []): seq[EvalResult] =
+  ## One make per slot, started together. Shared command builder with runEval.
+  doAssert slugs.len == slots.len
+  if slugs.len == 0:
+    return
+  if not waitForQuietBox():
+    for _ in slots:
+      result.add(EvalResult(outcome: evalBusy,
+        detail: "box load stayed over the eval cap for 30 min — not rolling"))
+    return
+
+  type Job = object
+    p: Process
+    slot: int
+    slug: string
+    before: Time
+    outPath: string
+    wallTimeout: int
+
+  var jobs: seq[Job]
+  for i, slot in slots:
+    let cmd = buildEvalCommand(lc, extraVars, slot)
+    let outPath = checkoutDir / slotDataPrefix(slot) / "make.out"
+    jobs.add(Job(
+      p: startEvalProcess(checkoutDir, cmd, outPath),
+      slot: slot,
+      slug: slugs[i],
+      before: runLogMtime(checkoutDir / runLogRelPath(slot)),
+      outPath: outPath,
+      wallTimeout: cmd.wallTimeout,
+    ))
+
+  let started = epochTime()
+  let limitS = float(jobs[0].wallTimeout + 900)
+  for job in jobs:
+    let remaining = max(1, int((limitS - (epochTime() - started)) * 1000))
+    var rc = job.p.waitForExit(remaining)
+    if rc == -1:
+      if running(job.p):
+        job.p.kill()
+      rc = job.p.waitForExit(5_000)
+    job.p.close()
+    let output = if fileExists(job.outPath): readFile(job.outPath) else: ""
+    result.add(collectEvalResult(checkoutDir, job.slug, job.slot, rc,
+      output, job.before))
+
+proc agentLeaseCli(root: string): string =
+  root / "monofuel-vanilla-wow" / "agents" / "agent_lease.py"
+
+proc evalSlotOwner*(): string =
+  ## Lease owner for this conductor process. Same owner on every slot.
+  "conductor-" & $getCurrentProcessId()
+
+proc claimEvalSlots*(root: string, want: int, purpose = "eval"): seq[int] =
+  ## Non-blocking probe of evalslot-1..3. Never claims slot 0.
+  let nWant = max(0, min(want, EvalSlotMax))
+  let cli = agentLeaseCli(root)
+  if not fileExists(cli) or nWant == 0:
+    return
+  let owner = evalSlotOwner()
+  for n in EvalSlotMin .. EvalSlotMax:
+    if result.len >= nWant:
+      break
+    let (rc, _) = runCommandCapture(root, cli, @[
+      "claim", "evalslot-" & $n,
+      "--owner", owner,
+      "--purpose", purpose,
+      "--ttl-minutes", $EvalSlotTtlMinutes,
+    ], timeoutMs = 15_000)
+    if rc == 0:
+      result.add(n)
+
+proc claimEvalSlot*(root: string, purpose = "eval"): int =
+  ## First free agent slot, or 0 when none are free.
+  let got = claimEvalSlots(root, 1, purpose)
+  if got.len == 0: 0 else: got[0]
+
+proc releaseEvalSlot*(root: string, slot: int) =
+  ## Drop this process's lease on evalslot-N. No-op for slot 0 or a missing CLI.
+  if slot < EvalSlotMin or slot > EvalSlotMax:
+    return
+  let cli = agentLeaseCli(root)
+  if not fileExists(cli):
+    return
+  discard runCommandCapture(root, cli, @[
+    "release", "evalslot-" & $slot,
+    "--owner", evalSlotOwner(),
+  ], timeoutMs = 15_000)
+
+proc releaseEvalSlots*(root: string, slots: openArray[int]) =
+  ## Release every held agent slot.
+  for slot in slots:
+    releaseEvalSlot(root, slot)
 
 proc compareVals(op: string, cand, reference: float): bool =
   case op

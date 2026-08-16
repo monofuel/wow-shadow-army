@@ -4,7 +4,7 @@
 ## journals state so a crash resumes instead of forgetting.
 
 import
-  std/[algorithm, json, os, sequtils, strutils],
+  std/[json, os, sequtils, strutils],
   scriptorium/git_ops,
   ./agents,
   ./cfg,
@@ -114,32 +114,58 @@ proc runGateBranch*(cfgAll: ConductorConfig,
   # 3." The champion is likewise defined by its median eval. Roll up to
   # three valid evals and gate on the median-northing report. Opt out
   # with CONDUCTOR_GATE_MEDIAN3=0 for quick probes.
-  let median3 = getEnv("CONDUCTOR_GATE_MEDIAN3", "1") != "0"
+  let median3 = median3Enabled()
   let rollTarget = if median3: 3 else: 1
   var reports: seq[JsonNode] = @[]
-  var rollIdx = 0
-  while reports.len < rollTarget:
-    inc rollIdx
-    echo "conductor: gate-branch full-course eval (roll ", reports.len + 1,
-      "/", rollTarget, ", several minutes)"
-    let eval = runEval(worktree, lc,
-      ticketId & "-gatebranch-r" & $rollIdx, @[forkClientVar(root)])
-    if eval.outcome != evalOk:
-      if reports.len == 0:
-        return TickResult(outcome: toBusy, ticketId: ticketId,
-          detail: $eval.outcome & ": " & eval.detail)
-      # keep already-banked rolls; retry the slot a bounded number of times
-      if rollIdx >= rollTarget + 4:
-        return TickResult(outcome: toBusy, ticketId: ticketId,
-          detail: "eval slot lost mid-series: " & eval.detail)
-      continue
-    reports.add(eval.report)
-  proc northing(r: JsonNode): float =
-    if r.isNil: 0.0 else: r{"max_northing"}.getFloat(0.0)
-  reports.sort(proc(a, b: JsonNode): int = cmp(northing(a), northing(b)))
-  let eval = EvalResult(outcome: evalOk, report: reports[reports.len div 2],
+  var held: seq[int] = @[]
+  defer:
+    releaseEvalSlots(root, held)
+  if median3:
+    if not waitForQuietBox():
+      return TickResult(outcome: toBusy, ticketId: ticketId,
+        detail: "evalBusy: box load stayed over the eval cap for 30 min — not rolling")
+    held = claimEvalSlots(root, rollTarget, ticketId & "-gatebranch")
+    if held.len == 0:
+      return TickResult(outcome: toBusy, ticketId: ticketId,
+        detail: "evalBusy: no eval slot free")
+  if median3 and held.len >= 2:
+    var slugs: seq[string] = @[]
+    for i, slot in held:
+      slugs.add(ticketId & "-gatebranch-r" & $(i + 1))
+    echo "conductor: gate-branch concurrent evals on slots ",
+      held.mapIt($it).join(",")
+    let batch = runConcurrentEvals(worktree, lc, slugs, held,
+      @[forkClientVar(root)])
+    for item in batch:
+      if item.outcome == evalOk:
+        reports.add(item.report)
+    if reports.len == 0:
+      let first = batch[0]
+      return TickResult(outcome: toBusy, ticketId: ticketId,
+        detail: $first.outcome & ": " & first.detail)
+  else:
+    let serialSlot = if held.len == 1: held[0] else: 0
+    var rollIdx = 0
+    while reports.len < rollTarget:
+      inc rollIdx
+      echo "conductor: gate-branch full-course eval (roll ", reports.len + 1,
+        "/", rollTarget, ", several minutes)"
+      let eval = runEval(worktree, lc,
+        ticketId & "-gatebranch-r" & $rollIdx, @[forkClientVar(root)],
+        serialSlot)
+      if eval.outcome != evalOk:
+        if reports.len == 0:
+          return TickResult(outcome: toBusy, ticketId: ticketId,
+            detail: $eval.outcome & ": " & eval.detail)
+        # keep already-banked rolls; retry the slot a bounded number of times
+        if rollIdx >= rollTarget + 4:
+          return TickResult(outcome: toBusy, ticketId: ticketId,
+            detail: "eval slot lost mid-series: " & eval.detail)
+        continue
+      reports.add(eval.report)
+  let eval = EvalResult(outcome: evalOk, report: pickMedianReport(reports),
     detail: "median of " & $reports.len & " rolls: " &
-      reports.mapIt($it{"max_northing"}.getFloat(0.0).int).join("/"))
+      reports.mapIt($reportNorthing(it).int).join("/"))
   echo "conductor: gate-branch ", eval.detail
   let champ = champion(ledgerPath(laneDirPath, leagueName))
   let gate = runGate(eval.report,

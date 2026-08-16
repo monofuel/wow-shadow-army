@@ -10,7 +10,7 @@
 # Config: <wow-coworld root>/conductor.json.  Design: docs/conductor.md.
 
 import
-  std/[algorithm, json, os, sequtils, sets, strutils, tables],
+  std/[json, os, sequtils, sets, strutils, tables],
   scriptorium/git_ops,
   conductor/cfg,
   conductor/evalgate,
@@ -110,24 +110,48 @@ proc cmdBaseline(cfgAll: ConductorConfig, leagueName, root: string) =
     headSha(lane), ") — this takes several minutes"
   # Same variance discipline as gate-branch (goal-loop.md): the champion
   # row is "SHAs + median eval". Three rolls, keep the median report.
-  let median3 = getEnv("CONDUCTOR_GATE_MEDIAN3", "1") != "0"
+  let median3 = median3Enabled()
   let rollTarget = if median3: 3 else: 1
   var reports: seq[JsonNode] = @[]
   var res = EvalResult(outcome: evalFailed, detail: "no roll ran")
-  var rollIdx = 0
-  while reports.len < rollTarget and rollIdx < rollTarget + 4:
-    inc rollIdx
-    echo "conductor: baseline roll ", reports.len + 1, "/", rollTarget
-    res = runEval(lane, lc, "baseline-r" & $rollIdx)
-    if res.outcome == evalOk:
-      reports.add(res.report)
+  var held: seq[int] = @[]
+  defer:
+    releaseEvalSlots(root, held)
+  if median3:
+    if not waitForQuietBox():
+      res = EvalResult(outcome: evalBusy,
+        detail: "box load stayed over the eval cap for 30 min — not rolling")
+    else:
+      held = claimEvalSlots(root, rollTarget, "baseline")
+      if held.len == 0:
+        res = EvalResult(outcome: evalBusy, detail: "no eval slot free")
+  if res.outcome != evalBusy:
+    if median3 and held.len >= 2:
+      var slugs: seq[string] = @[]
+      for i, slot in held:
+        slugs.add("baseline-r" & $(i + 1))
+      echo "conductor: baseline concurrent rolls on slots ",
+        held.mapIt($it).join(",")
+      let batch = runConcurrentEvals(lane, lc, slugs, held)
+      for item in batch:
+        if item.outcome == evalOk:
+          reports.add(item.report)
+        else:
+          res = item
+    else:
+      let serialSlot = if held.len == 1: held[0] else: 0
+      var rollIdx = 0
+      while reports.len < rollTarget and rollIdx < rollTarget + 4:
+        inc rollIdx
+        echo "conductor: baseline roll ", reports.len + 1, "/", rollTarget
+        res = runEval(lane, lc, "baseline-r" & $rollIdx, slot = serialSlot)
+        if res.outcome == evalOk:
+          reports.add(res.report)
   if reports.len > 0:
-    proc northing(r: JsonNode): float = r{"max_northing"}.getFloat(0.0)
-    reports.sort(proc(a, b: JsonNode): int = cmp(northing(a), northing(b)))
-    res = EvalResult(outcome: evalOk, report: reports[reports.len div 2],
+    res = EvalResult(outcome: evalOk, report: pickMedianReport(reports),
       detail: "median of " & $reports.len)
     echo "conductor: baseline rolls ",
-      reports.mapIt($it{"max_northing"}.getFloat(0.0).int).join("/"),
+      reports.mapIt($reportNorthing(it).int).join("/"),
       " — median kept"
   case res.outcome
   of evalBusy:
