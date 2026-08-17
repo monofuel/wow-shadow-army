@@ -109,6 +109,7 @@ local STUCK_SECONDS = 6.0
 local STUCK_GAP_SECONDS = 2.0
 
 local CLASS_WARRIOR = 1
+local CLASS_ROGUE = 4
 local CLASS_PRIEST = 5
 local CLASS_MAGE = 8
 local CLASS_WARLOCK = 9
@@ -1565,6 +1566,16 @@ local function mage_action(view, target)
     reason = filler and "mage_nuke" or "mage_melee_fallback" }
 end
 
+local function rogue_action(view, target)
+  local strike = pick_spell(view, { "Sinister Strike" })
+  if strike then
+    return { kind = "attack", guid = target.guid, spell = strike.spell_id,
+      stop_distance = 4.0, reason = "rogue_sinister_strike" }
+  end
+  return { kind = "attack", guid = target.guid, stop_distance = 4.0,
+    reason = "rogue_melee" }
+end
+
 local function self_buff(view, role)
   local priorities = role == "tank" and { "Battle Shout" }
     or role == "healer" and { "Inner Fire" }
@@ -1975,6 +1986,15 @@ function M.decide(view)
   if not party.in_group or not murist_member then
     local flee = survive_step(view)
     if flee then return finish(flee, view, "solo", role) end
+    if (view.active_cast_spell_id or 0) ~= 0 or
+        (view.active_channel_spell_id or 0) ~= 0 then
+      return finish({ kind = "hold", reason = "finish_active_cast" },
+        view, "solo", role)
+    end
+    if not view.in_combat then
+      local pet = summon_demon(view, role)
+      if pet then return finish(pet, view, "solo", role) end
+    end
     local intent = solo.decide(view)
     return finish(intent, view, "solo", role)
   end
@@ -2078,6 +2098,7 @@ function M.decide(view)
     local action = role == "tank" and warrior_action(view, target)
       or role == "healer" and priest_damage(view, target)
       or view.class_id == CLASS_MAGE and mage_action(view, target)
+      or view.class_id == CLASS_ROGUE and rogue_action(view, target)
       or warlock_action(view, target)
     return finish(action, view, "escort", role, leader, target)
   end

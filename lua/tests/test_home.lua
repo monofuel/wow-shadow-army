@@ -563,6 +563,38 @@ r = home.decide(v)
 check(r.kind == "cast_spell" and r.spell == 687,
   "with the imp out the warlock goes back to self-buffing")
 
+home.reset()
+v = frame(9)
+v.party = { in_group = false, members = {} }
+v.units = {}
+v.spell_facts = { spell(688, "Summon Imp", 1) }
+r = home.decide(v)
+check(r.kind == "cast_spell" and r.spell == 688 and r.reason == "summon_imp",
+  "petless solo warlock summons its imp before grinding")
+check(r.status.mode == "solo", "solo summon reports solo mode")
+v.active_cast_spell_id = 688
+r = home.decide(v)
+check(r.kind == "hold" and r.reason == "finish_active_cast",
+  "solo does not interrupt the 10s summon")
+v.active_cast_spell_id = 0
+v.units = {
+  { guid = 4245, name = "Imp", summoner_guid = 200,
+    player_can_attack = false, death_known = true, is_dead = false,
+    distance = 2, location = { map_id = 0, position = { x = 1, y = 0, z = 0 } } },
+}
+r = home.decide(v)
+check(not (r.kind == "cast_spell" and r.spell == 688),
+  "solo warlock with a live imp does not resummon")
+home.reset()
+v = frame(9)
+v.party = { in_group = false, members = {} }
+v.in_combat = true
+v.spell_facts = { spell(688, "Summon Imp", 1) }
+v.units = { hostile(301, 200) }
+r = home.decide(v)
+check(not (r.kind == "cast_spell" and r.spell == 688),
+  "solo warlock does not start a summon mid-fight")
+
 -- A mob beating on a party member's PET is party business too.
 v = frame(9)
 v.spell_facts = {
@@ -1544,6 +1576,24 @@ v.party.members[2].location = { map_id = 0, x = 6, y = 0, z = 0 }
 r = home.decide(v)
 check(r.kind == "cast_spell" and r.spell == 1243 and r.target_guid == 100,
   "fortitude buffs the member standing next to the healer")
+
+home.reset()
+v = frame(4)
+v.party.members[1].name = "Kamish"
+v.in_combat = true
+v.units = { leader_unit(3, true, 300), hostile(300, 100) }
+v.action_buttons = {
+  bar(1752, "Sinister Strike"), bar(2098, "Eviscerate"), bar(686, "Shadow Bolt"),
+}
+r = home.decide(v)
+check(r.kind == "attack" and r.spell == 1752 and
+  r.reason == "rogue_sinister_strike",
+  "escort rogue fills with Sinister Strike, not Shadow Bolt")
+check(r.stop_distance == 4.0, "escort rogue stops in melee")
+v.action_buttons[1].usable = false
+r = home.decide(v)
+check(r.kind == "attack" and r.spell == nil and r.reason == "rogue_melee",
+  "escort rogue auto-attacks when energy-starved")
 
 wow.log = realLog
 
