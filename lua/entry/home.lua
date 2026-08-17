@@ -19,7 +19,6 @@ local NEAR_YARDS = 8.0
 local HARD_LEASH_YARDS = 18.0
 local HEAL_RANGE_YARDS = 30.0
 local RES_WAIT_SECONDS = 20.0
-local RELEASE_RETRY_SECONDS = 5.0
 local PROMOTE_RETRY_SECONDS = 5.0
 -- Cloth dies in two hits from what Murist pulls. Below this, stop
 -- swinging and step out so the healer has a target instead of a corpse.
@@ -141,7 +140,6 @@ local CHAT_MAX_TEXT = 120
 local CHAT_STALE_SECONDS = 60.0
 
 local dead_since = nil
-local last_release_at = nil
 local last_promote_at = nil
 local stuckAnchor = nil
 local stuckSince = nil
@@ -1168,13 +1166,9 @@ local function death_intent(view, now)
     if beru_can_resurrect(view) and now - dead_since < RES_WAIT_SECONDS then
       return { kind = "hold", reason = "wait_for_beru_resurrection" }, "waiting_for_beru"
     end
-    -- /release is chat-box lifecycle, same as /reclaim. Re-issuing it every
-    -- tick (Tusk, 2026-08-16) wedges decide and the realm drops the seat.
-    if last_release_at and now - last_release_at < RELEASE_RETRY_SECONDS then
-      return { kind = "hold", reason = "release_pending" }, "releasing"
-    end
-    last_release_at = now
-    return { kind = "release", reason = "release_spirit" }, "releasing"
+    -- CMSG_REPOP_REQUEST drops the world session on this host. A corpse
+    -- can still take a rez; ghost reclaim does not teleport the session.
+    return { kind = "hold", reason = "skip_release" }, "waiting_for_rez"
   end
   if view.is_ghost then
     if view.can_reclaim_corpse then
@@ -1838,7 +1832,6 @@ end
 
 function M.reset()
   dead_since = nil
-  last_release_at = nil
   last_promote_at = nil
   forget_stuck()
   stuckSeenAt = nil
