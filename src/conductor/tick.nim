@@ -312,8 +312,13 @@ proc runTick*(cfgAll: ConductorConfig, leagueName, repo, root: string): TickResu
             repro.report{"reason"}.getStr("no reason"), repro.report,
             cfgAll.maxAttemptsPerTicket)
     echo "conductor: full-course eval (several minutes)"
+    # The primary tick gate obeys the same variance discipline as
+    # gate-branch/baseline (goal-loop.md): a single-roll merge sets a
+    # lucky-max champion floor that median-gated candidates can never
+    # beat (0078 merged at a lone 12,509 exactly this way).
+    let tickRolls = if getEnv("CONDUCTOR_GATE_MEDIAN3", "1") != "0": 3 else: 1
     let eval = runEvalSeries(worktree, root, lc, ticket.id,
-      @[forkClientVar(root)], 1, ticket.id & "-gate")
+      @[forkClientVar(root)], tickRolls, ticket.id & "-gate")
     case eval.outcome
     of evalBusy:
       unclaim(root, inProgressPath, "eval slot busy: " & eval.detail)
