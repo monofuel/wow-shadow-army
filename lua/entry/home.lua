@@ -2019,6 +2019,12 @@ function M.decide(view)
   end
   local moving = leader_moving(leader_p, now)
   local fighting = fight_on(view, leader)
+  -- Imp before follow. A petless lock glued to hard_rejoin never reached
+  -- the idle buff window (Shadowfel/Igris live 2026-08-16).
+  if not fighting then
+    local pet = summon_demon(view, role)
+    if pet then return finish(pet, view, "escort", role, leader) end
+  end
   -- Out of combat, glue to Murist. IN a fight, stay on heals/peels/swings
   -- unless he is past the hard leash (2026-08-16 party wipe: 12yd follow
   -- beat Beru's heal and Tusk's peel, then everyone released).
