@@ -93,6 +93,10 @@ local UNSTICK_STILL_FRAMES = 40
 local UNSTICK_YARDS = 2.0
 local UNSTICK_LEG_YARDS = 22.0
 local UNSTICK_SECONDS = 6.0
+-- One compass. A church/WMO clip that returns the same pose on every
+-- local_steer bearing is not a wall the next heading will beat; spinning
+-- it forever owns decide and the seat never grinds again.
+local UNSTICK_BEARINGS = 8
 
 local LOOT_PREFIX_SLOT = "loot-slot:"
 local LOOT_PREFIX_MONEY = "loot-money:"
@@ -285,6 +289,7 @@ local stillSince = nil
 local stillFrames = 0
 local unstickUntil = nil
 local unstickBearing = 0
+local unstickTried = 0
 
 local function distance2d(ax, ay, bx, by)
   local dx, dy = ax - bx, ay - by
@@ -947,6 +952,7 @@ local function unstick_step(view, pos, engaged, busy)
   -- to "escape" is how the escape reflex started eating its own loot.
   if busy or view.in_combat or engaged or pinned then
     stillAnchor, stillSince, stillFrames = { x = pos.x, y = pos.y }, now, 0
+    unstickTried = 0
     if unstickUntil and now >= unstickUntil then unstickUntil = nil end
     return nil
   end
@@ -957,6 +963,7 @@ local function unstick_step(view, pos, engaged, busy)
   if distance2d(pos.x, pos.y, stillAnchor.x, stillAnchor.y) >= UNSTICK_YARDS then
     stillAnchor, stillSince, stillFrames = { x = pos.x, y = pos.y }, now, 0
     unstickUntil = nil
+    unstickTried = 0
     return nil
   end
   stillFrames = stillFrames + 1
@@ -965,6 +972,16 @@ local function unstick_step(view, pos, engaged, busy)
     -- keep the current bearing until the window closes
   elseif now - stillSince > UNSTICK_STILL_SECONDS and
       stillFrames >= UNSTICK_STILL_FRAMES then
+    unstickTried = unstickTried + 1
+    if unstickTried > UNSTICK_BEARINGS then
+      wow.log(string.format(
+        "unstick spin gave up at %.1f,%.1f after %d bearings",
+        pos.x, pos.y, UNSTICK_BEARINGS))
+      unstickTried = 0
+      unstickUntil = nil
+      stillAnchor, stillSince, stillFrames = { x = pos.x, y = pos.y }, now, 0
+      return nil
+    end
     unstickBearing = (unstickBearing + 1) % 8
     unstickUntil = now + UNSTICK_SECONDS
     wow.log(string.format(

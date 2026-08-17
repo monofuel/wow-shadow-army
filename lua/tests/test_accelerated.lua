@@ -1202,6 +1202,18 @@ check(escape.navigation_mode == "local_steer" and escape.allow_jump == true,
 check(math.abs(escape.x - 1837.7) < 25.0 and math.abs(escape.y - 1630.1) < 25.0,
   "escape leg is short")
 
+-- Same pose through a full compass (church/WMO, nav returns the seat)
+-- must yield. Spinning bearings 0..7 forever owns decide.
+for i = 1, 7 do
+  clock = clock + 6.1
+  local nextLeg = grind.decide(wedgedView())
+  check(nextLeg.reason == "unstick",
+    "compass bearing " .. i .. " still unsticks")
+end
+clock = clock + 6.1
+check(grind.decide(wedgedView()).reason ~= "unstick",
+  "a same-pose compass does not spin forever")
+
 -- Displacement clears it.
 local moved = view({}, {
   level = 3,
