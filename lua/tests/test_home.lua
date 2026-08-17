@@ -422,10 +422,22 @@ check(r.kind == "hold" and r.reason == "wait_for_beru_resurrection",
   "dead seat briefly waits for plausible Beru resurrection")
 v.simulation_time = 121
 r = home.decide(v)
-check(r.kind == "release", "dead seat releases after bounded resurrection wait")
+check(r.kind == "hold" and r.reason == "skip_release",
+  "dead seat does not /release after the resurrection wait")
 r = home.decide(v)
-check(r.kind == "hold" and r.reason == "release_pending",
-  "do not spam /release every tick")
+check(r.kind == "hold" and r.reason == "skip_release",
+  "skip_release holds every tick; one /release still drops the session")
+v.resurrect_offer_guid = 999
+r = home.decide(v)
+check(r.kind == "accept_rez",
+  "a rez offer still wins after the skip-release window")
+
+home.reset()
+v = frame()
+v.is_dead = true
+r = home.decide(v)
+check(r.kind == "hold" and r.reason == "skip_release",
+  "a dead seat with no Beru never emits /release")
 
 home.reset()
 v = frame()
