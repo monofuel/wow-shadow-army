@@ -159,6 +159,78 @@ local mageNoCharge = grind.decide(view({ unit(86, 15.0, 3) }, {
 check(mageNoCharge.spell ~= 100, "non-warrior does not Charge")
 check(mageNoCharge.spell == 133 and mageNoCharge.stop_distance == 22.0,
   "mage stands at Fireball range instead of walking into melee")
+check(mageNoCharge.reason == "mage_nuke", "mage filler reason is mage_nuke")
+
+-- Rakan: a bolt that is ready must not walk into 2yd staff range, even
+-- under the old 35% mana floor, and even while the cast is movement-locked.
+grind.reset()
+local mageMelee = grind.decide(view({ unit(87, 2.0, 2) }, {
+  class_id = 8,
+  in_combat = true,
+  auto_attack_guid = 87,
+  powers = { 20 },
+  action_buttons = {
+    { slot = 2, spell_id = 133, usable = true, usable_known = true },
+  },
+}))
+check(mageMelee.kind == "attack" and mageMelee.spell == 133 and
+  mageMelee.stop_distance == 22.0,
+  "mage Fireballs from 2yd even below the mana floor")
+
+local mageWalking = grind.decide(view({ unit(88, 2.0, 2) }, {
+  class_id = 8,
+  in_combat = true,
+  auto_attack_guid = 88,
+  is_moving = true,
+  action_buttons = {
+    { slot = 2, spell_id = 133, usable = false, usable_known = true,
+      not_enough_mana = false, movement_inhibits_cast_start = true },
+    { slot = 5, spell_id = 5019, usable = true, usable_known = true },
+  },
+}))
+check(mageWalking.kind == "attack" and mageWalking.spell == nil and
+  mageWalking.stop_distance == 22.0 and mageWalking.reason == "mage_hold_range",
+  "a movement-locked Fireball holds caster range instead of wanding or melee")
+
+local mageFrost = grind.decide(view({ unit(89, 18.0, 2) }, {
+  class_id = 8,
+  action_buttons = {
+    { slot = 2, spell_id = 116, usable = true, usable_known = true },
+  },
+}))
+check(mageFrost.spell == 116 and mageFrost.stop_distance == 22.0,
+  "mage fills with Frostbolt when that is the bolt on the bar")
+
+local mageOom = grind.decide(view({ unit(90, 8.0, 2) }, {
+  class_id = 8,
+  in_combat = true,
+  auto_attack_guid = 90,
+  powers = { 5 },
+  action_buttons = {
+    { slot = 2, spell_id = 133, usable = false, usable_known = true,
+      not_enough_mana = true },
+    { slot = 5, spell_id = 5019, usable = true, usable_known = true },
+  },
+}))
+check(mageOom.kind == "attack" and mageOom.spell == 5019 and
+  mageOom.stop_distance == 22.0 and mageOom.reason == "mage_wand",
+  "OOM mage wands at caster range")
+
+local mageWanding = grind.decide(view({ unit(90, 8.0, 2) }, {
+  class_id = 8,
+  in_combat = true,
+  auto_attack_guid = 90,
+  powers = { 5 },
+  action_buttons = {
+    { slot = 2, spell_id = 133, usable = false, usable_known = true,
+      not_enough_mana = true },
+    { slot = 5, spell_id = 5019, usable = true, usable_known = true,
+      active = true },
+  },
+}))
+check(mageWanding.spell == nil and mageWanding.stop_distance == 22.0 and
+  mageWanding.reason == "mage_wanding",
+  "an already-firing wand is not re-pressed")
 
 local rogue = grind.decide(view({ unit(82, 5.0, 3) }, {
   class_id = 4,

@@ -118,7 +118,11 @@ local NUKES_BY_CLASS = {
   [7] = { 529, 403 },    -- shaman: Lightning Bolt r2/r1
   [9] = { 695, 686 },    -- warlock: Shadow Bolt r2/r1
   [5] = { 591, 585 },    -- priest: Smite r2/r1
-  [8] = { 2136, 145, 143, 133 }, -- mage: Fire Blast r1, Fireball r3/r2/r1
+  [8] = {
+    10199, 10197, 8413, 8412, 2138, 2137, 2136, -- Fire Blast r7-r1
+    25306, 10151, 10150, 10149, 10148, 8402, 8401, 8400, 3140, 145, 143, 133, -- Fireball
+    25304, 10181, 10180, 10179, 8408, 8407, 8406, 7322, 837, 205, 116, -- Frostbolt
+  },
   [1] = { 285, 284, 78 },   -- warrior: Heroic Strike r3/r2/r1
   [4] = { 1758, 1757, 1752 }, -- rogue: Sinister Strike r3/r2/r1
 }
@@ -144,6 +148,9 @@ local BUFFS_BY_CLASS = {
 -- host is walking to ENGAGE_YARDS (movement_inhibits_cast_start), so a
 -- 4yd stop turns a mage into a staff-swinging corpse.
 local CASTER_STOP_YARDS = 22.0
+local CLASS_MAGE = 8
+local SHOOT_WAND = 5019
+local WAND_REPRESS_SECONDS = 3.0
 local CASTER_CLASS = {
   [5] = true, [7] = true, [8] = true, [9] = true, [11] = true,
 }
@@ -193,6 +200,8 @@ local lastPos = nil
 local lastProgressAt = nil
 local holdsAfterKill = 0
 local buffedAt = nil
+local wandPressedAt = nil
+local wandPressedGuid = nil
 -- Questgivers with nothing left for us, forgotten again whenever our quest
 -- state changes and they might have something new.
 local exhausted = {}
@@ -414,6 +423,40 @@ local function pick_nuke(view)
     if usable_spell(view, prio[i]) then return prio[i] end
   end
   return nil
+end
+
+local function button_for(view, spellId)
+  for i = 1, #(view.action_buttons or {}) do
+    local button = view.action_buttons[i]
+    if button.spell_id == spellId then return button end
+  end
+  return nil
+end
+
+local function nuke_affordable(view)
+  local prio = NUKES_BY_CLASS[view.class_id or 0]
+  if not prio then return nil end
+  for i = 1, #prio do
+    local button = button_for(view, prio[i])
+    if button and not button.not_enough_mana then return prio[i] end
+  end
+  return nil
+end
+
+local function pick_wand(view, target)
+  local button = button_for(view, SHOOT_WAND)
+  if not button then return nil, false end
+  if button.usable_known and not button.usable and not button.active then
+    return nil, false
+  end
+  if button.not_enough_mana then return nil, false end
+  local now = wow.time()
+  local guid = target and target.guid
+  local justPressed = wandPressedAt ~= nil and guid ~= nil and
+    wandPressedGuid == guid and (now - wandPressedAt) < WAND_REPRESS_SECONDS
+  if button.active or justPressed then return nil, true end
+  wandPressedAt, wandPressedGuid = now, guid
+  return SHOOT_WAND, true
 end
 
 local function pick_charge(view, target)
@@ -1249,6 +1292,8 @@ function M.reset()
   exhausted = {}
   hubCooldown = {}
   pursuing, pursuingSince, questBudgetSince, questPausedAt = nil, nil, nil, nil
+  wandPressedAt = nil
+  wandPressedGuid = nil
 end
 
 function M.decide(view)
@@ -1522,8 +1567,28 @@ function M.decide(view)
   if target then
     local spell = pick_charge(view, target)
     local stop = ENGAGE_YARDS
+    local reason = "grind"
     if spell then
       stop = CHARGE_MAX_YARDS
+      reason = "charge"
+    elseif (view.class_id or 0) == CLASS_MAGE then
+      -- Walking makes Fireball unusable. A 4yd fallback then keeps the
+      -- seat moving, so the bolt never becomes usable.
+      stop = CASTER_STOP_YARDS
+      spell = pick_nuke(view)
+      if spell then
+        reason = "mage_nuke"
+      elseif nuke_affordable(view) then
+        reason = "mage_hold_range"
+      else
+        local wand, wanding = pick_wand(view, target)
+        if wand then
+          spell = wand
+          reason = "mage_wand"
+        elseif wanding then
+          reason = "mage_wanding"
+        end
+      end
     elseif mana >= NUKE_MANA_FLOOR_PCT then
       spell = pick_nuke(view)
       if spell and CASTER_CLASS[view.class_id or 0] then
@@ -1541,7 +1606,7 @@ function M.decide(view)
       spell = spell,
       stop_distance = stop,
       route_profile = "prefer_ground",
-      reason = spell and stop == CHARGE_MAX_YARDS and "charge" or "grind",
+      reason = reason,
       status = progress_status(view),
     }
   end
