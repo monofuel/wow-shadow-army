@@ -182,6 +182,12 @@ local RECOVERY_MANA_PCT = 55.0
 local RETREAT_HEALTH_PCT = 20.0
 local FINISH_TARGET_HEALTH_PCT = 20.0
 local NUKE_MANA_FLOOR_PCT = 35.0
+-- Staff range is ~5yd. A mage standing there with a Fireball that never
+-- lands (LOS through a WMO, facing, a select the death bit missed) is
+-- not in a fight. Ignore that guid so pick_target can take the next mob.
+local STALE_SWING_SECONDS = 8.0
+local STALE_SWING_FRAMES = 8
+local STALE_IGNORE_SECONDS = 45.0
 
 -- Headings walked in turn. Legs start from wherever the seat is standing, so
 -- clearing one patch of ground leads onto the next instead of pacing a box.
@@ -300,6 +306,12 @@ local stillFrames = 0
 local unstickUntil = nil
 local unstickBearing = 0
 local unstickTried = 0
+local ignoreUntil = {}
+local swingGuid = nil
+local swingHp = nil
+local swingSince = nil
+local swingFrames = 0
+local swingX, swingY = nil, nil
 
 local function distance2d(ax, ay, bx, by)
   local dx, dy = ax - bx, ay - by
@@ -330,9 +342,38 @@ local function unit_distance(unit)
   return unit.distance or 1e9
 end
 
+local function ignored(guid)
+  if not guid or guid == 0 then return false end
+  local deadline = ignoreUntil[guid]
+  return deadline ~= nil and wow.time() < deadline
+end
+
+local function note_swing(target, pos, now)
+  local hp = target.health_known and target.health or nil
+  local same = swingGuid == target.guid and swingHp == hp
+  local still = swingX and
+    distance2d(pos.x, pos.y, swingX, swingY) < UNSTICK_YARDS
+  if same and still then
+    swingFrames = swingFrames + 1
+    if swingSince and now - swingSince >= STALE_SWING_SECONDS and
+        swingFrames >= STALE_SWING_FRAMES then
+      ignoreUntil[target.guid] = now + STALE_IGNORE_SECONDS
+      swingGuid, swingHp, swingSince, swingX, swingY = nil, nil, nil, nil, nil
+      swingFrames = 0
+      return true
+    end
+    return false
+  end
+  swingGuid, swingHp, swingSince = target.guid, hp, now
+  swingX, swingY = pos.x, pos.y
+  swingFrames = 1
+  return false
+end
+
 -- Mirrors upstream's actionable-target rule: the mobs that are safe to fight
 -- and actually pay us.
 local function huntable(view, unit, freshPull, reach)
+  if ignored(unit.guid) then return false end
   if not unit.player_can_attack then return false end
   if unit.death_known and unit.is_dead then return false end
   if unit.health_known and unit.health <= 0 then return false end
@@ -350,7 +391,7 @@ end
 
 local function engaged_unit(view)
   local guid = view.auto_attack_guid or 0
-  if guid == 0 then return nil end
+  if guid == 0 or ignored(guid) then return nil end
   for i = 1, #(view.units or {}) do
     local unit = view.units[i]
     if unit.guid == guid and not (unit.death_known and unit.is_dead) then
@@ -1322,6 +1363,9 @@ function M.reset()
   pursuing, pursuingSince, questBudgetSince, questPausedAt = nil, nil, nil, nil
   wandPressedAt = nil
   wandPressedGuid = nil
+  ignoreUntil = {}
+  swingGuid, swingHp, swingSince, swingX, swingY = nil, nil, nil, nil, nil
+  swingFrames = 0
 end
 
 function M.decide(view)
@@ -1592,6 +1636,10 @@ function M.decide(view)
     target = pick_target(view, true)
   end
 
+  if target and note_swing(target, pos, wow.time()) then
+    target = pick_target(view, true)
+  end
+
   if target then
     local spell = pick_charge(view, target)
     local stop = ENGAGE_YARDS
@@ -1600,8 +1648,6 @@ function M.decide(view)
       stop = CHARGE_MAX_YARDS
       reason = "charge"
     elseif (view.class_id or 0) == CLASS_MAGE then
-      -- Walking makes Fireball unusable. A 4yd fallback then keeps the
-      -- seat moving, so the bolt never becomes usable.
       stop = CASTER_STOP_YARDS
       spell = pick_nuke(view)
       if spell then
