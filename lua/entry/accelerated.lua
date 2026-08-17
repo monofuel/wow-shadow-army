@@ -29,9 +29,8 @@ local QUEST_LOG_LIMIT = 20
 -- QUESTS flag, which the scored lanes keep off, so the trade here is the home
 -- lane's alone: quests finished beats kills per minute.
 local QUESTGIVER_YARDS = 120.0
--- Rank-2 scout (unmarked friendly) is only for NPCs we can already talk to.
--- Walking 90yd to a Deathguard (Bellion, 2026-08-16) wedges on a guard that
--- never has a quest; real givers are reached via generated starters.
+-- Rank-2 scout is last-yards, questgiver-flagged, and only when no !/? is
+-- already visible. Friendly vendors/guards have no quest (Bellion, 2026-08-16).
 local SCOUT_YARDS = 35.0
 -- Empty-log walk to a generated starter. Sarvis is ~141yd from the
 -- Deathknell zombie field; keep this above that and below a zone hop.
@@ -550,6 +549,29 @@ local function marker_status(view, guid)
   return 0
 end
 
+local function has_service(unit, name)
+  for i = 1, #(unit.services or {}) do
+    if unit.services[i] == name then return true end
+  end
+  return false
+end
+
+local function is_questgiver(unit)
+  if not unit then return false end
+  if unit.is_questgiver then return true end
+  return has_service(unit, "questgiver")
+end
+
+local function marked_giver_visible(view)
+  for i = 1, #(view.units or {}) do
+    local status = marker_status(view, view.units[i].guid)
+    if status == MARKER_AVAILABLE or MARKER_REWARD[status] then
+      return true
+    end
+  end
+  return false
+end
+
 local function greeting_row(view)
   local rows = view.quest_frame and view.quest_frame.greeting_rows or {}
   -- A turn-in is worth more than a new quest, so answer active rows first.
@@ -583,6 +605,7 @@ local function dialog_open(view)
   local frame = view.quest_frame or {}
   if frame.open then return true end
   if view.gossip_open then return true end
+  if view.merchant_open then return true end
   return false
 end
 
@@ -782,6 +805,12 @@ local function quest_step(view, allowTurnInTravel, allowAcceptTravel, allowScout
     return { kind = "ui_press", control = "GossipFrameGreetingGoodbyeButton",
       reason = "gossip_done" }
   end
+  if view.merchant_open then
+    questBudgetSince = nil
+    exhausted[view.merchant_guid or 0] = true
+    return { kind = "ui_press", control = "MerchantFrameCloseButton",
+      reason = "merchant_not_quest" }
+  end
 
   if not allowTurnInTravel and not allowAcceptTravel then
     pursuing, pursuingSince, questBudgetSince = nil, nil, nil
@@ -790,6 +819,9 @@ local function quest_step(view, allowTurnInTravel, allowAcceptTravel, allowScout
 
   local now = wow.time()
   -- Prefer turn-in (reward) markers over new accepts when ranking givers.
+  -- Scout is the markerless fallback only: a visible !/? means we already
+  -- have work, so do not walk Deathguards / vendors (Bellion, 2026-08-16).
+  local allowUnmarked = allowScout and not marked_giver_visible(view)
   local best, bestDistance, bestRank = nil, nil, nil
   for i = 1, #(view.units or {}) do
     local unit = view.units[i]
@@ -800,13 +832,9 @@ local function quest_step(view, allowTurnInTravel, allowAcceptTravel, allowScout
     elseif status == MARKER_AVAILABLE and allowAcceptTravel and
         #(view.accepted_quests or {}) < QUEST_LOG_LIMIT then
       rank = 1
-    elseif allowScout and status == 0 and
+    elseif allowUnmarked and status == 0 and
         unit.player_can_attack_known and not unit.player_can_attack and
-        unit.object_kind ~= "player" then
-      -- Players are friendly and markerless too, but they have no dialog to
-      -- give — the army was scouting its own soldiers. NPCs only.
-      -- No log-limit gate here: a full-but-finished log still wants its
-      -- unmarked enders found, and the details panel declines on its own.
+        unit.object_kind ~= "player" and is_questgiver(unit) then
       rank = 2
     end
     if rank and not exhausted[unit.guid] and

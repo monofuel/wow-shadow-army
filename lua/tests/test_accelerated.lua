@@ -333,6 +333,7 @@ local function giver(guid, distance, name)
     name = name or "Giver",
     player_can_attack_known = true,
     player_can_attack = false,
+    services = { "questgiver" },
   })
 end
 
@@ -418,7 +419,7 @@ clock = clock + 10.0
 local scout = grind.decide(unmarkedNpc)
 check(scout.kind == "interact" and scout.guid == 910 and
   scout.reason == "scout_npc",
-  "idle log: scouts an unmarked friendly NPC")
+  "idle log: scouts an unmarked questgiver")
 
 -- When routing has no path to a distant giver, the pursuit falls back to a
 -- local-steer leg at the NPC instead of stalling on "unavailable".
@@ -651,6 +652,131 @@ local afterGoodbye = view({
 clock = clock + 10.0
 check(grind.decide(afterGoodbye).kind ~= "interact",
   "empty greeting exhausts the NPC for the scout rank")
+
+-- Rank-2 is questgivers only. A Deathguard / vendor with no questgiver
+-- flag is not "ask around town" (Bellion looping Blacksmith Rand).
+local guardOnly = view({
+  unit(932, 8.0, 5, {
+    name = "Deathguard Randolph",
+    player_can_attack_known = true,
+    player_can_attack = false,
+    services = {},
+  }),
+}, {
+  level = 3,
+  quest_markers = {},
+  quest_frame = { open = false },
+  accepted_quests = {}, quest_objectives = {}, completed_quest_ids = {},
+  ui_nodes = {},
+  action_buttons = {
+    { slot = 1, spell_id = 5176, usable = true, usable_known = true },
+  },
+})
+clock = clock + 10.0
+local guardStep = grind.decide(guardOnly)
+check(guardStep.reason ~= "scout_npc" and guardStep.reason ~= "scout_walk",
+  "does not scout a friendly NPC that is not a questgiver")
+
+local vendorVsGiver = view({
+  unit(933, 5.0, 5, {
+    name = "Blacksmith Rand",
+    player_can_attack_known = true,
+    player_can_attack = false,
+    services = { "vendor", "repair" },
+  }),
+  giver(934, 20.0, "Sarvis"),
+}, {
+  level = 3,
+  quest_markers = {},
+  quest_frame = { open = false },
+  accepted_quests = {}, quest_objectives = {}, completed_quest_ids = {},
+  ui_nodes = {},
+  action_buttons = {
+    { slot = 1, spell_id = 5176, usable = true, usable_known = true },
+  },
+})
+clock = clock + 10.0
+local pickGiver = grind.decide(vendorVsGiver)
+check(pickGiver.kind == "interact" and pickGiver.guid == 934 and
+  pickGiver.reason == "scout_npc",
+  "idle log: scouts the unmarked questgiver, not the closer vendor")
+
+-- A visible !/? is already work. Do not fall through to vendor scout
+-- after the marked giver is (or is not) exhausted.
+local markedNotVendor = view({
+  unit(935, 5.0, 5, {
+    name = "Blacksmith Rand",
+    player_can_attack_known = true,
+    player_can_attack = false,
+    services = { "vendor", "repair" },
+  }),
+  giver(936, 60.0, "Novice Elreth"),
+}, {
+  level = 3,
+  quest_markers = { { questgiver_guid = 936, status = 5 } },
+  quest_frame = { open = false },
+  accepted_quests = {}, quest_objectives = {}, completed_quest_ids = {},
+  ui_nodes = {},
+  action_buttons = {
+    { slot = 1, spell_id = 5176, usable = true, usable_known = true },
+  },
+})
+clock = clock + 10.0
+local markedWalk = grind.decide(markedNotVendor)
+check(markedWalk.kind == "interact" and markedWalk.guid == 936 and
+  markedWalk.reason == "questgiver",
+  "visible accept marker outranks an unmarked vendor")
+
+local merchantOpen = view({
+  unit(937, 2.0, 5, {
+    name = "Blacksmith Rand",
+    player_can_attack_known = true,
+    player_can_attack = false,
+    services = { "gossip", "questgiver" },
+  }),
+  giver(938, 15.0, "Sarvis"),
+}, {
+  level = 3,
+  merchant_open = true,
+  merchant_guid = 937,
+  quest_markers = {},
+  quest_frame = { open = false },
+  accepted_quests = {}, quest_objectives = {}, completed_quest_ids = {},
+  ui_nodes = {},
+  action_buttons = {
+    { slot = 1, spell_id = 5176, usable = true, usable_known = true },
+  },
+})
+clock = clock + 10.0
+local closeMerchant = grind.decide(merchantOpen)
+check(closeMerchant.kind == "ui_press" and
+  closeMerchant.control == "MerchantFrameCloseButton" and
+  closeMerchant.reason == "merchant_not_quest",
+  "closes a merchant window opened by a scout interact")
+local afterMerchant = view({
+  unit(937, 2.0, 5, {
+    name = "Blacksmith Rand",
+    player_can_attack_known = true,
+    player_can_attack = false,
+    services = { "gossip", "questgiver" },
+  }),
+  giver(938, 15.0, "Sarvis"),
+}, {
+  level = 3,
+  merchant_open = false,
+  merchant_guid = 0,
+  quest_markers = {},
+  quest_frame = { open = false },
+  accepted_quests = {}, quest_objectives = {}, completed_quest_ids = {},
+  ui_nodes = {},
+  action_buttons = {
+    { slot = 1, spell_id = 5176, usable = true, usable_known = true },
+  },
+})
+clock = clock + 10.0
+local afterClose = grind.decide(afterMerchant)
+check(afterClose.kind == "interact" and afterClose.guid == 938,
+  "merchant close exhausts the vendor and scouts the questgiver")
 
 local openDialog = view({}, {
   level = 3,

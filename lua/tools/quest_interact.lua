@@ -34,13 +34,11 @@ local function pick_interactable(me, list, skip_id)
   local best, best_d2, best_rank = nil, nil, 99
   for i = 1, #(list or {}) do
     local u = list[i]
-    if u and u.id and u.id > 0 and u.kind ~= "object" then
+    if u and u.id and u.id > 0 and u.kind ~= "object" and is_questgiver(u) then
       if skip_id == nil or u.id ~= skip_id then
-        local rank = 2
+        local rank = 1
         if pure_questgiver(u) then
           rank = 0
-        elseif is_questgiver(u) then
-          rank = 1
         end
         local d2 = dist2(me, u)
         if best == nil or rank < best_rank or (rank == best_rank and d2 ~= nil and (best_d2 == nil or d2 < best_d2)) then
@@ -50,6 +48,18 @@ local function pick_interactable(me, list, skip_id)
     end
   end
   return best, best_d2
+end
+
+local function empty_gossip_skip(quest)
+  if not quest then return nil end
+  local noOffers = not quest.offers or #quest.offers == 0
+  if quest.merchant_open and noOffers then
+    return quest.merchant_id or quest.merchant_guid
+  end
+  if (quest.gossip_open or quest.empty_gossip) and noOffers then
+    return quest.gossip_guid or quest.npc_id
+  end
+  return nil
 end
 
 return registry.register({
@@ -100,7 +110,8 @@ return registry.register({
       }
     end
 
-    local best, best_d2 = pick_interactable(me, quest.interactables, nil)
+    local skip_id = args.skip_id or empty_gossip_skip(quest)
+    local best, best_d2 = pick_interactable(me, quest.interactables, skip_id)
     if best then
       if best_d2 ~= nil and best_d2 > (6 * 6) and best.x then
         return {
