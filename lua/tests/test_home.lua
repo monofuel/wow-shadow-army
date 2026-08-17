@@ -19,6 +19,11 @@ local function check(ok, label)
   checks = checks + 1
 end
 
+local function idle_ok(r)
+  return (r.kind == "hold" and r.reason == "in_formation")
+    or (r.kind == "navigate" and r.reason == "formation_fidget")
+end
+
 local function spell(id, name, rank)
   return {
     spell_id = id, name = name, name_known = true, rank = rank or 1,
@@ -113,8 +118,16 @@ home.reset()
 v = frame()
 v.units = {}
 r = home.decide(v)
-check(r.status.mode == "solo", "unobservable Murist selects solo fallback")
-check(r.kind ~= "accept_party" and r.kind ~= "follow", "solo fallback does not invent party actions")
+check((r.reason == "hold_for_murist" or r.reason == "formation_fidget")
+    and r.status.mode == "escort",
+  "in Murist's party we hold/fidget, never solo, when he is unseen")
+
+home.reset()
+v = frame()
+v.party = { in_group = false, members = {} }
+v.units = {}
+r = home.decide(v)
+check(r.status.mode == "solo", "an ungrouped seat still solos")
 
 -- Out-of-sight Murist with a known roster position: rejoin, don't shrug solo.
 home.reset()
@@ -214,7 +227,7 @@ v.units = {}
 v.location = { map_id = 0, position = { x = 0, y = 0, z = 60 } }
 v.party.members[2].location_known = true
 v.party.members[2].elevation_known = false
-v.party.members[2].location = { map_id = 0, x = 10, y = 0, z = 0, o = 0 }
+v.party.members[2].location = { map_id = 0, x = 5, y = 0, z = 0, o = 0 }
 r = home.decide(v)
 check(r.status.mode ~= "rejoin",
   "own height alone does not trip the rejoin leash on a heightless row")
@@ -238,7 +251,8 @@ v.units = {}
 v.party.members[2].location_known = true
 v.party.members[2].location = { map_id = 1, x = 200, y = 0, z = 0, o = 0 }
 r = home.decide(v)
-check(r.status.mode == "solo", "cross-map roster position falls back to solo")
+check(r.reason == "hold_for_murist" or r.reason == "formation_fidget",
+  "cross-map roster position holds/fidgets; we do not solo-wander")
 
 -- follow/assist are not intent-boundary verbs (intent.nim); the escort
 -- expresses both as navigate-to-leader, which the pilot actually accepts.
@@ -246,8 +260,84 @@ v = frame()
 v.units = { leader_unit(30, false) }
 r = home.decide(v)
 check(r.kind == "navigate" and r.reason == "hard_rejoin_murist" and
-  r.route_profile == "prefer_ground" and r.stop_distance and r.stop_distance > 0,
-  "hard leash navigates to Murist on a routed path")
+  r.navigation_mode == "local_steer" and r.stop_distance and r.stop_distance > 0,
+  "hard leash walks straight at a visible Murist")
+
+-- A road that heads the wrong way must not steal the follow (Shadowfel
+-- walked east to 2812 while Murist was at 2655).
+home.set_roads({ [0] = { { 0, 50, 0, 0, 150, 0, 0, 250, 0 } } })
+home.reset()
+v = frame()
+v.units = { leader_unit(200, false) }
+r = home.decide(v)
+check(r.kind == "navigate" and r.reason == "hard_rejoin_murist" and
+  math.abs((r.x or 0) - 200) < 1,
+  "a receding road waypoint is ignored; walk at Murist")
+home.set_roads({})
+home.reset()
+
+v = frame()
+v.units = { leader_unit(12, false) }
+r = home.decide(v)
+check(r.kind == "navigate" and r.reason == "follow_murist",
+  "visible Murist past 8yd always follows")
+
+v = frame()
+v.units = { leader_unit(12, true, 300), hostile(300, 100) }
+r = home.decide(v)
+check(r.reason ~= "follow_murist",
+  "a fight at 12yd is played, not dropped to follow Murist")
+check(r.kind == "attack" or r.kind == "cast_spell",
+  "warlock at 12yd mid-fight still swings")
+
+v = frame()
+v.units = { leader_unit(25, true, 300), hostile(300, 100) }
+r = home.decide(v)
+check(r.kind == "navigate" and r.reason == "hard_rejoin_murist",
+  "a fight past the hard leash still rejoins")
+
+home.reset()
+v = frame()
+v.health = 20
+v.max_health = 100
+v.in_combat = true
+v.units = { leader_unit(3, true, 300), hostile(300, 100) }
+r = home.decide(v)
+check(r.kind == "navigate" and r.reason == "survive_flee",
+  "a seat at 20% hp steps off the mob instead of dying")
+
+-- A runner inside 8yd must not park. Live Shadowfel held in_formation at
+-- 7.6yd while Murist kept going 2434 -> 2440.
+home.reset()
+v = frame()
+v.units = { leader_unit(6, false) }
+v.simulation_time = 100
+r = home.decide(v)
+check(idle_ok(r), "first sample of a close Murist is still formation")
+v.units = { leader_unit(7.5, false) }
+v.simulation_time = 100.2
+r = home.decide(v)
+check(r.kind == "navigate" and r.reason == "follow_murist" and
+    r.stop_distance and r.stop_distance <= 2.5,
+  "a moving Murist inside 8yd is followed, not held")
+
+home.reset()
+v = frame()
+v.units = { leader_unit(6, false) }
+v.simulation_time = 100
+home.decide(v)
+v.simulation_time = 100.2
+r = home.decide(v)
+check(idle_ok(r), "a standing Murist inside 8yd still holds")
+
+home.reset()
+v = frame()
+v.units = {}
+v.party.members[2].location_known = true
+v.party.members[2].location = { map_id = 0, x = 12, y = 0, z = 0, o = 0 }
+r = home.decide(v)
+check(r.kind == "navigate" and r.reason == "rejoin_murist_far",
+  "off-screen Murist past 8yd rejoins instead of solo")
 
 v = frame()
 v.units = { leader_unit(3, true) }
@@ -333,6 +423,9 @@ check(r.kind == "hold" and r.reason == "wait_for_beru_resurrection",
 v.simulation_time = 121
 r = home.decide(v)
 check(r.kind == "release", "dead seat releases after bounded resurrection wait")
+r = home.decide(v)
+check(r.kind == "hold" and r.reason == "release_pending",
+  "do not spam /release every tick")
 
 home.reset()
 v = frame()
@@ -437,7 +530,7 @@ check(r.kind == "cast_spell" and r.spell == 1454 and
   "mana-blocked Summon Imp life taps for the mana instead of holding")
 v.health = 20
 r = home.decide(v)
-check(r.kind == "hold" and r.reason == "in_formation",
+check(idle_ok(r),
   "a hurt warlock does not life tap for a summon")
 v.health = 100
 v.action_buttons[1].usable = true
@@ -534,7 +627,7 @@ check(r.kind == "interact" and r.reason == "loot_corpse",
 
 v = frame()
 r = home.decide(v)
-check(r.kind == "hold" and r.reason == "in_formation",
+check(idle_ok(r),
   "idle escort does not pull unrelated mobs")
 check(r.kind ~= "ui_press", "no roll prompt presses nothing")
 
@@ -629,7 +722,7 @@ put_line("stand ready")
 v = frame()
 v.simulation_time = 200
 r = home.decide(v)
-check(r.kind == "hold" and r.reason == "in_formation",
+check(idle_ok(r),
   "a host without chat support never reaches the mailbox")
 check(outbox_present(), "an unsupported host leaves the line for a newer one")
 
@@ -650,13 +743,13 @@ check(r.kind == "chat" and r.text == "stand ready",
   "an in-flight line repeats while the box is open")
 v = chat_frame(300.4)
 r = home.decide(v)
-check(r.kind == "hold" and r.reason == "in_formation",
+check(idle_ok(r),
   "the closed box ends the sequence")
 
 put_line("again already")
 v = chat_frame(305)
 r = home.decide(v)
-check(r.kind == "hold" and r.reason == "in_formation",
+check(idle_ok(r),
   "a second line inside the gap is not spoken")
 v = chat_frame(325)
 r = home.decide(v)
@@ -689,21 +782,21 @@ home.reset()
 put_line("/script evil()")
 v = chat_frame(600)
 r = home.decide(v)
-check(r.kind == "hold" and r.reason == "in_formation",
+check(idle_ok(r),
   "a line that opens a slash command is refused")
 
 home.reset()
 put_line(string.rep("x", 121))
 v = chat_frame(700)
 r = home.decide(v)
-check(r.kind == "hold" and r.reason == "in_formation",
+check(idle_ok(r),
   "a line past the length cap is refused")
 
 home.reset()
 put_line("asked an hour ago", string.format("%d", os.time() - 3600))
 v = chat_frame(750)
 r = home.decide(v)
-check(r.kind == "hold" and r.reason == "in_formation",
+check(idle_ok(r),
   "a line written long before this seat looked is not spoken")
 check(not outbox_present(), "the stale line is still cleared from the mailbox")
 
@@ -719,11 +812,26 @@ chat_off = "1"
 put_line("silence me")
 v = chat_frame(800)
 r = home.decide(v)
-check(r.kind == "hold" and r.reason == "in_formation",
+check(idle_ok(r),
   "the kill switch stops the seat speaking")
 check(outbox_present(), "a silenced seat does not even open the mailbox")
 chat_off = nil
 os.execute("rm -rf '" .. chat_dir .. "'")
+
+-- Formation hold is silent; vanilla AFKs after ~5 min. First idle hop
+-- is a movement packet so <AFK> clears.
+home.reset()
+v = frame()
+r = home.decide(v)
+check(r.kind == "navigate" and r.reason == "formation_fidget",
+  "first idle in formation hops so the AFK timer cannot start")
+r = home.decide(v)
+check(r.kind == "hold" and r.reason == "in_formation",
+  "the hop is rate limited; later ticks hold")
+v.simulation_time = 200
+r = home.decide(v)
+check(r.kind == "navigate" and r.reason == "formation_fidget",
+  "the hop repeats after the fidget interval")
 
 -- Displacement watchdog: a ghost wedged in place for more than eight seconds
 -- across several frames escapes by a short local-steer leg, then rotates
@@ -964,6 +1072,9 @@ check(r.kind == "sell_item" and r.item_guid == 13,
 --    the roomiest one, out of combat, one per tick.
 local function bagless_frame()
   local bf = frame(9) -- warlock
+  -- Equip is banned while Murist is grouped (0074 hang). These tests
+  -- cover the solo verb, so drop the party.
+  bf.party = { in_group = false, members = {} }
   bf.equip_supported = true
   bf.equipment_items = {} -- zero bags equipped: the live home-seat shape
   bf.inventory_items = {
@@ -977,46 +1088,65 @@ local function bagless_frame()
   return bf
 end
 
+-- Off-screen Murist wins over a carried bag. Live Igris sat on
+-- equip_bag at 1897,-242 while Murist was 600yd east on the roster.
 home.reset()
 logged = {}
 v = bagless_frame()
+v.party = frame().party
+v.units = {}
+v.party.members[2].location_known = true
+v.party.members[2].elevation_known = false
+v.party.members[2].location = { map_id = 0, x = 400, y = 0, z = 0, o = 0 }
 r = home.decide(v)
-check(r.kind == "equip_item" and r.item_guid == 22,
-  "a free bag slot equips the largest carried bag first")
-check(logs_matching("bags: equipping") ~= nil,
-  "an equip names the bag and the slot in the log")
-r = home.decide(v)
-check(r.kind ~= "equip_item", "equips are rate limited inside the gap")
-v.simulation_time = 104
-r = home.decide(v)
-check(r.kind == "equip_item" and r.item_guid == 21,
-  "the next tick equips the next bag, not the same one again")
+check(r.kind == "navigate" and (r.reason == "rejoin_murist_far" or
+    r.reason == "rejoin_murist_road"),
+  "a carried bag does not pin a seat that should walk to Murist")
+check(r.status.mode == "rejoin", "bag-vs-rejoin reports rejoin, not vendor")
 
--- The fork accepts equip_item for a bag but the bag never lands (measured
--- 2026-08-16). An unbounded retry would burn a tick every 3s forever, so the
--- seat stands down after a fixed budget of attempts that changed nothing.
 home.reset()
 logged = {}
 v = bagless_frame()
--- Four spares, so the attempt budget is what stops the seat rather than
--- simply running out of distinct bags to try.
-v.inventory_items = {
-  bag_row(31, 4496, "Small Brown Pouch", 1, 0, 1, 25, { container_slots = 6 }),
-  bag_row(32, 4497, "Small Green Pouch", 1, 0, 1, 25, { container_slots = 6 }),
-  bag_row(33, 4498, "Small Blue Pouch", 1, 0, 1, 25, { container_slots = 6 }),
-  bag_row(34, 4499, "Small Black Pouch", 1, 0, 1, 25, { container_slots = 6 }),
-}
-local attempts, t = 0, 100
-for _ = 1, 12 do
-  v.simulation_time = t
-  r = home.decide(v)
-  if r.kind == "equip_item" then attempts = attempts + 1 end
-  t = t + 4
-end
-check(attempts == 3,
-  "a host that accepts equip_item but never lands the bag is tried 3 times")
-check(logs_matching("standing down") ~= nil,
+v.party = frame().party
+v.units = { leader_unit(12, false) }
+r = home.decide(v)
+check(r.kind == "navigate" and r.reason == "follow_murist",
+  "a carried bag does not pin a seat while Murist is walking")
+
+home.reset()
+logged = {}
+v = bagless_frame()
+v.party = frame().party
+v.units = { leader_unit(3, false) }
+r = home.decide(v)
+check(r.kind ~= "equip_item",
+  "in Murist's party never emits equip_item")
+
+home.reset()
+logged = {}
+v = bagless_frame()
+v.party = frame().party
+v.units = {}
+r = home.decide(v)
+check(r.kind ~= "equip_item" and
+    (r.reason == "hold_for_murist" or r.reason == "formation_fidget"),
+  "unseen Murist with no rejoin holds/fidgets instead of equipping")
+
+home.reset()
+logged = {}
+v = bagless_frame()
+r = home.decide(v)
+check(r.kind ~= "equip_item",
+  "0074: first equip_item freezes decide, so solo seats skip the verb")
+check(logs_matching("0074 host freeze") ~= nil,
+  "the skip names the fork freeze once")
+r = home.decide(v)
+check(logs_matching("0074 host freeze") ~= nil,
   "standing down says why, once")
+
+-- When EQUIP_EMIT is restored, the attempt budget still has to cap a
+-- host that accepts the verb but never lands the bag. That path is
+-- dead while the live emit is off; the skip above is the live gate.
 
 -- Never the Hearthstone, never armour: only class-1 rows with real capacity.
 home.reset()
@@ -1102,15 +1232,13 @@ home.reset()
 logged = {}
 v = solo_full_bags()
 r = home.decide(v)
-check(r.kind == "interact" and r.guid == 2115 and r.reason == "open_vendor",
-  "a solo seat with full bags walks to the nearest vendor")
-check(r.status.mode == "vendor", "vendor seek reports vendor mode")
+check(r.reason ~= "open_vendor" and r.reason ~= "open_vendor_walk",
+  "live interact freeze: vendor seek is off; full bags still grind")
 
 v.quest_frame = { open = true, panel = "reward" }
 r = home.decide(v)
-check(r.kind == "ui_press" and r.control == "QuestFrameCancelButton" and
-  r.reason == "vendor_clear_dialog",
-  "a full-bag reward panel is closed so the seat can reach the vendor")
+check(r.reason ~= "vendor_clear_dialog",
+  "vendor seek off means no dialog-clear for the vendor walk")
 
 v.quest_frame = { open = false }
 v.free_bag_slots = 5
@@ -1149,36 +1277,16 @@ v.units = {
   },
 }
 r = home.decide(v)
-check(r.kind == "interact" and r.guid == 2113 and r.reason == "open_vendor",
-  "a full-bag seat prefers a pure vendor over a questgiver-vendor")
+check(r.reason ~= "open_vendor",
+  "vendor seek off: no interact even when a pure vendor is in view")
 
--- Routed interact wedges at nav=planning; steer the last yards instead.
 local old_nav = wow.nav_progress
 wow.nav_progress = function() return { state = "planning" } end
 home.reset()
 v = solo_full_bags()
 r = home.decide(v)
-check(r.kind == "navigate" and r.navigation_mode == "local_steer" and
-  r.reason == "open_vendor_walk",
-  "a planning nav steers the last yards to the vendor")
-wow.nav_progress = function() return { state = "unavailable" } end
-r = home.decide(v)
-check(r.kind == "navigate" and r.reason == "open_vendor_walk",
-  "an unavailable route also steers to the vendor")
-
--- Same displacement watchdog as corpse/rejoin: a 90yd local_steer that
--- stops displacing must hop, not freeze on open_vendor_walk forever.
-home.reset()
-v = solo_full_bags()
-wow.nav_progress = function() return { state = "planning" } end
-r = nil
-for t = 100, 109, 1 do
-  v.simulation_time = t
-  r = home.decide(v)
-end
-check(r.kind == "navigate" and r.reason == "vendor_unstick" and
-  r.navigation_mode == "local_steer" and r.allow_jump == true,
-  "a wedged vendor walk escapes with a vendor unstick")
+check(r.reason ~= "open_vendor_walk" and r.reason ~= "vendor_unstick",
+  "vendor seek off: no steered vendor walk")
 wow.nav_progress = old_nav
 
 -- Escort warrior Charges to close; other classes never do.
