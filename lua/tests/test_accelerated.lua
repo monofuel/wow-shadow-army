@@ -159,6 +159,78 @@ local mageNoCharge = grind.decide(view({ unit(86, 15.0, 3) }, {
 check(mageNoCharge.spell ~= 100, "non-warrior does not Charge")
 check(mageNoCharge.spell == 133 and mageNoCharge.stop_distance == 22.0,
   "mage stands at Fireball range instead of walking into melee")
+check(mageNoCharge.reason == "mage_nuke", "mage filler reason is mage_nuke")
+
+-- Rakan: a bolt that is ready must not walk into 2yd staff range, even
+-- under the old 35% mana floor, and even while the cast is movement-locked.
+grind.reset()
+local mageMelee = grind.decide(view({ unit(87, 2.0, 2) }, {
+  class_id = 8,
+  in_combat = true,
+  auto_attack_guid = 87,
+  powers = { 20 },
+  action_buttons = {
+    { slot = 2, spell_id = 133, usable = true, usable_known = true },
+  },
+}))
+check(mageMelee.kind == "attack" and mageMelee.spell == 133 and
+  mageMelee.stop_distance == 22.0,
+  "mage Fireballs from 2yd even below the mana floor")
+
+local mageWalking = grind.decide(view({ unit(88, 2.0, 2) }, {
+  class_id = 8,
+  in_combat = true,
+  auto_attack_guid = 88,
+  is_moving = true,
+  action_buttons = {
+    { slot = 2, spell_id = 133, usable = false, usable_known = true,
+      not_enough_mana = false, movement_inhibits_cast_start = true },
+    { slot = 5, spell_id = 5019, usable = true, usable_known = true },
+  },
+}))
+check(mageWalking.kind == "attack" and mageWalking.spell == nil and
+  mageWalking.stop_distance == 22.0 and mageWalking.reason == "mage_hold_range",
+  "a movement-locked Fireball holds caster range instead of wanding or melee")
+
+local mageFrost = grind.decide(view({ unit(89, 18.0, 2) }, {
+  class_id = 8,
+  action_buttons = {
+    { slot = 2, spell_id = 116, usable = true, usable_known = true },
+  },
+}))
+check(mageFrost.spell == 116 and mageFrost.stop_distance == 22.0,
+  "mage fills with Frostbolt when that is the bolt on the bar")
+
+local mageOom = grind.decide(view({ unit(90, 8.0, 2) }, {
+  class_id = 8,
+  in_combat = true,
+  auto_attack_guid = 90,
+  powers = { 5 },
+  action_buttons = {
+    { slot = 2, spell_id = 133, usable = false, usable_known = true,
+      not_enough_mana = true },
+    { slot = 5, spell_id = 5019, usable = true, usable_known = true },
+  },
+}))
+check(mageOom.kind == "attack" and mageOom.spell == 5019 and
+  mageOom.stop_distance == 22.0 and mageOom.reason == "mage_wand",
+  "OOM mage wands at caster range")
+
+local mageWanding = grind.decide(view({ unit(90, 8.0, 2) }, {
+  class_id = 8,
+  in_combat = true,
+  auto_attack_guid = 90,
+  powers = { 5 },
+  action_buttons = {
+    { slot = 2, spell_id = 133, usable = false, usable_known = true,
+      not_enough_mana = true },
+    { slot = 5, spell_id = 5019, usable = true, usable_known = true,
+      active = true },
+  },
+}))
+check(mageWanding.spell == nil and mageWanding.stop_distance == 22.0 and
+  mageWanding.reason == "mage_wanding",
+  "an already-firing wand is not re-pressed")
 
 local rogue = grind.decide(view({ unit(82, 5.0, 3) }, {
   class_id = 4,
@@ -261,6 +333,7 @@ local function giver(guid, distance, name)
     name = name or "Giver",
     player_can_attack_known = true,
     player_can_attack = false,
+    services = { "questgiver" },
   })
 end
 
@@ -346,7 +419,7 @@ clock = clock + 10.0
 local scout = grind.decide(unmarkedNpc)
 check(scout.kind == "interact" and scout.guid == 910 and
   scout.reason == "scout_npc",
-  "idle log: scouts an unmarked friendly NPC")
+  "idle log: scouts an unmarked questgiver")
 
 -- When routing has no path to a distant giver, the pursuit falls back to a
 -- local-steer leg at the NPC instead of stalling on "unavailable".
@@ -580,6 +653,131 @@ clock = clock + 10.0
 check(grind.decide(afterGoodbye).kind ~= "interact",
   "empty greeting exhausts the NPC for the scout rank")
 
+-- Rank-2 is questgivers only. A Deathguard / vendor with no questgiver
+-- flag is not "ask around town" (Bellion looping Blacksmith Rand).
+local guardOnly = view({
+  unit(932, 8.0, 5, {
+    name = "Deathguard Randolph",
+    player_can_attack_known = true,
+    player_can_attack = false,
+    services = {},
+  }),
+}, {
+  level = 3,
+  quest_markers = {},
+  quest_frame = { open = false },
+  accepted_quests = {}, quest_objectives = {}, completed_quest_ids = {},
+  ui_nodes = {},
+  action_buttons = {
+    { slot = 1, spell_id = 5176, usable = true, usable_known = true },
+  },
+})
+clock = clock + 10.0
+local guardStep = grind.decide(guardOnly)
+check(guardStep.reason ~= "scout_npc" and guardStep.reason ~= "scout_walk",
+  "does not scout a friendly NPC that is not a questgiver")
+
+local vendorVsGiver = view({
+  unit(933, 5.0, 5, {
+    name = "Blacksmith Rand",
+    player_can_attack_known = true,
+    player_can_attack = false,
+    services = { "vendor", "repair" },
+  }),
+  giver(934, 20.0, "Sarvis"),
+}, {
+  level = 3,
+  quest_markers = {},
+  quest_frame = { open = false },
+  accepted_quests = {}, quest_objectives = {}, completed_quest_ids = {},
+  ui_nodes = {},
+  action_buttons = {
+    { slot = 1, spell_id = 5176, usable = true, usable_known = true },
+  },
+})
+clock = clock + 10.0
+local pickGiver = grind.decide(vendorVsGiver)
+check(pickGiver.kind == "interact" and pickGiver.guid == 934 and
+  pickGiver.reason == "scout_npc",
+  "idle log: scouts the unmarked questgiver, not the closer vendor")
+
+-- A visible !/? is already work. Do not fall through to vendor scout
+-- after the marked giver is (or is not) exhausted.
+local markedNotVendor = view({
+  unit(935, 5.0, 5, {
+    name = "Blacksmith Rand",
+    player_can_attack_known = true,
+    player_can_attack = false,
+    services = { "vendor", "repair" },
+  }),
+  giver(936, 60.0, "Novice Elreth"),
+}, {
+  level = 3,
+  quest_markers = { { questgiver_guid = 936, status = 5 } },
+  quest_frame = { open = false },
+  accepted_quests = {}, quest_objectives = {}, completed_quest_ids = {},
+  ui_nodes = {},
+  action_buttons = {
+    { slot = 1, spell_id = 5176, usable = true, usable_known = true },
+  },
+})
+clock = clock + 10.0
+local markedWalk = grind.decide(markedNotVendor)
+check(markedWalk.kind == "interact" and markedWalk.guid == 936 and
+  markedWalk.reason == "questgiver",
+  "visible accept marker outranks an unmarked vendor")
+
+local merchantOpen = view({
+  unit(937, 2.0, 5, {
+    name = "Blacksmith Rand",
+    player_can_attack_known = true,
+    player_can_attack = false,
+    services = { "gossip", "questgiver" },
+  }),
+  giver(938, 15.0, "Sarvis"),
+}, {
+  level = 3,
+  merchant_open = true,
+  merchant_guid = 937,
+  quest_markers = {},
+  quest_frame = { open = false },
+  accepted_quests = {}, quest_objectives = {}, completed_quest_ids = {},
+  ui_nodes = {},
+  action_buttons = {
+    { slot = 1, spell_id = 5176, usable = true, usable_known = true },
+  },
+})
+clock = clock + 10.0
+local closeMerchant = grind.decide(merchantOpen)
+check(closeMerchant.kind == "ui_press" and
+  closeMerchant.control == "MerchantFrameCloseButton" and
+  closeMerchant.reason == "merchant_not_quest",
+  "closes a merchant window opened by a scout interact")
+local afterMerchant = view({
+  unit(937, 2.0, 5, {
+    name = "Blacksmith Rand",
+    player_can_attack_known = true,
+    player_can_attack = false,
+    services = { "gossip", "questgiver" },
+  }),
+  giver(938, 15.0, "Sarvis"),
+}, {
+  level = 3,
+  merchant_open = false,
+  merchant_guid = 0,
+  quest_markers = {},
+  quest_frame = { open = false },
+  accepted_quests = {}, quest_objectives = {}, completed_quest_ids = {},
+  ui_nodes = {},
+  action_buttons = {
+    { slot = 1, spell_id = 5176, usable = true, usable_known = true },
+  },
+})
+clock = clock + 10.0
+local afterClose = grind.decide(afterMerchant)
+check(afterClose.kind == "interact" and afterClose.guid == 938,
+  "merchant close exhausts the vendor and scouts the questgiver")
+
 local openDialog = view({}, {
   level = 3,
   quest_frame = { open = true, panel = "details" },
@@ -700,6 +898,45 @@ clock = clock + 80.0
 local afterPatience = grind.decide(stuckGiver)
 check(afterPatience.kind ~= "interact" or afterPatience.guid ~= 903,
   "gives up on a questgiver after patience")
+
+-- A turn-in we never reached is a failed walk, not a silent giver. Exhausting
+-- it strands the rank-0 marker for the rest of the session (Baran: Sarvis).
+do
+  grind.reset()
+  local farTurnIn = view({
+    giver(940, 40.0, "Sarvis"),
+  }, {
+    level = 4,
+    quest_markers = { { questgiver_guid = 940, status = 6 } },
+    quest_frame = { open = false },
+    accepted_quests = { 364, 376 },
+    quest_objectives = {
+      { quest_id = 364, complete = true, entry = 1501 },
+      { quest_id = 376, complete = false, entry = 0 },
+    },
+    completed_quest_ids = {},
+    ui_nodes = {},
+    action_buttons = {
+      { slot = 1, spell_id = 5176, usable = true, usable_known = true },
+    },
+  })
+  clock = clock + 5.0
+  local approach = grind.decide(farTurnIn)
+  check(approach.kind == "interact" and approach.guid == 940,
+    "starts a far turn-in walk")
+  clock = clock + 65.0
+  local timedOut = grind.decide(farTurnIn)
+  check(not timedOut or timedOut.guid ~= 940,
+    "releases the far giver when the approach budget expires")
+  clock = clock + 5.0
+  local cooling = grind.decide(farTurnIn)
+  check(not cooling or cooling.guid ~= 940,
+    "cools down a failed approach instead of exhausting the giver")
+  clock = clock + 50.0
+  local retry = grind.decide(farTurnIn)
+  check(retry.kind == "interact" and retry.guid == 940,
+    "retries the turn-in after the approach cooldown")
+end
 
 -- Reward panels that offer a choice: a bare /questreward is rejected by the
 -- client ("Choose a quest reward first"), so the choice button is pressed
@@ -1201,6 +1438,18 @@ check(escape.navigation_mode == "local_steer" and escape.allow_jump == true,
   "escape uses the bearing-only reflex that owns walls")
 check(math.abs(escape.x - 1837.7) < 25.0 and math.abs(escape.y - 1630.1) < 25.0,
   "escape leg is short")
+
+-- Same pose through a full compass (church/WMO, nav returns the seat)
+-- must yield. Spinning bearings 0..7 forever owns decide.
+for i = 1, 7 do
+  clock = clock + 6.1
+  local nextLeg = grind.decide(wedgedView())
+  check(nextLeg.reason == "unstick",
+    "compass bearing " .. i .. " still unsticks")
+end
+clock = clock + 6.1
+check(grind.decide(wedgedView()).reason ~= "unstick",
+  "a same-pose compass does not spin forever")
 
 -- Displacement clears it.
 local moved = view({}, {

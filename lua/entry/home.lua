@@ -19,7 +19,12 @@ local NEAR_YARDS = 8.0
 local HARD_LEASH_YARDS = 18.0
 local HEAL_RANGE_YARDS = 30.0
 local RES_WAIT_SECONDS = 20.0
+local RELEASE_RETRY_SECONDS = 5.0
 local PROMOTE_RETRY_SECONDS = 5.0
+-- Cloth dies in two hits from what Murist pulls. Below this, stop
+-- swinging and step out so the healer has a target instead of a corpse.
+local FLEE_HP_PCT = 35.0
+local FLEE_YARDS = 18.0
 
 -- The healer's mana IS the party's health bar. Smite is 15-30 mana a cast and
 -- the wand is free, so below the wand floor every point is worth more as the
@@ -70,6 +75,9 @@ local TANK_NAME = "tusk"
 -- says so itself (short-hop). Over it, a straight line through open country is
 -- an aggro chain and a corpse run, and the road is a freeway.
 local ROAD_MIN_YARDS = 80.0
+-- A bank this tall next to the road is how a 17yd follow grinds z=39 while
+-- Murist stands on z=43. Six yards was too generous for Tirisfal terraces.
+local ROAD_CLIFF_Z = 3.0
 -- Walk at the route point this far ahead rather than at the leader, so the
 -- pilot's own navmesh routing stays ON the road between waypoints. About one
 -- decimation step of lua/data/bot_roads.lua.
@@ -101,6 +109,7 @@ local STUCK_SECONDS = 6.0
 local STUCK_GAP_SECONDS = 2.0
 
 local CLASS_WARRIOR = 1
+local CLASS_ROGUE = 4
 local CLASS_PRIEST = 5
 local CLASS_MAGE = 8
 local CLASS_WARLOCK = 9
@@ -132,6 +141,7 @@ local CHAT_MAX_TEXT = 120
 local CHAT_STALE_SECONDS = 60.0
 
 local dead_since = nil
+local last_release_at = nil
 local last_promote_at = nil
 local stuckAnchor = nil
 local stuckSince = nil
@@ -147,6 +157,15 @@ local chat_pending = nil
 local wand_pressed_at = nil
 local wand_pressed_guid = nil
 local last_shout_at = nil
+-- Vanilla AFK is ~5 min with no movement. Formation hold is silent.
+local FIDGET_SECONDS = 90.0
+local fidget_at = nil
+-- Formation range is a stop, not a park. A leader still moving inside
+-- NEAR_YARDS has to stay a follow or the seat stands while he runs off.
+local LEAD_RUN_YDS = 1.5
+local LEAD_STILL_YDS = 0.5
+local LEAD_STILL_SECONDS = 0.4
+local last_lead = nil
 
 local AURA_FAMILIES = {
   ["curse of agony"] = { 980, 1014, 6217, 11711, 11712, 11713 },
@@ -205,12 +224,17 @@ end
 local function point(row)
   if not row then return nil end
   if row.location and row.location.position then return row.location.position end
+  -- Roster rows and some live mirrors are flat {x,y,z}, not MapPosition.
+  if row.location and row.location.x then return row.location end
   if row.position then return row.position end
   return nil
 end
 
 local function view_point(view)
-  return view and view.location and view.location.position or nil
+  if not view or not view.location then return nil end
+  if view.location.position then return view.location.position end
+  if view.location.x then return view.location end
+  return nil
 end
 
 local function distance(a, b)
@@ -221,30 +245,91 @@ local function distance(a, b)
   return math.sqrt(dx * dx + dy * dy + dz * dz)
 end
 
+-- The router reports "following" while the client repeats the same pose
+-- (Igris, 2448,445 z39 vs Murist at z43). Walkout / failed_here / same-pose
+-- means the planned corridor is dead; hop, don't re-ask for the same route.
+local function nav_pose_dead()
+  local nav = wow.nav_progress() or {}
+  if nav.failed_here then return true end
+  if tostring(nav.state or "") == "walkout" then return true end
+  local err = tostring(nav.error or "")
+  return string.find(err, "same pose", 1, true) ~= nil
+end
+
+local function apply_nav_fallback(intent)
+  local nav = wow.nav_progress() or {}
+  if tostring(nav.state or "") == "unavailable" or nav_pose_dead() then
+    intent.route_profile = nil
+    intent.navigation_mode = "local_steer"
+    if nav_pose_dead() then intent.allow_jump = true end
+  end
+  return intent
+end
+
+-- True when `wp` is closer to `goal` than `mine` is, in the XY plane.
+-- A road hop that fails this is how a follow walks AWAY from Murist.
+local function closer_on_plane(mine, wp, goal)
+  if not mine or not wp or not goal then return false end
+  local function d2(a, b)
+    local dx = (a.x or 0) - (b.x or 0)
+    local dy = (a.y or 0) - (b.y or 0)
+    return dx * dx + dy * dy
+  end
+  return d2(wp, goal) + 1.0 < d2(mine, goal)
+end
+
 -- The intent boundary has no follow or assist verb (intent.nim knows
 -- navigate/attack/interact/...); emitting one parked the seat in bad_intent
 -- holds while mobs beat on it. Following IS navigating to where the leader
 -- stands, at formation distance, steering locally so town navmesh gaps
 -- cannot stall the escort.
-local function follow_leader(leader, reason)
+local road_waypoint
+local function follow_leader(view, leader, reason, moving)
   local p = point(leader)
   if not p then return { kind = "hold", reason = "leader_position_unknown" } end
   -- No allow_jump: local_steer reads it as a license to hop continuously
   -- while closing, and a formation follow on open ground never needs it.
-  -- Route by default — bare local_steer walks a straight line and wedges on
-  -- terrain at hard-leash range (Tusk, 69yd, 2026-08-16); steer directly
-  -- only when the router reports it has no answer from here.
+  -- safe_ground, not prefer_ground: the latter will walk a hillside that
+  -- "is ground" (Shadowfel, 2491,-441,z85 over Murist at z77).
+  -- stop_distance 6 on a runner is "reached" while he is still pulling away.
   local intent = {
     kind = "navigate",
     x = p.x, y = p.y, z = p.z,
-    stop_distance = NEAR_YARDS * 0.75,
-    route_profile = "prefer_ground",
+    stop_distance = moving and 2.0 or (NEAR_YARDS * 0.75),
+    route_profile = "safe_ground",
     reason = reason,
   }
   if leader.location and leader.location.map_id then
     intent.map_id = math.floor(leader.location.map_id)
   end
-  if wow.nav_progress().state == "unavailable" then
+  -- Roads when the crow line is a long walk OR a cliff: height gap at
+  -- hard-leash range is how a seat climbs the bank next to the road.
+  local mine = view_point(view)
+  local d2 = nil
+  local dz = 0
+  if mine then
+    local dx = (mine.x or 0) - (p.x or 0)
+    local dy = (mine.y or 0) - (p.y or 0)
+    d2 = math.sqrt(dx * dx + dy * dy)
+    dz = math.abs((mine.z or 0) - (p.z or 0))
+  end
+  -- A height gap used to force a road even at 20yd — that waypoint can sit
+  -- AWAY from Murist (Shadowfel ran 2812,491 while Murist was at 2655,456).
+  -- Only take pavement that is strictly closer to the leader in the plane.
+  if mine and intent.map_id and d2 and d2 > ROAD_MIN_YARDS then
+    local wp = road_waypoint(mine, p, intent.map_id)
+    if wp and closer_on_plane(mine, wp, p) then
+      intent.x, intent.y, intent.z = wp.x, wp.y, wp.z
+      intent.stop_distance = ROAD_WAYPOINT_STOP
+      intent.reason = reason .. "_road"
+    end
+  end
+  -- Inside one road-step of Murist, walk AT him. safe_ground navmesh at
+  -- 20-40yd is how Shadowfel "follows" by touring Agamand.
+  if d2 and d2 <= ROAD_MIN_YARDS then
+    intent.route_profile = nil
+    intent.navigation_mode = "local_steer"
+  elseif wow.nav_progress().state == "unavailable" then
     intent.route_profile = nil
     intent.navigation_mode = "local_steer"
   end
@@ -312,7 +397,7 @@ end
 -- walking at the leader. nil covers every road bail (no data, a hole in the
 -- bake, a road that would not help) AND the last leg, where the next route
 -- point IS the leader and the plain rejoin intent already says it better.
-local function road_waypoint(mine, goal, map_id)
+function road_waypoint(mine, goal, map_id)
   local graph = road_graph(map_id)
   if not graph then return nil end
   local pts, meta = road_route.route(graph, mine, goal)
@@ -320,7 +405,11 @@ local function road_waypoint(mine, goal, map_id)
   local x, y, z, i = road_route.nextPoint(pts, mine.x, mine.y,
     ROAD_LOOKAHEAD_YARDS)
   if not x or not i or i >= #pts then return nil end
-  return { x = x, y = y, z = z }
+  local wp = { x = x, y = y, z = z }
+  -- closer_on_plane: a waypoint farther from the goal than we already are
+  -- is pavement behind us. Walk at the goal instead.
+  if not closer_on_plane(mine, wp, goal) then return nil end
+  return wp
 end
 
 -- Height is not evidence of progress here: a seat wedged against the
@@ -438,7 +527,7 @@ local function rejoin_leader(view, member)
     p = { map_id = p.map_id, x = p.x, y = p.y, z = mine.z }
   end
   local d = flat and distance2d(mine, p) or distance(mine, p)
-  if not d or d <= HARD_LEASH_YARDS then return nil end
+  if not d or d <= NEAR_YARDS then return nil end
   local intent = {
     kind = "navigate",
     x = p.x, y = p.y, z = p.z,
@@ -453,7 +542,7 @@ local function rejoin_leader(view, member)
   -- re-decided from scratch every tick rather than committed to a plan.
   if d > ROAD_MIN_YARDS and mine then
     local wp = road_waypoint(mine, p, intent.map_id)
-    if wp then
+    if wp and closer_on_plane(mine, wp, p) then
       intent.x, intent.y, intent.z = wp.x, wp.y, wp.z
       intent.stop_distance = ROAD_WAYPOINT_STOP
       intent.reason = "rejoin_murist_road"
@@ -507,6 +596,11 @@ local function is_party_property(view, guid)
 end
 
 local function visible_player_by_name(view, name)
+  local member = party_member(view, name)
+  if member and member.guid then
+    local by_guid = visible_unit(view, member.guid)
+    if by_guid then return by_guid end
+  end
   local wanted = lower(name)
   for _, unit in ipairs(view.units or {}) do
     if lower(unit.name) == wanted and unit.is_player_controlled ~= false then
@@ -809,12 +903,23 @@ local EQUIP_GAP_SECONDS = 3.0
 -- closed, an unbounded retry burns a tick every 3s on a live seat forever and
 -- buries the log. Three tries is enough to prove the verb is not landing.
 local EQUIP_MAX_ATTEMPTS = 3
+-- 0074 live: the FIRST accepted equip_item freezes the lua-bot pilot
+-- (no later decide, status dies). The attempt budget never runs on a
+-- real seat. Flip this when the fork lands bags in slots 19-22.
+local EQUIP_EMIT = false
 local equip_last_at = nil
 local equip_tried = {}
 local equip_attempts = 0
 local equip_gave_up = false
 
 local function equip_bags_step(view, now)
+  if not EQUIP_EMIT then
+    if not equip_gave_up then
+      equip_gave_up = true
+      wow.log("bags: skipping equip_item — 0074 host freeze; standing down")
+    end
+    return nil
+  end
   if not view.equip_supported then return nil end
   if equip_gave_up then return nil end
   -- The verb rejects in combat host-side (bots/lua_bot/pilot.nim), and a
@@ -886,6 +991,10 @@ end
 -- vendor and interact; vendor_sell_step takes the next ticks.
 local VENDOR_SEEK_FREE_SLOTS = 2
 local VENDOR_INTERACT_STOP = 3.5
+-- Live 2026-08-16: first-frame `interact` open_vendor freezes decide the
+-- same way 0074 equip_item does (Baran/Kargalgan status stuck sequence=1).
+-- Flip this when interact no longer kills the pilot.
+local VENDOR_SEEK_EMIT = false
 
 local function unit_has_service(unit, name)
   for i = 1, #(unit.services or {}) do
@@ -915,6 +1024,7 @@ local function nearest_vendor(view)
 end
 
 local function vendor_seek_step(view)
+  if not VENDOR_SEEK_EMIT then return nil end
   if view.in_combat or view.is_dead or view.is_ghost then return nil end
   if view.merchant_open then return nil end
   if not view.sell_supported then return nil end
@@ -1058,6 +1168,12 @@ local function death_intent(view, now)
     if beru_can_resurrect(view) and now - dead_since < RES_WAIT_SECONDS then
       return { kind = "hold", reason = "wait_for_beru_resurrection" }, "waiting_for_beru"
     end
+    -- /release is chat-box lifecycle, same as /reclaim. Re-issuing it every
+    -- tick (Tusk, 2026-08-16) wedges decide and the realm drops the seat.
+    if last_release_at and now - last_release_at < RELEASE_RETRY_SECONDS then
+      return { kind = "hold", reason = "release_pending" }, "releasing"
+    end
+    last_release_at = now
     return { kind = "release", reason = "release_spirit" }, "releasing"
   end
   if view.is_ghost then
@@ -1084,7 +1200,7 @@ local function death_intent(view, now)
       local d = distance(mine, corpse)
       if mine and d and d > ROAD_MIN_YARDS and intent.map_id then
         local wp = road_waypoint(mine, corpse, math.floor(intent.map_id))
-        if wp then
+        if wp and closer_on_plane(mine, wp, corpse) then
           intent.x, intent.y, intent.z = wp.x, wp.y, wp.z
           intent.stop_distance = ROAD_WAYPOINT_STOP
           intent.reason = "corpse_run_road"
@@ -1450,6 +1566,16 @@ local function mage_action(view, target)
     reason = filler and "mage_nuke" or "mage_melee_fallback" }
 end
 
+local function rogue_action(view, target)
+  local strike = pick_spell(view, { "Sinister Strike" })
+  if strike then
+    return { kind = "attack", guid = target.guid, spell = strike.spell_id,
+      stop_distance = 4.0, reason = "rogue_sinister_strike" }
+  end
+  return { kind = "attack", guid = target.guid, stop_distance = 4.0,
+    reason = "rogue_melee" }
+end
+
 local function self_buff(view, role)
   local priorities = role == "tank" and { "Battle Shout" }
     or role == "healer" and { "Inner Fire" }
@@ -1616,8 +1742,103 @@ local function chat_step(view, now)
     reason = "party_banter" }
 end
 
+local function leader_moving(p, now)
+  if not p then
+    last_lead = nil
+    return false
+  end
+  if not last_lead then
+    last_lead = { x = p.x, y = p.y, t = now, moving = false, still_at = now }
+    return false
+  end
+  local dt = now - last_lead.t
+  if dt > 0 then
+    local dx = (p.x or 0) - last_lead.x
+    local dy = (p.y or 0) - last_lead.y
+    local speed = math.sqrt(dx * dx + dy * dy) / dt
+    if speed >= LEAD_RUN_YDS then
+      last_lead.moving = true
+      last_lead.still_at = nil
+    elseif speed < LEAD_STILL_YDS then
+      if not last_lead.still_at then last_lead.still_at = now end
+      if now - last_lead.still_at >= LEAD_STILL_SECONDS then
+        last_lead.moving = false
+      end
+    else
+      last_lead.still_at = nil
+    end
+    last_lead.x, last_lead.y, last_lead.t = p.x, p.y, now
+  end
+  return last_lead.moving
+end
+
+local function fight_on(view, leader)
+  if view.in_combat then return true end
+  if leader and leader.is_in_combat then return true end
+  for _, unit in ipairs(view.units or {}) do
+    if hostile(unit) and is_party_property(view, unit.target_guid) then
+      local d = unit.combat_distance_known and unit.combat_distance
+        or unit.distance or 1e9
+      if d <= PEEL_RANGE_YARDS then return true end
+    end
+  end
+  return false
+end
+
+-- Step off the mob that is about to finish us. A hold at 20% is a corpse.
+local function survive_step(view)
+  if view.is_dead or view.is_ghost then return nil end
+  if self_health_pct(view) >= FLEE_HP_PCT then return nil end
+  local mine = view_point(view)
+  if not mine then return nil end
+  local nearest, nd = nil, nil
+  for _, unit in ipairs(view.units or {}) do
+    if hostile(unit) then
+      local d = unit.combat_distance_known and unit.combat_distance
+        or unit.distance or 1e9
+      if not nd or d < nd then nearest, nd = unit, d end
+    end
+  end
+  if not nearest or not nd or nd > 12 then return nil end
+  local p = point(nearest)
+  if not p then return nil end
+  local dx, dy = mine.x - p.x, mine.y - p.y
+  local mag = math.sqrt(dx * dx + dy * dy)
+  if mag < 0.5 then dx, dy, mag = 1, 0, 1 end
+  return {
+    kind = "navigate",
+    x = mine.x + dx / mag * FLEE_YARDS,
+    y = mine.y + dy / mag * FLEE_YARDS,
+    z = mine.z,
+    map_id = math.floor((view.location and view.location.map_id) or 0),
+    stop_distance = 2.0,
+    navigation_mode = "local_steer",
+    allow_jump = true,
+    reason = "survive_flee",
+  }
+end
+
+local function formation_fidget(view, now)
+  local pos = view_point(view)
+  if not pos or not view.location then return nil end
+  if fidget_at and now - fidget_at < FIDGET_SECONDS then return nil end
+  fidget_at = now
+  return {
+    kind = "navigate",
+    x = pos.x + 1.5,
+    y = pos.y,
+    z = pos.z,
+    map_id = math.floor(view.location.map_id or 0),
+    stop_distance = 0.5,
+    navigation_mode = "local_steer",
+    allow_jump = true,
+    reason = "formation_fidget",
+  }
+end
+
 function M.reset()
   dead_since = nil
+  last_release_at = nil
   last_promote_at = nil
   forget_stuck()
   stuckSeenAt = nil
@@ -1635,6 +1856,8 @@ function M.reset()
   wand_pressed_at = nil
   wand_pressed_guid = nil
   last_shout_at = nil
+  fidget_at = nil
+  last_lead = nil
 end
 
 function M.decide(view)
@@ -1659,8 +1882,14 @@ function M.decide(view)
   -- slots cannot accept a quest reward, and every bag it is carrying instead
   -- of wearing is six slots it already owns. Self-limiting — at most four
   -- bags exist to equip, and the step goes quiet once the slots are full.
-  local wear = equip_bags_step(view, now)
-  if wear then return finish(wear, view, "vendor", role) end
+  -- Never equip while Murist is in the party. The host accepts equip_item
+  -- then freezes decide (0074) — Igris/Shadowfel read as offline after
+  -- "bags: equipping". Solo seats still try. Ticket 0082 buys; 0074 must
+  -- land before escort equips again.
+  if not party_member(view, MURIST) then
+    local wear = equip_bags_step(view, now)
+    if wear then return finish(wear, view, "vendor", role) end
+  end
 
   local seek = vendor_seek_step(view)
   if seek then
@@ -1748,8 +1977,24 @@ function M.decide(view)
       if escape then return finish(escape, view, "rejoin", role) end
       return finish(rejoin, view, "rejoin", role)
     end
+    -- In Murist's party we never fall through to solo.decide.
+    local fidget = formation_fidget(view, now)
+    if fidget then return finish(fidget, view, "escort", role) end
+    return finish({ kind = "hold", reason = "hold_for_murist" },
+      view, "escort", role)
   end
-  if not party.in_group or not murist_member or not leader then
+  if not party.in_group or not murist_member then
+    local flee = survive_step(view)
+    if flee then return finish(flee, view, "solo", role) end
+    if (view.active_cast_spell_id or 0) ~= 0 or
+        (view.active_channel_spell_id or 0) ~= 0 then
+      return finish({ kind = "hold", reason = "finish_active_cast" },
+        view, "solo", role)
+    end
+    if not view.in_combat then
+      local pet = summon_demon(view, role)
+      if pet then return finish(pet, view, "solo", role) end
+    end
     local intent = solo.decide(view)
     return finish(intent, view, "solo", role)
   end
@@ -1764,24 +2009,40 @@ function M.decide(view)
     local emergency = healer_action(view, true)
     if emergency then return finish(emergency, view, "escort", role, leader) end
   end
+  local flee = survive_step(view)
+  if flee then return finish(flee, view, "escort", role, leader) end
 
   -- Party kills arm the shared loot machinery (state lives in accelerated;
   -- lootSeen dedupe makes the extra call idempotent for solo ticks).
   solo.note_kills(view)
 
-  local leader_distance = distance(view_point(view), point(leader))
-  if not leader_distance or leader_distance > HARD_LEASH_YARDS then
-    -- The hard leash is a blind long walk exactly like the corpse run and the
-    -- off-screen rejoin, and it wedges the same way: Tusk parked at
-    -- 2234.4,-17.9 for 90s with nav reporting "following" and the pilot's own
-    -- nav_no_route_escape firing at that spot and failing (2026-08-16). The
-    -- watchdog only ever ran on the recovery and rejoin branches because those
-    -- return before solo.decide; this branch returns before them, so it had no
-    -- escape at all. rejoin_busy keeps a tank that is legitimately holding a
-    -- pull out of leash range from being yanked off it.
-    local escape = stuck_step(view, now, rejoin_busy(view), "escort_unstick")
-    if escape then return finish(escape, view, "escort", role, leader) end
-    return finish(follow_leader(leader, "hard_rejoin_murist"),
+  local leader_p = point(leader)
+  local leader_distance = distance2d(view_point(view), leader_p)
+  if not leader_distance then
+    leader_distance = distance(view_point(view), leader_p)
+  end
+  if not leader_distance then
+    leader_distance = tonumber(leader.distance)
+  end
+  local moving = leader_moving(leader_p, now)
+  local fighting = fight_on(view, leader)
+  -- Out of combat, glue to Murist. IN a fight, stay on heals/peels/swings
+  -- unless he is past the hard leash (2026-08-16 party wipe: 12yd follow
+  -- beat Beru's heal and Tusk's peel, then everyone released).
+  local trail = moving and not fighting
+  local chase = (not fighting and (not leader_distance or
+      leader_distance > NEAR_YARDS or trail))
+    or (fighting and leader_distance and leader_distance > HARD_LEASH_YARDS)
+  if chase then
+    if not leader_distance or leader_distance > HARD_LEASH_YARDS then
+      local escape = stuck_step(view, now, rejoin_busy(view), "escort_unstick")
+      if escape then return finish(escape, view, "escort", role, leader) end
+    else
+      forget_stuck()
+    end
+    local reason = (not leader_distance or leader_distance > HARD_LEASH_YARDS)
+      and "hard_rejoin_murist" or "follow_murist"
+    return finish(follow_leader(view, leader, reason, moving),
       view, "escort", role, leader)
   end
 
@@ -1837,6 +2098,7 @@ function M.decide(view)
     local action = role == "tank" and warrior_action(view, target)
       or role == "healer" and priest_damage(view, target)
       or view.class_id == CLASS_MAGE and mage_action(view, target)
+      or view.class_id == CLASS_ROGUE and rogue_action(view, target)
       or warlock_action(view, target)
     return finish(action, view, "escort", role, leader, target)
   end
@@ -1844,12 +2106,7 @@ function M.decide(view)
   if leader.is_in_combat then
     -- No assist verb either; the useful translation of "assist" with no
     -- visible hostile is closing on the leader until their target is.
-    return finish(follow_leader(leader, "assist_murist_close"),
-      view, "escort", role, leader)
-  end
-
-  if leader_distance > NEAR_YARDS then
-    return finish(follow_leader(leader, "follow_murist"),
+    return finish(follow_leader(view, leader, "assist_murist_close", moving),
       view, "escort", role, leader)
   end
 
@@ -1875,6 +2132,17 @@ function M.decide(view)
       if speak then return finish(speak, view, "escort", role, leader) end
     end
   end
+
+  -- Vanilla flags AFK after ~5 min with no input. A hold in formation is
+  -- exactly that, so Beru showed <AFK> while glued to Murist. A short
+  -- hop every FIDGET_SECONDS is a movement packet; it also clears an
+  -- already-set AFK.
+  if moving then
+    return finish(follow_leader(view, leader, "follow_murist", true),
+      view, "escort", role, leader)
+  end
+  local fidget = formation_fidget(view, now)
+  if fidget then return finish(fidget, view, "escort", role, leader) end
 
   return finish({ kind = "hold", reason = "in_formation" },
     view, "escort", role, leader)

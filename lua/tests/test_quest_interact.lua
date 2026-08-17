@@ -111,4 +111,42 @@ do
   assert_eq(d.unit_id, 11, "prefer pure qg even if farther")
 end
 
+-- A vendor / Deathguard is not a quest surface. Scout must not loop them.
+do
+  local frame = {
+    self_unit = { x = 0, y = 0, z = 0, map_id = 0 },
+    quest = {
+      offers = {},
+      interactables = {
+        { id = 20, kind = "unit", services = { "vendor", "repair" }, x = 1, y = 0, z = 0 },
+        { id = 21, kind = "unit", services = {}, x = 2, y = 0, z = 0 },
+      },
+      turn_ins = {},
+    },
+  }
+  local d = qi.decide(frame, {})
+  assert_eq(d.kind, "hold")
+  assert_eq(d.reason, "no_quest_surface")
+end
+
+-- Empty merchant / gossip rotates off that NPC onto another giver.
+do
+  local frame = {
+    self_unit = { x = 0, y = 0, z = 0, map_id = 0 },
+    quest = {
+      offers = {},
+      merchant_open = true,
+      merchant_id = 20,
+      interactables = {
+        { id = 20, kind = "unit", is_questgiver = true, services = { "questgiver", "vendor" }, x = 1, y = 0, z = 0 },
+        { id = 11, kind = "unit", is_questgiver = true, services = { "questgiver" }, x = 3, y = 0, z = 0 },
+      },
+      turn_ins = {},
+    },
+  }
+  local d = qi.decide(frame, {})
+  assert_eq(d.kind, "interact_unit")
+  assert_eq(d.unit_id, 11, "empty merchant rotates to the other giver")
+end
+
 print("test_quest_interact: ok")

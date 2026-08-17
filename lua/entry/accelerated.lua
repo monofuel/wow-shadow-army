@@ -29,9 +29,8 @@ local QUEST_LOG_LIMIT = 20
 -- QUESTS flag, which the scored lanes keep off, so the trade here is the home
 -- lane's alone: quests finished beats kills per minute.
 local QUESTGIVER_YARDS = 120.0
--- Rank-2 scout (unmarked friendly) is only for NPCs we can already talk to.
--- Walking 90yd to a Deathguard (Bellion, 2026-08-16) wedges on a guard that
--- never has a quest; real givers are reached via generated starters.
+-- Rank-2 scout is last-yards, questgiver-flagged, and only when no !/? is
+-- already visible. Friendly vendors/guards have no quest (Bellion, 2026-08-16).
 local SCOUT_YARDS = 35.0
 -- Empty-log walk to a generated starter. Sarvis is ~141yd from the
 -- Deathknell zombie field; keep this above that and below a zone hop.
@@ -40,9 +39,11 @@ local STARTER_HUB_YARDS = 220.0
 -- not killing while we stand there.
 local QUESTGIVER_PATIENCE = 75.0
 -- Hard cap on continuous quest travel/interact so a stuck giver cannot eat
--- the whole episode even if patience is reset by marker noise. Must exceed the
--- walk QUESTGIVER_YARDS implies, or every approach is abandoned in transit.
+-- the whole episode even if patience is reset by marker noise.
 local QUEST_BUDGET_SECONDS = 60.0
+-- Failed walks get a cooldown, not a session-long blacklist: exhausting a
+-- giver we never reached strands every Deathknell turn-in behind a wall.
+local QUEST_APPROACH_COOLDOWN = 45.0
 -- Questgiver memory. Marker status only exists for units the client can see,
 -- so a seat that grinds its way out of town loses every giver at once: no unit
 -- row, no marker, nothing to want. Roaming is a random walk and does not come
@@ -93,6 +94,10 @@ local UNSTICK_STILL_FRAMES = 40
 local UNSTICK_YARDS = 2.0
 local UNSTICK_LEG_YARDS = 22.0
 local UNSTICK_SECONDS = 6.0
+-- One compass. A church/WMO clip that returns the same pose on every
+-- local_steer bearing is not a wall the next heading will beat; spinning
+-- it forever owns decide and the seat never grinds again.
+local UNSTICK_BEARINGS = 8
 
 local LOOT_PREFIX_SLOT = "loot-slot:"
 local LOOT_PREFIX_MONEY = "loot-money:"
@@ -112,7 +117,11 @@ local NUKES_BY_CLASS = {
   [7] = { 529, 403 },    -- shaman: Lightning Bolt r2/r1
   [9] = { 695, 686 },    -- warlock: Shadow Bolt r2/r1
   [5] = { 591, 585 },    -- priest: Smite r2/r1
-  [8] = { 2136, 145, 143, 133 }, -- mage: Fire Blast r1, Fireball r3/r2/r1
+  [8] = {
+    10199, 10197, 8413, 8412, 2138, 2137, 2136, -- Fire Blast r7-r1
+    25306, 10151, 10150, 10149, 10148, 8402, 8401, 8400, 3140, 145, 143, 133, -- Fireball
+    25304, 10181, 10180, 10179, 8408, 8407, 8406, 7322, 837, 205, 116, -- Frostbolt
+  },
   [1] = { 285, 284, 78 },   -- warrior: Heroic Strike r3/r2/r1
   [4] = { 1758, 1757, 1752 }, -- rogue: Sinister Strike r3/r2/r1
 }
@@ -138,6 +147,9 @@ local BUFFS_BY_CLASS = {
 -- host is walking to ENGAGE_YARDS (movement_inhibits_cast_start), so a
 -- 4yd stop turns a mage into a staff-swinging corpse.
 local CASTER_STOP_YARDS = 22.0
+local CLASS_MAGE = 8
+local SHOOT_WAND = 5019
+local WAND_REPRESS_SECONDS = 3.0
 local CASTER_CLASS = {
   [5] = true, [7] = true, [8] = true, [9] = true, [11] = true,
 }
@@ -187,6 +199,8 @@ local lastPos = nil
 local lastProgressAt = nil
 local holdsAfterKill = 0
 local buffedAt = nil
+local wandPressedAt = nil
+local wandPressedGuid = nil
 -- Questgivers with nothing left for us, forgotten again whenever our quest
 -- state changes and they might have something new.
 local exhausted = {}
@@ -285,6 +299,7 @@ local stillSince = nil
 local stillFrames = 0
 local unstickUntil = nil
 local unstickBearing = 0
+local unstickTried = 0
 
 local function distance2d(ax, ay, bx, by)
   local dx, dy = ax - bx, ay - by
@@ -409,6 +424,40 @@ local function pick_nuke(view)
   return nil
 end
 
+local function button_for(view, spellId)
+  for i = 1, #(view.action_buttons or {}) do
+    local button = view.action_buttons[i]
+    if button.spell_id == spellId then return button end
+  end
+  return nil
+end
+
+local function nuke_affordable(view)
+  local prio = NUKES_BY_CLASS[view.class_id or 0]
+  if not prio then return nil end
+  for i = 1, #prio do
+    local button = button_for(view, prio[i])
+    if button and not button.not_enough_mana then return prio[i] end
+  end
+  return nil
+end
+
+local function pick_wand(view, target)
+  local button = button_for(view, SHOOT_WAND)
+  if not button then return nil, false end
+  if button.usable_known and not button.usable and not button.active then
+    return nil, false
+  end
+  if button.not_enough_mana then return nil, false end
+  local now = wow.time()
+  local guid = target and target.guid
+  local justPressed = wandPressedAt ~= nil and guid ~= nil and
+    wandPressedGuid == guid and (now - wandPressedAt) < WAND_REPRESS_SECONDS
+  if button.active or justPressed then return nil, true end
+  wandPressedAt, wandPressedGuid = now, guid
+  return SHOOT_WAND, true
+end
+
 local function pick_charge(view, target)
   if view.in_combat then return nil end
   local prio = CHARGE_BY_CLASS[view.class_id or 0]
@@ -500,6 +549,29 @@ local function marker_status(view, guid)
   return 0
 end
 
+local function has_service(unit, name)
+  for i = 1, #(unit.services or {}) do
+    if unit.services[i] == name then return true end
+  end
+  return false
+end
+
+local function is_questgiver(unit)
+  if not unit then return false end
+  if unit.is_questgiver then return true end
+  return has_service(unit, "questgiver")
+end
+
+local function marked_giver_visible(view)
+  for i = 1, #(view.units or {}) do
+    local status = marker_status(view, view.units[i].guid)
+    if status == MARKER_AVAILABLE or MARKER_REWARD[status] then
+      return true
+    end
+  end
+  return false
+end
+
 local function greeting_row(view)
   local rows = view.quest_frame and view.quest_frame.greeting_rows or {}
   -- A turn-in is worth more than a new quest, so answer active rows first.
@@ -533,6 +605,7 @@ local function dialog_open(view)
   local frame = view.quest_frame or {}
   if frame.open then return true end
   if view.gossip_open then return true end
+  if view.merchant_open then return true end
   return false
 end
 
@@ -732,13 +805,23 @@ local function quest_step(view, allowTurnInTravel, allowAcceptTravel, allowScout
     return { kind = "ui_press", control = "GossipFrameGreetingGoodbyeButton",
       reason = "gossip_done" }
   end
+  if view.merchant_open then
+    questBudgetSince = nil
+    exhausted[view.merchant_guid or 0] = true
+    return { kind = "ui_press", control = "MerchantFrameCloseButton",
+      reason = "merchant_not_quest" }
+  end
 
   if not allowTurnInTravel and not allowAcceptTravel then
     pursuing, pursuingSince, questBudgetSince = nil, nil, nil
     return nil
   end
 
+  local now = wow.time()
   -- Prefer turn-in (reward) markers over new accepts when ranking givers.
+  -- Scout is the markerless fallback only: a visible !/? means we already
+  -- have work, so do not walk Deathguards / vendors (Bellion, 2026-08-16).
+  local allowUnmarked = allowScout and not marked_giver_visible(view)
   local best, bestDistance, bestRank = nil, nil, nil
   for i = 1, #(view.units or {}) do
     local unit = view.units[i]
@@ -749,16 +832,13 @@ local function quest_step(view, allowTurnInTravel, allowAcceptTravel, allowScout
     elseif status == MARKER_AVAILABLE and allowAcceptTravel and
         #(view.accepted_quests or {}) < QUEST_LOG_LIMIT then
       rank = 1
-    elseif allowScout and status == 0 and
+    elseif allowUnmarked and status == 0 and
         unit.player_can_attack_known and not unit.player_can_attack and
-        unit.object_kind ~= "player" then
-      -- Players are friendly and markerless too, but they have no dialog to
-      -- give — the army was scouting its own soldiers. NPCs only.
-      -- No log-limit gate here: a full-but-finished log still wants its
-      -- unmarked enders found, and the details panel declines on its own.
+        unit.object_kind ~= "player" and is_questgiver(unit) then
       rank = 2
     end
     if rank and not exhausted[unit.guid] and
+        not (hubCooldown[unit.guid] and now < hubCooldown[unit.guid]) and
         not (unit.death_known and unit.is_dead) then
       local d = unit_distance(unit)
       local maxD = rank == 2 and SCOUT_YARDS or QUESTGIVER_YARDS
@@ -770,7 +850,6 @@ local function quest_step(view, allowTurnInTravel, allowAcceptTravel, allowScout
   end
   -- TEMP probe (0065): what the travel scan concluded. Remove with fix.
   do
-    local now = wow.time()
     if not travelProbeAt or now - travelProbeAt > 15 then
       travelProbeAt = now
       wow.log(string.format("travel best=%s rank=%s tin=%s acc=%s scout=%s",
@@ -780,21 +859,26 @@ local function quest_step(view, allowTurnInTravel, allowAcceptTravel, allowScout
     end
   end
   if best then
-    local now = wow.time()
     if pursuing ~= best.guid then
       pursuing, pursuingSince = best.guid, now
       questBudgetSince = now
     end
-    if questBudgetSince and now - questBudgetSince > QUEST_BUDGET_SECONDS then
-      exhausted[best.guid] = true
+    local timedOut = (questBudgetSince and
+        now - questBudgetSince > QUEST_BUDGET_SECONDS) or
+      (pursuingSince and now - pursuingSince > QUESTGIVER_PATIENCE)
+    if timedOut then
+      local closeMsg = (questBudgetSince and
+          now - questBudgetSince > QUEST_BUDGET_SECONDS) and
+        "quest budget exhausted on " or "gave up on questgiver "
       pursuing, pursuingSince, questBudgetSince = nil, nil, nil
-      wow.log("quest budget exhausted on " .. (best.name or "?"))
-      return nil
-    end
-    if now - pursuingSince > QUESTGIVER_PATIENCE then
-      exhausted[best.guid] = true
-      pursuing, pursuingSince, questBudgetSince = nil, nil, nil
-      wow.log("gave up on questgiver " .. (best.name or "?"))
+      if bestDistance > QUEST_WALK_FALLBACK_YARDS then
+        hubCooldown[best.guid] = now + QUEST_APPROACH_COOLDOWN
+        wow.log(string.format("quest approach timed out on %s (%.0fyd)",
+          best.name or "?", bestDistance))
+      else
+        exhausted[best.guid] = true
+        wow.log(closeMsg .. (best.name or "?"))
+      end
       return nil
     end
     local scouting = bestRank == 2
@@ -947,6 +1031,7 @@ local function unstick_step(view, pos, engaged, busy)
   -- to "escape" is how the escape reflex started eating its own loot.
   if busy or view.in_combat or engaged or pinned then
     stillAnchor, stillSince, stillFrames = { x = pos.x, y = pos.y }, now, 0
+    unstickTried = 0
     if unstickUntil and now >= unstickUntil then unstickUntil = nil end
     return nil
   end
@@ -957,6 +1042,7 @@ local function unstick_step(view, pos, engaged, busy)
   if distance2d(pos.x, pos.y, stillAnchor.x, stillAnchor.y) >= UNSTICK_YARDS then
     stillAnchor, stillSince, stillFrames = { x = pos.x, y = pos.y }, now, 0
     unstickUntil = nil
+    unstickTried = 0
     return nil
   end
   stillFrames = stillFrames + 1
@@ -965,6 +1051,16 @@ local function unstick_step(view, pos, engaged, busy)
     -- keep the current bearing until the window closes
   elseif now - stillSince > UNSTICK_STILL_SECONDS and
       stillFrames >= UNSTICK_STILL_FRAMES then
+    unstickTried = unstickTried + 1
+    if unstickTried > UNSTICK_BEARINGS then
+      wow.log(string.format(
+        "unstick spin gave up at %.1f,%.1f after %d bearings",
+        pos.x, pos.y, UNSTICK_BEARINGS))
+      unstickTried = 0
+      unstickUntil = nil
+      stillAnchor, stillSince, stillFrames = { x = pos.x, y = pos.y }, now, 0
+      return nil
+    end
     unstickBearing = (unstickBearing + 1) % 8
     unstickUntil = now + UNSTICK_SECONDS
     wow.log(string.format(
@@ -1221,6 +1317,11 @@ function M.reset()
   bagUseSettleUntil = nil
   bagBlockedNpc = nil
   bagBlockedQuest = nil
+  exhausted = {}
+  hubCooldown = {}
+  pursuing, pursuingSince, questBudgetSince, questPausedAt = nil, nil, nil, nil
+  wandPressedAt = nil
+  wandPressedGuid = nil
 end
 
 function M.decide(view)
@@ -1494,8 +1595,28 @@ function M.decide(view)
   if target then
     local spell = pick_charge(view, target)
     local stop = ENGAGE_YARDS
+    local reason = "grind"
     if spell then
       stop = CHARGE_MAX_YARDS
+      reason = "charge"
+    elseif (view.class_id or 0) == CLASS_MAGE then
+      -- Walking makes Fireball unusable. A 4yd fallback then keeps the
+      -- seat moving, so the bolt never becomes usable.
+      stop = CASTER_STOP_YARDS
+      spell = pick_nuke(view)
+      if spell then
+        reason = "mage_nuke"
+      elseif nuke_affordable(view) then
+        reason = "mage_hold_range"
+      else
+        local wand, wanding = pick_wand(view, target)
+        if wand then
+          spell = wand
+          reason = "mage_wand"
+        elseif wanding then
+          reason = "mage_wanding"
+        end
+      end
     elseif mana >= NUKE_MANA_FLOOR_PCT then
       spell = pick_nuke(view)
       if spell and CASTER_CLASS[view.class_id or 0] then
@@ -1513,7 +1634,7 @@ function M.decide(view)
       spell = spell,
       stop_distance = stop,
       route_profile = "prefer_ground",
-      reason = spell and stop == CHARGE_MAX_YARDS and "charge" or "grind",
+      reason = reason,
       status = progress_status(view),
     }
   end
