@@ -1466,4 +1466,70 @@ local moved = view({}, {
 clock = clock + 10.0
 check(grind.decide(moved).reason ~= "unstick", "a moving seat is never unstuck")
 
+-- Mage at 5yd with a staff and fumes: Fireball is the hit, melee is not.
+grind.reset()
+grind.set_quests(false)
+local mageFumes = view({ unit(201, 5.0, 1) }, {
+  class_id = 8,
+  auto_attack_guid = 201,
+  in_combat = true,
+  powers = { 20 },
+  max_powers = { 100 },
+  action_buttons = {
+    { slot = 1, spell_id = 133, usable = true, usable_known = true },
+  },
+})
+local fumes = grind.decide(mageFumes)
+check(fumes.kind == "attack" and fumes.spell == 133 and
+  fumes.stop_distance == 22.0,
+  "mage at 5yd Fireballs even below the mana floor")
+
+-- Same target, same hp, same place: the swing never landed. Take the next.
+grind.reset()
+local function wallView()
+  return view({
+    unit(202, 5.0, 1),
+    unit(203, 12.0, 1),
+  }, {
+    class_id = 8,
+    auto_attack_guid = 202,
+    in_combat = true,
+    powers = { 20 },
+    max_powers = { 100 },
+    action_buttons = {
+      { slot = 1, spell_id = 133, usable = true, usable_known = true },
+    },
+  })
+end
+check(grind.decide(wallView()).guid == 202, "opens on the engaged 5yd mob")
+local switched = nil
+for _ = 1, 10 do
+  clock = clock + 1.0
+  switched = grind.decide(wallView())
+end
+check(switched.kind == "attack" and switched.guid == 203,
+  "abandons a 5yd grind that never damaged")
+
+-- A landing hit resets the stale clock.
+grind.reset()
+local function liveView(hp)
+  return view({
+    unit(204, 5.0, 1, { health = hp, max_health = 40 }),
+    unit(205, 12.0, 1),
+  }, {
+    class_id = 8,
+    auto_attack_guid = 204,
+    in_combat = true,
+    action_buttons = {
+      { slot = 1, spell_id = 133, usable = true, usable_known = true },
+    },
+  })
+end
+check(grind.decide(liveView(40)).guid == 204, "starts on the live target")
+clock = clock + 4.0
+check(grind.decide(liveView(20)).guid == 204, "hp drop is a landing hit")
+clock = clock + 4.0
+check(grind.decide(liveView(20)).guid == 204,
+  "under the stale window after a hit, stay")
+
 print("test_accelerated: " .. passed .. " ok")
