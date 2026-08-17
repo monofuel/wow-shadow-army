@@ -40,9 +40,11 @@ local STARTER_HUB_YARDS = 220.0
 -- not killing while we stand there.
 local QUESTGIVER_PATIENCE = 75.0
 -- Hard cap on continuous quest travel/interact so a stuck giver cannot eat
--- the whole episode even if patience is reset by marker noise. Must exceed the
--- walk QUESTGIVER_YARDS implies, or every approach is abandoned in transit.
+-- the whole episode even if patience is reset by marker noise.
 local QUEST_BUDGET_SECONDS = 60.0
+-- Failed walks get a cooldown, not a session-long blacklist: exhausting a
+-- giver we never reached strands every Deathknell turn-in behind a wall.
+local QUEST_APPROACH_COOLDOWN = 45.0
 -- Questgiver memory. Marker status only exists for units the client can see,
 -- so a seat that grinds its way out of town loses every giver at once: no unit
 -- row, no marker, nothing to want. Roaming is a random walk and does not come
@@ -743,6 +745,7 @@ local function quest_step(view, allowTurnInTravel, allowAcceptTravel, allowScout
     return nil
   end
 
+  local now = wow.time()
   -- Prefer turn-in (reward) markers over new accepts when ranking givers.
   local best, bestDistance, bestRank = nil, nil, nil
   for i = 1, #(view.units or {}) do
@@ -764,6 +767,7 @@ local function quest_step(view, allowTurnInTravel, allowAcceptTravel, allowScout
       rank = 2
     end
     if rank and not exhausted[unit.guid] and
+        not (hubCooldown[unit.guid] and now < hubCooldown[unit.guid]) and
         not (unit.death_known and unit.is_dead) then
       local d = unit_distance(unit)
       local maxD = rank == 2 and SCOUT_YARDS or QUESTGIVER_YARDS
@@ -775,7 +779,6 @@ local function quest_step(view, allowTurnInTravel, allowAcceptTravel, allowScout
   end
   -- TEMP probe (0065): what the travel scan concluded. Remove with fix.
   do
-    local now = wow.time()
     if not travelProbeAt or now - travelProbeAt > 15 then
       travelProbeAt = now
       wow.log(string.format("travel best=%s rank=%s tin=%s acc=%s scout=%s",
@@ -785,21 +788,26 @@ local function quest_step(view, allowTurnInTravel, allowAcceptTravel, allowScout
     end
   end
   if best then
-    local now = wow.time()
     if pursuing ~= best.guid then
       pursuing, pursuingSince = best.guid, now
       questBudgetSince = now
     end
-    if questBudgetSince and now - questBudgetSince > QUEST_BUDGET_SECONDS then
-      exhausted[best.guid] = true
+    local timedOut = (questBudgetSince and
+        now - questBudgetSince > QUEST_BUDGET_SECONDS) or
+      (pursuingSince and now - pursuingSince > QUESTGIVER_PATIENCE)
+    if timedOut then
+      local closeMsg = (questBudgetSince and
+          now - questBudgetSince > QUEST_BUDGET_SECONDS) and
+        "quest budget exhausted on " or "gave up on questgiver "
       pursuing, pursuingSince, questBudgetSince = nil, nil, nil
-      wow.log("quest budget exhausted on " .. (best.name or "?"))
-      return nil
-    end
-    if now - pursuingSince > QUESTGIVER_PATIENCE then
-      exhausted[best.guid] = true
-      pursuing, pursuingSince, questBudgetSince = nil, nil, nil
-      wow.log("gave up on questgiver " .. (best.name or "?"))
+      if bestDistance > QUEST_WALK_FALLBACK_YARDS then
+        hubCooldown[best.guid] = now + QUEST_APPROACH_COOLDOWN
+        wow.log(string.format("quest approach timed out on %s (%.0fyd)",
+          best.name or "?", bestDistance))
+      else
+        exhausted[best.guid] = true
+        wow.log(closeMsg .. (best.name or "?"))
+      end
       return nil
     end
     local scouting = bestRank == 2
@@ -1238,6 +1246,9 @@ function M.reset()
   bagUseSettleUntil = nil
   bagBlockedNpc = nil
   bagBlockedQuest = nil
+  exhausted = {}
+  hubCooldown = {}
+  pursuing, pursuingSince, questBudgetSince, questPausedAt = nil, nil, nil, nil
 end
 
 function M.decide(view)

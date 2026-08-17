@@ -701,6 +701,45 @@ local afterPatience = grind.decide(stuckGiver)
 check(afterPatience.kind ~= "interact" or afterPatience.guid ~= 903,
   "gives up on a questgiver after patience")
 
+-- A turn-in we never reached is a failed walk, not a silent giver. Exhausting
+-- it strands the rank-0 marker for the rest of the session (Baran: Sarvis).
+do
+  grind.reset()
+  local farTurnIn = view({
+    giver(940, 40.0, "Sarvis"),
+  }, {
+    level = 4,
+    quest_markers = { { questgiver_guid = 940, status = 6 } },
+    quest_frame = { open = false },
+    accepted_quests = { 364, 376 },
+    quest_objectives = {
+      { quest_id = 364, complete = true, entry = 1501 },
+      { quest_id = 376, complete = false, entry = 0 },
+    },
+    completed_quest_ids = {},
+    ui_nodes = {},
+    action_buttons = {
+      { slot = 1, spell_id = 5176, usable = true, usable_known = true },
+    },
+  })
+  clock = clock + 5.0
+  local approach = grind.decide(farTurnIn)
+  check(approach.kind == "interact" and approach.guid == 940,
+    "starts a far turn-in walk")
+  clock = clock + 65.0
+  local timedOut = grind.decide(farTurnIn)
+  check(not timedOut or timedOut.guid ~= 940,
+    "releases the far giver when the approach budget expires")
+  clock = clock + 5.0
+  local cooling = grind.decide(farTurnIn)
+  check(not cooling or cooling.guid ~= 940,
+    "cools down a failed approach instead of exhausting the giver")
+  clock = clock + 50.0
+  local retry = grind.decide(farTurnIn)
+  check(retry.kind == "interact" and retry.guid == 940,
+    "retries the turn-in after the approach cooldown")
+end
+
 -- Reward panels that offer a choice: a bare /questreward is rejected by the
 -- client ("Choose a quest reward first"), so the choice button is pressed
 -- first and the plain verb only runs once a choice is selected.
