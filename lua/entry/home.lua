@@ -1962,6 +1962,15 @@ function M.decide(view)
 
   local leader = murist_member and visible_player_by_name(view, "Murist") or nil
   if party.in_group and murist_member and not leader then
+    if (view.active_cast_spell_id or 0) ~= 0 or
+        (view.active_channel_spell_id or 0) ~= 0 then
+      return finish({ kind = "hold", reason = "finish_active_cast" },
+        view, "rejoin", role)
+    end
+    if not view.in_combat then
+      local pet = summon_demon(view, role)
+      if pet then return finish(pet, view, "rejoin", role) end
+    end
     -- Murist is on the roster but not in visual range: walk to where the
     -- roster says he is instead of shrugging into the solo brain.
     local rejoin = rejoin_leader(view, murist_member)

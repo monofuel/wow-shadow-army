@@ -293,6 +293,19 @@ r = home.decide(v)
 check(r.kind == "cast_spell" and r.spell == 688 and r.reason == "summon_imp",
   "petless escort lock summons before the hard rejoin")
 
+home.reset()
+v = frame(9)
+v.units = {}
+v.party.members[2].location_known = true
+v.party.members[2].location = { map_id = 0, x = 400, y = 0, z = 0 }
+v.action_buttons = {
+  { slot = 1, kind = "spell", spell_id = 688, spell_name = "Summon Imp",
+    usable_known = true, usable = true, cooldown_ms = 0 },
+}
+r = home.decide(v)
+check(r.kind == "cast_spell" and r.spell == 688 and r.reason == "summon_imp",
+  "petless lock summons before walking to an off-screen Murist")
+
 v = frame()
 v.units = { leader_unit(12, true, 300), hostile(300, 100) }
 r = home.decide(v)
