@@ -133,6 +133,9 @@ const
     (name: "Tusk", startTarget: "tusk-start", stopTarget: "tusk-stop"),
     (name: "Beru", startTarget: "beru-start", stopTarget: "beru-stop")
   ]
+  ## Dedicated-four live Lua debug base. Makefile default stays empty so
+  ## league/traverse/scaled `seat-start` never inherit the home block.
+  HomeDebugPortBase = 7788
   ## SELECT-only projection of characters (VMaNGOS schema) + xp bar + life/zone + HP/MP + pos.
   ## `xp` is progress into the current level; next-level threshold joins
   ## `mangos.player_xp_for_level` (world DB on the same MariaDB).
@@ -219,8 +222,8 @@ ORDER BY FIELD(cq.status, 1, 3, 5), qt.QuestLevel, cq.quest"""
   ## Older addon banner still seen in the wild.
   LegacyPrefix = "<ShadowArmy> "
   ## Seat babysitter (ticket 0055). A home seat whose Lua status heartbeat is
-  ## older than this while its launcher PID is still alive is WEDGED: the
-  ## client process exists but the policy has stopped ticking.
+  ## older than this while its launcher PID is still alive is WEDGED — unless
+  ## launcher.log or observer/heartbeat.json is still moving (client talking).
   SeatWedgeStaleSec* = 90.0
   ## How often the babysitter samples every seat's status file.
   SeatWatchPollMs = 10_000
@@ -2910,6 +2913,7 @@ proc runShellDetached(cmd: string): tuple[ok: bool, detail: string] =
 proc startBotSeat*(name: string): JsonNode =
   ## Request one embedded Lua seat through the Makefile lifecycle. The target
   ## detaches the launcher and records its PID/log/status under home-army/.
+  ## Arms HOME_DEBUG_PORT_BASE so the sidecar binds 7788 plus seat index.
   let target = seatMakeTarget(name)
   if target.len == 0:
     return %*{"ok": false, "name": name, "action": "start",
@@ -2924,7 +2928,7 @@ proc startBotSeat*(name: string): JsonNode =
   if not fileExists(root / "Makefile"):
     return %*{"ok": false, "name": name, "action": "start",
               "detail": &"Makefile missing in {root} — set SYSTEM_ARMY_DIR"}
-  let r = runShell(&"make -C {quoteShell(root)} {quoteShell(target)}")
+  let r = runShell(&"make -C {quoteShell(root)} {quoteShell(target)} HOME_DEBUG_PORT_BASE={HomeDebugPortBase}")
   if not r.ok:
     return %*{"ok": false, "name": name, "action": "start", "detail": r.detail}
   result = %*{"ok": true, "name": name, "action": "start",
@@ -4337,12 +4341,14 @@ proc seatWedgeStaleSec*(): float =
 proc classifySeat*(
     pidAlive, hasStatus: bool,
     statusAgeSec: float,
-    staleSec = SeatWedgeStaleSec
+    staleSec = SeatWedgeStaleSec,
+    chatterAgeSec = -1.0
 ): string =
-  ## Pure liveness rule. A seat only counts as WEDGED when its launcher is
-  ## alive AND a status file exists AND that file has stopped moving: a seat
-  ## with no status file yet is still booting (a cold `nim r` build is slow),
-  ## and must never be restarted for it.
+  ## Pure liveness rule. WEDGED only when the launcher is alive, status.json
+  ## exists and has stopped moving, AND client chatter is also stale or
+  ## missing. No status file yet is still booting (a cold `nim r` build is
+  ## slow) and must never be restarted for it. Stale status with fresh
+  ## launcher.log / observer heartbeat is starting — the client is talking.
   if not pidAlive:
     return "stopped"
   if not hasStatus:
@@ -4350,6 +4356,8 @@ proc classifySeat*(
   if statusAgeSec < -2.0:
     return "starting" # clock skew / file written in the future
   if statusAgeSec > staleSec:
+    if chatterAgeSec != -1.0 and chatterAgeSec <= staleSec:
+      return "starting"
     return "wedged"
   result = "running"
 
@@ -4513,6 +4521,23 @@ proc seatHeartbeatAge*(name: string): tuple[hasStatus: bool, ageSec: float] =
   except CatchableError:
     result = (hasStatus: false, ageSec: -1.0)
 
+proc seatClientChatterAge*(name: string): float =
+  ## Youngest age of launcher.log or observer/heartbeat.json; -1 if neither exists.
+  result = -1.0
+  var found = false
+  let dir = seatRuntimeDir(name)
+  for rel in ["launcher.log", "observer" / "heartbeat.json"]:
+    let path = dir / rel
+    if not fileExists(path):
+      continue
+    try:
+      let age = epochTime() - getLastModificationTime(path).toUnixFloat()
+      if not found or age < result:
+        result = age
+        found = true
+    except CatchableError:
+      discard
+
 proc seatWatchPassAgeSec*(): float =
   ## Seconds since the babysitter last COMPLETED a sampling pass; -1 before the
   ## first pass. Recoveries run inline on the watch thread, so one hung child
@@ -4543,7 +4568,9 @@ proc seatWatchStatus*(): seq[SeatWatch] =
     let hb = seatHeartbeatAge(w.name)
     w.hasStatus = hb.hasStatus
     w.statusAgeSec = hb.ageSec
-    w.state = classifySeat(w.pidAlive, w.hasStatus, w.statusAgeSec, staleSec)
+    w.state = classifySeat(
+      w.pidAlive, w.hasStatus, w.statusAgeSec, staleSec,
+      seatClientChatterAge(w.name))
     w.restarts = pruneRestartStamps(rec.stamps, nowSec).len
     w.lastActionAgeSec =
       if rec.lastActionAt > 0: nowSec - rec.lastActionAt else: -1.0
@@ -4633,7 +4660,8 @@ proc babysitSeatsOnce*() =
     let hb = seatHeartbeatAge(name)
     let hasStatus = hb.hasStatus
     let age = hb.ageSec
-    let state = classifySeat(pidAlive, hasStatus, age, staleSec)
+    let state = classifySeat(
+      pidAlive, hasStatus, age, staleSec, seatClientChatterAge(name))
     var lastActionAt = 0.0
     var tracked = false
     withLock gSeatWatchLock:

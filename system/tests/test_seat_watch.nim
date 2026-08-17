@@ -28,6 +28,15 @@ suite "classifySeat":
     check classifySeat(true, true, 91.0) == "wedged"
     check classifySeat(true, true, 30.0, staleSec = 10.0) == "wedged"
 
+  test "stale status with fresh chatter is starting":
+    check classifySeat(true, true, 91.0, chatterAgeSec = 3.0) == "starting"
+
+  test "stale status with stale chatter is wedged":
+    check classifySeat(true, true, 91.0, chatterAgeSec = 91.0) == "wedged"
+
+  test "stale status with missing chatter is wedged":
+    check classifySeat(true, true, 91.0, chatterAgeSec = -1.0) == "wedged"
+
   test "clock skew reads as starting, not wedged":
     check classifySeat(true, true, -30.0) == "starting"
 
@@ -95,7 +104,7 @@ suite "evidence + display":
     check "Tusk" in body
 
 proc writeWedgedSeat(root, seat: string, statusAgeSec: int) =
-  ## A seat dir that looks wedged: live pid, frozen status.json, fat log.
+  ## A seat dir that looks wedged: live pid, frozen status.json, frozen log.
   let seatDir = root / "local_data" / "home-army" / seat
   createDir(seatDir / "status")
   # The test process itself is the "live launcher": guaranteed alive, and the
@@ -109,6 +118,7 @@ proc writeWedgedSeat(root, seat: string, statusAgeSec: int) =
   writeFile(statusPath, """{"bot":{"mode":"home"}}""")
   let old = getTime() - initDuration(seconds = statusAgeSec)
   setLastModificationTime(statusPath, old)
+  setLastModificationTime(seatDir / "launcher.log", old)
 
 proc seatNamed(seats: seq[SeatWatch], name: string): SeatWatch =
   ## Pick one seat out of the babysitter view by name (order-independent).
@@ -426,11 +436,11 @@ suite "roster seats (throwaway army root)":
 # ---------------------------------------------------------------------------
 
 proc restampSeat(root, seat: string, ageSec: int) =
-  ## Re-date a seat's status.json to look `ageSec` old; nothing else changes.
-  let statusPath =
-    root / "local_data" / "home-army" / seat / "status" / "status.json"
-  setLastModificationTime(
-    statusPath, getTime() - initDuration(seconds = ageSec))
+  ## Re-date status.json and launcher.log to look `ageSec` old.
+  let seatDir = root / "local_data" / "home-army" / seat
+  let old = getTime() - initDuration(seconds = ageSec)
+  setLastModificationTime(seatDir / "status" / "status.json", old)
+  setLastModificationTime(seatDir / "launcher.log", old)
 
 suite "heartbeat age is read live, never served from a stale snapshot":
   test "a seat that goes stale AFTER the last pass still reads wedged":
