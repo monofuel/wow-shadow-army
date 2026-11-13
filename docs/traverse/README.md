@@ -57,7 +57,7 @@ monofuel's manual run of the course:
   inputs (`player/launch/proof_of_life.py`).
 - Fair play: no mounts, no relocation, no hand-authored continent route;
   sparse strategy beats + shared mesh navigation are allowed
-  ([traverse_wow.md](traverse_wow.md)).
+  (traverse_wow.md (archived privately)).
 
 ## Route status by segment
 
@@ -175,7 +175,7 @@ it in the act. Evidence first; no guess-fixes.
 | [petrel-plan.md](petrel-plan.md) | Plan of record — legs, fatigue, swim-north, weekend contender thesis |
 | [duskwallow-plan.md](duskwallow-plan.md) | Isolated swim segment — water entry → Dustwallow; scoreboard + gates |
 | [traverse-2026-08-07.md](traverse-2026-08-07.md) | Real goal (Everlook) + bird variants (Petrel/Skua/Gannet) |
-| [traverse_wow.md](traverse_wow.md) | League scouting: rules, scoring, fixture, submission gates |
+| traverse_wow.md (archived privately) | League scouting: rules, scoring, fixture, submission gates |
 | [realign-runs-2026-08-07.md](realign-runs-2026-08-07.md) | Realign run log — per-run progress, wedges, root causes |
 | [current-issues-2026-08-07.md](current-issues-2026-08-07.md) | Open issues as of 08-07 — stall class, swim corner-cutting, mob deaths, infra footguns |
 | [pathing.md](pathing.md) | Layers: sparse beats + nav A→B (fair play, multi-comp) |
@@ -183,7 +183,7 @@ it in the act. Evidence first; no guess-fixes.
 | [merchant-bay-progress-2026-08-07.md](merchant-bay-progress-2026-08-07.md) | Swim-run evidence + fatigue findings |
 | [traverse-2026-08-05.md](traverse-2026-08-05.md) / [traverse-2026-08-06.md](traverse-2026-08-06.md) | Day notes; manual-route learnings |
 | [petrel-upstream-realign.md](petrel-upstream-realign.md) | *Historical* — prefer-upstream realign of the `.so`-era fork |
-| [clientview-migration.md](clientview-migration.md) | *Historical* — ClientView bridge pilot (deleted in `1454caa`) |
+| clientview-migration.md (archived privately) | *Historical* — ClientView bridge pilot (deleted in `1454caa`) |
 | [embed-lua-client.md](embed-lua-client.md) | *Historical* — libpetrel embed strategy (deleted in `1454caa`) |
 | [army-debug.md](army-debug.md) | *Historical* — embedded flight recorder / admin port |
 | [pathfinding-plan.md](pathfinding-plan.md) | *Historical* — Nim RPB feet plan (feet now live upstream) |

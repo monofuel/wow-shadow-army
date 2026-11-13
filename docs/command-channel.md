@@ -87,7 +87,7 @@ fixture chat lines, no realm needed).
 ## Open questions before building
 
 Answers landed 2026-07-25 — full evidence and citations in
-[docs/party-formation.md](party-formation.md).
+docs/party-formation.md (archived privately).
 
 1. **Do chat messages appear in EnvironmentFrame? — No, but chat IS
    perceived.** The frame contract has no chat surface at all. `SMSG_MESSAGECHAT`
@@ -109,7 +109,7 @@ Answers landed 2026-07-25 — full evidence and citations in
 5. **Party formation is UNBLOCKED** — two bots formed a real server-side party
    with no upstream patch. `invite_party` needs a dungeon goal with a declared
    roster; `accept_party` needs only a pending invite. See
-   [docs/party-formation.md](party-formation.md) and `make party-form`.
+   docs/party-formation.md (archived privately) and `make party-form`.
 
 **Hard rule learned the hard way:** bots never address the human's character —
 no invites, no whispers, nothing. A test invite interrupted monofuel's session.

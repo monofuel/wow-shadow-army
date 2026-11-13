@@ -3,7 +3,7 @@
 **Status:** planning (not implemented)  
 **Scope:** Kalimdor Traverse ClientView Lua pilot only — look less dumb on
 minor terrain; still fair-play ordinary input.  
-**Related:** [clientview-migration.md](clientview-migration.md) (working pilot),
+**Related:** clientview-migration.md (archived privately) (working pilot),
 upstream RealPlayerBot `bots/real_playerbot/policy/navigation.nim`.
 
 ---

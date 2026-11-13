@@ -58,6 +58,10 @@ published artifact. Private hosting does not waive them.
   inform investigation; verify behavior against our own observations and
   tests and write our own implementation and explanation. Do not import
   third-party code or data without checking its provenance and license.
+- **Keep private communications and unpublished source material private.**
+  Do not commit internal messages, personnel assessments, or verbatim excerpts
+  from private upstream documentation or code without permission to publish
+  them. Attribution and a source-code license do not supply that permission.
 - **License only what we have authority to license.** Confirm ownership and
   applicable Softmax rights before selecting a source license. Preserve
   required third-party copyright notices, attribution, and license terms;

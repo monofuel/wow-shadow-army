@@ -20,14 +20,14 @@ interesting here.
 
 | # | Doc | One line |
 |---|---|---|
-| 1 | [combat-basics.md](combat-basics.md) | No GCD; swing timer, cast bars, resources, stats, hit/dodge/parry/glancing, downranking |
-| 2 | [threat-and-tanking.md](threat-and-tanking.md) | The core dungeon mechanic: threat numbers, 110/130% overtake, taunts, CC |
-| 3 | [party-and-roles.md](party-and-roles.md) | 5-man party, 1/1/3 trinity, manual invites, loot rules, XP split, rez options |
-| 4 | [classes-1.12.md](classes-1.12.md) | All 9 classes: roles at 19 and 60, lowbie toolkit, talent trees, RFC profile ids |
-| 5 | [leveling-1-20.md](leveling-1-20.md) | The Horde 1-20 you will actually play; trainers, talents at 10, no mount until 40 |
+| 1 | combat-basics.md (archived privately) | No GCD; swing timer, cast bars, resources, stats, hit/dodge/parry/glancing, downranking |
+| 2 | threat-and-tanking.md (archived privately) | The core dungeon mechanic: threat numbers, 110/130% overtake, taunts, CC |
+| 3 | party-and-roles.md (archived privately) | 5-man party, 1/1/3 trinity, manual invites, loot rules, XP split, rez options |
+| 4 | classes-1.12.md (archived privately) | All 9 classes: roles at 19 and 60, lowbie toolkit, talent trees, RFC profile ids |
+| 5 | leveling-1-20.md (archived privately) | The Horde 1-20 you will actually play; trainers, talents at 10, no mount until 40 |
 | 6 | [world-and-travel.md](world-and-travel.md) | Kalimdor/EK, Orgrimmar districts, flight paths, zeppelins, hearthstone, zone bands |
-| 7 | [dungeons-and-rfc.md](dungeons-and-rfc.md) | Dungeon etiquette, then RFC: layout, four bosses, route, wipe causes, tournament contract |
-| 8 | [death-and-recovery.md](death-and-recovery.md) | Corpse runs, rez sickness, durability, permadeath interaction, bot recovery rules |
+| 7 | dungeons-and-rfc.md (archived privately) | Dungeon etiquette, then RFC: layout, four bosses, route, wipe causes, tournament contract |
+| 8 | death-and-recovery.md (archived privately) | Corpse runs, rez sickness, durability, permadeath interaction, bot recovery rules |
 | 9 | [professions-economy.md](professions-economy.md) | 2+3 professions, gathering/crafting chains, skill colors, AH, mail, Industry Empire substrate |
 
 Read 1→2→3 before your first dungeon. Read 5→6 before your first play session.

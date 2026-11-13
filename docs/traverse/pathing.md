@@ -13,7 +13,7 @@ feet properly** — no more half-hooks),
 [embed-lua-client.md](embed-lua-client.md) (Lua in-process host),
 [obstacle-avoidance.md](obstacle-avoidance.md) (older polish notes),
 [petrel-plan.md](petrel-plan.md) (course thesis),
-[clientview-migration.md](clientview-migration.md) (historical pilot stack).
+clientview-migration.md (archived privately) (historical pilot stack).
 
 ---
 
@@ -178,4 +178,4 @@ Pathing is “done enough” for multi-comp / multi-week use when:
   `tools/traverse_lua_bridge.nim`
 - Launch: `make traverse` / `make traverse-headed`
 - Upstream: `bots/real_playerbot/policy/navigation.nim`, client navmeshes
-- League rules / scoring: [traverse_wow.md](traverse_wow.md)
+- League rules / scoring: traverse_wow.md (archived privately)

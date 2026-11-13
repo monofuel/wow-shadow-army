@@ -7,7 +7,7 @@ is not implemented (corrected 2026-08-07)
 **Supersedes for feet:** the per-tick `TRAVERSE_LUA_BRIDGE` process-spawn hack
 and pure hop lowerer as the long-term path.  
 **Related:** [pathing.md](pathing.md) (beats + nav A→B), [petrel-plan.md](petrel-plan.md),
-[clientview-migration.md](clientview-migration.md) (historical ClientView pilot;
+clientview-migration.md (archived privately) (historical ClientView pilot;
 `/player` is still a valid *external* shape, not how we unlock RPB nav).
 
 ---

@@ -14,12 +14,12 @@ file — do not fork a second strategy elsewhere.
 |---|---|
 | **This file** | Full plan: thesis, stack, legs, fatigue, success bar, non-goals |
 | [traverse-2026-08-05.md](traverse-2026-08-05.md) | Day checklist / scratchpad (points here) |
-| [clientview-migration.md](clientview-migration.md) | ClientView pilot how/why (done) |
+| clientview-migration.md (archived privately) | ClientView pilot how/why (done) |
 | [pathing.md](pathing.md) | Pathing layers: major beats + nav A→B |
 | [pathfinding-plan.md](pathfinding-plan.md) | Feet plan: full path+recover; ban straight-line shortcuts |
 | [embed-lua-client.md](embed-lua-client.md) | Embed Lua strategy in-process (libpetrel) |
 | [obstacle-avoidance.md](obstacle-avoidance.md) | Older land polish notes; see pathing.md for architecture of record |
-| [traverse_wow.md](traverse_wow.md) | League rules / scoring / submit gates |
+| traverse_wow.md (archived privately) | League rules / scoring / submit gates |
 | [army-debug.md](army-debug.md) | Old `/env` army_host debug port (not CV path) |
 
 ---

@@ -65,3 +65,23 @@ tools/tests/debug_decide
 # Petrel in-process embed (built artifact)
 tools/libpetrel.so
 .conductor/
+
+# Withdrawn private correspondence and upstream excerpts.
+/docs/clientview.md
+/docs/control-plane.md
+/docs/deploy-2026-08-04.md
+/docs/milestone-1-evidence.md
+/docs/nim-client.md
+/docs/party-formation.md
+/docs/traverse/clientview-migration.md
+/docs/traverse/traverse_wow.md
+/docs/traverse_wow.md
+/docs/warlock-seat.md
+/docs/work-2026-08-03.md
+/docs/wow/classes-1.12.md
+/docs/wow/combat-basics.md
+/docs/wow/death-and-recovery.md
+/docs/wow/dungeons-and-rfc.md
+/docs/wow/leveling-1-20.md
+/docs/wow/party-and-roles.md
+/docs/wow/threat-and-tanking.md
