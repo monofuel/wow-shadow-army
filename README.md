@@ -1,9 +1,9 @@
 # WoW Shadow Army
 
-An experimental research project exploring autonomous play in classic World
-of Warcraft (1.12), with bot policies, a player companion addon, and development
-tools. The project covers solo leveling, navigation, and a party of bots
-playing alongside a human.
+An experimental World of Warcraft (1.12) project inspired by the anime
+series *Solo Leveling*: a human player adventuring alongside an army of
+companion bots. The repository includes bot policies, a player companion
+addon, and tools for developing and observing the army.
 
 Gameplay policies are written in **Lua**. **Nim** powers the dashboard,
 experiment orchestration, and map viewer, as well as the separate game client
@@ -19,9 +19,9 @@ This checkout is not currently a verified, ready-to-run distribution.
 
 - **Party assistance:** bots follow a human player, assist in combat, perform
   class roles such as tanking and healing, and recover after death. The home
-  policy falls back to solo leveling when the human is absent.
-- **Solo leveling:** policies select combat targets, manage resources, loot,
-  and optionally interact with quests.
+  policy levels on its own when the human is absent.
+- **Automated character leveling:** policies select combat targets, manage
+  resources, loot, and optionally interact with quests.
 - **World traversal:** a navigation policy handles running, swimming,
   shapeshifting, and recovery while crossing a continent.
 - **Observation and iteration:** a player addon, dashboard, and map viewer
