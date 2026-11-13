@@ -14,8 +14,8 @@ also excluded by object ID, removing exact copies under other names.
 ## Private-documentation follow-up
 
 A subsequent publication review identified private correspondence and excerpts
-from unpublished upstream documentation. Eighteen historical documentation
-paths and forty stored blob versions were removed in a second history rewrite.
+from unpublished upstream documentation. Twenty-one historical documentation
+paths and 44 stored blob versions were removed in a second history rewrite.
 The same removal list above includes these paths. Links to the withdrawn notes
 are now plain historical references; the source code and MIT license are
 unchanged by this pass.
@@ -87,3 +87,8 @@ pass="$cleanup/publication-docs.0vsDNg"
 nim r --hints:off "$pass/find_private_excerpts.nim" "$PWD" \
   /home/monofuel/src/wow-coworld/coworld-vanilla-wow "$pass"
 ```
+
+The independent follow-up review identified three further quote-bearing notes,
+including prose copied from private upstream source comments. Those notes were
+also withdrawn from the complete master history. Their additional checkpoint
+and commit mapping are retained alongside the initial documentation cleanup.

@@ -8,6 +8,7 @@ docs/milestone-1-evidence.md
 docs/nim-client.md
 docs/party-formation.md
 docs/postmortems/2026-08-15-asset-server-attachments/tusk-wedge-log-excerpt.txt
+docs/quest-crash-forensics.md
 docs/traverse/clientview-migration.md
 docs/traverse/traverse_wow.md
 docs/traverse_wow.md
@@ -19,7 +20,9 @@ docs/wow/death-and-recovery.md
 docs/wow/dungeons-and-rfc.md
 docs/wow/leveling-1-20.md
 docs/wow/party-and-roles.md
+docs/wow/professions-economy.md
 docs/wow/threat-and-tanking.md
+docs/wow/world-and-travel.md
 lua/config/traverse_beats.json
 lua/config/traverse_beats.lua
 lua/config/traverse_coast_beats.json

@@ -71,5 +71,5 @@ order:
 - [traverse/route-engineering.md](traverse/route-engineering.md) — beat
   placement techniques (corridor probing, spawn fields, road mask,
   trace-pinning, autopsies)
-- [wow/world-and-travel.md](wow/world-and-travel.md) — travel lore
+- wow/world-and-travel.md (archived privately) — travel lore
   (flight points, roads-as-safety)
