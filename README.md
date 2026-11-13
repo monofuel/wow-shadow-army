@@ -1,9 +1,9 @@
 # WoW Shadow Army
 
-Bot policies, a player companion addon, and development tools for autonomous
-play in classic World of Warcraft (1.12). Built during Softmax's WoW Coworld
-experiments, the project explores solo leveling, navigation, and a party of
-bots playing alongside a human.
+An experimental research project exploring autonomous play in classic World
+of Warcraft (1.12), with bot policies, a player companion addon, and development
+tools. The project covers solo leveling, navigation, and a party of bots
+playing alongside a human.
 
 Gameplay policies are written in **Lua**. **Nim** powers the dashboard,
 experiment orchestration, and map viewer, as well as the separate game client
