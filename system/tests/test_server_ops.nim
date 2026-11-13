@@ -178,6 +178,35 @@ suite "server status views":
     check "active" in rows
     check "3/10" in rows
 
+  test "army quest board parse + bot tally skips Murist":
+    check armyQuestState(1, 3) == "rewarded"
+    check armyQuestState(0, 1) == "ready"
+    check armyQuestState(0, 3) == "active"
+    check armyQuestState(0, 5) == "failed"
+    check "character_queststatus" in ArmyQuestSql
+    check "cq.rewarded" in ArmyQuestSql
+    # name quest status rewarded mob1-4 item1-4 title level reqMob1-4 reqItem1-4
+    let tsv = "Kargalgan\t1470\t1\t1\t0\t0\t0\t0\t0\t0\t0\t0\tPiercing the Veil\t4\t0\t0\t0\t0\t0\t0\t0\t0\n" &
+              "Kargalgan\t376\t1\t0\t6\t6\t0\t0\t0\t0\t0\t0\tThe Damned\t2\t6\t6\t0\t0\t0\t0\t0\t0\n" &
+              "Murist\t364\t1\t1\t0\t0\t0\t0\t0\t0\t0\t0\tThe Mindless Ones\t1\t0\t0\t0\t0\t0\t0\t0\t0\n"
+    let parsed = parseArmyQuestTsv(tsv)
+    check parsed.len == 3
+    check parsed[0].state == "rewarded"
+    check parsed[0].progress == ""
+    check parsed[1].state == "ready"
+    check parsed[1].progress == "6/6 · 6/6"
+    let board = tallyArmyQuestBoard(parsed)
+    check board.rewarded == 1
+    check board.ready == 1
+    check board.active == 0
+    let html = renderArmyQuestRows(board)
+    check "Piercing the Veil" in html
+    check "rewarded" in html
+    check "ready" in html
+    let strip = renderArmyQuestSummary(board)
+    check "1 rewarded" in strip
+    check "50% done" in strip
+
 suite "seat cell":
   test "seat cell is always a terse On/Off (detail in tooltip only)":
     let off = renderSeatCell(Character(

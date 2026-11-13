@@ -42,6 +42,8 @@ against. The upstream checkout lives as a sibling:
 - `tools/` — party promote, fair-play audit, traverse/replay tooling
 - `kb/` — bot memory for the future LLM planner (map facts, quest ids, tool
   reliability). **Empty on purpose** — see `kb/README.md`
+- `bot_notes/` — Watcher field log: every death, live pathing/combat bugs.
+  See `bot_notes/README.md`. Not bot memory.
 - `docs/` — everything written for humans/agents on this repo: design notes,
   protocol and upstream notes, postmortems (`docs/postmortems/`). Start with
   `docs/interfaces.md` (the map of every boundary), then `docs/nim-client.md`

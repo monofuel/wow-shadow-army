@@ -199,6 +199,26 @@ LEFT JOIN mangos.quest_template qt ON qt.entry = cq.quest
   AND qt.patch = (SELECT MAX(p.patch) FROM mangos.quest_template p WHERE p.entry = cq.quest)
 WHERE cq.rewarded = 0 AND cq.status IN (1, 3, 5)
 ORDER BY FIELD(cq.status, 1, 3, 5), qt.QuestLevel, cq.quest"""
+  ## Army-wide quest board: open log + rewarded rows. Foundation seats
+  ## match the Inventory tab hide list. rewarded=1 is a turned-in quest;
+  ## status 1/3/5 with rewarded=0 is still on the log.
+  ArmyQuestSql* = """SELECT c.name, cq.quest, cq.status, cq.rewarded,
+cq.mob_count1, cq.mob_count2, cq.mob_count3, cq.mob_count4,
+cq.item_count1, cq.item_count2, cq.item_count3, cq.item_count4,
+COALESCE(NULLIF(qt.Title, ''), CONCAT('Quest#', cq.quest)),
+COALESCE(qt.QuestLevel, 0),
+COALESCE(qt.ReqCreatureOrGOCount1, 0), COALESCE(qt.ReqCreatureOrGOCount2, 0),
+COALESCE(qt.ReqCreatureOrGOCount3, 0), COALESCE(qt.ReqCreatureOrGOCount4, 0),
+COALESCE(qt.ReqItemCount1, 0), COALESCE(qt.ReqItemCount2, 0),
+COALESCE(qt.ReqItemCount3, 0), COALESCE(qt.ReqItemCount4, 0)
+FROM character_queststatus cq
+INNER JOIN characters c ON c.guid = cq.guid
+LEFT JOIN mangos.quest_template qt ON qt.entry = cq.quest
+  AND qt.patch = (SELECT MAX(p.patch) FROM mangos.quest_template p WHERE p.entry = cq.quest)
+WHERE c.name NOT IN ('Botmage', 'Botpriest', 'Botrogue', 'Botshaman',
+  'Botwarrior', 'Cowcam', 'Nightsun')
+  AND (cq.rewarded = 1 OR cq.status IN (1, 3, 5))
+ORDER BY c.name, cq.rewarded DESC, FIELD(cq.status, 1, 3, 5), cq.quest"""
   ## Live addon events only; history stays in the log file.
   EventRingCap = 1000
   ## How often the Chat.log tailer polls for new bytes.
@@ -322,6 +342,23 @@ type
     status*: string ## "complete" | "active" | "failed"
     statusCode*: int ## raw VMaNGOS QuestStatus
     progress*: string ## short objective progress ("3/10 · 1/5")
+
+  ArmyQuestEntry* = object
+    ## One quest row on the army board (open log or rewarded).
+    name*: string
+    questId*: int
+    title*: string
+    level*: int
+    state*: string ## "rewarded" | "ready" | "active" | "failed"
+    progress*: string
+
+  ArmyQuestBoard* = object
+    ## Realm quest board + bot-only turn-in counts (Murist excluded).
+    rows*: seq[ArmyQuestEntry]
+    rewarded*: int
+    ready*: int
+    active*: int
+    failed*: int
 
   TraverseCharacter* = object
     ## Northbound fixture row from the traverse scenario characters DB.
@@ -977,6 +1014,65 @@ proc parseQuestLogTsv*(tsv: string): seq[QuestLogEntry] =
 proc listCharacterQuests*(name: string): seq[QuestLogEntry] =
   ## Active (unrewarded) quest log for one character. SELECT only.
   result = parseQuestLogTsv(dockerMariadbSelect(questLogSqlFor(name)))
+
+proc armyQuestState*(rewarded, status: int): string =
+  ## Board label: turned-in beats log status.
+  if rewarded != 0:
+    return "rewarded"
+  result = case status
+    of 1: "ready"
+    of 3: "active"
+    of 5: "failed"
+    else: "other"
+
+proc parseArmyQuestTsv*(tsv: string): seq[ArmyQuestEntry] =
+  ## Parse army-quest TSV (22 columns) into board rows.
+  result = @[]
+  for line in tsv.splitLines():
+    if line.len == 0:
+      continue
+    let cols = line.split('\t')
+    if cols.len < 22:
+      continue
+    try:
+      var mobCur, mobNeed, itemCur, itemNeed: array[4, int]
+      for i in 0 .. 3:
+        mobCur[i] = parseInt(cols[4 + i])
+        itemCur[i] = parseInt(cols[8 + i])
+        mobNeed[i] = parseInt(cols[14 + i])
+        itemNeed[i] = parseInt(cols[18 + i])
+      let rewarded = parseInt(cols[3])
+      let status = parseInt(cols[2])
+      let progress =
+        if rewarded != 0: ""
+        else: formatQuestProgress(mobCur, mobNeed, itemCur, itemNeed)
+      result.add(ArmyQuestEntry(
+        name: cols[0],
+        questId: parseInt(cols[1]),
+        state: armyQuestState(rewarded, status),
+        title: cols[12],
+        level: parseInt(cols[13]),
+        progress: progress
+      ))
+    except ValueError:
+      discard
+
+proc tallyArmyQuestBoard*(rows: seq[ArmyQuestEntry]): ArmyQuestBoard =
+  ## Count bot rows only (Murist is the human seat).
+  result.rows = rows
+  for row in rows:
+    if row.name == AdminRequesterName:
+      continue
+    case row.state
+    of "rewarded": inc result.rewarded
+    of "ready": inc result.ready
+    of "active": inc result.active
+    of "failed": inc result.failed
+    else: discard
+
+proc listArmyQuests*(): ArmyQuestBoard =
+  ## Army quest board. SELECT only.
+  result = tallyArmyQuestBoard(parseArmyQuestTsv(dockerMariadbSelect(ArmyQuestSql)))
 
 proc xpProgress*(xp, nextLevelXp: int): tuple[toLevel, pct: int] =
   ## Derive remaining XP and 0..100 percent into the current level.
@@ -5926,6 +6022,7 @@ proc navTabClass(active, tab: string): string =
 proc renderNav*(active: string): string =
   ## Tab strip: Army | Murist | Inventory | Advisor | Traverse | Admin.
   let army = navTabClass(active, "army")
+  let quests = navTabClass(active, "quests")
   let murist = navTabClass(active, "murist")
   let inventory = navTabClass(active, "inventory")
   let advisor = navTabClass(active, "advisor")
@@ -5934,6 +6031,7 @@ proc renderNav*(active: string): string =
   result = &"""
 <nav class="tabs" role="tablist">
   <a{army} href="/army" role="tab">Army</a>
+  <a{quests} href="/quests" role="tab">Quests</a>
   <a{murist} href="/murist" role="tab">Murist</a>
   <a{inventory} href="/inventory" role="tab">Inventory</a>
   <a{advisor} href="/advisor" role="tab">Advisor</a>
@@ -6120,6 +6218,79 @@ proc renderQuestRows*(quests: seq[QuestLogEntry], realmOffline = false): string 
         <td class="payload">{progress}</td>
       </tr>
 """)
+
+proc renderArmyQuestSummary*(board: ArmyQuestBoard, realmOffline = false): string =
+  ## Strip: bot rewarded / ready / active + turn-in rate.
+  if realmOffline:
+    return ""
+  let denom = board.rewarded + board.ready + board.active + board.failed
+  let pct = if denom == 0: 0 else: (board.rewarded * 100) div denom
+  result = &"""<span class="army-summary">{board.rewarded} rewarded · {board.ready} ready · {board.active} active · {pct}% done</span>"""
+
+proc renderArmyQuestRows*(board: ArmyQuestBoard, realmOffline = false): string =
+  ## Army quest table body.
+  if realmOffline:
+    return """<tr><td colspan="6" class="empty">Realm offline — start on <a href="/admin">Admin</a>.</td></tr>"""
+  if board.rows.len == 0:
+    return """<tr><td colspan="6" class="empty">No quests.</td></tr>"""
+  result = ""
+  for q in board.rows:
+    let statusCls =
+      case q.state
+      of "rewarded": "badge ok"
+      of "ready": "badge accent"
+      of "failed": "badge bad"
+      of "active": "badge"
+      else: "badge"
+    let progress = if q.progress.len > 0: escapeHtml(q.progress) else: "—"
+    result.add(&"""
+      <tr>
+        <td class="name">{escapeHtml(q.name)}</td>
+        <td class="lvl">{q.level}</td>
+        <td class="name">{escapeHtml(q.title)}</td>
+        <td class="meta">#{q.questId}</td>
+        <td><span class="{statusCls}">{escapeHtml(q.state)}</span></td>
+        <td class="payload">{progress}</td>
+      </tr>
+""")
+
+proc renderQuestsPage*(board: ArmyQuestBoard, realmOffline = false): string =
+  ## Quests tab: army accepted vs rewarded.
+  let summary = renderArmyQuestSummary(board, realmOffline = realmOffline)
+  let rows = renderArmyQuestRows(board, realmOffline = realmOffline)
+  let body = &"""
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Quests</h2>
+        <div class="panel-actions"
+             id="quests-summary"
+             hx-get="/quests/summary"
+             hx-trigger="every {PollSeconds}s"
+             hx-swap="innerHTML settle:0s swap:0s">{summary}</div>
+      </div>
+      <div class="table-scroll">
+      <table>
+        <thead>
+          <tr>
+            <th>Seat</th>
+            <th>Lvl</th>
+            <th>Title</th>
+            <th>Id</th>
+            <th>State</th>
+            <th>Progress</th>
+          </tr>
+        </thead>
+        <tbody
+           hx-get="/quests/all"
+           hx-trigger="every {PollSeconds}s"
+           hx-swap="innerHTML settle:0s swap:0s">
+{rows}
+        </tbody>
+      </table>
+      </div>
+    </section>
+"""
+  result = renderDashboard("Quests", "quests", body)
 
 proc renderMuristPage*(
     murist: Option[Character],
@@ -6723,6 +6894,49 @@ proc muristQuestsHandler(request: Request) {.gcsafe.} =
     request.respond(500, htmlHeaders(),
       &"""<tr><td colspan="5" class="empty">error: {escapeHtml(e.msg)}</td></tr>""")
 
+proc loadArmyQuestBoard(): tuple[board: ArmyQuestBoard, realmOffline: bool] =
+  ## Shared fetch for the Quests tab + MCP.
+  result.realmOffline = true
+  result.board = ArmyQuestBoard()
+  {.gcsafe.}:
+    let status = serverStatus()
+    if status.running:
+      try:
+        result.board = listArmyQuests()
+        result.realmOffline = false
+      except CatchableError:
+        result.realmOffline = true
+
+proc questsPageHandler(request: Request) {.gcsafe.} =
+  ## GET /quests — army accepted vs rewarded.
+  try:
+    let loaded = loadArmyQuestBoard()
+    request.respond(200, htmlHeaders(),
+      renderQuestsPage(loaded.board, realmOffline = loaded.realmOffline))
+  except Exception as e:
+    request.respond(500, htmlHeaders(),
+      &"<!DOCTYPE html><html><body><h1>Quests error</h1><pre>{escapeHtml(e.msg)}</pre></body></html>")
+
+proc questsAllHandler(request: Request) {.gcsafe.} =
+  ## GET /quests/all — htmx fragment: army quest rows.
+  try:
+    let loaded = loadArmyQuestBoard()
+    request.respond(200, htmlHeaders(),
+      renderArmyQuestRows(loaded.board, realmOffline = loaded.realmOffline))
+  except Exception as e:
+    request.respond(500, htmlHeaders(),
+      &"""<tr><td colspan="6" class="empty">error: {escapeHtml(e.msg)}</td></tr>""")
+
+proc questsSummaryHandler(request: Request) {.gcsafe.} =
+  ## GET /quests/summary — htmx fragment: bot turn-in strip.
+  try:
+    let loaded = loadArmyQuestBoard()
+    request.respond(200, htmlHeaders(),
+      renderArmyQuestSummary(loaded.board, realmOffline = loaded.realmOffline))
+  except Exception as e:
+    request.respond(500, htmlHeaders(),
+      &"""<span class="empty">error: {escapeHtml(e.msg)}</span>""")
+
 proc muristEventsHandler(request: Request) {.gcsafe.} =
   ## GET /murist/events — htmx fragment: Murist-only addon event rows.
   try:
@@ -7110,6 +7324,8 @@ proc serverInfoHandler(request: Request) {.gcsafe.} =
       "version": gMcpServer.serverInfo.version,
       "endpoints": {
         "army": "/army",
+        "quests": "/quests",
+        "quests_all": "/quests/all",
         "murist": "/murist",
         "inventory": "/inventory",
         "inventory_all": "/inventory/all",
@@ -7144,7 +7360,7 @@ proc serverInfoHandler(request: Request) {.gcsafe.} =
         "list_characters", "addon_events", "reload_addon", "send_announce",
         "respawn_shadow_army", "tele_party_to_murist",
         "server_status", "start_server", "stop_server",
-        "start_bot", "stop_bot"
+        "start_bot", "stop_bot", "army_quests"
       ],
       "write_scope": "SOAP announce + admin revive/tele/tele-to-murist for fixed bot seats + realm lifecycle up/down + bot seat start/stop (local ops)"
     }
@@ -7581,8 +7797,49 @@ proc registerMcpTools(server: McpServer) =
   server.registerRichTool(seatWatchTool, seatWatchMcpHandler)
   server.registerRichTool(inventoryTool, characterInventoryMcpHandler)
   server.registerRichTool(requestInventoryTool, requestInventoryMcpHandler)
+  let armyQuestsTool = McpTool(
+    name: "army_quests",
+    description: "Army quest board: accepted vs rewarded (character_queststatus). Hides foundation seats. Bot counts exclude Murist.",
+    inputSchema: %*{
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false,
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    }
+  )
+
+  proc armyQuestsMcpHandler(arguments: JsonNode): ToolResult {.gcsafe.} =
+    ## Same board as GET /quests.
+    discard arguments
+    var board: ArmyQuestBoard
+    {.gcsafe.}:
+      board = listArmyQuests()
+    var rows = newJArray()
+    for row in board.rows:
+      rows.add(%*{
+        "name": row.name,
+        "quest_id": row.questId,
+        "title": row.title,
+        "level": row.level,
+        "state": row.state,
+        "progress": row.progress
+      })
+    let payload = %*{
+      "rewarded": board.rewarded,
+      "ready": board.ready,
+      "active": board.active,
+      "failed": board.failed,
+      "rows": rows
+    }
+    result = ToolResult(
+      content: @[textContent($payload)],
+      structuredContent: some(payload),
+      isError: false
+    )
+
   server.registerRichTool(startBotTool, startBotMcpHandler)
   server.registerRichTool(stopBotTool, stopBotMcpHandler)
+  server.registerRichTool(armyQuestsTool, armyQuestsMcpHandler)
 
 proc httpPort*(): int =
   ## Listen port. SYSTEM_HTTP_PORT exists so an isolated instance (fake
@@ -7607,6 +7864,9 @@ proc main() =
   var router: Router
   router.get("/", armyPageHandler)
   router.get("/army", armyPageHandler)
+  router.get("/quests", questsPageHandler)
+  router.get("/quests/all", questsAllHandler)
+  router.get("/quests/summary", questsSummaryHandler)
   router.get("/murist", muristPageHandler)
   router.get("/murist/status", muristStatusHandler)
   router.get("/murist/quests", muristQuestsHandler)

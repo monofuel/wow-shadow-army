@@ -5,6 +5,7 @@ Management server for the wow-shadow-army: one Nim binary, many interfaces.
 | Interface | Path | Role |
 |---|---|---|
 | Army tab | `GET /` / `GET /army` | roster (offline-safe) |
+| Quests tab | `GET /quests` | army accepted vs rewarded |
 | Murist tab | `GET /murist` | human seat metrics + Murist events |
 | Inventory tab | `GET /inventory` | realm-wide bags, item-centric (characters DB) |
 | Advisor tab | `GET /advisor` | addon event tail + reload |
@@ -96,8 +97,9 @@ Optional env:
 
 Open http://127.0.0.1:7777/ (aliases `/army`).
 
-Tabs in the header: **Army** | **Murist** | **Advisor** | **Admin**.
+Tabs in the header: **Army** | **Quests** | **Murist** | **Advisor** | **Admin**.
 
+- **Quests** (`GET /quests`) — army quest board from `character_queststatus`: **rewarded** (turned in), **ready** (objectives done, not turned in), **active**, **failed**. Strip is bot-only (Murist excluded). Polls `GET /quests/all` + `GET /quests/summary`.
 - **Army** (`GET /army`) — roster only (hides foundation `Bot*` / Nightsun / Cowcam). Order: Murist → Shadowfel → Igris → Tusk → Beru, then others. Columns: name · level · XP · **HP/MP** · class · **zone** · **pos** · gold · **life** · **seat** · **bot** Start/Stop. Panel head shows army strip (`N online · alive/ghost/dead · ctrl k/n`). Polls `GET /roster` every few seconds via htmx. MCP `list_characters` still accepts `include_foundation=true` for the full realm.
 - **Army → Seat watch** — babysitter row per home seat, **whole fleet**: the four dedicated seats first, then every row of `tools/data/home_army_roster.tsv`. Light (green live / amber starting / grey stopped / **red wedged**), heartbeat age, auto-restarts this hour, last action, wedge evidence file. Panel head counts `N/M live · X wedged`. Polls `GET /seats`; a seat that burned its restart budget shows a persistent red alert banner. See "Seat babysitter" below.
 - **Murist** (`GET /murist`) — human seat snapshot (level, class, race, gold, zone, pos, XP, vitals, life/online) + **quest log** (unrewarded: complete/active/failed + objective progress) + **bags** (chat-bus inventory: item, id, qty, vendor sell/value, data age) + Murist-only addon events. Polls `GET /murist/status`, `GET /murist/quests`, `GET /murist/inventory`, `GET /murist/events`.

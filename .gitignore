@@ -13,6 +13,41 @@ nimcache/
 local_classic/
 captures/
 
+# Game-derived outputs stay local; see AGENTS.md copyright hygiene.
+/system/static/icons/
+/addons/ShadowArmy/*Data.lua
+/lua/data/bot_quest_hubs.lua
+/lua/data/bot_roads.lua
+/lua/config/traverse*beats.json
+/lua/config/traverse*beats.lua
+/lua/tests/traverse_route_fixture.lua
+/tools/data/road_waypoints_*.jsonl
+/tools/data/spawns_*.tsv
+/tools/traverse_checkpoints.json
+/tests/fixtures/frames/
+/tools/fixtures/clientview/
+/tools/tests/fixtures/godview_fixture.jsonl
+/tools/tests/fixtures/thousand_needles_blue_reference.json
+/scores/traverse.jsonl
+/docs/postmortems/2026-08-15-asset-server-attachments/tusk-wedge-log-excerpt.txt
+/bot_notes/
+*.mpq
+*.blp
+*.dbc
+*.adt
+*.wdt
+*.wdl
+*.m2
+*.wmo
+*.state
+*.srm
+*.pcap
+*.pcapng
+*.png
+*.wav
+*.ogg
+*.mp3
+
 # Built binaries (compile with `make army-host-build` / nim c)
 tools/army_host
 tools/player_bin

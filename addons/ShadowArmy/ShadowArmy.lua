@@ -54,6 +54,61 @@ local function questZoneHere(q, spotZone, header, currentZone, zoneNames)
   return false
 end
 
+-- WorldMapArea (map 0). mx=(L-wy)/(L-R)*100  my=(T-wx)/(T-B)*100
+-- wy=L-mx/100*(L-R)  wx=T-my/100*(T-B)
+local QUEST_WMA = {
+  [85] = { L = 3033.3, R = -1485.4, T = 3837.5, B = 825.0 },
+  [1497] = { L = 873.2, R = -86.2, T = 1877.9, B = 1237.8 },
+}
+
+local QUEST_CITY_PARENT = {
+  [1497] = 85,
+}
+
+local function questOverlayLinked(a, b)
+  return a and b and (QUEST_CITY_PARENT[a] == b or QUEST_CITY_PARENT[b] == a)
+end
+
+local function questZoneIdByName(name, zoneNames)
+  if not name or name == "" or not zoneNames then return nil end
+  local found = nil
+  for id, n in pairs(zoneNames) do
+    if n == name and ((not found) or id < found) then
+      found = id
+    end
+  end
+  return found
+end
+
+local function questOverlayPercent(fromZone, x, y, toZone)
+  if not fromZone or not toZone or fromZone == toZone then return nil end
+  if not questOverlayLinked(fromZone, toZone) then return nil end
+  if not x or not y then return nil end
+  local src, dst = QUEST_WMA[fromZone], QUEST_WMA[toZone]
+  if not src or not dst then return nil end
+  local wy = src.L - (x / 100) * (src.L - src.R)
+  local wx = src.T - (y / 100) * (src.T - src.B)
+  local mx = (dst.L - wy) / (dst.L - dst.R) * 100
+  local my = (dst.T - wx) / (dst.T - dst.B) * 100
+  if mx >= 0 and mx <= 100 and my >= 0 and my <= 100 then
+    return mx, my
+  end
+  return nil
+end
+
+local function questLocalSpot(q, spotZone, x, y, header, currentZone, zoneNames)
+  if not x or not y then return nil end
+  local hereId = questZoneIdByName(currentZone, zoneNames)
+  if spotZone and hereId and spotZone ~= hereId then
+    local mx, my = questOverlayPercent(spotZone, x, y, hereId)
+    if mx then return mx, my end
+  end
+  if questZoneHere(q, spotZone, header, currentZone, zoneNames) then
+    return x, y
+  end
+  return nil
+end
+
 local function questDistance(x, y, px, py, yardsX, yardsY)
   local dx = x - px
   local dy = y - py
@@ -363,15 +418,17 @@ function QuestModel.build(opts)
         obj.label = w.label or obj.label
         obj.text = "Turn in: " .. obj.label
         obj.zoneName = zoneNames and w.zone and zoneNames[w.zone] or nil
-        if pos and w.x and w.y
-            and questZoneHere(q, w.zone, lq.header or "", currentZone, zoneNames) then
+        local lx, ly = questLocalSpot(
+          q, w.zone, w.x, w.y, lq.header or "", currentZone, zoneNames)
+        if pos and lx then
+          obj.zoneName = currentZone
           obj.dist, obj.dx, obj.dy = questDistance(
-            w.x, w.y, pos.x, pos.y, yardsX, yardsY)
+            lx, ly, pos.x, pos.y, yardsX, yardsY)
           entry.minDist = obj.dist
           seq = seq + 1
           candidates[questGetn(candidates) + 1] = {
             questKey = entry.key, title = entry.title, label = obj.label,
-            x = w.x, y = w.y, dx = obj.dx, dy = obj.dy, dist = obj.dist,
+            x = lx, y = ly, dx = obj.dx, dy = obj.dy, dist = obj.dist,
             turnIn = true, tracked = entry.tracked, seq = seq,
           }
         end
@@ -404,18 +461,20 @@ function QuestModel.build(opts)
             local si = 1
             while si <= questGetn(spots) do
               local s = spots[si]
-              if s.x and s.y
-                  and questZoneHere(q, s.zone, lq.header or "", currentZone, zoneNames) then
+              local lx, ly = questLocalSpot(
+                q, s.zone, s.x, s.y, lq.header or "", currentZone, zoneNames)
+              if lx then
                 local dist, dx, dy = questDistance(
-                  s.x, s.y, pos.x, pos.y, yardsX, yardsY)
+                  lx, ly, pos.x, pos.y, yardsX, yardsY)
                 if not obj.dist or dist < obj.dist then
                   obj.dist, obj.dx, obj.dy = dist, dx, dy
                 end
                 seq = seq + 1
+                obj.zoneName = currentZone
                 candidates[questGetn(candidates) + 1] = {
                   questKey = entry.key, title = entry.title, label = obj.label,
                   have = obj.have, need = obj.need,
-                  x = s.x, y = s.y, dx = dx, dy = dy, dist = dist,
+                  x = lx, y = ly, dx = dx, dy = dy, dist = dist,
                   turnIn = false, tracked = entry.tracked, seq = seq,
                 }
               end
@@ -448,14 +507,16 @@ function QuestModel.build(opts)
         -- 8-line panel leaves it to the map.
         local pending = nBoards > 0
         dobj.pending = pending
-        if pos and w.x and w.y
-            and questZoneHere(q, w.zone, lq.header or "", currentZone, zoneNames) then
+        local lx, ly = questLocalSpot(
+          q, w.zone, w.x, w.y, lq.header or "", currentZone, zoneNames)
+        if pos and lx then
+          dobj.zoneName = currentZone
           dobj.dist, dobj.dx, dobj.dy = questDistance(
-            w.x, w.y, pos.x, pos.y, yardsX, yardsY)
+            lx, ly, pos.x, pos.y, yardsX, yardsY)
           seq = seq + 1
           candidates[questGetn(candidates) + 1] = {
             questKey = entry.key, title = entry.title, label = dobj.label,
-            x = w.x, y = w.y, dx = dobj.dx, dy = dobj.dy, dist = dobj.dist,
+            x = lx, y = ly, dx = dobj.dx, dy = dobj.dy, dist = dobj.dist,
             turnIn = true, delivery = true, pending = pending,
             tracked = entry.tracked, seq = seq,
           }
@@ -632,6 +693,7 @@ function QuestModel.fromText(from, maxNames, maxChars, more)
   return s
 end
 
+QuestModel.overlayPercent = questOverlayPercent
 ShadowArmy.questModel = QuestModel
 
 --------------------------------------------------------------------------
@@ -2279,7 +2341,7 @@ local F = {}
 
 -- Bump on every edit. The System watches Chat.log for "<SA> loaded rev=..."
 -- after sending a reload — a new rev proves the edit actually loaded.
-local REV = "r56"
+local REV = "r58"
 
 -- Log window (r16): every F.say()/F.emit() line also lands here with a
 -- timestamp, so errors survive chat scroll-off and can be reviewed in-game.
@@ -6819,7 +6881,7 @@ end
 
 do
   local HUD_W, HUD_H = 190, 164
-  local HUD_TOP_Y = -140       -- default: under the buff bar, above the fray
+  local HUD_TOP_Y = -52        -- top-center; keep the widget out of the world
   local HUD_PIP_MAX = 16       -- pool; the presets need 8 (art) and 12 (no art)
   local HUD_NORTH_R = 56       -- the "N" tick's radius, px
 
@@ -6847,7 +6909,7 @@ do
   hudFrame:RegisterForDrag("LeftButton")
   hudFrame:SetScript("OnDragStart", function() hudFrame:StartMoving() end)
   hudFrame:SetScript("OnDragStop", function() hudFrame:StopMovingOrSizing() end)
-  hudFrame:Show()
+  hudFrame:Hide()
 
   -- The needle's origin. Sits above centre so the three text rows below it
   -- clear the tip even when the arrow points straight down.
@@ -6875,14 +6937,17 @@ do
 
   local hudQuestText = hudFrame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
   hudQuestText:SetPoint("BOTTOM", hudFrame, "BOTTOM", 0, 34)
+  hudQuestText:SetWidth(HUD_W - 12)
   hudQuestText:SetJustifyH("CENTER")
 
   local hudDistText = hudFrame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
   hudDistText:SetPoint("BOTTOM", hudFrame, "BOTTOM", 0, 18)
+  hudDistText:SetWidth(HUD_W - 12)
   hudDistText:SetJustifyH("CENTER")
 
   local hudNoteText = hudFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
   hudNoteText:SetPoint("BOTTOM", hudFrame, "BOTTOM", 0, 4)
+  hudNoteText:SetWidth(HUD_W - 12)
   hudNoteText:SetJustifyH("CENTER")
 
   -- Scratch texture for the capability probe below: never shown, never a pip,
@@ -6912,7 +6977,6 @@ do
   function F.hudReset()
     hudFrame:ClearAllPoints()
     hudFrame:SetPoint("TOP", UIParent, "TOP", 0, HUD_TOP_Y)
-    hudFrame:Show()
   end
 
   -- Why the needle is not on screen right now, or nil while it is. The panel
@@ -6975,9 +7039,8 @@ do
     hudNorth:Hide()
     hudQuestText:SetText("")
     hudDistText:SetText("")
-    -- Deliberately NOT silent: the one dim line is the whole point of r56's
-    -- diagnostic rule. /sa arrow off removes the frame entirely.
-    hudNoteText:SetText("|cFF777777" .. (reason or "no guidance") .. "|r")
+    hudNoteText:SetText("")
+    hudFrame:Hide()
   end
 
   -- Places the "N" tick, so player-relative rotation is visible rather than
@@ -7004,7 +7067,6 @@ do
       hudFrame:Hide()
       return
     end
-    hudFrame:Show()
     local model = ShadowArmy and ShadowArmy.hudModel
     if not model then
       hudBlank("hud model unavailable")
@@ -7023,10 +7085,6 @@ do
     end
     local t = quest.target
     if not t then
-      -- r54 taught this one: a log full of CROSS-ZONE quests produces no
-      -- target at all, and "no target" on a full quest log reads as a broken
-      -- addon. The away list already knows where those quests actually are,
-      -- so the arrow says the zone name instead of shrugging.
       local a = quest.away and quest.away[1]
       if a and a.zoneName then
         hudBlank("#" .. tostring(a.num) .. " is in " .. a.zoneName)
@@ -7050,6 +7108,7 @@ do
       return
     end
     hud.reason = nil
+    hudFrame:Show()
     local cfg = hud.art and model.needle or model.needleNoArt
     local pips, np = model.needlePips(ux, uy, cfg)
     local r, g, b = t.r or 1, t.g or 0.82, t.b or 0

@@ -522,4 +522,55 @@ cands = { { title = "third", dist = 40, pending = true } }
 check(model.pickTarget(list, cands).title == "third",
   "a pending delivery beats drawing nothing at all")
 
+-- Capital/parent overlay: Bethor sits in Undercity's box but QuestData
+-- often stores him as Tirisfal 65.7,68.8 (ZoneOrSort=85).
+local ucZones = { [85] = "Tirisfal Glades", [1497] = "Undercity" }
+local bx, by = model.overlayPercent(85, 65.7, 68.8, 1497)
+check(bx and by, "Bethor Tirisfal 65.7,68.8 remaps into Undercity")
+check(bx > 83.5 and bx < 85.0 and by > 16.8 and by < 18.2,
+  "Bethor remaps near UC 84.1,17.4")
+local rx, ry = model.overlayPercent(1497, 84.1, 17.4, 85)
+check(rx and ry and rx > 65.0 and rx < 66.5 and ry > 68.0 and ry < 69.5,
+  "inverse UC 84.1,17.4 remaps onto Tirisfal ruins")
+check(model.overlayPercent(85, 61.3, 50.8, 1497) == nil,
+  "Brill does not become an Undercity pin")
+
+local lichTirisfal = {
+  ["The Prodigal Lich"] = {
+    zone = 85,
+    turnIn = { label = "Bethor Iceshard", zone = 85, x = 65.7, y = 68.8 },
+  },
+}
+r = model.build({
+  quests = { { title = "The Prodigal Lich", header = "Tirisfal Glades",
+    complete = true } },
+  data = lichTirisfal, zoneNames = ucZones, currentZone = "Undercity",
+  pos = { x = 84.0, y = 17.0 },
+})
+check(#r.candidates == 1, "in Undercity, Tirisfal-coded Bethor is an in-zone pin")
+check(r.candidates[1].x > 83 and r.candidates[1].x < 85
+    and r.candidates[1].y > 16.5 and r.candidates[1].y < 18.5,
+  "the pin uses remapped Undercity percent")
+check(model.pickTarget(r.list, r.candidates) ~= nil,
+  "a remapped in-zone target exists so the HUD needle stays up")
+check(#model.awayRows(r.list, "Undercity") == 0,
+  "remapped Bethor is not a breadcrumb")
+
+local lichUC = {
+  ["The Prodigal Lich"] = {
+    zone = 85,
+    turnIn = { label = "Bethor Iceshard", zone = 1497, x = 84.1, y = 17.4 },
+  },
+}
+r = model.build({
+  quests = { { title = "The Prodigal Lich", header = "Tirisfal Glades",
+    complete = true } },
+  data = lichUC, zoneNames = ucZones, currentZone = "Tirisfal Glades",
+  pos = { x = 61.0, y = 52.0 },
+})
+check(#r.candidates == 1,
+  "in Tirisfal, Undercity-coded Bethor remaps onto the ruins overlay")
+check(r.candidates[1].x > 65.0 and r.candidates[1].x < 66.5,
+  "inverse pin is on the Tirisfal map")
+
 print("test_advisor_quest_model: " .. passed .. " checks passed")
