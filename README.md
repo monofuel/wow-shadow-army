@@ -1,114 +1,95 @@
-# wow-shadow-army
+# WoW Shadow Army
 
-Solo-leveling bot army for `coworld-vanilla-wow`. One human (monofuel) plus
-a population of persona bots — combat shadows and industry shadows — built
-on the game's typed control boundary.
+Bot policies, a player companion addon, and development tools for autonomous
+play in classic World of Warcraft (1.12). Built during Softmax's WoW Coworld
+experiments, the project explores solo leveling, navigation, and a party of
+bots playing alongside a human.
 
-Plan and doctrine: `coworld-playbook/games/solo-leveling.md`.
-Architecture target: racha_notes `AI/game_bots/architecture.md` (three
-layers: knowledgebase / Lua tool library / LLM planner).
+Gameplay policies are written in **Lua**. **Nim** powers the dashboard,
+experiment orchestration, and map viewer, as well as the separate game client
+that hosts the bots.
 
-## Where this sits
+**Current status: source available for review; runtime restoration pending.**
+The `master` branch and its history have been cleaned of extracted game
+assets, generated game datasets, and captured fixtures. Some code still
+expects those local inputs, and the build and launch paths need restoration.
+This checkout is not currently a verified, ready-to-run distribution.
 
-Our bots run inside `../monofuel-vanilla-wow` — a thin fork of the upstream
-Nim client kept as close to upstream as possible. The fork adds one generic
-**lua-bot** identity (`bots/lua_bot/`, gated behind `-d:luaBotVm`) that
-embeds a Lua 5.3 VM, mirrors the typed Observation into a snake_case view,
-and executes declarative intents through upstream capabilities (the
-RealPlayerBot route engine does all pathing). The brains live here, in
-`lua/entry/*.lua`; flexibility belongs in the Lua, not the host.
+## What the project explores
 
-```
-knowledgebase (kb/)          <- bot memory: reserved, empty, unbuilt
-LLM planner (later)          <- goal selection, toolsmithing
-Lua brains (lua/entry/)      <- decide(view) -> typed intents, per league
-────────── embedded Lua 5.3 VM (-d:luaBotVm) ──────────
-lua-bot host                 <- ../monofuel-vanilla-wow bots/lua_bot/: view, intent, execution
-────────── WoW 1.12 protocol over ws bridge ──────────
-VMaNGOS realm
-```
+- **Party assistance:** bots follow a human player, assist in combat, perform
+  class roles such as tanking and healing, and recover after death. The home
+  policy falls back to solo leveling when the human is absent.
+- **Solo leveling:** policies select combat targets, manage resources, loot,
+  and optionally interact with quests.
+- **World traversal:** a navigation policy handles running, swimming,
+  shapeshifting, and recovery while crossing a continent.
+- **Observation and iteration:** a player addon, dashboard, and map viewer
+  help inspect behavior; experiment tooling evaluates proposed code changes.
 
-## Upstream pin
+## Start reading here
 
-`upstream.lock` records the `coworld-vanilla-wow` commit we build/test
-against. The upstream checkout lives as a sibling:
-`../coworld-vanilla-wow`. Move the pin deliberately; upstream moves fast.
+| Component | Source | What to look for |
+|---|---|---|
+| Party policy | [home.lua](lua/entry/home.lua) | Following, combat roles, party support, and solo fallback |
+| Leveling policy | [accelerated.lua](lua/entry/accelerated.lua) | Target selection, resource management, and optional quest behavior |
+| Traversal policy | [traverse.lua](lua/entry/traverse.lua) | Navigation decisions, movement forms, and failure handling |
+| Shared Lua tools | [lua/tools/](lua/tools/) | Movement, quest interaction, item decisions, and road routing |
+| Shadow Advisor addon | [ShadowArmy.lua](addons/ShadowArmy/ShadowArmy.lua) | In-game player UI, inventory and quest helpers, and telemetry |
+| Dashboard and MCP server | [system_server.nim](system/system_server.nim) | Character status, inventory, addon events, and local administration |
+| Experiment conductor | [src/conductor/](src/conductor/) | Coding/review agents, evaluation gates, experiment records, and deployment controls |
+| Map browser | [map_browser.nim](src/tools/map_browser.nim) | Terrain and navigation overlays for debugging routes |
 
-## Layout
+Tests live alongside these components in [lua/tests/](lua/tests/),
+[system/tests/](system/tests/), and [tools/tests/](tools/tests/).
+Local data generators and operator utilities are in [tools/](tools/).
 
-- `lua/tools/` — named-intent tool library (the LLM-facing language)
-- `lua/entry/home.lua` — persistent-realm party/role/recovery policy
-- `lua/tests/` — fast unit tests, run by `make test` (must stay instant)
-- `tools/` — party promote, fair-play audit, traverse/replay tooling
-- `kb/` — bot memory for the future LLM planner (map facts, quest ids, tool
-  reliability). **Empty on purpose** — see `kb/README.md`
-- `bot_notes/` — Watcher field log: every death, live pathing/combat bugs.
-  See `bot_notes/README.md`. Not bot memory.
-- `docs/` — everything written for humans/agents on this repo: design notes,
-  protocol and upstream notes, postmortems (`docs/postmortems/`). Start with
-  `docs/interfaces.md` (the map of every boundary), then `docs/nim-client.md`
-  (the upstream client interface we code against), then `docs/v2.md`
-  (`docs/control-plane.md` is the v1-era design, kept as history)
+## How the bots fit into the game
 
-## Human quickstart
+The bots run inside a separate Nim client fork, `monofuel-vanilla-wow`,
+connected to a local VMaNGOS game server. Each bot character
+has its own client process and embedded Lua 5.3 VM.
 
-Play the local docker realm as a normal human (create level-1 characters,
-etc.). Full bring-up detail: `coworld-playbook/games/vanilla-wow.md`.
+The client exposes an observation of the game world to the Lua policy. The
+policy chooses an intent, such as following a party member or casting a spell;
+the client validates and executes it. Game protocol handling, perception,
+and movement mechanics belong to the client. This repository holds the
+policies and supporting tools.
 
-Prereqs (one-time, already done on high-steel): upstream checkout at
-`../coworld-vanilla-wow`, extracted VMaNGOS data + mysql dumps under its
-`local_data/`, and a built `coworld-vmangos:local` image.
+The Shadow Advisor is a separate addon for the human player's client. The
+dashboard collects status and addon events and exposes local management
+operations through a web UI and the Model Context Protocol (MCP).
 
-```sh
-# Terminal A — start realm (foreground logs; Ctrl-C detaches logs only)
-make start-server
+### Where AI is used
 
-# Once (or after a fresh DB wipe) — ensure the playtest account
-make account
+The gameplay policies in this checkout are scripted Lua decision logic.
+The conductor uses external coding and review agents to propose and evaluate
+changes to those policies, with software checks controlling acceptance.
 
-# Terminal B — native human client
-make play
+A gameplay LLM planner and durable bot knowledgebase were planned, but are
+not implemented here. The [kb/](kb/) directory documents that intended layer.
 
-# Separately, when the four bot seats should be online
-make home-army-start
-make home-army-status
-```
+## Dependencies and project status
 
-| Item | Value |
-|---|---|
-| Account | `monofuel` |
-| Password | `password` |
-| realmd | `127.0.0.1:3724` |
-| world | `127.0.0.1:8085` |
-| healthz | `http://127.0.0.1:8080` |
+The original development setup used Linux/NixOS, Nix development shells,
+Nim, Lua, Docker, a separate client/server checkout, and locally supplied
+game data. Parts of the tooling also depend on the surrounding development
+workspace. Standalone setup is part of the planned runtime restoration.
 
-- **Bot lifecycle:** realm start/stop and bot start/stop are intentionally
-  separate. `make home-army-start`, `home-army-status`, `home-army-stop`, and
-  `home-army-restart` manage only Shadowfel, Igris, Tusk, and Beru. They do not
-  create accounts or alter persistent realm data.
-- **Bot policy:** each headless client runs the embedded `lua-bot` with
-  `lua/entry/home.lua`. It accepts Murist's invite, promotes Murist when
-  necessary, follows/assists him, performs its class role, and recovers from
-  death. Without an observable grouped Murist it safely uses the solo
-  `accelerated` policy.
-- **Runtime state:** each seat writes under
-  `local_data/home-army/<Character>/` (`launcher.pid`, `launcher.log`,
-  `status/status.json`, and `observer/`). The System uses PID plus the fresh
-  Lua status heartbeat for liveness.
-- **Stop:** `make stop-server` (compose stop/rm of `coworld-game`). Never
-  `docker kill`. Ctrl-C on `make start-server` only detaches log follow —
-  containers keep running until `make stop-server`.
-- **Persistence:** MariaDB lives in a docker named volume
-  (`vmangos-coworld-db`). Accounts and characters survive `stop-server` /
-  restarts. Only `docker_vmangos_server.py down --volumes` or `up --fresh`
-  wipes state (not exposed by these targets).
-- **Unit tests:** `make test` stays local (no realm mutation): Lua tools under
-  `lua/tests/` + Nim tiers (`system/tests/`, `tools/tests/`) and existing
-  operator-script checks.
-  All build/test/run commands belong inside this repo's `nix develop` shell.
+The [interface overview](docs/interfaces.md) explains the client/policy
+boundary. More detail is available for the [addon](docs/advisor.md),
+[dashboard](system/README.md), [conductor](docs/conductor.md), and
+[map browser](docs/tools/map-browser.md). Some documents preserve earlier
+designs and commands; treat them as engineering references while restoration
+is pending.
 
-## Rules
+## Game data and licensing
 
-See `AGENTS.md`. Highlights: fair play (party cooperation only through facts
-the client observes), keep generic client-interface changes in
-`../monofuel-vanilla-wow`, and keep `make test` green before every commit.
+Game client binaries, artwork, audio, extracted databases, and generated game
+datasets are excluded from the shared source. Data generators remain in the
+repository; their inputs must be supplied locally and their outputs kept out
+of Git. See the [repository policy](AGENTS.md#copyright-hygiene-and-licensing)
+and [content cleanup record](docs/copyright-cleanup.md).
+
+No project source license has been selected yet. Third-party game content
+is not covered by any future source-code license for this project.
