@@ -34,8 +34,8 @@ must replay reviewed source changes without reintroducing excluded content.
 Future GitHub publication must use a fresh master-only clone and push only
 `refs/heads/master`; never mirror-push the original repository.
 
-No source license is selected or changed by this cleanup. The repository
-policy is a conservative content boundary, not a legal rights clearance.
+Source licensing is maintained separately in [LICENSE](../LICENSE). The
+repository policy does not grant rights to third-party game content.
 
 ## How to regenerate the verification
 

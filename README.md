@@ -91,5 +91,6 @@ repository; their inputs must be supplied locally and their outputs kept out
 of Git. See the [repository policy](AGENTS.md#copyright-hygiene-and-licensing)
 and [content cleanup record](docs/copyright-cleanup.md).
 
-No project source license has been selected yet. Third-party game content
-is not covered by any future source-code license for this project.
+The project's original source code and documentation are licensed under the
+[MIT License](LICENSE). Third-party dependencies and game content retain
+their own licenses and rights.
