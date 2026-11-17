@@ -4,8 +4,9 @@ Home for **Kalimdor Traverse** notes, plans, and version labels. Point new
 traverse writeups here instead of scattering under `docs/`.
 
 **Petrel** is our traverse bot. Same bot across every hosting era — the
-brain is `lua/entry/traverse.lua`, today running on the generic **lua-bot**
-host in `monofuel-vanilla-wow` (`--bot=lua-bot --lua-entry=traverse`),
+league brain is `lua/entry/petrel.lua` (`traverse.lua` is the newer home
+lineage), today running on the generic **lua-bot**
+host in `monofuel-vanilla-wow` (`--bot=lua-bot --lua-entry=petrel`),
 which replaced the earlier libpetrel `.so` / ClientView bridge plumbing.
 
 ## Speedrun doctrine (non-negotiable)

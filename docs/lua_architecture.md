@@ -95,8 +95,8 @@ Host selection (current: the **lua-bot** host in `monofuel-vanilla-wow`;
 
 | Context | Mode selection |
 |---|---|
-| Local accelerated | `--bot=lua-bot --lua-entry=accelerated` (`make accelerated-pol`) |
-| Local traverse (Petrel) | `--bot=lua-bot --lua-entry=traverse` (`make traverse-pol`) |
+| Local accelerated (Peregrine) | `--bot=lua-bot --lua-entry=peregrine` (`make accelerated-pol`) |
+| Local traverse (Petrel) | `--bot=lua-bot --lua-entry=petrel` (`make traverse-pol`) |
 | League player image | Container maps to one entry per league |
 | Tests | `lua/tests/test_*.lua` fake `_G.wow` and assert on intent tables |
 

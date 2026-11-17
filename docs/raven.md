@@ -5,7 +5,7 @@
 | Policy name | `raven` |
 | League | Persistent Leveling `league_778f16b8-1247-488e-a993-b48d6928b137` |
 | Character | undead / warlock / male |
-| Brain | lua-bot + `lua/entry/accelerated.lua` (general leveler) |
+| Brain | lua-bot + `lua/entry/peregrine.lua` (deployed leveler, quests off) |
 | Image | `make raven-image` → `raven:latest` |
 
 ## Local
