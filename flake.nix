@@ -28,6 +28,12 @@
         libGL
       ];
       libPath = pkgs.lib.makeLibraryPath runtimeLibs;
+      dockerfileLines = pkgs.lib.splitString "\n" (builtins.readFile ./Dockerfile);
+      nimVersionLine = pkgs.lib.findFirst
+        (line: pkgs.lib.hasPrefix "ARG NIM_VERSION=" line)
+        (throw "Dockerfile must pin NIM_VERSION")
+        dockerfileLines;
+      pinnedNim = pkgs.lib.removePrefix "ARG NIM_VERSION=" nimVersionLine;
     in {
       devShells.${system}.default = pkgs.mkShell {
         name = "wow-shadow-army";
@@ -67,6 +73,22 @@
           export LD_LIBRARY_PATH="${libPath}''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
           export LIBRARY_PATH="${pkgs.openssl.out}/lib:${pkgs.bzip2.out}/lib''${LIBRARY_PATH:+:$LIBRARY_PATH}"
           export C_INCLUDE_PATH="${pkgs.openssl.dev}/include''${C_INCLUDE_PATH:+:$C_INCLUDE_PATH}"
+          # Nim deps live in the dedicated wow-coworld Nimby global profile,
+          # shared with the client fork; config.nims reads its generated
+          # nim.cfg. Explicit overrides win.
+          export NIMBY_HOME="''${NIMBY_HOME:-$HOME/.nimby/profiles/wow-coworld}"
+          export NIMBY_PKGS_DIR="''${NIMBY_PKGS_DIR:-$NIMBY_HOME/pkgs}"
+          # Prefer the Nim the Dockerfile pins (the fork's pin too) over
+          # nixpkgs' nim, without touching the shared ~/.nimby/nim default.
+          for pinnedNimBin in "$NIMBY_HOME/nim-${pinnedNim}/bin" "$HOME/.nimby/nim-${pinnedNim}/bin"; do
+            if [ -x "$pinnedNimBin/nim" ]; then
+              export PATH="$pinnedNimBin:$PATH"
+              break
+            fi
+          done
+          if [ ! -x "$pinnedNimBin/nim" ]; then
+            echo "wow-shadow-army: Nim ${pinnedNim} missing; run nimby use ${pinnedNim}" >&2
+          fi
         '';
       };
     };
