@@ -1,4 +1,4 @@
-# Petrel — hosted Traverse policy (unheaded lua-bot + the traverse entry).
+# Petrel — hosted Traverse policy (unheaded lua-bot + the petrel entry).
 #
 # Base image is monofuel-vanilla-wow's lua_bot_player_runtime (vanilla-wow-player
 # built with -d:luaBotVm). Its CMD launches the unheaded embedded lua-bot from
@@ -7,11 +7,13 @@
 # crossing, fatigue swim, Merchant Bay, Barrens connector, painted northern
 # roads.
 #
-# Only tracked code is copied. The route beats in lua/config/ are local data
-# derived from world data and recorded play, so they never enter an image
-# layer. traverse.lua requires them at boot: this image does not run until an
-# operator mounts that directory read-only at runtime:
-#   -v <local>/lua/config:/opt/policy/lua/config:ro
+# Only tracked code is copied. Petrel's route beats (lua/config/petrel/) are
+# local data derived from world data and recorded play, so they never enter
+# an image layer. petrel.lua requires them at boot: this image does not run
+# until an operator mounts that directory read-only at runtime:
+#   -v <local>/lua/config/petrel:/opt/policy/lua/config/petrel:ro
+# It is therefore not a standalone hosted submission; the hosted platform
+# would have to supply that mount.
 #
 # Build (from this worktree, after the base image exists):
 #   make petrel-image
@@ -28,6 +30,6 @@ COPY lua/entry/ /opt/policy/lua/entry/
 COPY lua/tools/ /opt/policy/lua/tools/
 
 ENV COWORLD_LUA_REPO=/opt/policy
-ENV COWORLD_LUA_ENTRY=traverse
+ENV COWORLD_LUA_ENTRY=petrel
 # The wet chain is unconditional — the PETREL_SWIM gate was removed
 # outright after it shipped v1/v2/v3 with swim OFF (ticket 0015).

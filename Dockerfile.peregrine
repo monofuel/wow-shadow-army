@@ -1,4 +1,4 @@
-# Peregrine — Accelerated Leveling policy (unheaded lua-bot + grind entry).
+# Peregrine — Accelerated Leveling policy (unheaded lua-bot + peregrine entry).
 #
 # Base image is monofuel-vanilla-wow's lua_bot_player_runtime (vanilla-wow-player
 # built with -d:luaBotVm). Its CMD launches the unheaded embedded lua-bot from
@@ -6,9 +6,8 @@
 # code and locks the entry module.
 #
 # Only tracked code is copied. lua/data/ (generated quest-hub tables) is local
-# data and stays out of the image; accelerated.lua runs without it (seen-givers
-# only). An operator who has it can mount it read-only at runtime:
-#   -v <local>/lua/data:/opt/policy/lua/data:ro
+# data and stays out of the image; peregrine.lua requires nothing outside
+# lua/entry and never reads it. The image is code-only and runs as built.
 #
 # Build (from this worktree, after the base image exists):
 #   make peregrine-image
@@ -26,4 +25,4 @@ COPY lua/entry/ /opt/policy/lua/entry/
 COPY lua/tools/ /opt/policy/lua/tools/
 
 ENV COWORLD_LUA_REPO=/opt/policy
-ENV COWORLD_LUA_ENTRY=accelerated
+ENV COWORLD_LUA_ENTRY=peregrine

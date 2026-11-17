@@ -23,8 +23,14 @@ WOW_ENV := $(CURDIR)/tools/wow_env.sh
 
 # Our fork of the client: hosts the lua-bot identity that runs lua/entry/*.lua.
 FORK_CLIENT := $(abspath ../monofuel-vanilla-wow)
-# Lua entry module driven by the accelerated targets.
-ENTRY ?= accelerated
+# League policy entries (lua/entry/<module>.lua). Peregrine (ten-x) and
+# Raven (persistent) run the deployed leveler with quests off; Petrel (race)
+# runs the deployed traverse brain, whose route tables are local inputs under
+# lua/config/petrel/. Override to run another entry (accelerated, traverse,
+# home) through the same league launch.
+ENTRY ?= peregrine
+PERSISTENT_ENTRY ?= $(ENTRY)
+TRAVERSE_ENTRY ?= petrel
 # League launches (ten-x, persistent, race) run the fork launcher, which
 # provisions its own league realm. Home-realm and session overrides from this
 # Makefile or the calling shell are scrubbed so they cannot steer that realm
@@ -47,19 +53,30 @@ NATIVE_LAUNCH = $(if $(and $(wildcard $(LEAGUE_DATA)/dbc/.),$(wildcard $(LEAGUE_
 	env $(addprefix -u ,$(NATIVE_LAUNCH_UNSET)) \
 	VANILLA_WOW_EXTRACTED_DATA_DIR=$(LEAGUE_DATA) \
 	nix develop $(FORK_CLIENT) --command nim r tools/launch_nim_player.nim --
-# Lua-bot options are launcher options (before any second `--`); targets
-# append further launcher options such as --presentation or --proof-of-life.
+# $(call <X>_LAUNCH,<options>): lua-bot options and the call argument (e.g.
+# --presentation or --proof-of-life) are launcher options; the character a
+# league creates follows the second `--` as ordinary player options. The race
+# league keeps its premade character, so TRAVERSE_LAUNCH creates none and
+# targets append launcher options to it directly.
 # Hosted Accelerated is "accelerated"; local 10x launcher profile is ten-x.
+PEREGRINE_CHARACTER = --create-character-name=Peregrine \
+	--create-character-race=tauren --create-character-class=druid \
+	--create-character-gender=male
+RAVEN_CHARACTER = --create-character-name=Raven \
+	--create-character-race=undead --create-character-class=warlock \
+	--create-character-gender=male
 LUA_BOT_LAUNCH = $(NATIVE_LAUNCH) --league=ten-x \
-	--bot=lua-bot --lua-repo=$(CURDIR) --lua-entry=$(ENTRY)
+	--bot=lua-bot --lua-repo=$(CURDIR) --lua-entry=$(ENTRY) $(1) \
+	-- $(PEREGRINE_CHARACTER)
 # Persistent league local proof / smoke (1x durable profile).
 PERSISTENT_LAUNCH = $(NATIVE_LAUNCH) --league=persistent \
-	--bot=lua-bot --lua-repo=$(CURDIR) --lua-entry=$(ENTRY)
-# Same host, traverse league: Petrel runs as lua/entry/traverse.lua.
+	--bot=lua-bot --lua-repo=$(CURDIR) --lua-entry=$(PERSISTENT_ENTRY) $(1) \
+	-- $(RAVEN_CHARACTER)
+# Same host, traverse league: Petrel runs as lua/entry/petrel.lua.
 # Upstream renamed the leagues in the hosted-session protocol update
 # (2026-08-10): traverse -> race (same kalimdor_traversal scenario).
 TRAVERSE_LAUNCH = $(NATIVE_LAUNCH) --league=race \
-	--bot=lua-bot --lua-repo=$(CURDIR) --lua-entry=traverse \
+	--bot=lua-bot --lua-repo=$(CURDIR) --lua-entry=$(TRAVERSE_ENTRY) \
 	--lua-status-dir=$(CURDIR)/local_data/traverse-status
 
 # Local realm operator inputs (paths relative to UPSTREAM).
@@ -328,8 +345,8 @@ test-nim-soft:
 		echo "test-nim-soft: nim not on PATH — skip"; \
 	fi
 
-# Traverse tests run on the local recorded route when present (under
-# WSA_PRIVATE_INPUTS, default the repo root); the second pass keeps the
+# Traverse and petrel tests run on the local recorded route when present
+# (under WSA_PRIVATE_INPUTS, default the repo root); the second pass keeps the
 # synthetic route fixture exercised in that case too.
 test-lua:
 	@rc=0; for t in lua/tests/test_*.lua; do \
@@ -337,6 +354,12 @@ test-lua:
 	done; \
 	if [ -f "$${WSA_PRIVATE_INPUTS:-.}/lua/config/traverse_beats.lua" ]; then \
 		for t in lua/tests/test_traverse.lua lua/tests/test_traverse_wet.lua; do \
+			echo "== $$t (synthetic route)"; TRAVERSE_ROUTE=synthetic \
+				LUA_PATH="lua/?.lua;lua/entry/?.lua;lua/tools/?.lua;;" $(RUN_LUA) $$t || rc=1; \
+		done; \
+	fi; \
+	if [ -f "$${WSA_PRIVATE_INPUTS:-.}/lua/config/petrel/traverse_beats.lua" ]; then \
+		for t in lua/tests/test_petrel*.lua; do \
 			echo "== $$t (synthetic route)"; TRAVERSE_ROUTE=synthetic \
 				LUA_PATH="lua/?.lua;lua/entry/?.lua;lua/tools/?.lua;;" $(RUN_LUA) $$t || rc=1; \
 		done; \
@@ -422,19 +445,19 @@ EXTRA ?=
 # Full-length league episode (720 wall seconds at 10x) with the final score
 # read back from the bot's own status file.
 accelerated-episode:
-	@cd $(FORK_CLIENT) && timeout 900 $(LUA_BOT_LAUNCH) --presentation=unheaded || true
+	@cd $(FORK_CLIENT) && timeout 900 $(call LUA_BOT_LAUNCH,--presentation=unheaded) || true
 	@python3 tools/episode_score.py
-# Unheaded accelerated run of the lua-bot (ENTRY=<module>, default accelerated).
+# Unheaded accelerated run of the lua-bot (ENTRY=<module>, default peregrine).
 accelerated:
-	@cd $(FORK_CLIENT) && $(LUA_BOT_LAUNCH) --presentation=unheaded
+	@cd $(FORK_CLIENT) && $(call LUA_BOT_LAUNCH,--presentation=unheaded)
 
 # Bounded proof-of-life receipt for the lua-bot: the league admission gate.
 accelerated-pol:
-	@cd $(FORK_CLIENT) && $(LUA_BOT_LAUNCH) --proof-of-life
+	@cd $(FORK_CLIENT) && $(call LUA_BOT_LAUNCH,--proof-of-life)
 
 # Watch the lua-bot play (opens a window; run only when asked).
 accelerated-headed:
-	@cd $(FORK_CLIENT) && $(LUA_BOT_LAUNCH) --presentation=headed
+	@cd $(FORK_CLIENT) && $(call LUA_BOT_LAUNCH,--presentation=headed)
 
 # ---------------------------------------------------------------------------
 # Peregrine: hosted Accelerated policy image (unheaded lua-bot + this lua/).
@@ -466,7 +489,7 @@ peregrine-image: lua-bot-player-image
 	echo "built $(PEREGRINE_IMAGE) (policy name: peregrine)"
 
 # Petrel: hosted Traverse policy image (unheaded lua-bot + this lua/,
-# entry=traverse). Same shape as Peregrine; see Dockerfile.petrel and
+# entry=petrel). Same shape as Peregrine; see Dockerfile.petrel and
 # playbooks/upload-bot.md. Does NOT upload or submit.
 PETREL_IMAGE ?= petrel:latest
 .PHONY: petrel-image
@@ -480,7 +503,7 @@ petrel-image: lua-bot-player-image
 	echo "built $(PETREL_IMAGE) (policy name: petrel)"
 
 # ---------------------------------------------------------------------------
-# Raven: hosted Persistent policy (same lua leveler; undead warlock at submit).
+# Raven: hosted Persistent policy (peregrine entry; undead warlock at submit).
 # ---------------------------------------------------------------------------
 RAVEN_IMAGE ?= raven:latest
 .PHONY: raven-image persistent-pol persistent persistent-headed
@@ -494,13 +517,13 @@ raven-image: lua-bot-player-image
 	echo "built $(RAVEN_IMAGE) (policy name: raven; submit undead/warlock)"
 
 persistent-pol:
-	@cd $(FORK_CLIENT) && $(PERSISTENT_LAUNCH) --proof-of-life
+	@cd $(FORK_CLIENT) && $(call PERSISTENT_LAUNCH,--proof-of-life)
 
 persistent:
-	@cd $(FORK_CLIENT) && $(PERSISTENT_LAUNCH) --presentation=unheaded
+	@cd $(FORK_CLIENT) && $(call PERSISTENT_LAUNCH,--presentation=unheaded)
 
 persistent-headed:
-	@cd $(FORK_CLIENT) && $(PERSISTENT_LAUNCH) --presentation=headed
+	@cd $(FORK_CLIENT) && $(call PERSISTENT_LAUNCH,--presentation=headed)
 
 # Regenerate addons/ShadowArmy/QuestData.lua from the world DB + WorldMapArea.dbc
 # (docs/quest-data.md). Read-only DB access; requires the realm up. Deterministic,

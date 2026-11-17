@@ -1,14 +1,13 @@
-# Raven — Persistent Leveling policy (unheaded lua-bot + general leveler).
+# Raven — Persistent Leveling policy (unheaded lua-bot + peregrine entry).
 #
 # Same packaging as Peregrine; character prefs at submit are undead warlock.
-# Entry module is the shared general leveler (accelerated.lua). The base
-# image's CMD launches the unheaded embedded lua-bot from COWORLD_LUA_REPO /
-# COWORLD_LUA_ENTRY.
+# Entry module is the deployed Peregrine leveler (peregrine.lua, quests off).
+# The base image's CMD launches the unheaded embedded lua-bot from
+# COWORLD_LUA_REPO / COWORLD_LUA_ENTRY.
 #
 # Only tracked code is copied. lua/data/ (generated quest-hub tables) is local
-# data and stays out of the image; accelerated.lua runs without it. An
-# operator who has it can mount it read-only at runtime:
-#   -v <local>/lua/data:/opt/policy/lua/data:ro
+# data and stays out of the image; peregrine.lua requires nothing outside
+# lua/entry and never reads it. The image is code-only and runs as built.
 #
 #   make raven-image
 #   uv run coworld upload-policy raven:latest --name raven
@@ -23,4 +22,4 @@ COPY lua/entry/ /opt/policy/lua/entry/
 COPY lua/tools/ /opt/policy/lua/tools/
 
 ENV COWORLD_LUA_REPO=/opt/policy
-ENV COWORLD_LUA_ENTRY=accelerated
+ENV COWORLD_LUA_ENTRY=peregrine
