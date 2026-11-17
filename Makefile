@@ -66,11 +66,13 @@ RAVEN_CHARACTER = --create-character-name=Raven \
 	--create-character-race=undead --create-character-class=warlock \
 	--create-character-gender=male
 LUA_BOT_LAUNCH = $(NATIVE_LAUNCH) --league=ten-x \
-	--bot=lua-bot --lua-repo=$(CURDIR) --lua-entry=$(ENTRY) $(1) \
+	--bot=lua-bot --lua-repo=$(CURDIR) --lua-entry=$(ENTRY) \
+	--lua-status-dir=$(CURDIR)/local_data/accelerated-status $(1) \
 	-- $(PEREGRINE_CHARACTER)
 # Persistent league local proof / smoke (1x durable profile).
 PERSISTENT_LAUNCH = $(NATIVE_LAUNCH) --league=persistent \
-	--bot=lua-bot --lua-repo=$(CURDIR) --lua-entry=$(PERSISTENT_ENTRY) $(1) \
+	--bot=lua-bot --lua-repo=$(CURDIR) --lua-entry=$(PERSISTENT_ENTRY) \
+	--lua-status-dir=$(CURDIR)/local_data/persistent-status $(1) \
 	-- $(RAVEN_CHARACTER)
 # Same host, traverse league: Petrel runs as lua/entry/petrel.lua.
 # Upstream renamed the leagues in the hosted-session protocol update
