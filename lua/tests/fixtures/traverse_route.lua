@@ -213,8 +213,10 @@ function M.routes()
   }
 end
 
-function M.install()
-  for name, cfg in pairs(M.routes()) do
+-- `routes` (module name -> table) defaults to this fixture's own routes, so
+-- other route generations can reuse the same local/synthetic selection.
+function M.install(routes)
+  for name, cfg in pairs(routes or M.routes()) do
     package.loaded[name] = nil
     package.preload[name] = function() return cfg end
   end
@@ -232,8 +234,8 @@ local function localPath(root, name)
 end
 
 -- True when every recorded route module exists under root.
-function M.hasLocal(root)
-  for name in pairs(M.routes()) do
+function M.hasLocal(root, routes)
+  for name in pairs(routes or M.routes()) do
     local f = io.open(localPath(root, name), "r")
     if not f then return false end
     f:close()
@@ -242,8 +244,8 @@ function M.hasLocal(root)
 end
 
 -- Register the recorded route modules from root under package.preload.
-function M.installLocal(root)
-  for name in pairs(M.routes()) do
+function M.installLocal(root, routes)
+  for name in pairs(routes or M.routes()) do
     local path = localPath(root, name)
     package.loaded[name] = nil
     package.preload[name] = function() return dofile(path) end
@@ -252,13 +254,14 @@ end
 
 -- Install the route the tests should run on; returns "local route" or
 -- "synthetic".
-function M.select()
+function M.select(routes)
+  routes = routes or M.routes()
   local root = M.localRoot()
-  if os.getenv("TRAVERSE_ROUTE") ~= "synthetic" and M.hasLocal(root) then
-    M.installLocal(root)
+  if os.getenv("TRAVERSE_ROUTE") ~= "synthetic" and M.hasLocal(root, routes) then
+    M.installLocal(root, routes)
     return "local route"
   end
-  M.install()
+  M.install(routes)
   return "synthetic"
 end
 

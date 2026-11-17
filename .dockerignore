@@ -13,3 +13,4 @@ addons
 nimcache
 **/.nimcache
 **/nimcache
+lua/config/petrel

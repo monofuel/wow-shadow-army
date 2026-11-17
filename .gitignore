@@ -20,6 +20,7 @@ captures/
 /lua/data/bot_roads.lua
 /lua/config/traverse*beats.json
 /lua/config/traverse*beats.lua
+/lua/config/petrel/
 /lua/tests/traverse_route_fixture.lua
 /tools/data/road_waypoints_*.jsonl
 /tools/data/spawns_*.tsv
