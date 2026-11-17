@@ -13,4 +13,6 @@ addons
 nimcache
 **/.nimcache
 **/nimcache
-lua/config/petrel
+# Supplied locally at runtime; generated world/route/quest data is not code.
+lua/config
+lua/data
