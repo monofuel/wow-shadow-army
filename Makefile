@@ -25,19 +25,40 @@ WOW_ENV := $(CURDIR)/tools/wow_env.sh
 FORK_CLIENT := $(abspath ../monofuel-vanilla-wow)
 # Lua entry module driven by the accelerated targets.
 ENTRY ?= accelerated
+# League launches (ten-x, persistent, race) run the fork launcher, which
+# provisions its own league realm. Home-realm and session overrides from this
+# Makefile or the calling shell are scrubbed so they cannot steer that realm
+# (the root health check list plus the home debug port, eval slot and SOAP
+# config override), and the extracted data is the current
+# side-by-side install rather than the home realm's data directory.
+# CHECKPOINT runs keep the SOAP config override their prelude exports.
+LEAGUE_DATA_DIR ?= $(CURDIR)/local_data/vmangos-5875-data-current
+LEAGUE_DATA = $(realpath $(LEAGUE_DATA_DIR))
+NATIVE_LAUNCH_UNSET = VMANGOS_DB_DIR VMANGOS_MYSQL_DUMPS_DIR \
+	VMANGOS_MIGRATION_BACKUP_DIR VMANGOS_CAPTURES_DIR COWORLD_CONFIG_DIR \
+	COWORLD_RUN_DIR COWORLD_RECORD_DIR VANILLA_WOW_LOGIN_WS_URL \
+	VANILLA_WOW_GAME_WS_URL COWORLD_PLAYER_WS_URL WOW_SDK_NIM_RUNTIME_DIR \
+	VANILLA_WOW_NAVMESH_HELPER VMANGOS_IMAGE VMANGOS_NATIVE_IMAGE \
+	COWORLD_VMANGOS_FEATURES COMPOSE_PROJECT_NAME COMPOSE_FILE \
+	VMANGOS_COMPOSE_FILE VANILLA_WOW_LUA_DEBUG_DIR COWORLD_EVAL_SLOT \
+	$(if $(CHECKPOINT),,VMANGOS_MANGOSD_CONFIG_OVERRIDES)
+NATIVE_LAUNCH = $(if $(and $(wildcard $(LEAGUE_DATA)/dbc/.),$(wildcard $(LEAGUE_DATA)/mmaps/.)),,$(error league data dir is not an extracted-data install (needs dbc/ and mmaps/): $(LEAGUE_DATA_DIR))) \
+	$(if $(findstring /vmangos-db/,$(abspath $(LEAGUE_DATA_DIR))/ $(LEAGUE_DATA)/),$(error refusing league data inside vmangos-db: $(LEAGUE_DATA_DIR))) \
+	env $(addprefix -u ,$(NATIVE_LAUNCH_UNSET)) \
+	VANILLA_WOW_EXTRACTED_DATA_DIR=$(LEAGUE_DATA) \
+	nix develop $(FORK_CLIENT) --command nim r tools/launch_nim_player.nim --
+# Lua-bot options are launcher options (before any second `--`); targets
+# append further launcher options such as --presentation or --proof-of-life.
 # Hosted Accelerated is "accelerated"; local 10x launcher profile is ten-x.
-LUA_BOT_LAUNCH = nix develop $(FORK_CLIENT) --command \
-	nim r tools/launch_nim_player.nim -- --league=ten-x \
+LUA_BOT_LAUNCH = $(NATIVE_LAUNCH) --league=ten-x \
 	--bot=lua-bot --lua-repo=$(CURDIR) --lua-entry=$(ENTRY)
 # Persistent league local proof / smoke (1x durable profile).
-PERSISTENT_LAUNCH = nix develop $(FORK_CLIENT) --command \
-	nim r tools/launch_nim_player.nim -- --league=persistent \
+PERSISTENT_LAUNCH = $(NATIVE_LAUNCH) --league=persistent \
 	--bot=lua-bot --lua-repo=$(CURDIR) --lua-entry=$(ENTRY)
 # Same host, traverse league: Petrel runs as lua/entry/traverse.lua.
 # Upstream renamed the leagues in the hosted-session protocol update
 # (2026-08-10): traverse -> race (same kalimdor_traversal scenario).
-TRAVERSE_LAUNCH = nix develop $(FORK_CLIENT) --command \
-	nim r tools/launch_nim_player.nim -- --league=race \
+TRAVERSE_LAUNCH = $(NATIVE_LAUNCH) --league=race \
 	--bot=lua-bot --lua-repo=$(CURDIR) --lua-entry=traverse \
 	--lua-status-dir=$(CURDIR)/local_data/traverse-status
 
@@ -231,12 +252,19 @@ test-road-artifacts:
 # Offline land-beat corridor lint (Detour helper + spawn TSV). Exits 0 on SKIP
 # when helper/mmaps are missing so bare CI hosts stay green. make test uses
 # --warn-only so corridor FAILs do not red the unit suite; traverse-lint is strict.
+# The beat files are local-only route data (gitignored, see AGENTS.md copyright
+# hygiene), so the soft lint names and skips each one a checkout lacks.
+TRAVERSE_LINT_BEATS = lua/config/traverse_land_beats.json \
+	lua/config/traverse_connector_land_beats.json \
+	lua/config/traverse_finale_beats.json
 traverse-lint-soft:
-	@python3 tools/traverse_route_lint.py --warn-only
-	@python3 tools/traverse_route_lint.py --warn-only \
-		--beats lua/config/traverse_connector_land_beats.json
-	@python3 tools/traverse_route_lint.py --warn-only \
-		--beats lua/config/traverse_finale_beats.json
+	@for b in $(TRAVERSE_LINT_BEATS); do \
+		if [ -f "$$b" ]; then \
+			python3 tools/traverse_route_lint.py --warn-only --beats "$$b" || exit 1; \
+		else \
+			echo "traverse-lint-soft: SKIP $$b (local route data not present)"; \
+		fi; \
+	done
 traverse-lint:
 	@python3 tools/traverse_route_lint.py
 	@python3 tools/traverse_route_lint.py \
@@ -300,10 +328,19 @@ test-nim-soft:
 		echo "test-nim-soft: nim not on PATH — skip"; \
 	fi
 
+# Traverse tests run on the local recorded route when present (under
+# WSA_PRIVATE_INPUTS, default the repo root); the second pass keeps the
+# synthetic route fixture exercised in that case too.
 test-lua:
 	@rc=0; for t in lua/tests/test_*.lua; do \
 		echo "== $$t"; LUA_PATH="lua/?.lua;lua/entry/?.lua;lua/tools/?.lua;;" $(RUN_LUA) $$t || rc=1; \
-	done; exit $$rc
+	done; \
+	if [ -f "$${WSA_PRIVATE_INPUTS:-.}/lua/config/traverse_beats.lua" ]; then \
+		for t in lua/tests/test_traverse.lua lua/tests/test_traverse_wet.lua; do \
+			echo "== $$t (synthetic route)"; TRAVERSE_ROUTE=synthetic \
+				LUA_PATH="lua/?.lua;lua/entry/?.lua;lua/tools/?.lua;;" $(RUN_LUA) $$t || rc=1; \
+		done; \
+	fi; exit $$rc
 
 # Optional Nim unit tier (enum maps / pure parsers). Not part of `make test`
 # so CI and bare hosts without nim stay green. PATH-nim first, else nix develop
@@ -313,11 +350,6 @@ test-nim:
 		rc=0; \
 		for t in system/tests/test_*.nim tools/tests/test_*.nim; do \
 			[ -f "$$t" ] || continue; \
-			case "$$t" in \
-				*test_map_browser_waypoints*) \
-					echo "== $$t (skipped: needs the client fork 3D deps)"; \
-					continue ;; \
-			esac; \
 			echo "== $$t =="; \
 			nim r --hints:off --warnings:off "$$t" || rc=1; \
 		done; \
@@ -390,11 +422,11 @@ EXTRA ?=
 # Full-length league episode (720 wall seconds at 10x) with the final score
 # read back from the bot's own status file.
 accelerated-episode:
-	@cd $(FORK_CLIENT) && timeout 900 $(LUA_BOT_LAUNCH) --presentation=headless || true
+	@cd $(FORK_CLIENT) && timeout 900 $(LUA_BOT_LAUNCH) --presentation=unheaded || true
 	@python3 tools/episode_score.py
-# Headless accelerated run of the lua-bot (ENTRY=<module>, default accelerated).
+# Unheaded accelerated run of the lua-bot (ENTRY=<module>, default accelerated).
 accelerated:
-	@cd $(FORK_CLIENT) && $(LUA_BOT_LAUNCH) --presentation=headless
+	@cd $(FORK_CLIENT) && $(LUA_BOT_LAUNCH) --presentation=unheaded
 
 # Bounded proof-of-life receipt for the lua-bot: the league admission gate.
 accelerated-pol:
@@ -405,9 +437,11 @@ accelerated-headed:
 	@cd $(FORK_CLIENT) && $(LUA_BOT_LAUNCH) --presentation=headed
 
 # ---------------------------------------------------------------------------
-# Peregrine: hosted Accelerated policy image (rendered lua-bot + this lua/).
-# Base binary from monofuel-vanilla-wow target lua_bot_player_runtime; this
-# worktree only bakes lua/ and locks --lua-entry=accelerated.
+# Peregrine: hosted Accelerated policy image (unheaded lua-bot + this lua/).
+# Base binary from monofuel-vanilla-wow target lua_bot_player_runtime, built
+# by the fork's own image owner (clean tracked checkout, SSH-forwarded nimby
+# sync, checkout revision stamped). Policy images bake only tracked lua code;
+# see the Dockerfile.* headers for the private route data they do not carry.
 # Does NOT upload or submit — see playbooks/upload-bot.md.
 # ---------------------------------------------------------------------------
 LUA_BOT_PLAYER_IMAGE ?= coworld-lua-bot-player:latest
@@ -419,11 +453,8 @@ lua-bot-player-image:
 		echo "error: fork checkout missing: $(FORK_CLIENT)" >&2; exit 1; \
 	fi; \
 	cd "$(FORK_CLIENT)"; \
-	docker build --platform linux/amd64 --ssh default \
-		-f player/Dockerfile \
-		--target lua_bot_player_runtime \
-		-t $(LUA_BOT_PLAYER_IMAGE) .; \
-	test "$$(docker image inspect $(LUA_BOT_PLAYER_IMAGE) --format '{{.Architecture}}')" = amd64
+	uv run python tools/build_player_image.py $(LUA_BOT_PLAYER_IMAGE) \
+		--platform linux/amd64 --target lua_bot_player_runtime
 
 peregrine-image: lua-bot-player-image
 	@set -e; \
@@ -434,7 +465,7 @@ peregrine-image: lua-bot-player-image
 	test "$$(docker image inspect $(PEREGRINE_IMAGE) --format '{{.Architecture}}')" = amd64; \
 	echo "built $(PEREGRINE_IMAGE) (policy name: peregrine)"
 
-# Petrel: hosted Traverse policy image (rendered lua-bot + this lua/,
+# Petrel: hosted Traverse policy image (unheaded lua-bot + this lua/,
 # entry=traverse). Same shape as Peregrine; see Dockerfile.petrel and
 # playbooks/upload-bot.md. Does NOT upload or submit.
 PETREL_IMAGE ?= petrel:latest
@@ -466,7 +497,7 @@ persistent-pol:
 	@cd $(FORK_CLIENT) && $(PERSISTENT_LAUNCH) --proof-of-life
 
 persistent:
-	@cd $(FORK_CLIENT) && $(PERSISTENT_LAUNCH) --presentation=headless
+	@cd $(FORK_CLIENT) && $(PERSISTENT_LAUNCH) --presentation=unheaded
 
 persistent-headed:
 	@cd $(FORK_CLIENT) && $(PERSISTENT_LAUNCH) --presentation=headed
@@ -901,7 +932,7 @@ endef
 traverse:
 	@mkdir -p local_data/health-logs
 	@$(TRAVERSE_CHECKPOINT_PRELUDE); \
-	$(call TRAVERSE_RUN,headless)
+	$(call TRAVERSE_RUN,unheaded)
 
 # Headed Petrel run for manual verification (opens a window — human use).
 traverse-headed:

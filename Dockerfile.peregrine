@@ -1,8 +1,14 @@
-# Peregrine — Accelerated Leveling policy (rendered lua-bot + grind entry).
+# Peregrine — Accelerated Leveling policy (unheaded lua-bot + grind entry).
 #
 # Base image is monofuel-vanilla-wow's lua_bot_player_runtime (vanilla-wow-player
-# built with -d:luaBotVm). This layer only bakes the league lua/ tree and locks
-# the entry module.
+# built with -d:luaBotVm). Its CMD launches the unheaded embedded lua-bot from
+# COWORLD_LUA_REPO / COWORLD_LUA_ENTRY; this layer only bakes the tracked lua
+# code and locks the entry module.
+#
+# Only tracked code is copied. lua/data/ (generated quest-hub tables) is local
+# data and stays out of the image; accelerated.lua runs without it (seen-givers
+# only). An operator who has it can mount it read-only at runtime:
+#   -v <local>/lua/data:/opt/policy/lua/data:ro
 #
 # Build (from this worktree, after the base image exists):
 #   make peregrine-image
@@ -13,14 +19,11 @@
 #     --league league_faf92aca-4edd-4591-923f-27b09af629bb \
 #     --race tauren --character-class druid --gender male --json
 
-# syntax=docker/dockerfile:1.7
-
 ARG LUA_BOT_PLAYER_IMAGE=coworld-lua-bot-player:latest
 FROM ${LUA_BOT_PLAYER_IMAGE}
 
-COPY lua/ /opt/policy/lua/
+COPY lua/entry/ /opt/policy/lua/entry/
+COPY lua/tools/ /opt/policy/lua/tools/
 
 ENV COWORLD_LUA_REPO=/opt/policy
 ENV COWORLD_LUA_ENTRY=accelerated
-
-CMD ["tini", "--", "/usr/local/bin/lua_bot_entry.sh"]

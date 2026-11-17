@@ -34,46 +34,77 @@ local function any_log_find(needle)
   return nil
 end
 
+-- Recorded route data is local-only. The brain runs on it when this checkout
+-- has it, else on a synthetic route with the same shape
+-- (lua/tests/fixtures/traverse_route.lua).
+local routeSource = require("tests.fixtures.traverse_route").select()
+print("test_traverse: route = " .. routeSource)
+
 local route = require("config.traverse_beats")
 local landRoute = require("config.traverse_land_beats")
 local connectorRoute = require("config.traverse_connector_land_beats")
 local finaleRoute = require("config.traverse_finale_beats")
+local interiorRoute = require("config.traverse_finale_interior_beats")
 local petrel = require("traverse")
 
--- The route data survived the move off host-injected args.
-check(route.goal_id == "duskwallow_coast", "route keeps the segment goal")
--- The north land phase is a SPARSE strategy-beat list (fair play): one beat
--- per road decision point, strictly increasing x (hook beats may decrease),
--- ending at the cave mouth.
-check(landRoute.goal_id == "felwood_cave_entrance" and #landRoute.beats == 34,
-  "land route is sparse and ends at the Timbermaw cave mouth")
-check(connectorRoute.goal_id == "top_barrens" and #connectorRoute.beats == 9,
-  "connector route reaches the northern land handoff")
-check(finaleRoute.goal_id == "everlook" and #finaleRoute.beats == 11,
-  "finale route runs north tunnel to Everlook (no exterior hold node)")
-local interiorRoute = require("config.traverse_finale_interior_beats")
-check(#interiorRoute.beats >= 30,
-  "interior route carries the walked Timbermaw chain")
-for _, b in ipairs(interiorRoute.beats) do
-  check(b.hook == true,
-    "interior beats are all hooks (galleries double back in x): " .. b.id)
-  check(b.navigation_mode == "local_steer",
-    "interior beats declare local_steer for the WMO: " .. b.id)
+-- Route shape the brain depends on. Checked on the synthetic route always,
+-- and on the local recorded route tables when this checkout has them.
+local function routeContract(source, r)
+  local function rcheck(cond, name) check(cond, source .. ": " .. name) end
+  -- The route data survived the move off host-injected args.
+  rcheck(r.route.goal_id == "duskwallow_coast", "route keeps the segment goal")
+  -- The north land phase is a SPARSE strategy-beat list (fair play): one beat
+  -- per road decision point, strictly increasing x (hook beats may decrease),
+  -- ending at the cave mouth.
+  rcheck(r.land.goal_id == "felwood_cave_entrance" and
+      r.land.beats[#r.land.beats].id == r.land.goal_id,
+    "land route is sparse and ends at the Timbermaw cave mouth")
+  rcheck(r.connector.goal_id == "top_barrens" and
+      r.connector.beats[#r.connector.beats].id == r.connector.goal_id,
+    "connector route reaches the northern land handoff")
+  rcheck(r.finale.goal_id == "everlook" and
+      r.finale.beats[#r.finale.beats].id == r.finale.goal_id,
+    "finale route runs north tunnel to Everlook (no exterior hold node)")
+  rcheck(#r.interior.beats >= 30,
+    "interior route carries the walked Timbermaw chain")
+  for _, b in ipairs(r.interior.beats) do
+    rcheck(b.hook == true,
+      "interior beats are all hooks (galleries double back in x): " .. b.id)
+    rcheck(b.navigation_mode == "local_steer",
+      "interior beats declare local_steer for the WMO: " .. b.id)
+  end
+  rcheck(r.finale.beats[1].id == "timbermaw_north_tunnel",
+    "finale starts at the north tunnel after the interior chain")
+  for i = 2, #r.land.beats do
+    rcheck(r.land.beats[i].hook or r.land.beats[i].x > r.land.beats[i - 1].x,
+      "land beats march north monotonically (hooks exempt)")
+  end
+  local wetCount = 0
+  for _, b in ipairs(r.route.beats) do
+    if b.wet then wetCount = wetCount + 1 end
+  end
+  rcheck(wetCount > 0 and wetCount == #r.route.beats - 2,
+    "route keeps the wet ribbon behind its two land legs")
+  rcheck(r.route.beats[1].id == "land_approach" and
+      r.route.beats[2].id == "water_entry",
+    "land legs lead the route")
 end
-check(finaleRoute.beats[1].id == "timbermaw_north_tunnel",
-  "finale starts at the north tunnel after the interior chain")
-for i = 2, #landRoute.beats do
-  check(landRoute.beats[i].hook or landRoute.beats[i].x > landRoute.beats[i - 1].x,
-    "land beats march north monotonically (hooks exempt)")
+
+routeContract(routeSource, {
+  route = route, land = landRoute, connector = connectorRoute,
+  finale = finaleRoute, interior = interiorRoute,
+})
+
+-- The recorded route's exact sizes guard against a truncated local copy.
+if routeSource == "local route" then
+  check(#landRoute.beats == 34, "local route: land route keeps 34 beats")
+  check(#connectorRoute.beats == 9, "local route: connector keeps 9 beats")
+  check(#finaleRoute.beats == 11, "local route: finale keeps 11 beats")
+  check(#route.beats == 55,
+    "local route: route keeps every beat (incl. the two clearance guards)")
+else
+  print("test_traverse: SKIP recorded-route size checks (route = synthetic)")
 end
-check(#route.beats == 55, "route keeps every beat (incl. the two clearance guards)")
-local wetCount = 0
-for _, b in ipairs(route.beats) do
-  if b.wet then wetCount = wetCount + 1 end
-end
-check(wetCount == 53, "route keeps the wet ribbon")
-check(route.beats[1].id == "land_approach" and route.beats[2].id == "water_entry",
-  "land legs lead the route")
 
 local function view(x, y, extra)
   local v = {

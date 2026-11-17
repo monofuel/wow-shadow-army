@@ -2,6 +2,7 @@
 """Unit tests for tools/traverse_route_lint.py (no live navmesh helper)."""
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 import unittest
@@ -608,10 +609,35 @@ class TestProbeLegCli(unittest.TestCase):
         with mock.patch.object(trl, "resources_ready", return_value=True), mock.patch.object(
             trl, "make_helper_probe", return_value=self.probe
         ), contextlib.redirect_stdout(buf):
-            rc = trl.main(["--helper", "/tmp/x", "--mmaps", "/tmp", *extra])
+            rc = trl.main(
+                [
+                    "--helper", "/tmp/x", "--mmaps", "/tmp",
+                    "--beats", str(self.beats), "--spawns", str(self.spawns),
+                    *extra,
+                ]
+            )
         return rc, buf.getvalue()
 
     def setUp(self) -> None:
+        # The real land-beat route is local-only data; a three-beat synthetic
+        # route keeps the CLI leg selection deterministic.
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        self.beats = Path(td.name) / "beats.json"
+        self.beats.write_text(
+            json.dumps(
+                {
+                    "beats": [
+                        {"id": "ashenvale_pass_1", "x": 2000.0, "y": -1500.0, "z": 100.0},
+                        {"id": "ashenvale_pass_2", "x": 2100.0, "y": -1450.0, "z": 105.0},
+                        {"id": "ashenvale_pass_3", "x": 2200.0, "y": -1400.0, "z": 110.0},
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        self.spawns = Path(td.name) / "no_spawns.tsv"
+
         def probe(source, target, flags):
             return trl.ProbeResult(
                 complete=True,

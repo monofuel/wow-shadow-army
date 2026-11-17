@@ -1,12 +1,22 @@
 ## Road waypoint JSONL loader for the map browser.
-import std/[os, unittest]
+import std/[os, strformat, unittest]
 
 import map_browser/roads
 
+const
+  SyntheticSegmentsPerMap = 30
+
 let fixture =
   getCurrentDir() / "tools" / "tests" / "fixtures" / "road_waypoints_fixture.jsonl"
-let azerothArtifact =
-  getCurrentDir() / "tools" / "data" / "road_waypoints_azeroth.jsonl"
+
+proc writeSyntheticRoadArtifact(path: string; mapName: string; mapId: int) =
+  ## Write a synthetic per-continent road artifact with a meta header line.
+  var text = &"""{{"meta": 1, "map": "{mapName}", "map_id": {mapId}}}""" & "\n"
+  for i in 0 ..< SyntheticSegmentsPerMap:
+    let x = float(i) * 10.0
+    text.add &"""{{"id": "b{i:04}", "source": "baked", "pts": [[{x}, 0.0, 1.0], [{x}, 10.0, 1.0]]}}"""
+    text.add "\n"
+  writeFile(path, text)
 
 suite "road waypoint parsing":
   test "fixture skips garbage and short segments":
@@ -49,18 +59,59 @@ suite "road waypoint parsing":
     check segments[1].points[2].z == 90.0'f32
 
   test "repo artifacts load kalimdor and azeroth":
-    let roads = loadRoadWaypoints(getCurrentDir())
-    check roads.len > 50
-    var haveKalimdor = false
-    var haveAzeroth = false
+    let root = getTempDir() / "wsa_test_map_browser_road_" & $getCurrentProcessId()
+    removeDir(root)
+    createDir(root / "tools" / "data")
+    defer: removeDir(root)
+    writeSyntheticRoadArtifact(
+      root / "tools" / "data" / "road_waypoints_kalimdor.jsonl", "kalimdor", 1)
+    writeSyntheticRoadArtifact(
+      root / "tools" / "data" / "road_waypoints_azeroth.jsonl", "azeroth", 0)
+    let roads = loadRoadWaypoints(root)
+    check roads.len == 2 * SyntheticSegmentsPerMap
+    var kalimdorCount = 0
+    var azerothCount = 0
     for segment in roads:
       if segment.mapId == 1'u32:
-        haveKalimdor = true
+        inc kalimdorCount
       elif segment.mapId == 0'u32:
-        haveAzeroth = true
-    check haveKalimdor
-    if fileExists(azerothArtifact):
-      check haveAzeroth
+        inc azerothCount
+    check kalimdorCount == SyntheticSegmentsPerMap
+    check azerothCount == SyntheticSegmentsPerMap
+
+  test "kalimdor artifact alone still loads":
+    let root = getTempDir() / "wsa_test_map_browser_road_k_" & $getCurrentProcessId()
+    removeDir(root)
+    createDir(root / "tools" / "data")
+    defer: removeDir(root)
+    writeSyntheticRoadArtifact(
+      root / "tools" / "data" / "road_waypoints_kalimdor.jsonl", "kalimdor", 1)
+    let roads = loadRoadWaypoints(root)
+    check roads.len == SyntheticSegmentsPerMap
+    for segment in roads:
+      check segment.mapId == 1'u32
+
+  test "local road artifacts load kalimdor and azeroth":
+    ## The baked artifacts are local-only; WSA_PRIVATE_INPUTS (default the
+    ## repo root) points at them.
+    let root = getEnv("WSA_PRIVATE_INPUTS", getCurrentDir())
+    let dataDir = root / "tools" / "data"
+    if not fileExists(dataDir / "road_waypoints_kalimdor.jsonl"):
+      echo "  SKIP local road artifacts not present under ", dataDir
+      skip()
+    else:
+      let roads = loadRoadWaypoints(root)
+      check roads.len > 50
+      var haveKalimdor = false
+      var haveAzeroth = false
+      for segment in roads:
+        if segment.mapId == 1'u32:
+          haveKalimdor = true
+        elif segment.mapId == 0'u32:
+          haveAzeroth = true
+      check haveKalimdor
+      if fileExists(dataDir / "road_waypoints_azeroth.jsonl"):
+        check haveAzeroth
 
   test "missing dir is empty":
     check loadRoadWaypoints("/nonexistent").len == 0

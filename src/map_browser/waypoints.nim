@@ -1,16 +1,14 @@
-## City waypoint data for the map browser, extracted from the fork's
-## real-playerbot world catalog (routes, great lifts, travel spells) and the
-## DBC taxi flight network. Pure data — rendering happens in the tool.
-##
-## The fork keeps route edges private; they are reconstructed here by probing
-## worldRoutePath for adjacent pairs (a direct edge is a 2-node path).
+## City waypoint data for the map browser, extracted from the fork's authored
+## world routes (roads, local transports, portals, boats) and the DBC taxi
+## flight network. Pure data — rendering happens in the tool.
 
 import
   std/[sets, tables],
   environment/contract/spatial_types,
-  environment/client/common,
   environment/client/world_catalogs/world_catalog_types,
-  bots/real_playerbot/policy/world_catalog
+  coworld_wow_sdk/[activity_catalog, authored_world_routes, route_graph, world_routes]
+
+export activity_catalog, world_routes
 
 type
   WaypointEdgeKind* = enum
@@ -23,7 +21,7 @@ type
     kind*: WaypointEdgeKind
 
   WaypointGraph* = object
-    nodes*: seq[RealPlayerBotWorldNode]
+    nodes*: seq[WorldRouteNode]
     edges*: seq[WaypointEdge]
 
   TaxiPolyline* = object
@@ -36,50 +34,57 @@ const GraphSeedNodeIds = [
   "alliance-wetlands-north"
 ]
 
-proc edgeKind(a, b: RealPlayerBotWorldNode): WaypointEdgeKind =
-  if a.greatLift or b.greatLift:
+proc edgeKind*(a, b: WorldRouteNode): WaypointEdgeKind =
+  ## Classify one authored connection. `wekLift` is a ride between two
+  ## vertical-transport nodes boarding the same local transport (great lift,
+  ## elevator). `wekSpell` is a teleport-style public transition — a portal
+  ## trigger or a boat/zeppelin crossing — whose endpoints share no walkable
+  ## ground. Everything else is an ordinary walking leg.
+  if a.verticalTransport and b.verticalTransport and
+      a.localTransportEntry != 0'u32 and
+      a.localTransportEntry == b.localTransportEntry:
     wekLift
-  elif a.travelSpellId != 0'u32 or b.travelSpellId != 0'u32:
+  elif worldRouteEdgeUsesPublicTransition(a, b):
     wekSpell
   else:
     wekWalk
 
-proc addRoute(graph: var WaypointGraph; route: RealPlayerBotWorldRoute) =
+proc addRoute(graph: var WaypointGraph; route: WorldRoute) =
+  ## Append every node and authored edge of one route to the graph.
   let base = graph.nodes.len
   for node in route.nodes:
     graph.nodes.add node
-  for i in 0 ..< route.nodes.len:
-    for j in i + 1 ..< route.nodes.len:
-      if worldRoutePath(route, i, j).len == 2 or
-          worldRoutePath(route, j, i).len == 2:
-        graph.edges.add WaypointEdge(
-          a: base + i,
-          b: base + j,
-          kind: edgeKind(route.nodes[i], route.nodes[j])
-        )
+  for edge in route.graph.edges:
+    if edge.first == edge.second:
+      continue
+    graph.edges.add WaypointEdge(
+      a: base + edge.first,
+      b: base + edge.second,
+      kind: edgeKind(route.nodes[edge.first], route.nodes[edge.second])
+    )
 
 proc buildWaypointGraph*(): WaypointGraph =
-  ## All catalog routes reachable from activity regions + known seeds.
+  ## All authored routes reachable from activity regions + known seeds.
   var seeds: seq[string]
-  for region in RealPlayerBotActivityRegions:
+  for region in AuthoredActivityRegions:
     if region.routeNodeId.len > 0:
       seeds.add region.routeNodeId
   for id in GraphSeedNodeIds:
     seeds.add id
 
-  var seenRoutes = initHashSet[string]()
+  var seenRoutes = initHashSet[int]()
   for id in seeds:
     let matched = worldRouteMatch(id)
     if matched.matchCount == 0 or matched.route.nodes.len == 0:
       continue
-    let routeKey = matched.route.nodes[0].id
-    if routeKey in seenRoutes:
+    if matched.routeIndex in seenRoutes:
       continue
-    seenRoutes.incl routeKey
+    seenRoutes.incl matched.routeIndex
     result.addRoute(matched.route)
 
-proc activityRegions*(): seq[RealPlayerBotActivityRegion] =
-  for region in RealPlayerBotActivityRegions:
+proc activityRegions*(): seq[AuthoredActivityRegion] =
+  ## Authored activity regions (city and field anchors) for the overlay.
+  for region in AuthoredActivityRegions:
     result.add region
 
 proc taxiPolylines*(

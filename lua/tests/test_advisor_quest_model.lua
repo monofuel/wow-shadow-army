@@ -416,76 +416,123 @@ check(r.list[1].objs[1].text == "Turn in: Stormwind Quartermaster",
 -- ------------------------------------------------- r54: monofuel's log ---
 -- The exact quest log that produced "2 days of map paths being broken"
 -- (2026-08-16, guid 1000007, standing in Brill): two same-zone Tirisfal
--- quests, one Silverpine delivery, one Orgrimmar delivery. Driven against the
--- REAL shipped QuestData so the regression is about the data we actually
--- ship, not a hand-built fixture that agrees with the code.
-dofile("addons/ShadowArmy/QuestData.lua")
-
-local brill = model.build({
-  quests = {
-    { key = 1, title = "Speak with Sevren", header = "Tirisfal Glades",
-      objectives = {} },
-    { key = 2, title = "At War With The Scarlet Crusade",
-      header = "Tirisfal Glades",
-      objectives = { { text = "Captain Melrache slain: 0/1", have = 0, need = 1 } } },
-    { key = 3, title = "Delivery to Silverpine Forest", header = "Tirisfal Glades",
-      objectives = {} },
-    { key = 4, title = "The Horde Needs Your Help!", header = "Orgrimmar",
-      objectives = {} },
+-- quests, one Silverpine delivery, one Orgrimmar delivery. Generated
+-- QuestData.lua is local-only (copyright hygiene), so the regression runs
+-- against a tiny synthetic table with the same shape: two Tirisfal enders,
+-- one Silverpine ender, one Orgrimmar ender. When a locally generated
+-- QuestData.lua is present, the same scenario also runs against it.
+local brillData = {
+  ["Speak with Sevren"] = {
+    id = 355, level = 5, minLevel = 3, zone = 85,
+    turnIn = { label = "Magistrate Sevren", zone = 85, x = 61.3, y = 50.8 },
   },
-  data = ShadowArmyQuestData, zoneNames = ShadowArmyQuestZones,
-  currentZone = "Tirisfal Glades", pos = { x = 61.0, y = 52.0 },
-})
+  ["At War With The Scarlet Crusade"] = {
+    id = 372, level = 8, minLevel = 5, zone = 85,
+    objectives = {
+      { label = "Captain Melrache", kind = "kill", count = 1,
+        spots = { { zone = 85, x = 34.0, y = 60.0 } } },
+    },
+    turnIn = { label = "Executor Zygand", zone = 85, x = 60.0, y = 51.0 },
+  },
+  ["Delivery to Silverpine Forest"] = {
+    id = 445, level = 10, minLevel = 5, zone = 85,
+    turnIn = { label = "Silverpine Courier", zone = 130, x = 44.0, y = 40.0 },
+  },
+  ["The Horde Needs Your Help!"] = {
+    id = 8792, level = 10, minLevel = 10, zone = 1637,
+    turnIn = { label = "Warlord Gorchuk", zone = 1637, x = 50.0, y = 50.0 },
+  },
+}
+local brillZones = {
+  [85] = "Tirisfal Glades", [130] = "Silverpine Forest", [1637] = "Orgrimmar",
+}
 
-check(#brill.list == 4, "all four of monofuel's quests are listed")
+local function brillScenario(source, data, zoneNames)
+  -- Prefix every check so a failure names the dataset that produced it.
+  local function bcheck(cond, name) check(cond, source .. ": " .. name) end
 
-local byTitle = {}
-for _, c in ipairs(brill.candidates) do
-  byTitle[c.title] = byTitle[c.title] or {}
-  table.insert(byTitle[c.title], c)
-end
+  local brill = model.build({
+    quests = {
+      { key = 1, title = "Speak with Sevren", header = "Tirisfal Glades",
+        objectives = {} },
+      { key = 2, title = "At War With The Scarlet Crusade",
+        header = "Tirisfal Glades",
+        objectives = { { text = "Captain Melrache slain: 0/1", have = 0, need = 1 } } },
+      { key = 3, title = "Delivery to Silverpine Forest", header = "Tirisfal Glades",
+        objectives = {} },
+      { key = 4, title = "The Horde Needs Your Help!", header = "Orgrimmar",
+        objectives = {} },
+    },
+    data = data, zoneNames = zoneNames,
+    currentZone = "Tirisfal Glades", pos = { x = 61.0, y = 52.0 },
+  })
 
-local function delivery(title)
-  for _, c in ipairs(byTitle[title] or {}) do
-    if c.delivery then return c end
+  bcheck(#brill.list == 4, "all four of monofuel's quests are listed")
+
+  local byTitle = {}
+  for _, c in ipairs(brill.candidates) do
+    byTitle[c.title] = byTitle[c.title] or {}
+    table.insert(byTitle[c.title], c)
   end
-  return nil
+
+  local function delivery(title)
+    for _, c in ipairs(byTitle[title] or {}) do
+      if c.delivery then return c end
+    end
+    return nil
+  end
+
+  bcheck(delivery("Speak with Sevren"),
+    "355 Speak with Sevren gets a same-zone delivery pin (Magistrate Sevren)")
+  bcheck(delivery("At War With The Scarlet Crusade"),
+    "372 At War With The Scarlet Crusade gets a delivery pin (Executor Zygand)")
+  bcheck(delivery("Speak with Sevren").pending == false,
+    "an objective-less delivery is actionable, not pending")
+  bcheck(delivery("At War With The Scarlet Crusade").pending == true,
+    "a delivery behind unfinished objectives is pending")
+  bcheck(not delivery("Delivery to Silverpine Forest"),
+    "445 invents no Tirisfal coordinate for its Silverpine ender")
+  bcheck(not delivery("The Horde Needs Your Help!"),
+    "8792 invents no Tirisfal coordinate for its Orgrimmar ender")
+
+  local target = model.pickTarget(brill.list, brill.candidates)
+  bcheck(target ~= nil, "the Brill log routes somewhere (r53 drew nothing here)")
+  bcheck(target.title == brill.list[1].title,
+    "the route serves the top quest of the checklist")
+  bcheck(target.pending ~= true, "the route never serves a pending delivery")
+
+  local away = model.awayRows(brill.list, "Tirisfal Glades")
+  bcheck(#away == 2, "exactly the two cross-zone quests get breadcrumbs")
+  local dest = {}
+  for _, a in ipairs(away) do dest[a.title] = a end
+  bcheck(dest["Delivery to Silverpine Forest"]
+    and dest["Delivery to Silverpine Forest"].zoneName == "Silverpine Forest"
+    and dest["Delivery to Silverpine Forest"].turnIn,
+    "445 breadcrumbs to Silverpine Forest")
+  bcheck(dest["The Horde Needs Your Help!"]
+    and dest["The Horde Needs Your Help!"].zoneName == "Orgrimmar",
+    "8792 breadcrumbs to Orgrimmar")
+  bcheck(dest["The Horde Needs Your Help!"].label == "Warlord Gorchuk",
+    "the breadcrumb names the ender it read from the data")
+  bcheck(not dest["Speak with Sevren"] and not dest["At War With The Scarlet Crusade"],
+    "quests that DO have local pins are not also breadcrumbed")
 end
 
-check(delivery("Speak with Sevren"),
-  "355 Speak with Sevren gets a same-zone delivery pin (Magistrate Sevren)")
-check(delivery("At War With The Scarlet Crusade"),
-  "372 At War With The Scarlet Crusade gets a delivery pin (Executor Zygand)")
-check(delivery("Speak with Sevren").pending == false,
-  "an objective-less delivery is actionable, not pending")
-check(delivery("At War With The Scarlet Crusade").pending == true,
-  "a delivery behind unfinished objectives is pending")
-check(not delivery("Delivery to Silverpine Forest"),
-  "445 invents no Tirisfal coordinate for its Silverpine ender")
-check(not delivery("The Horde Needs Your Help!"),
-  "8792 invents no Tirisfal coordinate for its Orgrimmar ender")
+brillScenario("synthetic", brillData, brillZones)
 
-local target = model.pickTarget(brill.list, brill.candidates)
-check(target ~= nil, "the Brill log routes somewhere (r53 drew nothing here)")
-check(target.title == brill.list[1].title,
-  "the route serves the top quest of the checklist")
-check(target.pending ~= true, "the route never serves a pending delivery")
-
-local away = model.awayRows(brill.list, "Tirisfal Glades")
-check(#away == 2, "exactly the two cross-zone quests get breadcrumbs")
-local dest = {}
-for _, a in ipairs(away) do dest[a.title] = a end
-check(dest["Delivery to Silverpine Forest"]
-  and dest["Delivery to Silverpine Forest"].zoneName == "Silverpine Forest"
-  and dest["Delivery to Silverpine Forest"].turnIn,
-  "445 breadcrumbs to Silverpine Forest")
-check(dest["The Horde Needs Your Help!"]
-  and dest["The Horde Needs Your Help!"].zoneName == "Orgrimmar",
-  "8792 breadcrumbs to Orgrimmar")
-check(dest["The Horde Needs Your Help!"].label == "Warlord Gorchuk",
-  "the breadcrumb names the ender it read from the data")
-check(not dest["Speak with Sevren"] and not dest["At War With The Scarlet Crusade"],
-  "quests that DO have local pins are not also breadcrumbed")
+-- Local-only inputs live under $WSA_PRIVATE_INPUTS (default the repo root).
+local privateRoot = os.getenv("WSA_PRIVATE_INPUTS")
+if privateRoot == nil or privateRoot == "" then privateRoot = "." end
+local localQuestData = privateRoot .. "/addons/ShadowArmy/QuestData.lua"
+local localQuestFile = io.open(localQuestData, "r")
+if localQuestFile then
+  localQuestFile:close()
+  dofile(localQuestData)
+  brillScenario("local QuestData", ShadowArmyQuestData, ShadowArmyQuestZones)
+else
+  print("test_advisor_quest_model: SKIP local QuestData Brill scenario ("
+    .. localQuestData .. " not present)")
+end
 
 -- ------------------------------------------------ r54: pickTarget rules ---
 -- Pure ordering rules, independent of any data file. Candidates arrive

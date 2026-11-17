@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
+import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -11,6 +15,72 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "tools"))
 import traverse_checkpoint as tc  # noqa: E402
+
+# The real checkpoint table is local-only (copyright hygiene). These tests run
+# the shipped resolver/CLI against a small table holding the course poses the
+# tests exercise.
+PRIMARY_COURSE = {
+    "water_entry": (-6784.5, -4833.9, 0.7),
+    "duskwallow_coast": (-4627.01, -4869.45, -2.37),
+    "merchant_coast": (-1816.8, -3899.5, -1.0),
+    "top_barrens": (1071.6, -2303.4, 91.7),
+    "felwood_cave_entrance": (6502.937, -2063.74, 576.017),
+    "everlook": (6687.333052, -4647.667, 721.678),
+}
+# Local-only inputs live under $WSA_PRIVATE_INPUTS (default the repo root).
+PRIVATE_ROOT = Path(os.environ.get("WSA_PRIVATE_INPUTS") or ROOT)
+LOCAL_TABLE = PRIVATE_ROOT / "tools" / "traverse_checkpoints.json"
+SHIPPED_CLI = ROOT / "tools" / "traverse_checkpoint.py"
+_table_dir: tempfile.TemporaryDirectory | None = None
+_table_patch = None
+_table_path: Path | None = None
+
+
+def run_shipped_cli(table: Path, *args: str) -> str:
+    """Run the shipped CLI as a separate process against `table`.
+
+    The CLI reads ROOT/tools/traverse_checkpoints.json, with ROOT taken from
+    its own file path, and has no table flag. For the canonical table it runs
+    in place; otherwise a byte-identical copy of the shipped script runs from
+    a temp tree with `table` beside it.
+    """
+    env = dict(os.environ)
+    env.pop("TRAVERSE_CHARACTER", None)
+    canonical = ROOT / "tools" / "traverse_checkpoints.json"
+    if table.resolve() == canonical.resolve():
+        cmd = [sys.executable, str(SHIPPED_CLI), *args]
+        return subprocess.check_output(cmd, text=True, env=env).strip()
+    with tempfile.TemporaryDirectory() as td:
+        tools = Path(td) / "tools"
+        tools.mkdir()
+        script = tools / SHIPPED_CLI.name
+        shutil.copyfile(SHIPPED_CLI, script)
+        shutil.copyfile(table, tools / canonical.name)
+        cmd = [sys.executable, str(script), *args]
+        return subprocess.check_output(cmd, text=True, env=env).strip()
+
+
+def setUpModule() -> None:
+    global _table_dir, _table_patch, _table_path
+    table = {"spawn": {"map_id": 1, "x": -9187.0, "y": -2530.25, "z": 14.0}}
+    for name, (x, y, z) in PRIMARY_COURSE.items():
+        table[name] = {
+            "map_id": 1, "x": x, "y": y, "z": z, "o": 0.0,
+            "tele_name": f"petrel_{name}",
+        }
+    _table_dir = tempfile.TemporaryDirectory()
+    path = Path(_table_dir.name) / "traverse_checkpoints.json"
+    path.write_text(json.dumps(table), encoding="utf-8")
+    _table_path = path
+    _table_patch = mock.patch.object(tc, "DEFAULT_TABLE", path)
+    _table_patch.start()
+
+
+def tearDownModule() -> None:
+    if _table_patch is not None:
+        _table_patch.stop()
+    if _table_dir is not None:
+        _table_dir.cleanup()
 
 
 class TestTraverseCheckpoint(unittest.TestCase):
@@ -21,17 +91,10 @@ class TestTraverseCheckpoint(unittest.TestCase):
         self.assertEqual(pose["z"], 0.7)
         self.assertEqual(pose["map_id"], 1)
         self.assertEqual(pose["tele_name"], "petrel_water_entry")
+        self.assertEqual(pose["name"], "water_entry")
 
     def test_primary_course_checkpoints(self) -> None:
-        expected = {
-            "water_entry": (-6784.5, -4833.9, 0.7),
-            "duskwallow_coast": (-4627.01, -4869.45, -2.37),
-            "merchant_coast": (-1816.8, -3899.5, -1.0),
-            "top_barrens": (1071.6, -2303.4, 91.7),
-            "felwood_cave_entrance": (6502.937, -2063.74, 576.017),
-            "everlook": (6687.333052, -4647.667, 721.678),
-        }
-        for name, coordinates in expected.items():
+        for name, coordinates in PRIMARY_COURSE.items():
             with self.subTest(checkpoint=name):
                 pose = tc.resolve_checkpoint(name)
                 self.assertEqual(
@@ -57,17 +120,8 @@ class TestTraverseCheckpoint(unittest.TestCase):
             tc.tele_command("North bound", "petrel_water_entry")
 
     def test_cli_tele_cmd_uses_shipped_resolver(self) -> None:
-        import subprocess
-
-        out = subprocess.check_output(
-            [
-                sys.executable,
-                str(ROOT / "tools" / "traverse_checkpoint.py"),
-                "tele-cmd",
-                "water_entry",
-            ],
-            text=True,
-        ).strip()
+        assert _table_path is not None
+        out = run_shipped_cli(_table_path, "tele-cmd", "water_entry")
         self.assertEqual(out, "tele name Northbound petrel_water_entry")
 
     def test_soap_execute_posts_real_command(self) -> None:
@@ -318,6 +372,39 @@ class TestTraverseCheckpoint(unittest.TestCase):
             self.assertIn("duration_s", data["scorecard"])
             self.assertAlmostEqual(data["scorecard"]["duration_s"], 5.0, places=2)
             self.assertIn("traverse scorecard", buf.getvalue())
+
+
+
+@unittest.skipUnless(
+    LOCAL_TABLE.is_file(), f"local checkpoint table not present: {LOCAL_TABLE}"
+)
+class TestLocalCheckpointTable(unittest.TestCase):
+    """The same course contract against the local recorded checkpoint table."""
+
+    def setUp(self) -> None:
+        self.table = tc.load_table(LOCAL_TABLE)
+
+    def test_primary_course_checkpoints(self) -> None:
+        for name, coordinates in PRIMARY_COURSE.items():
+            with self.subTest(checkpoint=name):
+                pose = tc.resolve_checkpoint(name, self.table)
+                self.assertEqual(
+                    (pose["x"], pose["y"], pose["z"]), coordinates
+                )
+                self.assertEqual(pose["map_id"], 1)
+                self.assertTrue(pose["tele_name"])
+
+    def test_water_entry_tele_name(self) -> None:
+        pose = tc.resolve_checkpoint("water_entry", self.table)
+        self.assertEqual(pose["tele_name"], "petrel_water_entry")
+
+    def test_spawn_has_no_tele(self) -> None:
+        pose = tc.resolve_checkpoint("spawn", self.table)
+        self.assertIsNone(pose.get("tele_name"))
+
+    def test_cli_tele_cmd_uses_shipped_resolver(self) -> None:
+        out = run_shipped_cli(LOCAL_TABLE, "tele-cmd", "water_entry")
+        self.assertEqual(out, "tele name Northbound petrel_water_entry")
 
 
 if __name__ == "__main__":

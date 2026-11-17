@@ -3,7 +3,7 @@
 
 import
   std/[math, os, strutils, tables],
-  environment/client/formats/[common, mpq, resolvers, wdl],
+  environment/client/formats/[format_primitives, mpq, resolvers, wdl],
   environment/client/localpaths
 
 const

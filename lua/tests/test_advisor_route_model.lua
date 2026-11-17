@@ -204,18 +204,39 @@ check(zN == 0 and #zPts == 0, "a zero budget draws nothing")
 -- Two days of "no path on the map" in Tirisfal, and the router was never the
 -- reason: every bail above still hands back a drawable two-point line. The
 -- ROUTE HAD NO TARGET (see test_advisor_quest_model's Brill log). Now that a
--- delivery waypoint exists, assert the last mile with the real shipped road
--- network and his real endpoints: player in Brill, Magistrate Sevren's spot.
-dofile("addons/ShadowArmy/RoadData.lua")
-check(ShadowArmyRoadData and ShadowArmyRoadData[85],
-  "RoadData ships a Tirisfal Glades (id 85) network")
+-- delivery waypoint exists, assert the last mile with his real endpoints:
+-- player in Brill, Magistrate Sevren's spot. Generated RoadData.lua is
+-- local-only (copyright hygiene), so the network is a small synthetic
+-- crossroads through those endpoints; a locally generated RoadData.lua gets
+-- the same check when present.
+local function brillLastMile(source, zoneSegments)
+  check(zoneSegments, source .. ": has a Tirisfal Glades (id 85) network")
+  local brillPts, brillMeta = model.route(model.build(zoneSegments),
+    { x = 61.0, y = 52.0 }, { x = 61.3, y = 50.8 })
+  check(#brillPts >= 2,
+    source .. ": Brill -> Magistrate Sevren always yields a drawable line ("
+      .. tostring(brillMeta.reason) .. ")")
+  check(brillPts[1].x == 61.0 and brillPts[#brillPts].x == 61.3,
+    source .. ": that line starts under the player and ends on the turn-in pin")
+end
 
-local brillPts, brillMeta = model.route(model.build(ShadowArmyRoadData[85]),
-  { x = 61.0, y = 52.0 }, { x = 61.3, y = 50.8 })
-check(#brillPts >= 2,
-  "Brill -> Magistrate Sevren always yields a drawable line ("
-    .. tostring(brillMeta.reason) .. ")")
-check(brillPts[1].x == 61.0 and brillPts[#brillPts].x == 61.3,
-  "that line starts under the player and ends on the turn-in pin")
+brillLastMile("synthetic", {
+  seg({ { 40.0, 52.0 }, { 50.0, 52.0 }, { 60.0, 52.0 }, { 70.0, 52.0 } }),
+  seg({ { 61.0, 30.0 }, { 61.0, 40.0 }, { 61.0, 50.0 }, { 61.0, 60.0 } }),
+})
+
+-- Local-only inputs live under $WSA_PRIVATE_INPUTS (default the repo root).
+local privateRoot = os.getenv("WSA_PRIVATE_INPUTS")
+if privateRoot == nil or privateRoot == "" then privateRoot = "." end
+local localRoadData = privateRoot .. "/addons/ShadowArmy/RoadData.lua"
+local localRoadFile = io.open(localRoadData, "r")
+if localRoadFile then
+  localRoadFile:close()
+  dofile(localRoadData)
+  brillLastMile("local RoadData", ShadowArmyRoadData and ShadowArmyRoadData[85])
+else
+  print("test_advisor_route_model: SKIP local RoadData last mile ("
+    .. localRoadData .. " not present)")
+end
 
 print("test_advisor_route_model: " .. passed .. " checks passed")

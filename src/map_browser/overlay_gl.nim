@@ -5,7 +5,6 @@
 import
   std/[math, tables],
   opengl, vmath,
-  bots/real_playerbot/policy/world_catalog,
   map_browser/[roads, runs, waypoints]
 
 const
@@ -136,14 +135,26 @@ proc edgeColor(kind: WaypointEdgeKind): tuple[r, g, b: float32] =
   of wekLift: LiftColor
   of wekSpell: SpellColor
 
-proc nodeKind(node: RealPlayerBotWorldNode): WaypointEdgeKind =
-  ## Kind used to color a waypoint node marker.
-  if node.greatLift:
+proc nodeKind(node: WorldRouteNode): WaypointEdgeKind =
+  ## Kind used to color a waypoint node marker. Lift markers need an authored
+  ## local transport entry, matching `edgeKind`; a bare `verticalTransport`
+  ## flag also marks vertically isolated regions such as the Undercity ring.
+  if node.verticalTransport and node.localTransportEntry != 0'u32:
     wekLift
-  elif node.travelSpellId != 0'u32:
+  elif node.transitionArrivalKnown or node.transportPathId != 0'u32:
     wekSpell
   else:
     wekWalk
+
+proc edgeLabel(kind: WaypointEdgeKind; a, b: WorldRouteNode): string =
+  ## Short label for a non-walking edge; boat and zeppelin crossings are
+  ## public transports rather than teleports.
+  if kind == wekLift:
+    "LIFT"
+  elif a.transportPathId != 0'u32 or b.transportPathId != 0'u32:
+    "TRANSPORT"
+  else:
+    "TELEPORT"
 
 proc pushVert(
   verts: var seq[float32];
@@ -248,7 +259,7 @@ proc rebuildOverlays*(
   showWaypoints, showTaxi: bool;
   graph: WaypointGraph;
   taxi: seq[TaxiPolyline];
-  regions: seq[RealPlayerBotActivityRegion];
+  regions: seq[AuthoredActivityRegion];
   loadedRuns: Table[string, TraverseRun];
   selectedRuns: seq[string];
   beats: seq[TraverseBeat];
@@ -301,7 +312,7 @@ proc rebuildOverlays*(
           x: (a.x + b.x) * 0.5'f32,
           y: (a.y + b.y) * 0.5'f32,
           z: (a.z + b.z) * 0.5'f32 + ZLift,
-          text: if edge.kind == wekLift: "LIFT" else: "TELEPORT"
+          text: edgeLabel(edge.kind, graph.nodes[edge.a], graph.nodes[edge.b])
         )
     for region in regions:
       if region.point.mapId != mapId:

@@ -43,6 +43,12 @@
           bzip2
           nginx
           uv
+          # Python tool tests; Pillow lets test_minimap_mask decode tiles
+          # instead of skipping.
+          (python3.withPackages (ps: [ ps.pillow ]))
+          # Private headless display (Xvfb + xauth) for map_browser
+          # MAP_BROWSER_AUTO renders.
+          xvfb-run
           # WoW 1.12 needs multi-arch wine (32+64).
           wineWow64Packages.stable
           # Loopback capture for make play-classic-netlog (often needs sudo).

@@ -21,6 +21,12 @@ _G.wow = {
   position = function() return nil end,
 }
 
+-- Recorded route data is local-only. The brain runs on it when this checkout
+-- has it, else on a synthetic route with the same shape
+-- (lua/tests/fixtures/traverse_route.lua).
+print("test_traverse_wet: route = "
+  .. require("tests.fixtures.traverse_route").select())
+
 local petrel = require("traverse")
 
 local function view(x, y, extra)
