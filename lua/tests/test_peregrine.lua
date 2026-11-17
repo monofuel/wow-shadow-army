@@ -296,11 +296,11 @@ local function huntView(units)
     { slot = 1, spell_id = 5176, usable = true, usable_known = true },
   } })
 end
-local function chase(seconds, states, units)
+local function chase(seconds, states, units, walkout)
   local last = nil
   for i = 1, math.floor(seconds / 0.15 + 0.5) do
     local state = states[(i - 1) % #states + 1]
-    nav = { state = state, failed_here = false, walkout_available = false,
+    nav = { state = state, failed_here = false, walkout_available = walkout or false,
       error = state == "unavailable" and VETO or "" }
     clock = clock + 0.15
     last = grind.decide(huntView(units))
@@ -317,6 +317,8 @@ check(chase(6.0, REPLAN, pack).guid == 1001,
 check(chase(0.15, { "following" }, pack).guid == 1001 and
   chase(6.0, REPLAN, pack).guid == 1001,
   "a followed route resets the window")
+check(chase(20.0, { "planning" }, pack).guid == 1001,
+  "an old refusal followed only by planning does not set the pull aside")
 check(#logged == 0, "nothing set aside yet")
 local moved = chase(3.0, REPLAN, pack)
 check(moved.kind == "attack" and moved.guid == 1002,
@@ -332,6 +334,24 @@ clock = clock + 60.0
 check(grind.decide(huntView({ guarded })).guid == 1001,
   "retries the pull once the exclusion expires")
 
+-- A fight with the unit ends that approach: refusals from before the fight
+-- do not carry into a later fresh acquisition of the same unit.
+local function fightView(units)
+  local v = huntView(units)
+  v.auto_attack_guid, v.in_combat = 1001, true
+  return v
+end
+chase(6.0, REPLAN, { guarded })
+nav = { state = "unavailable", failed_here = false, walkout_available = false, error = VETO }
+clock = clock + 0.15
+check(grind.decide(fightView({ guarded })).guid == 1001, "fights the engaged unit")
+check(chase(3.0, REPLAN, { guarded }).guid == 1001,
+  "a fresh approach after a fight starts its own window")
+check(chase(6.0, REPLAN, pack).guid == 1002,
+  "and still sets the pull aside when its refusals persist")
+check(grind.decide(fightView(pack)).guid == 1001,
+  "an engaged unit is fought even while set aside for fresh pulls")
+
 -- A roam leg's failures are not charged to a pull that appears afterwards.
 chase(10.0, { "unavailable" }, {})
 local fresh = { unit(1003, 12.0, 3) }
@@ -339,5 +359,11 @@ check(chase(7.5, { "unavailable" }, fresh).guid == 1003,
   "starts a new pull's window at its own first report")
 check(chase(1.0, { "unavailable" }, fresh).kind == "navigate",
   "and sets it aside when its own window runs out")
+
+-- The host walks out only for navigate and interact goals, so an attack
+-- approach that reports a walkout as available still gets set aside, and the
+-- roam leg that follows is where that walkout runs.
+check(chase(9.0, REPLAN, { unit(1004, 12.0, 3) }, true).kind == "navigate",
+  "a reported walkout does not hold a refused attack approach")
 
 print("test_peregrine: " .. passed .. " ok")

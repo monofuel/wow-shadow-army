@@ -92,6 +92,7 @@ local buffedAt = nil
 local chaseGuid = nil
 local chaseUnavailableSince = nil
 local chaseError = nil
+local chasedThisDecide = false
 local blockedUntil = {}
 -- Questgivers with nothing left for us, forgotten again whenever our quest
 -- state changes and they might have something new.
@@ -203,12 +204,17 @@ end
 
 -- The route engine vetoes a corridor that crosses an observed clearance
 -- constraint and rejects every replan while the guards stand, so the seat
--- waits on that pull forever. A pull whose route answers unavailable, with
--- no followed route in between, for a stall window is set aside. Planning
--- alone never counts: a slow answer is not a refusal. nav_progress reports
--- the previous decide, which M.decide guarantees was this same pull.
+-- waits on that pull forever. A pull is set aside only on a refusal that
+-- arrives a stall window after the first one, with no followed route in
+-- between; the replans between refusals report planning, which neither
+-- clears nor completes the window. nav_progress reports the previous decide,
+-- which M.decide guarantees was a fresh approach to this same pull.
+-- walkout_available is not consulted: the host takes walkout steps for
+-- navigate and interact goals only, never while closing on an attack, and the
+-- roam leg that follows a set-aside gets its walkout as usual.
 local function chase_blocked(target)
   local now = wow.time()
+  chasedThisDecide = true
   if chaseGuid ~= target.guid then
     chaseGuid, chaseUnavailableSince = target.guid, nil
     return false
@@ -220,7 +226,8 @@ local function chase_blocked(target)
     chaseUnavailableSince = chaseUnavailableSince or now
     chaseError = nav.error
   end
-  if not chaseUnavailableSince or now - chaseUnavailableSince < STALL_SECONDS then
+  if nav.state ~= "unavailable" or
+      now - chaseUnavailableSince < STALL_SECONDS then
     return false
   end
   for guid, untilAt in pairs(blockedUntil) do
@@ -654,9 +661,12 @@ local function decide(view)
 end
 
 function M.decide(view)
+  chasedThisDecide = false
   local intent = decide(view)
-  -- Any other intent owns the next nav report, so the chase starts over.
-  if intent.kind ~= "attack" or intent.guid ~= chaseGuid then
+  -- Any other intent, including a fight with an engaged unit, owns the next
+  -- nav report, so the approach is judged afresh next time.
+  if not chasedThisDecide or intent.kind ~= "attack" or
+      intent.guid ~= chaseGuid then
     chaseGuid, chaseUnavailableSince = nil, nil
   end
   return intent
