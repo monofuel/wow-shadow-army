@@ -59,6 +59,9 @@ local STALL_SECONDS = 8.0
 -- Rotating a leg restarts the route, so a leg has to be given time to work.
 local LEG_MIN_SECONDS = 4.0
 local PROGRESS_YARDS = 3.0
+-- A pull whose route keeps failing is set aside, then retried: the route
+-- engine's clearance veto lifts once the guarding units move or die.
+local BLOCKED_TARGET_SECONDS = 60.0
 local POST_KILL_HOLDS = 2
 
 -- Upstream's own recovery gates: below these, a fresh pull is a bad trade.
@@ -84,6 +87,12 @@ local lastPos = nil
 local lastProgressAt = nil
 local holdsAfterKill = 0
 local buffedAt = nil
+-- The fresh pull being closed on, how long its route has failed without
+-- being followed, and pulls set aside until a sim time.
+local chaseGuid = nil
+local chaseUnavailableSince = nil
+local chaseError = nil
+local blockedUntil = {}
 -- Questgivers with nothing left for us, forgotten again whenever our quest
 -- state changes and they might have something new.
 local exhausted = {}
@@ -165,11 +174,20 @@ local function credits_objective(view, unit)
   return false
 end
 
+local function target_blocked(guid, now)
+  local untilAt = blockedUntil[guid]
+  if not untilAt then return false end
+  if now < untilAt then return true end
+  blockedUntil[guid] = nil
+  return false
+end
+
 local function pick_target(view, freshPull)
+  local now = wow.time()
   local best, bestScore = nil, nil
   for i = 1, #(view.units or {}) do
     local unit = view.units[i]
-    if huntable(view, unit, freshPull) then
+    if huntable(view, unit, freshPull) and not target_blocked(unit.guid, now) then
       -- Distance decides, but a mob on an active objective is worth a walk.
       local score = unit_distance(unit)
       if QUESTS and credits_objective(view, unit) then
@@ -181,6 +199,38 @@ local function pick_target(view, freshPull)
     end
   end
   return best
+end
+
+-- The route engine vetoes a corridor that crosses an observed clearance
+-- constraint and rejects every replan while the guards stand, so the seat
+-- waits on that pull forever. A pull whose route answers unavailable, with
+-- no followed route in between, for a stall window is set aside. Planning
+-- alone never counts: a slow answer is not a refusal. nav_progress reports
+-- the previous decide, which M.decide guarantees was this same pull.
+local function chase_blocked(target)
+  local now = wow.time()
+  if chaseGuid ~= target.guid then
+    chaseGuid, chaseUnavailableSince = target.guid, nil
+    return false
+  end
+  local nav = wow.nav_progress()
+  if nav.state == "following" or nav.state == "reached" then
+    chaseUnavailableSince = nil
+  elseif nav.state == "unavailable" then
+    chaseUnavailableSince = chaseUnavailableSince or now
+    chaseError = nav.error
+  end
+  if not chaseUnavailableSince or now - chaseUnavailableSince < STALL_SECONDS then
+    return false
+  end
+  for guid, untilAt in pairs(blockedUntil) do
+    if untilAt <= now then blockedUntil[guid] = nil end
+  end
+  blockedUntil[target.guid] = now + BLOCKED_TARGET_SECONDS
+  chaseGuid, chaseUnavailableSince = nil, nil
+  wow.log(string.format("set aside unreachable %s (%s)",
+    target.name or "?", chaseError or ""))
+  return true
 end
 
 local function usable_spell(view, spellId)
@@ -434,7 +484,7 @@ local function progress_status(view)
   }
 end
 
-function M.decide(view)
+local function decide(view)
   -- Death first: everything else is unreachable from a corpse.
   if view.is_dead and not view.is_ghost then
     wow.set_status("dead: releasing")
@@ -564,6 +614,9 @@ function M.decide(view)
       }
     end
     target = pick_target(view, true)
+    if target and chase_blocked(target) then
+      target = pick_target(view, true)
+    end
   end
 
   if target then
@@ -598,6 +651,15 @@ function M.decide(view)
     reason = "roam_" .. heading,
     status = progress_status(view),
   }
+end
+
+function M.decide(view)
+  local intent = decide(view)
+  -- Any other intent owns the next nav report, so the chase starts over.
+  if intent.kind ~= "attack" or intent.guid ~= chaseGuid then
+    chaseGuid, chaseUnavailableSince = nil, nil
+  end
+  return intent
 end
 
 return M

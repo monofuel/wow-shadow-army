@@ -283,4 +283,61 @@ local afterPatience = grind.decide(stuckGiver)
 check(afterPatience.kind ~= "interact" or afterPatience.guid ~= 903,
   "gives up on a questgiver after patience")
 
+-- A pull whose route the engine keeps vetoing (an observed clearance
+-- constraint) replans as planning, planning, unavailable and never follows.
+-- It is set aside after a stall window, and only then.
+grind.set_quests(false)
+local logged = {}
+wow.log = function(msg) logged[#logged + 1] = msg end
+local VETO = "travel route crosses an observed clearance constraint"
+local REPLAN = { "planning", "planning", "unavailable" }
+local function huntView(units)
+  return view(units, { action_buttons = {
+    { slot = 1, spell_id = 5176, usable = true, usable_known = true },
+  } })
+end
+local function chase(seconds, states, units)
+  local last = nil
+  for i = 1, math.floor(seconds / 0.15 + 0.5) do
+    local state = states[(i - 1) % #states + 1]
+    nav = { state = state, failed_here = false, walkout_available = false,
+      error = state == "unavailable" and VETO or "" }
+    clock = clock + 0.15
+    last = grind.decide(huntView(units))
+  end
+  return last
+end
+local guarded, open = unit(1001, 13.0, 3), unit(1002, 30.0, 3)
+local pack = { guarded, open }
+check(chase(0.15, { "following" }, pack).guid == 1001, "chases the nearest pull")
+check(chase(20.0, { "planning" }, pack).guid == 1001,
+  "keeps a pull whose route is still planning")
+check(chase(6.0, REPLAN, pack).guid == 1001,
+  "keeps a vetoed pull inside the stall window")
+check(chase(0.15, { "following" }, pack).guid == 1001 and
+  chase(6.0, REPLAN, pack).guid == 1001,
+  "a followed route resets the window")
+check(#logged == 0, "nothing set aside yet")
+local moved = chase(3.0, REPLAN, pack)
+check(moved.kind == "attack" and moved.guid == 1002,
+  "moves on to the next pull once the veto outlasts the window")
+check(#logged == 1 and logged[1]:find("mob1001", 1, true) and
+  logged[1]:find(VETO, 1, true), "logs the pull it set aside")
+nav = { state = "following", failed_here = false, walkout_available = false }
+clock = clock + 0.15
+local alone = grind.decide(huntView({ guarded }))
+check(alone.kind == "navigate" and alone.reason:sub(1, 5) == "roam_",
+  "roams when the only pull is set aside")
+clock = clock + 60.0
+check(grind.decide(huntView({ guarded })).guid == 1001,
+  "retries the pull once the exclusion expires")
+
+-- A roam leg's failures are not charged to a pull that appears afterwards.
+chase(10.0, { "unavailable" }, {})
+local fresh = { unit(1003, 12.0, 3) }
+check(chase(7.5, { "unavailable" }, fresh).guid == 1003,
+  "starts a new pull's window at its own first report")
+check(chase(1.0, { "unavailable" }, fresh).kind == "navigate",
+  "and sets it aside when its own window runs out")
+
 print("test_peregrine: " .. passed .. " ok")
