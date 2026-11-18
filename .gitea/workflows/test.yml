@@ -27,9 +27,11 @@ jobs:
       - name: Lua unit suite + parse smoke
         run: make test-lua test-smoke-lua
 
-  # Nim leg: unit suites + compile smoke, deps pinned by nimby.lock
-  # (nimby sync -g installs into ~/.nimby/pkgs — the nim.cfg fallback paths;
-  # never workspace-mode sync). Cache keyed on the lock file.
+  # Nim leg: unit suites + compile smoke, deps pinned by nimby.lock. Same
+  # global profile as local dev (playbooks/pull-upstream.md in wow-coworld):
+  # NIMBY_HOME is its own Nimby workspace outside the checkout, `nimby sync -g`
+  # installs into $NIMBY_HOME/pkgs and writes their paths to $NIMBY_HOME/nim.cfg,
+  # which config.nims reads. Never workspace-mode sync. Cache keyed on the lock.
   nim-tests:
     runs-on: monolab-builder
     steps:
@@ -39,6 +41,9 @@ jobs:
       - uses: treeform/setup-nim-action@v6
         with:
           nim-version: '2.2.4'
+      # Absolute path, persisted for later steps: config.nims does not expand ~.
+      - name: Select the wow-coworld Nimby profile
+        run: echo "NIMBY_HOME=$HOME/.nimby/profiles/wow-coworld" >> "$GITHUB_ENV"
       - name: Cache nim packages
         uses: actions/cache@v3
         with:
@@ -48,8 +53,14 @@ jobs:
           key: ${{ runner.os }}-nimby-v1-${{ hashFiles('nimby.lock') }}
           restore-keys: |
             ${{ runner.os }}-nimby-v1-
+      # Nimby refuses to create a workspace inside a Git checkout, so the
+      # profile directory is created as one explicitly (no-op when cached).
       - name: Sync deps from lock
-        run: nimby sync -g nimby.lock
+        run: |
+          mkdir -p "$NIMBY_HOME"
+          cd "$NIMBY_HOME"
+          nimby create
+          nimby sync -g "$GITHUB_WORKSPACE/nimby.lock"
       - name: Nim unit suite + compile smoke
         run: make test-nim test-smoke-nim
 
