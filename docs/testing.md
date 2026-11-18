@@ -49,9 +49,20 @@ cannot hide a unit failure in another):
   lock and then this repo's lock → `make test-nim test-smoke-nim`. Both
   syncs install into `$NIMBY_HOME/pkgs` and append to `$NIMBY_HOME/nim.cfg`,
   which `config.nims` reads, so the profile holds the union of the two locks
-  exactly as local dev does. Lock-based `-g` sync from that external profile
-  is the ONLY nimby invocation allowed near this repo — plain workspace-mode
-  `nimby sync` mutates Softmax sibling checkouts.
+  exactly as local dev does. The fork's lock fetches Wololo (private Softmax
+  code) from the private Gitea mirror `Monolab/wololo` at its exact pin
+  `86aa2a6379bf352a18a4d717e1b5da63451e75c0`, also tagged
+  `ci-wow-coworld-pin-86aa…`. Only the sync step receives the
+  repository secret `WOLOLO_CI_READ_KEY`, a read-only key registered only on
+  that mirror and separate from `CI_DEPLOY_KEY`. The step writes the key to a
+  private temp dir that it deletes on exit, and checks the key's public
+  fingerprint before use. SSH ignores agents and config and trusts only the
+  Gitea host key pinned in the workflow. It runs an `ls-remote` of the pin tag
+  first, so mirror access is proven even when the package cache already holds
+  Wololo. No actual CI run has exercised this route yet. Lock-based `-g`
+  sync from that external profile is the ONLY nimby invocation allowed near
+  this repo — plain workspace-mode `nimby sync` mutates Softmax sibling
+  checkouts.
 
 Current tools have zero Lua module deps (no cjson/socket yet); add packages
 to the lua install step only when a unit test actually needs them. Unit jobs

@@ -35,11 +35,12 @@ jobs:
   # army lock and the fork pin, whose locks together make up the profile.
   # nim.cfg imports two sibling sources, checked out here at fixed commits:
   # the client fork (../monofuel-vanilla-wow: environment/, coworld_wow_sdk/)
-  # and scriptorium (../scriptorium/src: the conductor's library).
+  # and scriptorium (../scriptorium/src: the conductor's library). The fork's
+  # lock fetches private Wololo from the private Monolab/wololo Gitea mirror.
   nim-tests:
     runs-on: monolab-builder
     env:
-      FORK_PIN: 55f70b9be7d809c33b7b6217ae3c1cb007c627c0
+      FORK_PIN: baa25c1ef7e28e2e9a9ac1323b7b6e149df597a9
       SCRIPTORIUM_PIN: 565d6a84742e21f47374056db7be67589af72982
     steps:
       - uses: actions/checkout@v3
@@ -99,8 +100,50 @@ jobs:
       # profile directory is created as one explicitly (no-op when cached).
       # The fork's lock, then the army's: both `-g` syncs append to one
       # profile, whose union is what the fork modules and army code import.
+      # The fork's lock pins Wololo (private Softmax code) to the private
+      # Monolab/wololo Gitea mirror. WOLOLO_CI_READ_KEY is a repository secret
+      # holding a read-only key registered only on that mirror, separate from
+      # CI_DEPLOY_KEY. It exists only in this step, in a private temp dir that
+      # is removed on exit, and SSH trusts only the pinned Gitea host key. The
+      # ls-remote preflight proves the key reads the pin even when the package
+      # cache already holds Wololo and Nimby has nothing to fetch.
       - name: Sync deps from locks
+        env:
+          WOLOLO_CI_READ_KEY: ${{ secrets.WOLOLO_CI_READ_KEY }}
+          WOLOLO_KEY_FINGERPRINT: 'SHA256:6eLEF7HguEb9P74Yf9PyuC1LNMXQ9xhIUGtmyMuMi10'
+          WOLOLO_URL: 'ssh://git@10.11.4.11:222/Monolab/wololo.git'
+          WOLOLO_PIN: 86aa2a6379bf352a18a4d717e1b5da63451e75c0
+          WOLOLO_PIN_TAG: refs/tags/ci-wow-coworld-pin-86aa2a6379bf352a18a4d717e1b5da63451e75c0
+          GITEA_HOST_KEY: '[10.11.4.11]:222 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIB909FOcZXflNQ6j+A9yJRYdYQ/AVelTjZ+QfQVW6XyU'
         run: |
+          set -euo pipefail
+          set +x
+          if [ -z "${WOLOLO_CI_READ_KEY:-}" ]; then
+            echo "error: repository secret WOLOLO_CI_READ_KEY missing (read-only key for the private Monolab/wololo mirror)" >&2
+            exit 1
+          fi
+          ssh_dir="$(mktemp -d "${RUNNER_TEMP:-/tmp}/wololo-ssh.XXXXXX")"
+          trap 'rm -rf "$ssh_dir"' EXIT
+          trap 'exit 1' HUP INT TERM
+          chmod 700 "$ssh_dir"
+          (umask 077; printf '%s\n' "$WOLOLO_CI_READ_KEY" > "$ssh_dir/wololo_read_key")
+          unset WOLOLO_CI_READ_KEY
+          chmod 600 "$ssh_dir/wololo_read_key"
+          printf '%s\n' "$GITEA_HOST_KEY" > "$ssh_dir/known_hosts"
+          chmod 600 "$ssh_dir/known_hosts"
+          ssh-keygen -y -P '' -f "$ssh_dir/wololo_read_key" > "$ssh_dir/wololo_read_key.pub"
+          key_fingerprint="$(ssh-keygen -l -E sha256 -f "$ssh_dir/wololo_read_key.pub" | awk '{print $2}')"
+          if [ "$key_fingerprint" != "$WOLOLO_KEY_FINGERPRINT" ]; then
+            echo "error: WOLOLO_CI_READ_KEY fingerprint $key_fingerprint is not the expected $WOLOLO_KEY_FINGERPRINT" >&2
+            exit 1
+          fi
+          export GIT_SSH_COMMAND="ssh -F /dev/null -i $ssh_dir/wololo_read_key -o IdentityAgent=none -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$ssh_dir/known_hosts -o GlobalKnownHostsFile=/dev/null"
+          pin_tag_sha="$(git ls-remote --exit-code "$WOLOLO_URL" "$WOLOLO_PIN_TAG" | awk '{print $1}')"
+          if [ "$pin_tag_sha" != "$WOLOLO_PIN" ]; then
+            echo "error: $WOLOLO_PIN_TAG on the Wololo mirror is '$pin_tag_sha', expected $WOLOLO_PIN" >&2
+            exit 1
+          fi
+          echo "Wololo mirror read OK: $WOLOLO_PIN_TAG = $pin_tag_sha (key $key_fingerprint)"
           mkdir -p "$NIMBY_HOME"
           cd "$NIMBY_HOME"
           nimby create
