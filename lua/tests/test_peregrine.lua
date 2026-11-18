@@ -366,4 +366,30 @@ check(chase(1.0, { "unavailable" }, fresh).kind == "navigate",
 check(chase(9.0, REPLAN, { unit(1004, 12.0, 3) }, true).kind == "navigate",
   "a reported walkout does not hold a refused attack approach")
 
+-- A starting field leaves the nearest pull well beyond melee sight: a visible
+-- pull is walked to instead of roaming a blind leg, nearer pulls still win,
+-- and only an empty or out-of-range list falls back to roaming.
+nav = { state = "following", failed_here = false, walkout_available = false }
+local noBuff = {
+  action_buttons = {
+    { slot = 1, spell_id = 5176, usable = true, usable_known = true, in_range = true },
+  },
+}
+clock = clock + 0.15
+local distant = grind.decide(view({ unit(1201, 70.0, 2) }, noBuff))
+check(distant.kind == "attack" and distant.guid == 1201,
+  "walks to a visible pull beyond the old 40 yd search")
+clock = clock + 0.15
+local nearer = grind.decide(view({ unit(1201, 70.0, 2), unit(1202, 55.0, 2) }, noBuff))
+check(nearer.kind == "attack" and nearer.guid == 1202,
+  "the nearest visible pull still wins")
+clock = clock + 0.15
+local outOfSight = grind.decide(view({ unit(1203, 120.0, 2) }, noBuff))
+check(outOfSight.kind == "navigate" and outOfSight.reason:sub(1, 5) == "roam_",
+  "roams when every pull is beyond the search")
+clock = clock + 0.15
+local tooHigh = grind.decide(view({ unit(1204, 70.0, 6) }, noBuff))
+check(tooHigh.kind == "navigate" and tooHigh.reason:sub(1, 5) == "roam_",
+  "a distant pull above the fresh-pull ceiling is still skipped")
+
 print("test_peregrine: " .. passed .. " ok")

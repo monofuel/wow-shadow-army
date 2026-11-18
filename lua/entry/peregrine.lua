@@ -52,7 +52,9 @@ local BUFFS_BY_CLASS = {
 }
 
 local ENGAGE_YARDS = 4.0
-local SEARCH_YARDS = 40.0        -- a starting field is sparser than a road
+-- A starting field is sparse: walking to a visible pull beats a blind roam
+-- leg, so the search covers the whole unit list the client reports.
+local SEARCH_YARDS = 100.0
 local ROAM_YARDS = 70.0          -- a leg long enough to reach new spawns
 local CORPSE_STOP_YARDS = 30.0   -- the reclaim radius is 39; stop short of it
 local STALL_SECONDS = 8.0
