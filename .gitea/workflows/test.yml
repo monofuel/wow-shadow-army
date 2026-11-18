@@ -31,11 +31,53 @@ jobs:
   # global profile as local dev (playbooks/pull-upstream.md in wow-coworld):
   # NIMBY_HOME is its own Nimby workspace outside the checkout, `nimby sync -g`
   # installs into $NIMBY_HOME/pkgs and writes their paths to $NIMBY_HOME/nim.cfg,
-  # which config.nims reads. Never workspace-mode sync. Cache keyed on the lock.
+  # which config.nims reads. Never workspace-mode sync. Cache keyed on the
+  # army lock and the fork pin, whose locks together make up the profile.
+  # nim.cfg imports two sibling sources, checked out here at fixed commits:
+  # the client fork (../monofuel-vanilla-wow: environment/, coworld_wow_sdk/)
+  # and scriptorium (../scriptorium/src: the conductor's library).
   nim-tests:
     runs-on: monolab-builder
+    env:
+      FORK_PIN: 55f70b9be7d809c33b7b6217ae3c1cb007c627c0
+      SCRIPTORIUM_PIN: 565d6a84742e21f47374056db7be67589af72982
     steps:
       - uses: actions/checkout@v3
+      - name: Checkout sibling sources at pin
+        env:
+          # Same read-only deploy key as pin-check: the fork's commits live
+          # on the private Monolab/coworld-vanilla-wow mirror. Scriptorium
+          # is public on GitHub and needs no credentials.
+          CI_DEPLOY_KEY: ${{ secrets.CI_DEPLOY_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "$CI_DEPLOY_KEY" ]; then
+            echo "error: org secret CI_DEPLOY_KEY missing (read-only deploy key for the private mirrors)" >&2
+            exit 1
+          fi
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$CI_DEPLOY_KEY" > ~/.ssh/ci_deploy_key
+          chmod 600 ~/.ssh/ci_deploy_key
+          PARENT="$(dirname "$GITHUB_WORKSPACE")"
+          checkout_pin() {
+            dir="$1"; url="$2"; pin="$3"; branch="$4"
+            rm -rf "$dir"
+            git init -q "$dir"
+            git -C "$dir" remote add origin "$url"
+            if ! git -C "$dir" fetch --depth 1 origin "$pin"; then
+              echo "direct pin fetch failed — fetching $branch then checkout"
+              git -C "$dir" fetch origin "$branch"
+            fi
+            git -C "$dir" checkout -q --force "$pin"
+            echo "$dir HEAD=$(git -C "$dir" rev-parse HEAD)"
+          }
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/ci_deploy_key -o StrictHostKeyChecking=accept-new"
+          checkout_pin "$PARENT/monofuel-vanilla-wow" \
+            "ssh://git@10.11.4.11:222/Monolab/coworld-vanilla-wow.git" \
+            "$FORK_PIN" monofuel/master
+          checkout_pin "$PARENT/scriptorium" \
+            "https://github.com/monofuel/scriptorium.git" \
+            "$SCRIPTORIUM_PIN" master
       # treeform/setup-nim-action ships nim + nimby directly (Racha pattern);
       # 2.2.4 pinned to match local dev.
       - uses: treeform/setup-nim-action@v6
@@ -50,16 +92,19 @@ jobs:
           path: |
             ~/.nimble
             ~/.nimby
-          key: ${{ runner.os }}-nimby-v1-${{ hashFiles('nimby.lock') }}
+          key: ${{ runner.os }}-nimby-v1-${{ hashFiles('nimby.lock') }}-${{ env.FORK_PIN }}
           restore-keys: |
             ${{ runner.os }}-nimby-v1-
       # Nimby refuses to create a workspace inside a Git checkout, so the
       # profile directory is created as one explicitly (no-op when cached).
-      - name: Sync deps from lock
+      # The fork's lock, then the army's: both `-g` syncs append to one
+      # profile, whose union is what the fork modules and army code import.
+      - name: Sync deps from locks
         run: |
           mkdir -p "$NIMBY_HOME"
           cd "$NIMBY_HOME"
           nimby create
+          nimby sync -g "$(dirname "$GITHUB_WORKSPACE")/monofuel-vanilla-wow/nimby.lock"
           nimby sync -g "$GITHUB_WORKSPACE/nimby.lock"
       - name: Nim unit suite + compile smoke
         run: make test-nim test-smoke-nim

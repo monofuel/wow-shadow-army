@@ -38,13 +38,19 @@ cannot hide a unit failure in another):
   image carries a dep-less nim, so plain `make test` would run the nim tier
   without its packages and fail for the wrong reason (this exact failure
   shipped red from the v0.10.0 push until 2026-08-03).
-- **`nim-tests`**: checkout → `treeform/setup-nim-action@v6` (nim 2.2.4,
-  ships nimby; Racha build.yml pattern) → cache `~/.nimble` + `~/.nimby`
-  keyed on `hashFiles('nimby.lock')` → `nimby sync -g nimby.lock` →
-  `make test-nim test-smoke-nim`. `nimby.lock` pins mummy/jsony/zippy/webby/
-  crunchy/nimsimd/MCPort/nimponents at the SHAs local dev runs; the lock-based
-  `-g` sync installs into `~/.nimby/pkgs` (the nim.cfg fallback paths) and is
-  the ONLY nimby invocation allowed near this repo — plain workspace-mode
+- **`nim-tests`**: checkout → sibling sources at the job's `FORK_PIN` /
+  `SCRIPTORIUM_PIN` (`../monofuel-vanilla-wow` from the private mirror with
+  the read-only `CI_DEPLOY_KEY`, `../scriptorium` from public GitHub; the
+  `nim.cfg` paths the map-browser and conductor tests import) →
+  `treeform/setup-nim-action@v6` (nim 2.2.4, ships nimby; Racha build.yml
+  pattern) → `NIMBY_HOME=$HOME/.nimby/profiles/wow-coworld` → cache
+  `~/.nimble` + `~/.nimby` keyed on `hashFiles('nimby.lock')` and the fork
+  pin → `nimby create` in `$NIMBY_HOME`, then `nimby sync -g` of the fork's
+  lock and then this repo's lock → `make test-nim test-smoke-nim`. Both
+  syncs install into `$NIMBY_HOME/pkgs` and append to `$NIMBY_HOME/nim.cfg`,
+  which `config.nims` reads, so the profile holds the union of the two locks
+  exactly as local dev does. Lock-based `-g` sync from that external profile
+  is the ONLY nimby invocation allowed near this repo — plain workspace-mode
   `nimby sync` mutates Softmax sibling checkouts.
 
 Current tools have zero Lua module deps (no cjson/socket yet); add packages
