@@ -59,7 +59,7 @@ cannot hide a unit failure in another):
   fingerprint before use. SSH ignores agents and config and trusts only the
   Gitea host key pinned in the workflow. It runs an `ls-remote` of the pin tag
   first, so mirror access is proven even when the package cache already holds
-  Wololo. No actual CI run has exercised this route yet. Lock-based `-g`
+  Wololo. Lock-based `-g`
   sync from that external profile is the ONLY nimby invocation allowed near
   this repo — plain workspace-mode `nimby sync` mutates Softmax sibling
   checkouts.
