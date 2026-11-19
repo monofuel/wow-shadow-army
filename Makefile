@@ -120,6 +120,10 @@ HOME_SLOT ?= 0
 HOME_TOKEN ?= token-0
 HOME_ENTRY ?= home
 HOME_ARMY_DIR := $(CURDIR)/local_data/home-army
+# Every seat start runs this after its live-pid guard: it rotates launcher.log
+# and keeps the stopped client's heartbeats, status and runtime manifest under
+# one rotation id before anything is deleted or rewritten.
+RETAIN_SEAT_RUNTIME := $(CURDIR)/tools/retain_seat_runtime.sh
 HOME_STATUS_MAX_AGE ?= 30
 
 # Live Lua debug port for home seats (docs/lua-debug-port.md, ticket 0053).
@@ -184,10 +188,8 @@ define start_home_seat
 			echo "$(1) already running (pid $$pid)"; exit 0; \
 		fi; \
 	fi; \
+	$(RETAIN_SEAT_RUNTIME) "$$seat_dir"; \
 	rm -f "$$pid_file" "$$seat_dir/status/status.json" "$$seat_dir/control/request.json"; \
-	if [ -s "$$seat_dir/launcher.log" ]; then \
-		mv "$$seat_dir/launcher.log" "$$seat_dir/launcher.log.$$(date -u +%Y%m%dT%H%M%SZ)"; \
-	fi; \
 	setsid $(MAKE) --no-print-directory $(2) >"$$seat_dir/launcher.log" 2>&1 < /dev/null & \
 	pid=$$!; echo "$$pid" > "$$pid_file"; \
 	echo "starting $(1) (pid $$pid; log $$seat_dir/launcher.log)"; \
@@ -322,7 +324,7 @@ test-smoke: test-smoke-lua test-smoke-nim-soft test-smoke-sh
 # test-smoke-lua: a compile-check is a legitimate leg for code with no unit
 # suite). `bash -n` never executes a line.
 SH_CHECK_FILES = tools/home_army_scale.sh tools/soap.sh tools/realm_op.sh tools/private_seat_identity.sh \
-	tools/home_assets.sh
+	tools/home_assets.sh tools/retain_seat_runtime.sh
 test-smoke-sh:
 	@rc=0; for f in $(SH_CHECK_FILES); do \
 		[ -f "$$f" ] || continue; \
@@ -1611,10 +1613,8 @@ qa-seat-start:
 	if [ -s "$$pid_file" ] && kill -0 "$$(cat $$pid_file)" 2>/dev/null; then \
 		echo "$(QA_CHARACTER) already running (pid $$(cat $$pid_file))"; exit 0; \
 	fi; \
+	$(RETAIN_SEAT_RUNTIME) "$$seat_dir"; \
 	rm -f "$$pid_file" "$$seat_dir/status/status.json" "$$seat_dir/control/request.json"; \
-	if [ -s "$$seat_dir/launcher.log" ]; then \
-		mv "$$seat_dir/launcher.log" "$$seat_dir/launcher.log.$$(date -u +%Y%m%dT%H%M%SZ)"; \
-	fi; \
 	setsid $(MAKE) --no-print-directory qa-bot >"$$seat_dir/launcher.log" 2>&1 < /dev/null & \
 	pid=$$!; echo "$$pid" > "$$pid_file"; \
 	echo "starting $(QA_CHARACTER) (pid $$pid; log $$seat_dir/launcher.log)"; \
