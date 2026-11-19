@@ -71,7 +71,12 @@
         shellHook = ''
           export PKG_CONFIG_PATH="${pkgs.openssl.dev}/lib/pkgconfig''${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
           export LD_LIBRARY_PATH="${libPath}''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-          export LIBRARY_PATH="${pkgs.openssl.out}/lib:${pkgs.bzip2.out}/lib''${LIBRARY_PATH:+:$LIBRARY_PATH}"
+          # The fork's headed player links -l:libjemalloc.so.2. The ld wrapper
+          # only derives RUNPATHs for -lname, so the jemalloc RUNPATH is explicit.
+          # Never on LD_LIBRARY_PATH: it would shadow tools that carry their own
+          # prefixed jemalloc (uv).
+          export LIBRARY_PATH="${pkgs.openssl.out}/lib:${pkgs.bzip2.out}/lib:${pkgs.jemalloc}/lib''${LIBRARY_PATH:+:$LIBRARY_PATH}"
+          export NIX_LDFLAGS="''${NIX_LDFLAGS:+$NIX_LDFLAGS }-rpath ${pkgs.jemalloc}/lib"
           export C_INCLUDE_PATH="${pkgs.openssl.dev}/include''${C_INCLUDE_PATH:+:$C_INCLUDE_PATH}"
           # Nim deps live in the dedicated wow-coworld Nimby global profile,
           # shared with the client fork; config.nims reads its generated

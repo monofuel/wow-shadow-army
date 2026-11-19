@@ -838,19 +838,40 @@ PLAY_SLOT ?= 0
 PLAY_TOKEN ?= token-0
 PLAY_OWNER ?= monofuel
 # Runs from OUR fork so human sessions carry the fork's client fixes
-# (F9 movement-evidence logging); data env vars above still point at the
-# upstream checkout's local_data.
+# (F9 movement-evidence logging). Client geometry comes from the current
+# extracted-data install the league launches use (LEAGUE_DATA_DIR); the
+# upstream checkout's older extraction fails the launcher's release check.
+# This repo's dev shell supplies the runtime libraries (ssl, GL, X11, the
+# jemalloc the headed player links) and the nginx and uv the launcher's local
+# asset path needs. The fork's config.nims requires the Nim pinned by its
+# player/Dockerfile, so that Nimby-installed compiler is selected and verified
+# before compiling. tools/wow_env.sh is not sourced here: its global Nim and
+# fixed store paths override the dev shell.
+# `make play EXTRA=--check` validates the launch path without opening a client.
 play:
 	@set -e; \
 	if [ ! -d "$(FORK_CLIENT)" ]; then \
 		echo "error: fork checkout missing: $(FORK_CLIENT)" >&2; exit 1; \
 	fi; \
-	if [ ! -f "$(WOW_ENV)" ]; then \
-		echo "error: missing $(WOW_ENV)" >&2; exit 1; \
+	if [ ! -d "$(LEAGUE_DATA)/dbc" ] || [ ! -d "$(LEAGUE_DATA)/mmaps" ]; then \
+		echo "error: extracted client data missing (needs dbc/ and mmaps/): $(LEAGUE_DATA_DIR)" >&2; exit 1; \
 	fi; \
 	cd "$(FORK_CLIENT)"; \
-	nix shell nixpkgs\#nginx --command sh -c \
-		'. "$(WOW_ENV)"; \
+	VANILLA_WOW_EXTRACTED_DATA_DIR="$(LEAGUE_DATA)" \
+	nix develop "$(CURDIR)" --command sh -c \
+		'set -e; \
+		pin=$$(sed -n "s/^ARG NIM_VERSION=//p" player/Dockerfile); \
+		if [ -z "$$pin" ]; then \
+			echo "error: player/Dockerfile does not pin NIM_VERSION" >&2; exit 1; \
+		fi; \
+		for bin in "$$NIMBY_HOME/nim-$$pin/bin" "$$HOME/.nimby/nim-$$pin/bin"; do \
+			if [ -x "$$bin/nim" ]; then PATH="$$bin:$$PATH"; export PATH; break; fi; \
+		done; \
+		found=$$(nim --version | head -n 1); \
+		case "$$found" in \
+			*"Version $$pin "*) ;; \
+			*) echo "error: play requires Nim $$pin (nimby use $$pin); found: $$found" >&2; exit 1;; \
+		esac; \
 		export VANILLA_WOW_LOGIN_WS_URL="$(PLAY_WS)/tcp/realmd?slot=$(PLAY_SLOT)&token=$(PLAY_TOKEN)"; \
 		export VANILLA_WOW_GAME_WS_URL="$(PLAY_WS)/tcp/world?slot=$(PLAY_SLOT)&token=$(PLAY_TOKEN)"; \
 		nim r tools/launch_nim_player.nim -- \
