@@ -31,6 +31,17 @@ MYSQL_USER="${VANILLA_WOW_MYSQL_USER:-mangos}"
 MYSQL_PASS="${VANILLA_WOW_MYSQL_PASSWORD:-mangos}"
 DBS=(characters realmd mangos)
 
+# This legacy utility restores named volumes or overwrites live SQL. Neither
+# is the validated offline physical restore procedure for our private world.
+# Refuse before confirmation, stop, image pull, or any database write.
+private_db=$(realpath -m "$ARMY_ROOT/../local_data/vmangos-db/data")
+if [[ $(realpath -m "${VMANGOS_DB_DIR:-$private_db}") == "$private_db" ]] || \
+    docker container inspect "$CONTAINER" --format '{{range .Mounts}}{{println .Source}}{{end}}' 2>/dev/null \
+      | grep -Fxq "$private_db"; then
+  echo "restore-server: refusing legacy volume/live-SQL restore of the private file-backed world; use its verified cold-backup recovery procedure" >&2
+  exit 2
+fi
+
 if [[ $# -lt 1 ]]; then
   echo "usage: tools/restore_server.sh <backup-dir-or-name> [--yes]" >&2
   exit 2

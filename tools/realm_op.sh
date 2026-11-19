@@ -43,6 +43,45 @@ usage() {
 OP="$1"
 shift
 
+# The original private world has its own audited image and real file-backed
+# database. The current upstream Compose file ignores VMANGOS_DB_DIR. Never
+# let make/dashboard up replace it with a named-volume realm or newer schema.
+# Explicit disposable DB paths retain the existing upstream operator route.
+private_db=$(realpath -m "$ARMY_ROOT/../local_data/vmangos-db/data")
+if [[ $(realpath -m "$VMANGOS_DB_DIR") == "$private_db" ]]; then
+  case "$OP" in
+    up|down)
+      [[ $# == 0 ]] || { echo "realm_op: private lifecycle does not accept upstream build/reset flags" >&2; exit 2; }
+      private_launcher="$ARMY_ROOT/../tools/private_realm.sh"
+      [[ -x $private_launcher ]] || {
+        echo "realm_op: private launcher missing: $private_launcher; refusing the named-volume fallback" >&2
+        exit 1
+      }
+      if [[ $OP == up ]]; then private_verb=start; else private_verb=stop; fi
+      exec nix develop "$ARMY_ROOT" --command bash "$private_launcher" "$private_verb"
+      ;;
+    *)
+      echo "realm_op: private realm supports only up/down; use tools/private_realm.sh check for readiness. Refusing upstream config/reset operations." >&2
+      exit 2
+      ;;
+  esac
+fi
+
+# A different DB path is not sufficient isolation: upstream ignores it. Only
+# the actual target Compose project separates a disposable realm. Never let
+# its up/down replace or remove a container mounting the protected world.
+if [[ $OP == up || $OP == down ]]; then
+  target_project=${COMPOSE_PROJECT_NAME:-coworld-vmangos}
+  containers=$(docker ps -aq --filter "label=com.docker.compose.project=$target_project")
+  for container in $containers; do
+    mounts=$(docker container inspect "$container" --format '{{range .Mounts}}{{println .Source}}{{end}}')
+    if grep -Fxq "$private_db" <<< "$mounts"; then
+      echo "realm_op: target project $target_project contains the private file-backed world; refusing the disposable operator route" >&2
+      exit 2
+    fi
+  done
+fi
+
 discover_operator() {
   local root="$1"
   local candidates=(

@@ -128,10 +128,10 @@ const
   ## Bot seat lifecycle maps to the canonical Makefile targets. Murist is
   ## human-controlled and is intentionally never listed.
   SeatMakeTargets* = [
-    (name: "Shadowfel", startTarget: "shadowfel-start", stopTarget: "shadowfel-stop"),
-    (name: "Igris", startTarget: "igris-start", stopTarget: "igris-stop"),
-    (name: "Tusk", startTarget: "tusk-start", stopTarget: "tusk-stop"),
-    (name: "Beru", startTarget: "beru-start", stopTarget: "beru-stop")
+    (name: "Shadowfel", account: "shadow1", startTarget: "shadowfel-start", stopTarget: "shadowfel-stop"),
+    (name: "Igris", account: "shadow2", startTarget: "igris-start", stopTarget: "igris-stop"),
+    (name: "Tusk", account: "shadow3", startTarget: "tusk-start", stopTarget: "tusk-stop"),
+    (name: "Beru", account: "shadow4", startTarget: "beru-start", stopTarget: "beru-stop")
   ]
   ## Dedicated-four live Lua debug base. Makefile default stays empty so
   ## league/traverse/scaled `seat-start` never inherit the home block.
@@ -167,17 +167,17 @@ WHERE c.name='Northbound'"""
   ## template entry. Slot taxonomy is deliberately ignored — equipped, bag
   ## slots and backpack all roll into one total. LEFT JOINs keep characters
   ## with empty bags (they emit a single item-id 0 row).
-  RealmInventorySql = """SELECT c.guid, c.name, c.level, c.class, c.money, c.online,
+  RealmInventorySqlTemplate = """SELECT c.guid, c.name, c.level, c.class, c.money, c.online,
 COALESCE(ii.item_id, 0), COALESCE(SUM(ii.count), 0), COUNT(ii.guid)
 FROM characters c
+JOIN realmd.account a ON a.id = c.account
 LEFT JOIN character_inventory ci ON ci.guid = c.guid
 LEFT JOIN item_instance ii ON ii.guid = ci.item_guid
-WHERE c.name NOT IN ('Botmage', 'Botpriest', 'Botrogue', 'Botshaman',
-  'Botwarrior', 'Cowcam', 'Nightsun')
+WHERE __PARTY_SCOPE__
 GROUP BY c.guid, COALESCE(ii.item_id, 0)
 ORDER BY c.name, ii.item_id"""
-  ## ^ the seeded lvl-30 test characters and camera seats are not the army;
-  ## their (substantial) seeded inventories drowned out the real pool.
+  ## Membership comes from the human identity and configured home roster,
+  ## matched to realmd.account. Level and balance never determine eligibility.
   ## Active quest log for one character (unrewarded only).
   ## VMaNGOS status: 1=complete (turn-in ready), 3=incomplete/active, 5=failed.
   ## quest_template is multi-patch — take MAX(patch) per entry for Title/reqs.
@@ -1970,13 +1970,15 @@ proc parseRealmInventoryTsv*(tsv: string): seq[RealmInvCharacter] =
     result[at].itemTotal += count
     result[at].stackTotal += stacks
 
+proc realmInventorySql*(): string
+
 proc fetchRealmInventory*(): RealmInventory =
   ## One SELECT → the whole realm's bags. Never raises: a DB that is down
   ## comes back as an `error` string, not an exception through the router.
   result = RealmInventory(characters: @[], fetchedAt: epochTime(), error: "")
   try:
     result.characters =
-      parseRealmInventoryTsv(dockerMariadbSelect(RealmInventorySql))
+      parseRealmInventoryTsv(dockerMariadbSelect(realmInventorySql()))
   except CatchableError as e:
     result.error = e.msg
     result.fetchedAt = 0.0
@@ -2135,6 +2137,7 @@ proc realmInventoryToJson*(
       "holders": holders
     })
   result = %*{
+    "scope": "Murist and configured home bots (matched character and account)",
     "characters": chars,
     "character_count": inv.characters.len,
     "item_total": itemTotal,
@@ -2876,6 +2879,29 @@ proc seatTargets*(): seq[SeatTarget] =
     result.add(SeatTarget(name: seat.name, scaled: false))
   for t in scaledSeatTargets():
     result.add(t)
+
+proc inventoryScopePredicate*(members: openArray[tuple[name, account: string]]): string =
+  ## Select actual party memberships, regardless of level or balance. A name
+  ## alone is insufficient provenance; an unconfigured/QA/fixture account must
+  ## not contribute to the human's inventory. No currency is changed.
+  var clauses: seq[string]
+  for member in members:
+    if isSafeSeatToken(member.name) and isSafeSeatToken(member.account):
+      clauses.add("(UPPER(c.name) = '" & member.name.toUpperAscii &
+        "' AND UPPER(a.username) = '" & member.account.toUpperAscii & "')")
+  if clauses.len == 0: "0" else: "(" & clauses.join(" OR ") & ")"
+
+proc inventoryPartyScope*(): string =
+  var members = @[(name: AdminRequesterName, account: "monofuel")]
+  for seat in SeatMakeTargets:
+    members.add((seat.name, seat.account))
+  refreshSeatRoster()
+  for seat in scaledSeatTargets():
+    members.add((seat.name, seat.account))
+  inventoryScopePredicate(members)
+
+proc realmInventorySql*(): string =
+  RealmInventorySqlTemplate.replace("__PARTY_SCOPE__", inventoryPartyScope())
 
 proc seatTargetFor*(name: string): SeatTarget =
   ## Watched seat by name; `.name == ""` when the name is not watched.
@@ -5577,7 +5603,7 @@ proc renderRealmInventoryBody*(
       <p class="empty">No inventory yet — start the realm on <a href="/admin">Admin</a>.</p>"""
       else:
         """
-      <p class="empty">No characters on this realm.</p>"""
+      <p class="empty">No matching army characters.</p>"""
     return errNote & empty
   var itemTotal = 0
   var moneyTotal = 0
@@ -5598,7 +5624,7 @@ proc renderRealmInventoryBody*(
       return cmp(na, nb)
     return cmp(a.name, b.name)
   )
-  var goldTitle = "no gold on the realm"
+  var goldTitle = "no gold in the army"
   if goldHolders.len > 0:
     var bits: seq[string] = @[]
     for c in goldHolders:
@@ -5617,7 +5643,7 @@ proc renderRealmInventoryBody*(
   result = &"""
       <div class="panel-actions" style="margin-bottom:0.7rem">
         <span class="army-summary">{inv.characters.len} characters · {itemCount} item types · {itemTotal} items</span>
-        <span class="army-summary" title="{escapeHtml(goldTitle)}">{escapeHtml(formatGold(moneyTotal))} on the realm</span>
+        <span class="army-summary" title="{escapeHtml(goldTitle)}">{escapeHtml(formatGold(moneyTotal))} in the army</span>
         <span class="{ageCls}">read {formatAgeSec(age)} ago</span>
       </div>
 {errNote}
@@ -6130,7 +6156,7 @@ proc renderInventoryPage*(inventoryBody: string): string =
   let body = &"""
     <section class="panel">
       <div class="panel-head">
-        <h2>Realm inventory</h2>
+        <h2>Army inventory</h2>
         <div class="panel-actions">
           <span class="badge accent">characters DB</span>
           <button class="btn"

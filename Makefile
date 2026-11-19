@@ -610,7 +610,7 @@ start-server:
 	cd "$(SYSTEM_UPSTREAM_DIR)"; \
 	docker compose -f "$(COMPOSE_FILE)" --profile coworld logs -f coworld-game
 
-# Stop the coworld-game service (compose rm --stop). Does not wipe volumes
+# Stop the private coworld-game service, retaining its validated container.
 # (character/account DB state persists). Never docker kill.
 stop-server:
 	@set -e; \
@@ -870,7 +870,7 @@ play:
 		found=$$(nim --version | head -n 1); \
 		case "$$found" in \
 			*"Version $$pin "*) ;; \
-			*) echo "error: play requires Nim $$pin (nimby use $$pin); found: $$found" >&2; exit 1;; \
+			*) echo "error: play requires Nim $$pin under $$NIMBY_HOME/nim-$$pin/bin; found: $$found" >&2; exit 1;; \
 		esac; \
 		export VANILLA_WOW_LOGIN_WS_URL="$(PLAY_WS)/tcp/realmd?slot=$(PLAY_SLOT)&token=$(PLAY_TOKEN)"; \
 		export VANILLA_WOW_GAME_WS_URL="$(PLAY_WS)/tcp/world?slot=$(PLAY_SLOT)&token=$(PLAY_TOKEN)"; \

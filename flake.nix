@@ -92,7 +92,7 @@
             fi
           done
           if [ ! -x "$pinnedNimBin/nim" ]; then
-            echo "wow-shadow-army: Nim ${pinnedNim} missing; run nimby use ${pinnedNim}" >&2
+            echo "wow-shadow-army: Nim ${pinnedNim} missing; install it under $NIMBY_HOME/nim-${pinnedNim}/bin" >&2
           fi
         '';
       };
