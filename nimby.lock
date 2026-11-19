@@ -6,3 +6,5 @@ crunchy 0.1.11 https://github.com/guzba/crunchy 98eb6526982bb8aae8eec6e8781f4539
 nimsimd 1.3.2 https://github.com/guzba/nimsimd ba71ac4e2927ba61e6d1bf75d0d124eacc714d1c
 MCPort 1.0.0 https://github.com/monofuel/MCPort.git 5f6e3b20a20c53339114c8ff7155f3cf6ba53306
 nimponents 2.0.0 https://github.com/monofuel/nimponents 4ed143a490fa4c46d78b035ff4e3601f05b010ae
+curly 1.1.1 https://github.com/guzba/curly a0f42baacbc48f4e5924b18854c0df9dcc251466
+libcurl 1.0.0 https://github.com/Araq/libcurl 7a420498f60a31d99fc8513886ce36c4e8c3a4ae

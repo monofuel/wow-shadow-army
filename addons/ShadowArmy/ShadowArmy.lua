@@ -2341,7 +2341,7 @@ local F = {}
 
 -- Bump on every edit. The System watches Chat.log for "<SA> loaded rev=..."
 -- after sending a reload — a new rev proves the edit actually loaded.
-local REV = "r58"
+local REV = "r60"
 
 -- Log window (r16): every F.say()/F.emit() line also lands here with a
 -- timestamp, so errors survive chat scroll-off and can be reviewed in-game.
@@ -6585,15 +6585,24 @@ do
   local ROUTE_TARGET_MOVE = 1.0  -- % target drift before the route is recomputed
   local ROUTE_PLAYER_MOVE = 2.0  -- % player drift before the route is recomputed
   local ROUTE_LEAD = 1.0         -- % lookahead for the "go" bearing
-  -- Straight-guide look (r52). Same dot pool, deliberately weaker ink: the gap
-  -- is wide enough to read as dashes, the swatch is pulled halfway to grey, and
-  -- the dots are a pixel smaller than a road trail's. Road = follow this;
-  -- straight = there is nothing to follow, walk it. Still a step ABOVE the r48
-  -- road layer's field (3 px, 0.40) — guidance must outrank scenery.
-  local ROUTE_STRAIGHT_GAP = 2.0  -- % of map between straight-guide dots
+  -- Trail spacing is measured in projected map PIXELS, not zone percent: at
+  -- zone scale a 30-100 yd objective is only ~7-25 px away, so any percent
+  -- gap collapses to the two endpoints, and those sit under the player arrow
+  -- and the objective pin. Samples therefore start/stop a clearance away from
+  -- both icons and fill the visible stretch between them.
+  local ROUTE_ROAD_GAP_PX = 5     -- road trail: dense, reads as a line
+  local ROUTE_STRAIGHT_GAP_PX = 6 -- straight guide: wider, reads as dashes
+  local ROUTE_CLEAR_START = 6     -- px left clear under the player arrow
+  local ROUTE_CLEAR_END = 6       -- px left clear under the 10 px pin
+  local ROUTE_HALO = 2            -- px of dark backing on each side of a dot
+  local ROUTE_HALO_A = 0.70       -- the backing is what lifts it off the art
+  -- Straight-guide look (r52). Same dot pool, a pixel smaller than a road
+  -- trail's, swatch pulled toward grey and spaced as dashes. Road = follow
+  -- this; straight = there is nothing to follow, walk it. Both sit well above
+  -- the r48 road layer's field (3 px, 0.40) — guidance must outrank scenery.
   local ROUTE_STRAIGHT_SIZE = 4   -- px; the road trail is 5
-  local ROUTE_STRAIGHT_MIX = 0.45 -- 0 = quest colour, 1 = flat grey
-  local ROUTE_STRAIGHT_A = 0.42   -- alpha; the road trail is 0.55
+  local ROUTE_STRAIGHT_MIX = 0.25 -- 0 = quest colour, 1 = flat grey
+  local ROUTE_STRAIGHT_A = 0.90   -- alpha; the road trail is 0.95
 
   local route = {
     zone = nil,        -- AreaTable id the cached graph was built for
@@ -6746,33 +6755,84 @@ do
       .. (ROUTE_REASON_SHORT[reason] or reason) .. ")"
   end
 
-  local routeDots = {}
+  local routeLayer = CreateFrame("Frame", nil, WorldMapDetailFrame)
+  routeLayer:SetAllPoints(WorldMapDetailFrame)
+  routeLayer:SetFrameLevel(WorldMapDetailFrame:GetFrameLevel() + 2)
+  local routeDots, routeHalos = {}, {}
   function F.routeDot(i)
     local t = routeDots[i]
-    if t then return t end
-    -- ARTWORK, not OVERLAY: the trail passes UNDER the objective pins.
-    -- MUST stay lazily created: 1.12 ignores SetDrawLayer's sublevel, so
-    -- within ARTWORK only creation order puts this trail ABOVE the road
-    -- layer's eagerly-built pool. Prebuild this at load and the trail sinks.
-    t = WorldMapDetailFrame:CreateTexture(nil, "ARTWORK")
-    t:SetWidth(5)
-    t:SetHeight(5)
-    t:Hide()
-    routeDots[i] = t
-    return t
+    if t then return t, routeHalos[i] end
+    -- Keep the selected guide above map artwork and the surrounding pins.
+    -- Endpoint clearances preserve the player and destination markers.
+    -- Separate texture layers keep every halo below the coloured dots.
+    local k = 1
+    while k <= ROUTE_MAX_DOTS do
+      local h = routeLayer:CreateTexture(nil, "BACKGROUND")
+      h:SetTexture(0, 0, 0, ROUTE_HALO_A)
+      h:Hide()
+      routeHalos[k] = h
+      k = k + 1
+    end
+    k = 1
+    while k <= ROUTE_MAX_DOTS do
+      local d = routeLayer:CreateTexture(nil, "ARTWORK")
+      d:SetWidth(5)
+      d:SetHeight(5)
+      d:Hide()
+      routeDots[k] = d
+      k = k + 1
+    end
+    return routeDots[i], routeHalos[i]
   end
 
-  -- Where the dots go this frame, in percent. Reused across calls so a repaint
+  -- Where the dots go this frame, in map pixels, plus the route projected to
+  -- pixels with its cumulative length. Reused across calls so a repaint
   -- allocates nothing: this runs on every WORLD_MAP_UPDATE while the map is
-  -- open, and 40 fresh tables a frame is exactly the garbage 1.12 hates.
+  -- open, and fresh tables every frame are exactly the garbage 1.12 hates.
   local drawX, drawY = {}, {}
+  local pathX, pathY, pathS = {}, {}, {}
+
+  -- Evenly sample the projected polyline pathX/pathY (n points, cumulative
+  -- length pathS) every `gap` px, keeping clear0 px off the start and clear1
+  -- px off the end. A path too short to clear both icons gets its midpoint.
+  -- Returns the number of samples written to drawX/drawY.
+  local function sampleTrail(n, gap, clear0, clear1)
+    local total = pathS[n]
+    if not total or total <= 0 then return 0 end
+    local s0, s1 = clear0, total - clear1
+    if s1 < s0 then
+      s0 = total / 2
+      s1 = s0
+    end
+    local count = math.floor((s1 - s0) / gap) + 1
+    if count > ROUTE_MAX_DOTS then count = ROUTE_MAX_DOTS end
+    if count == 1 then
+      s0 = (s0 + s1) / 2
+      s1 = s0
+    end
+    local step = 0
+    if count > 1 then step = (s1 - s0) / (count - 1) end
+    local seg = 1
+    local np = 0
+    while np < count do
+      local d = s0 + step * np
+      while seg < n - 1 and pathS[seg + 1] < d do seg = seg + 1 end
+      local len = pathS[seg + 1] - pathS[seg]
+      local f = 0
+      if len > 0 then f = (d - pathS[seg]) / len end
+      np = np + 1
+      drawX[np] = pathX[seg] + (pathX[seg + 1] - pathX[seg]) * f
+      drawY[np] = pathY[seg] + (pathY[seg + 1] - pathY[seg]) * f
+    end
+    return np
+  end
 
   -- Same guards as F.questDrawMarkers: quest.posOK is the oracle for "the map is
   -- showing the player's own zone", so the trail can never decorate a zone the
   -- human is merely browsing.
   --
-  -- r52: BOTH answers get drawn. A road route samples its waypoints; a
-  -- straight/bailed route gets an evenly dotted line from the player to the
+  -- r52: BOTH answers get drawn. A road route follows its waypoints; a
+  -- straight/bailed route IS the two-point line from the player to the
   -- target. Drawing nothing on a bail was the whole "zero path guidance"
   -- report — and with the Brill corridor still missing from RoadData (ticket
   -- 0059) bails are the common case in Tirisfal, not the exception.
@@ -6785,46 +6845,38 @@ do
     local straight = route.straight
     local np = 0
 
-    if show and not straight then
-      -- A long route outruns the dot pool, so sample it evenly and always keep
-      -- the last point: the trail must end at the pin it is pointing at.
-      local step = 1
-      if route.n > ROUTE_MAX_DOTS then
-        step = math.ceil((route.n - 1) / (ROUTE_MAX_DOTS - 1))
-      end
-      local idx = 1
-      while idx < route.n and np < ROUTE_MAX_DOTS - 1 do
-        local p = route.points[idx]
-        np = np + 1
-        drawX[np], drawY[np] = p.x, p.y
-        idx = idx + step
-      end
-      local last = route.points[route.n]
-      np = np + 1
-      drawX[np], drawY[np] = last.x, last.y
-    elseif show then
-      -- The bailed route IS the two-point straight line, so its own endpoints
-      -- are the player and the target — no second read of quest.target needed,
-      -- and they are the same (possibly one tick stale) numbers the road trail
-      -- would have used.
-      local a, b = route.points[1], route.points[route.n]
-      if a and b and a.x and a.y and b.x and b.y then
-        local dx, dy = b.x - a.x, b.y - a.y
-        local want = math.floor(math.sqrt(dx * dx + dy * dy) / ROUTE_STRAIGHT_GAP) + 1
-        if want < 2 then want = 2 end
-        if want > ROUTE_MAX_DOTS then want = ROUTE_MAX_DOTS end
-        while np < want do
-          local f = np / (want - 1)
-          np = np + 1
-          drawX[np], drawY[np] = a.x + dx * f, a.y + dy * f
+    if show then
+      -- Project the selected route's own points; nothing is invented. The
+      -- straight answer is just its endpoints (player, target).
+      local n = 0
+      local i = 1
+      while i <= route.n do
+        local p = route.points[i]
+        if straight and i > 1 and i < route.n then p = nil end
+        if p and p.x and p.y then
+          n = n + 1
+          pathX[n] = p.x / 100 * w
+          pathY[n] = p.y / 100 * h
+          if n == 1 then
+            pathS[n] = 0
+          else
+            local dx, dy = pathX[n] - pathX[n - 1], pathY[n] - pathY[n - 1]
+            pathS[n] = pathS[n - 1] + math.sqrt(dx * dx + dy * dy)
+          end
         end
+        i = i + 1
+      end
+      if n >= 2 then
+        local gap = ROUTE_ROAD_GAP_PX
+        if straight then gap = ROUTE_STRAIGHT_GAP_PX end
+        np = sampleTrail(n, gap, ROUTE_CLEAR_START, ROUTE_CLEAR_END)
       end
     end
 
-    -- Quest colour, but smaller and dimmer than an objective pin: the trail is
-    -- context, the pins are the answer. The straight guide steps down again on
-    -- all three axes so the two kinds never read alike at a glance.
-    local size, alpha = 5, 0.55
+    -- Quest colour, a little smaller than an objective pin and on a dark
+    -- backing: the trail is context, the pins are the answer. The straight
+    -- guide is smaller, greyer and dashed so the two kinds never read alike.
+    local size, alpha = 5, 0.95
     local cr, cg, cb = route.r, route.g, route.b
     if straight then
       size, alpha = ROUTE_STRAIGHT_SIZE, ROUTE_STRAIGHT_A
@@ -6833,20 +6885,28 @@ do
       cg = cg * keep + 0.5 * ROUTE_STRAIGHT_MIX
       cb = cb * keep + 0.5 * ROUTE_STRAIGHT_MIX
     end
+    local hs = size + 2 * ROUTE_HALO
 
     local i = 1
     while i <= ROUTE_MAX_DOTS do
-      local t = F.routeDot(i)
+      local t, halo = F.routeDot(i)
       if i <= np then
-        t:ClearAllPoints() -- SetPoint ACCUMULATES anchors in 1.12
+        halo:ClearAllPoints() -- SetPoint ACCUMULATES anchors in 1.12
+        halo:SetWidth(hs)
+        halo:SetHeight(hs)
+        halo:SetPoint("CENTER", WorldMapDetailFrame, "TOPLEFT",
+          drawX[i], -drawY[i])
+        halo:Show()
+        t:ClearAllPoints()
         t:SetWidth(size)
         t:SetHeight(size)
         t:SetPoint("CENTER", WorldMapDetailFrame, "TOPLEFT",
-          drawX[i] / 100 * w, -(drawY[i] / 100 * h))
+          drawX[i], -drawY[i])
         t:SetTexture(cr, cg, cb, alpha)
         t:Show()
       else
         t:Hide()
+        halo:Hide()
       end
       i = i + 1
     end
@@ -7250,10 +7310,7 @@ do
   function F.roadDot(i)
     local t = roadDots[i]
     if t then return t end
-    -- ARTWORK sublevel -1: under the route trail (ARTWORK 0) and well under
-    -- the objective pins (OVERLAY). Old clients that ignore the sublevel
-    -- argument still get the right order from the eager pool below, because
-    -- within one layer 1.12 draws in creation order.
+    -- Below the objective pins (OVERLAY) and selected guide's higher frame.
     t = WorldMapDetailFrame:CreateTexture(nil, "ARTWORK")
     if t.SetDrawLayer then pcall(t.SetDrawLayer, t, "ARTWORK", -1) end
     t:SetWidth(ROAD_DOT)
@@ -7351,9 +7408,8 @@ do
 
   F.roadSetLayer(true)
 
-  -- Built once, at load. Within one draw layer 1.12 renders in CREATION
-  -- order, so making the whole pool before the first route dot exists is what
-  -- actually guarantees the trail stays on top of the network.
+  -- Reuse the road field across map openings. Selected guides and quest pins
+  -- use a higher frame above this ARTWORK layer.
   if WorldMapDetailFrame then
     local i = 1
     while i <= ROAD_MAX_DOTS do

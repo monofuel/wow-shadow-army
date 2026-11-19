@@ -5,6 +5,7 @@ wow = {
   set_status = function() end,
 }
 
+require("tests.lifecycle_fixture")
 local home = require("home")
 
 -- Road routing is fed synthetic maps here, never the baked artifact: a test
@@ -446,22 +447,28 @@ check(r.kind == "hold" and r.reason == "wait_for_beru_resurrection",
   "dead seat briefly waits for plausible Beru resurrection")
 v.simulation_time = 121
 r = home.decide(v)
-check(r.kind == "hold" and r.reason == "skip_release",
-  "dead seat does not /release after the resurrection wait")
+check(r.kind == "release" and r.reason == "release_spirit",
+  "dead seat releases once the resurrection wait is over")
 r = home.decide(v)
-check(r.kind == "hold" and r.reason == "skip_release",
-  "skip_release holds every tick; one /release still drops the session")
+check(r.kind == "hold" and r.reason == "release_pending",
+  "one release per retry window, not one per tick")
+v.simulation_time = 132
+r = home.decide(v)
+check(r.kind == "release", "a corpse that is still a corpse asks again")
 v.resurrect_offer_guid = 999
 r = home.decide(v)
 check(r.kind == "accept_rez",
-  "a rez offer still wins after the skip-release window")
+  "a rez offer still wins after the release window")
 
 home.reset()
 v = frame()
 v.is_dead = true
 r = home.decide(v)
-check(r.kind == "hold" and r.reason == "skip_release",
-  "a dead seat with no Beru never emits /release")
+check(r.kind == "hold" and r.reason == "wait_for_resurrection",
+  "a dead seat with no Beru waits briefly for a rez offer")
+v.simulation_time = 121
+r = home.decide(v)
+check(r.kind == "release", "then releases instead of holding forever")
 
 home.reset()
 v = frame()
@@ -603,7 +610,14 @@ home.reset()
 v = frame(9)
 v.party = { in_group = false, members = {} }
 v.units = {}
-v.spell_facts = { spell(688, "Summon Imp", 1) }
+v.pet = { guid_known = true, guid = 0 }
+v.known_spells = { 688 }
+v.action_bar_known = true
+v.action_buttons = {
+  { slot = 2, kind = "spell", spell_id = 688, spell_name = "Summon Imp",
+    usable_known = true, usable = true, cooldown_ms = 0,
+    not_enough_mana = false },
+}
 r = home.decide(v)
 check(r.kind == "cast_spell" and r.spell == 688 and r.reason == "summon_imp",
   "petless solo warlock summons its imp before grinding")
@@ -618,6 +632,7 @@ v.units = {
     player_can_attack = false, death_known = true, is_dead = false,
     distance = 2, location = { map_id = 0, position = { x = 1, y = 0, z = 0 } } },
 }
+v.pet = { guid_known = true, guid = 4245 }
 r = home.decide(v)
 check(not (r.kind == "cast_spell" and r.spell == 688),
   "solo warlock with a live imp does not resummon")
@@ -1105,24 +1120,70 @@ r = home.decide(v)
 check(logs_matching("bag items to sell") == report and #logged <= 2,
   "the shortlist is reported once per merchant, not once per tick")
 
--- 4. Host CAN sell: one item per tick, rate limited, never the same twice.
+-- 4. Host CAN sell: one sale at a time, re-sent until the bags show it left
+--    (the host floor throttles an early send silently), never a nil while a
+--    sale is pending (a nil lets the quest stack close the merchant).
 home.reset()
 logged = {}
 v = vendor_frame()
 v.sell_supported = true
+v.copper_known = true
+v.copper = 100
+v.free_bag_slots = 0
 r = home.decide(v)
 check(r.kind == "sell_item" and r.guid == 4242 and r.item_guid == 12,
   "an open merchant sells the unwearable mail first")
 check(r.status.mode == "vendor", "a sale reports vendor mode")
+v.simulation_time = 100.3
 r = home.decide(v)
-check(r.kind ~= "sell_item", "sales are rate limited inside the gap")
-v.simulation_time = 102
+check(r.kind == "sell_item" and r.item_guid == 12,
+  "an unconfirmed sale keeps the merchant and re-sends the same item")
+check(logs_matching("vendor: sold") == nil,
+  "nothing counts as sold while the item is still carried")
+table.remove(v.inventory_items, 2)
+v.copper = 155
+v.free_bag_slots = 1
+v.simulation_time = 100.9
 r = home.decide(v)
 check(r.kind == "sell_item" and r.item_guid == 13,
-  "the next tick sells the next item, not the same one again")
-v.simulation_time = 104
+  "the bags proving the sale move on to the next item")
+check(logs_matching("copper 100->155 free 0->1") ~= nil,
+  "a confirmed sale logs the real copper and free-slot change")
+table.remove(v.inventory_items, 2)
+v.simulation_time = 101.5
 r = home.decide(v)
 check(r.kind ~= "sell_item", "nothing left to sell ends the vendor step")
+
+-- 4b. A sale the bags never confirm times out; three in a row leave the
+--     merchant and hold the next vendor walk for the retry window.
+home.reset()
+logged = {}
+v = vendor_frame()
+v.sell_supported = true
+v.inventory_items[#v.inventory_items + 1] =
+  bag_row(15, 4865, "Ruined Pelt", 15, 0, 0, 5)
+v.inventory_items[#v.inventory_items + 1] =
+  bag_row(16, 7074, "Chipped Claw", 15, 0, 0, 4)
+local t = 200
+for _ = 1, 40 do
+  v.simulation_time = t
+  r = home.decide(v)
+  t = t + 0.5
+end
+check(r.kind ~= "sell_item",
+  "three unconfirmed sales stop selling instead of looping forever")
+check(logs_matching("unconfirmed — leaving the merchant") ~= nil,
+  "giving up on the merchant is logged")
+
+-- 4c. Combat outranks a pending sale.
+home.reset()
+v = vendor_frame()
+v.sell_supported = true
+r = home.decide(v)
+check(r.kind == "sell_item", "a sale starts out of combat")
+v.in_combat = true
+r = home.decide(v)
+check(r.kind ~= "sell_item", "combat takes the tick from a pending sale")
 
 -- 5. A warrior at the same vendor keeps the mail: warriors learn it at 40, so
 --    "cannot use yet" is never a sale.
@@ -1300,13 +1361,13 @@ home.reset()
 logged = {}
 v = solo_full_bags()
 r = home.decide(v)
-check(r.reason ~= "open_vendor" and r.reason ~= "open_vendor_walk",
-  "live interact freeze: vendor seek is off; full bags still grind")
+check(r.kind == "interact" and r.reason == "open_vendor" and r.guid == 2115,
+  "full bags with sellable junk open the vendor in view")
 
 v.quest_frame = { open = true, panel = "reward" }
 r = home.decide(v)
-check(r.reason ~= "vendor_clear_dialog",
-  "vendor seek off means no dialog-clear for the vendor walk")
+check(r.kind == "ui_press" and r.reason == "vendor_clear_dialog",
+  "full bags close an open dialog before walking to the vendor")
 
 v.quest_frame = { open = false }
 v.free_bag_slots = 5
@@ -1325,6 +1386,100 @@ v.units = { leader_unit(3, false), solo_full_bags().units[1] }
 r = home.decide(v)
 check(r.reason ~= "open_vendor",
   "an escort with Murist does not walk off to a vendor")
+
+-- 7b. A full-bag seat out of vendor range walks back to the vendor it last
+--     saw, and drops the memory if it arrives and the vendor is gone.
+home.reset()
+v = solo_full_bags()
+v.free_bag_slots = 8
+v.units = {
+  {
+    guid = 2113, name = "Archibald Kava", object_kind = "unit",
+    services = { "vendor", "repair" }, distance = 50,
+    death_known = true, is_dead = false, player_can_attack = false,
+    location = { map_id = 0, x = 50, y = 0, z = 0 },
+  },
+}
+r = home.decide(v)
+check(r.reason ~= "open_vendor", "roomy bags only remember the vendor")
+v.free_bag_slots = 0
+v.units = {}
+v.location = { map_id = 0, x = 300, y = 0, z = 0 }
+r = home.decide(v)
+check(r.kind == "navigate" and r.reason == "vendor_walk_remembered" and
+  r.x == 50, "full bags walk back to the last vendor seen")
+v.location = { map_id = 0, x = 52, y = 0, z = 0 }
+r = home.decide(v)
+check(r.reason ~= "vendor_walk_remembered",
+  "arriving where the vendor was and not seeing it forgets it")
+
+-- 7c. Never seen a vendor: walk to the nearest turn-in hub of an accepted
+--     quest; arriving with no vendor in view ends the attempt.
+home.reset()
+v = solo_full_bags()
+v.units = {}
+v.accepted_quests = { { quest_id = 99001 } }
+v.location = { map_id = 0, x = 300, y = 0, z = 0 }
+package.loaded["data.bot_quest_hubs"] =
+  { [99001] = { ender = { 0, 100, 0, 0, "Giver" } } }
+r = home.decide(v)
+check(r.kind == "navigate" and r.reason == "vendor_walk_hub" and r.x == 100,
+  "a full seat with no vendor memory walks to its quest hub")
+v.location = { map_id = 0, x = 105, y = 0, z = 0 }
+r = home.decide(v)
+check(r.reason ~= "vendor_walk_hub", "arriving at the hub without a vendor stops")
+v.location = { map_id = 0, x = 300, y = 0, z = 0 }
+r = home.decide(v)
+check(r.reason ~= "vendor_walk_hub", "the retry window holds the next hub walk")
+package.loaded["data.bot_quest_hubs"] = nil
+
+-- 7d. A vendor the seat cannot reach is skipped after the patience window.
+home.reset()
+v = solo_full_bags()
+v.units = {
+  { guid = 2113, name = "Archibald Kava", object_kind = "unit",
+    services = { "vendor", "repair" }, distance = 11,
+    death_known = true, is_dead = false, player_can_attack = false,
+    location = { map_id = 0, x = 11, y = 0, z = 0 } },
+  { guid = 2114, name = "Blacksmith Rand", object_kind = "unit",
+    services = { "vendor", "repair" }, distance = 28,
+    death_known = true, is_dead = false, player_can_attack = false,
+    location = { map_id = 0, x = 28, y = 0, z = 0 } },
+}
+v.simulation_time = 500
+r = home.decide(v)
+check(r.guid == 2113, "the nearest pure vendor is tried first")
+v.simulation_time = 530
+r = home.decide(v)
+check(r.guid == 2114 or r.reason == "vendor_unstick",
+  "an unreached vendor rotates to the next one")
+check(logs_matching("not reached in") ~= nil, "the rotation is logged")
+
+-- 7e. Three unreachable vendors in a row stop the walk for the retry window.
+home.reset()
+logged = {}
+v = solo_full_bags()
+v.units = {}
+for i = 1, 4 do
+  v.units[i] = { guid = 3000 + i, name = "V" .. i, object_kind = "unit",
+    services = { "vendor" }, distance = 10 + i,
+    death_known = true, is_dead = false, player_can_attack = false,
+    location = { map_id = 0, x = 10 + i, y = 0, z = 0 } }
+end
+local tt = 600
+for _ = 1, 4 do
+  v.simulation_time = tt
+  home.decide(v)
+  tt = tt + 26
+  v.simulation_time = tt
+  home.decide(v)
+end
+check(logs_matching("vendors unreachable") ~= nil,
+  "three unreachable vendors end the attempt")
+v.simulation_time = tt + 10
+r = home.decide(v)
+check(r.reason ~= "open_vendor" and r.reason ~= "open_vendor_route" and
+  r.reason ~= "vendor_walk_remembered", "the retry window holds the vendor walk")
 
 home.reset()
 v = solo_full_bags()
@@ -1345,16 +1500,22 @@ v.units = {
   },
 }
 r = home.decide(v)
-check(r.reason ~= "open_vendor",
-  "vendor seek off: no interact even when a pure vendor is in view")
+check(r.kind == "interact" and r.reason == "open_vendor" and r.guid == 2113,
+  "prefers the pure vendor over a questgiver-vendor")
 
 local old_nav = wow.nav_progress
 wow.nav_progress = function() return { state = "planning" } end
 home.reset()
 v = solo_full_bags()
 r = home.decide(v)
-check(r.reason ~= "open_vendor_walk" and r.reason ~= "vendor_unstick",
-  "vendor seek off: no steered vendor walk")
+check(r.kind == "navigate" and r.reason == "open_vendor_route",
+  "a planning stall far from the vendor asks the router, not a straight steer")
+home.reset()
+v = solo_full_bags()
+v.units[1].distance = 6
+r = home.decide(v)
+check(r.kind == "navigate" and r.reason == "open_vendor_walk",
+  "a planning-wedged route steers the last yards to the vendor")
 wow.nav_progress = old_nav
 
 -- Escort warrior Charges to close; other classes never do.
@@ -1634,3 +1795,66 @@ check(r.kind == "attack" and r.spell == nil and r.reason == "rogue_melee",
 wow.log = realLog
 
 print("test_home: " .. checks .. " checks passed")
+
+-- Solo persistent progression (lua/tools/lifecycle.lua), Legia/Vulcan shape:
+-- an undead warlock with Piercing the Veil accepted, no skulls, no imp.
+home.reset()
+v = frame(9)
+v.level = 4
+v.party = { in_group = false, members = {} }
+v.location = { map_id = 0, position = { x = 1100.0, y = 96.0, z = 10 } }
+v.known_spells = { 686, 687 }
+v.action_bar_known = true
+v.action_buttons = {
+  { slot = 1, kind = "spell", spell_id = 686, spell_name = "Shadow Bolt",
+    usable_known = true, usable = true, cooldown_ms = 0, not_enough_mana = false },
+}
+v.accepted_quests = { { quest_id = 1470 } }
+v.quest_objectives = { { quest_id = 1470, item_id = 6281, current = 0, required = 3 } }
+v.completed_quest_ids = {}
+v.units = {}
+r = home.decide(v)
+check(r.kind == "navigate" and r.reason == "class_quest_field" and r.status.mode == "solo",
+  "solo warlock with the imp quest open walks to the skull droppers: " ..
+    tostring(r.kind) .. "/" .. tostring(r.reason))
+
+-- A kill leaves the swing latched on the corpse with combat over; the seat
+-- loots its own corpse instead of treating that as a fight.
+v.location = { map_id = 0, position = { x = 1250.0, y = 0.0, z = 10 } }
+v.auto_attack_guid = 501
+v.units = {
+  { guid = 501, entry = 1890, name = "Rattlecage Skeleton", player_can_attack = true,
+    death_known = true, is_dead = true, health_known = true, health = 0,
+    max_health = 60, lootable_known = true, is_lootable = true,
+    tapped_known = true, is_tapped = true, tapped_by_player = true,
+    distance = 12, combat_distance_known = true, combat_distance = 12,
+    location = { map_id = 0, position = { x = 1262.0, y = 0.0, z = 10 } } },
+}
+r = home.decide(v)
+check(r.kind == "interact" and r.guid == 501,
+  "a stale swing on our lootable corpse walks to loot it: " ..
+    tostring(r.kind) .. "/" .. tostring(r.reason))
+print("test_home lifecycle: " .. checks .. " checks passed")
+
+-- A class-quest leg that stops displacing gets the bounded wedge escape.
+home.reset()
+v = frame(9)
+v.level = 3
+v.party = { in_group = false, members = {} }
+v.location = { map_id = 0, position = { x = 1180.0, y = 40.0, z = 10 } }
+v.known_spells = { 686 }
+v.action_bar_known = true
+v.action_buttons = {}
+v.accepted_quests = { { quest_id = 1470 } }
+v.quest_objectives = { { quest_id = 1470, item_id = 6281, current = 0, required = 3 } }
+v.completed_quest_ids = {}
+v.units = {}
+local escaped = nil
+for t = 0, 12, 0.5 do
+  v.simulation_time = 1000 + t
+  r = home.decide(v)
+  if r.reason == "progress_unstick" then escaped = r break end
+end
+check(escaped and escaped.navigation_mode == "local_steer",
+  "a wedged class-quest walk escapes with a local leg")
+print("test_home progress unstick: " .. checks .. " checks passed")

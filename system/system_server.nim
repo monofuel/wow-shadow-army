@@ -3127,6 +3127,26 @@ proc startSeatTarget*(t: SeatTarget): JsonNode =
 proc stopSeatTarget*(t: SeatTarget): JsonNode =
   if t.scaled: stopScaledSeat(t) else: stopBotSeat(t.name)
 
+proc startNamedSeat*(name: string): JsonNode =
+  ## Manual start by name (dashboard button, API, MCP): the original four and
+  ## every configured roster seat, through the babysitter's dispatcher.
+  ## Unknown, protected and human names are rejected without launching.
+  refreshSeatRoster()
+  let t = seatTargetFor(name)
+  if t.name.len == 0:
+    return %*{"ok": false, "name": name, "action": "start",
+              "detail": "not a launchable bot seat"}
+  startSeatTarget(t)
+
+proc stopNamedSeat*(name: string): JsonNode =
+  ## Manual stop by name; same lookup and rejection as startNamedSeat.
+  refreshSeatRoster()
+  let t = seatTargetFor(name)
+  if t.name.len == 0:
+    return %*{"ok": false, "name": name, "action": "stop",
+              "detail": "not a launchable bot seat"}
+  stopSeatTarget(t)
+
 # ---------------------------------------------------------------------------
 # Traverse detached ops: Lua proof-of-life + local watch_bots observer
 # ---------------------------------------------------------------------------
@@ -5012,8 +5032,11 @@ proc renderSeatCell*(s: Character): string =
   ## tooltip so it does not duplicate the Bot column.
   let net = if s.online: "On" else: "Off"
   let netCls = if s.online: "online" else: "offline"
+  var launchable = false
+  {.gcsafe.}:
+    launchable = isWatchedSeatName(s.name)
   let title =
-    if seatMakeTarget(s.name).len == 0:
+    if not launchable:
       "human seat"
     elif s.controlUp:
       "embedded Lua policy heartbeat is fresh"
@@ -5024,7 +5047,10 @@ proc renderSeatCell*(s: Character): string =
 proc renderBotCell*(s: Character): string =
   ## Per-seat Start/Stop button for launchable bot seats ("—" otherwise).
   ## controlUp is the truth signal: PID alive + Lua heartbeat fresh.
-  if seatMakeTarget(s.name).len == 0:
+  var launchable = false
+  {.gcsafe.}:
+    launchable = isWatchedSeatName(s.name)
+  if not launchable:
     return """<span class="xp-muted">—</span>"""
   if s.controlUp:
     result = &"""
@@ -7240,14 +7266,14 @@ proc botStartHandler(request: Request) {.gcsafe.} =
   ## POST /bots/start?name=<seat> — launch that seat, return roster rows.
   let name = request.queryParams["name"]
   {.gcsafe.}:
-    discard startBotSeat(name)
+    discard startNamedSeat(name)
   respondRosterRows(request)
 
 proc botStopHandler(request: Request) {.gcsafe.} =
   ## POST /bots/stop?name=<seat> — stop that seat, return roster rows.
   let name = request.queryParams["name"]
   {.gcsafe.}:
-    discard stopBotSeat(name)
+    discard stopNamedSeat(name)
   respondRosterRows(request)
 
 proc eventsPartialHandler(request: Request) {.gcsafe.} =
@@ -7653,7 +7679,7 @@ proc registerMcpTools(server: McpServer) =
     "properties": {
       "name": {
         "type": "string",
-        "description": "Bot seat name: Shadowfel, Igris, Tusk, or Beru"
+        "description": "Bot seat name: one of the original four (Shadowfel, Igris, Tusk, Beru) or a configured roster seat"
       }
     },
     "required": ["name"],
@@ -7672,7 +7698,7 @@ proc registerMcpTools(server: McpServer) =
     let name = if arguments != nil: arguments{"name"}.getStr("") else: ""
     var payload: JsonNode
     {.gcsafe.}:
-      payload = startBotSeat(name)
+      payload = startNamedSeat(name)
     result = ToolResult(
       content: @[textContent($payload)],
       structuredContent: some(payload),
@@ -7690,7 +7716,7 @@ proc registerMcpTools(server: McpServer) =
     let name = if arguments != nil: arguments{"name"}.getStr("") else: ""
     var payload: JsonNode
     {.gcsafe.}:
-      payload = stopBotSeat(name)
+      payload = stopNamedSeat(name)
     result = ToolResult(
       content: @[textContent($payload)],
       structuredContent: some(payload),

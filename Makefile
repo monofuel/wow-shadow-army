@@ -134,8 +134,22 @@ HOME_STATUS_MAX_AGE ?= 30
 # already-running seat gains nothing until its next restart.
 HOME_DEBUG_PORT_BASE ?=
 
+# Home seats log in to EXISTING characters only: the realm must already hold
+# exactly that name on that account with that class
+# (tools/private_seat_identity.sh), character creation stays off, the client
+# runs unheaded (no window, display, GPU or renderer), and its geometry comes
+# from the same current extracted-data install as make play. Like make play,
+# it runs in this repo's dev shell: the fork's pinned Nim and Lua prefix plus
+# the nginx the local asset path needs.
+HOME_SEAT_PREFLIGHT = \
+	if [ ! -d "$(LEAGUE_DATA)/dbc" ] || [ ! -d "$(LEAGUE_DATA)/mmaps" ]; then \
+		echo "error: extracted client data missing (needs dbc/ and mmaps/): $(LEAGUE_DATA_DIR)" >&2; exit 1; \
+	fi; \
+	$(MAKE) --no-print-directory home-assets-ready; \
+	"$(CURDIR)/tools/private_seat_identity.sh"
 define launch_home_seat
 	@set -e; \
+	$(HOME_SEAT_PREFLIGHT) "$(1)" "$(2)" "$(4)"; \
 	seat_dir="$(HOME_ARMY_DIR)/$(1)"; \
 	mkdir -p "$$seat_dir/status" "$$seat_dir/observer"; \
 	debug_dir=""; \
@@ -146,9 +160,12 @@ define launch_home_seat
 	VANILLA_WOW_LOGIN_WS_URL="$(HOME_WS)/tcp/realmd?slot=$(HOME_SLOT)&token=$(HOME_TOKEN)" \
 	VANILLA_WOW_GAME_WS_URL="$(HOME_WS)/tcp/world?slot=$(HOME_SLOT)&token=$(HOME_TOKEN)" \
 	VANILLA_WOW_LUA_DEBUG_DIR="$$debug_dir" \
+	VANILLA_WOW_PLAYER_CHARACTER_CREATION=0 \
+	VANILLA_WOW_EXTRACTED_DATA_DIR="$(LEAGUE_DATA)" \
+	SHADOW_SEAT_DIR="$$seat_dir" \
 	COWORLD_PLAYER_OBSERVER_DIR="$$seat_dir/observer" \
-	nix develop --command nim r tools/launch_nim_player.nim -- \
-		--controller=embedded --presentation=headless --bot=lua-bot \
+	nix develop "$(CURDIR)" --command nim r tools/launch_nim_player.nim -- \
+		--controller=embedded --presentation=unheaded --bot=lua-bot \
 		--owner=home-$(1) \
 		--lua-repo="$(CURDIR)" --lua-entry="$(HOME_ENTRY)" \
 		--lua-status-dir="$$seat_dir/status" \
@@ -304,7 +321,8 @@ test-smoke: test-smoke-lua test-smoke-nim-soft test-smoke-sh
 # Cheap parse-only gate for the operator shell scripts (same doctrine as
 # test-smoke-lua: a compile-check is a legitimate leg for code with no unit
 # suite). `bash -n` never executes a line.
-SH_CHECK_FILES = tools/home_army_scale.sh tools/soap.sh tools/realm_op.sh
+SH_CHECK_FILES = tools/home_army_scale.sh tools/soap.sh tools/realm_op.sh tools/private_seat_identity.sh \
+	tools/home_assets.sh
 test-smoke-sh:
 	@rc=0; for f in $(SH_CHECK_FILES); do \
 		[ -f "$$f" ] || continue; \
@@ -812,7 +830,7 @@ warlock-account:
 # Run Shadowfel's embedded home policy in the foreground. The detached
 # operator surface is `make shadowfel-start` / `make shadowfel-stop`.
 warlock-bot:
-	$(call launch_home_seat,$(WARLOCK_CHARACTER),$(WARLOCK_ACCOUNT),$(WARLOCK_PASS))
+	$(call launch_home_seat,$(WARLOCK_CHARACTER),$(WARLOCK_ACCOUNT),$(WARLOCK_PASS),$(WARLOCK_CLASS))
 
 # Launch the native client for HUMAN play against OUR local persistent realm.
 #
@@ -1115,7 +1133,7 @@ igris-account:
 
 # Run Igris's embedded home policy in the foreground.
 igris-bot:
-	$(call launch_home_seat,$(IGRIS_CHARACTER),$(IGRIS_ACCOUNT),$(IGRIS_PASS))
+	$(call launch_home_seat,$(IGRIS_CHARACTER),$(IGRIS_ACCOUNT),$(IGRIS_PASS),$(IGRIS_CLASS))
 
 # Compatibility alias: every home bot now runs from the fork.
 .PHONY: warlock-bot-fork
@@ -1152,7 +1170,7 @@ tusk-account:
 
 # Run Tusk's embedded home policy in the foreground.
 tusk-bot:
-	$(call launch_home_seat,$(TUSK_CHARACTER),$(TUSK_ACCOUNT),$(TUSK_PASS))
+	$(call launch_home_seat,$(TUSK_CHARACTER),$(TUSK_ACCOUNT),$(TUSK_PASS),$(TUSK_CLASS))
 
 # ---------------------------------------------------------------------------
 # Beru — undead PRIEST (healer) for the 5-man cast (docs/personas/beru.md).
@@ -1185,7 +1203,7 @@ beru-account:
 
 # Run Beru's embedded home policy in the foreground.
 beru-bot:
-	$(call launch_home_seat,$(BERU_CHARACTER),$(BERU_ACCOUNT),$(BERU_PASS))
+	$(call launch_home_seat,$(BERU_CHARACTER),$(BERU_ACCOUNT),$(BERU_PASS),$(BERU_CLASS))
 
 # Explicit bot lifecycle. These targets do not start or stop the persistent
 # realm and do not create accounts; character/server state stays untouched.
@@ -1371,6 +1389,7 @@ seat-provision: seat-account seat-character
 seat-bot: seat-guard
 	@set -e; \
 	if [ -z "$(SEAT_USER)" ]; then echo "error: SEAT_USER=<account> is required" >&2; exit 1; fi; \
+	$(HOME_SEAT_PREFLIGHT) "$(SEAT)" "$(SEAT_USER)" "$(SEAT_CLASS)"; \
 	seat_dir="$(HOME_ARMY_DIR)/$(SEAT)"; \
 	mkdir -p "$$seat_dir/status" "$$seat_dir/observer"; \
 	debug_dir=""; \
@@ -1385,19 +1404,99 @@ seat-bot: seat-guard
 	VANILLA_WOW_LOGIN_WS_URL="$(HOME_WS)/tcp/realmd?slot=$(SEAT_SLOT)&token=$(SEAT_TOKEN)" \
 	VANILLA_WOW_GAME_WS_URL="$(HOME_WS)/tcp/world?slot=$(SEAT_SLOT)&token=$(SEAT_TOKEN)" \
 	VANILLA_WOW_LUA_DEBUG_DIR="$$debug_dir" \
-	VANILLA_WOW_PLAYER_CHARACTER_CREATION=1 \
-	VANILLA_WOW_PLAYER_CHARACTER_RACE="$(SEAT_RACE)" \
-	VANILLA_WOW_PLAYER_CHARACTER_CLASS="$(SEAT_CLASS)" \
-	VANILLA_WOW_PLAYER_CHARACTER_GENDER="$(SEAT_GENDER)" \
+	VANILLA_WOW_PLAYER_CHARACTER_CREATION=0 \
+	VANILLA_WOW_EXTRACTED_DATA_DIR="$(LEAGUE_DATA)" \
+	SHADOW_SEAT_DIR="$$seat_dir" \
 	COWORLD_PLAYER_OBSERVER_DIR="$$seat_dir/observer" \
-	nix develop --command nim r tools/launch_nim_player.nim -- \
-		--controller=embedded --presentation=headless --bot=lua-bot \
+	nix develop "$(CURDIR)" --command nim r tools/launch_nim_player.nim -- \
+		--controller=embedded --presentation=unheaded --bot=lua-bot \
 		--owner=home-$(SEAT) \
 		--lua-repo="$(CURDIR)" --lua-entry="$(SEAT_ENTRY)" \
 		--lua-status-dir="$$seat_dir/status" \
 		--username="$(SEAT_USER)" --password="$(SEAT_PASS)" \
 		--character-name="$(SEAT)" \
 		--skip-cinematic
+
+# Shared checkout assets for every home seat: one nginx owned by the
+# wow-home-assets user unit (app.slice), never by a seat launcher, so stopping
+# any one seat leaves terrain reads working for the rest. Seat preflight starts
+# it on demand and waits until it serves the asset version the unit prepared;
+# launchers then only reuse it.
+HOME_ASSETS_UNIT ?= wow-home-assets
+HOME_ASSETS_URL_FILE := $(HOME_ARMY_DIR)/assets-url
+HOME_ASSETS_VERSION_FILE := $(HOME_ARMY_DIR)/assets-version
+HOME_ASSETS_READY_SECONDS ?= 180
+HOME_ASSETS_START_RACE_SECONDS ?= 30
+HOME_USER_BUS = XDG_RUNTIME_DIR="$${XDG_RUNTIME_DIR:-/run/user/$$(id -u)}"
+
+# A unit started before the version file existed recorded the version it
+# prepared only in its journal ("serving asset version V at URL"); adopt that
+# line when it names the current URL. A parallel seat that loses the
+# systemd-run race accepts the winner's unit once it is active.
+home-assets-start:
+	@set -e; \
+	if $(HOME_USER_BUS) systemctl --user is-active --quiet $(HOME_ASSETS_UNIT); then \
+		if [ ! -s "$(HOME_ASSETS_VERSION_FILE)" ] && [ -s "$(HOME_ASSETS_URL_FILE)" ]; then \
+			url=$$(cat "$(HOME_ASSETS_URL_FILE)"); \
+			version=$$($(HOME_USER_BUS) journalctl --user -u $(HOME_ASSETS_UNIT) -o cat --no-pager 2>/dev/null | \
+				sed -n "s|^home_assets: serving asset version \([^ ]*\) at $$url\$$|\1|p" | tail -n 1); \
+			if [ -n "$$version" ]; then \
+				printf "%s\n" "$$version" >"$(HOME_ASSETS_VERSION_FILE)"; \
+				echo "adopted $(HOME_ASSETS_UNIT) asset version $$version"; \
+			fi; \
+		fi; \
+		echo "$(HOME_ASSETS_UNIT) already running"; exit 0; \
+	fi; \
+	mkdir -p "$(HOME_ARMY_DIR)"; rm -f "$(HOME_ASSETS_URL_FILE)" "$(HOME_ASSETS_VERSION_FILE)"; \
+	$(HOME_USER_BUS) systemctl --user reset-failed $(HOME_ASSETS_UNIT) 2>/dev/null || true; \
+	if ! $(HOME_USER_BUS) systemd-run --user --unit=$(HOME_ASSETS_UNIT) --slice=app.slice --collect \
+		-p Restart=on-failure -p RestartSec=2 \
+		--working-directory="$(CURDIR)" \
+		--setenv=HOME="$$HOME" --setenv=PATH="$$PATH" \
+		--setenv=VANILLA_WOW_EXTRACTED_DATA_DIR="$(LEAGUE_DATA)" \
+		nix develop "$(CURDIR)" --command "$(CURDIR)/tools/home_assets.sh" \
+		"$(FORK_CLIENT)" "$(HOME_ASSETS_URL_FILE)" "$(HOME_ASSETS_VERSION_FILE)"; then \
+		i=0; \
+		while :; do \
+			state=$$($(HOME_USER_BUS) systemctl --user show -p ActiveState --value $(HOME_ASSETS_UNIT) 2>/dev/null); \
+			if [ "$$state" = active ] || [ "$$state" = activating ]; then \
+				echo "$(HOME_ASSETS_UNIT) started by a parallel seat"; exit 0; \
+			fi; \
+			if [ $$i -ge $(HOME_ASSETS_START_RACE_SECONDS) ]; then \
+				echo "error: could not start $(HOME_ASSETS_UNIT) (journalctl --user -u $(HOME_ASSETS_UNIT))" >&2; exit 1; \
+			fi; \
+			sleep 1; i=$$((i + 1)); \
+		done; \
+	fi; \
+	echo "started $(HOME_ASSETS_UNIT); logs: journalctl --user -u $(HOME_ASSETS_UNIT)"
+
+# Ready only when the listener serves exactly the version the unit prepared:
+# during a port takeover an older launcher-owned listener can still answer.
+home-assets-ready: home-assets-start
+	@i=0; \
+	while :; do \
+		if [ -s "$(HOME_ASSETS_URL_FILE)" ] && [ -s "$(HOME_ASSETS_VERSION_FILE)" ]; then \
+			served=$$(curl -fsS --max-time 2 "$$(cat "$(HOME_ASSETS_URL_FILE)")/asset_version.txt" 2>/dev/null || true); \
+			if [ -n "$$served" ] && [ "$$served" = "$$(cat "$(HOME_ASSETS_VERSION_FILE)")" ]; then \
+				exit 0; \
+			fi; \
+		fi; \
+		state=$$($(HOME_USER_BUS) systemctl --user show -p ActiveState --value $(HOME_ASSETS_UNIT) 2>/dev/null); \
+		if [ "$$state" != active ] && [ "$$state" != activating ]; then \
+			echo "error: $(HOME_ASSETS_UNIT) is not running (journalctl --user -u $(HOME_ASSETS_UNIT))" >&2; exit 1; \
+		fi; \
+		if [ $$i -ge $(HOME_ASSETS_READY_SECONDS) ]; then \
+			echo "error: shared home assets not serving the prepared version after $(HOME_ASSETS_READY_SECONDS)s" >&2; exit 1; \
+		fi; \
+		sleep 1; i=$$((i + 1)); \
+	done
+
+# Stops terrain reads for every running home seat; stop the seats first.
+home-assets-stop:
+	@$(HOME_USER_BUS) systemctl --user stop $(HOME_ASSETS_UNIT) 2>/dev/null || true; \
+	rm -f "$(HOME_ASSETS_URL_FILE)" "$(HOME_ASSETS_VERSION_FILE)"; echo "stopped $(HOME_ASSETS_UNIT)"
+
+.PHONY: home-assets-start home-assets-ready home-assets-stop
 
 # Reuses the original detach/pid/log-rotate machinery. HOME_DEBUG_PORT_BASE is
 # NOT consulted here (index 0 is passed only to satisfy the macro arity); this

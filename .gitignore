@@ -18,6 +18,7 @@ captures/
 /addons/ShadowArmy/*Data.lua
 /lua/data/bot_quest_hubs.lua
 /lua/data/bot_roads.lua
+/lua/data/bot_lifecycle_positions.lua
 /lua/config/traverse*beats.json
 /lua/config/traverse*beats.lua
 /lua/config/petrel/

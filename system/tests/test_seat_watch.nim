@@ -609,3 +609,35 @@ seat-stop:
       # And a completed pass is stamped, so the panel knows the watch is alive.
       check seatWatchPassAgeSec() >= 0.0
       check seatWatchPassAgeSec() < SeatWatchStallSec
+
+suite "manual start/stop by name (throwaway army root)":
+  test "roster seats dispatch the parameterized family; others are rejected":
+    let root = getTempDir() / "sa-seat-manual-" & $getCurrentProcessId()
+    removeDir(root)
+    createDir(root)
+    defer: removeDir(root)
+    writeScaledRoot(root, "Legix\tshadow20\twarlock\n")
+    putEnv("SYSTEM_ARMY_DIR", root)
+    defer: delEnv("SYSTEM_ARMY_DIR")
+
+    for name in ["Botwarrior", "Murist", "Kaisel", "legix", ""]:
+      check not startNamedSeat(name){"ok"}.getBool(true)
+      check not stopNamedSeat(name){"ok"}.getBool(true)
+    check "not a launchable" in startNamedSeat("Kaisel"){"detail"}.getStr("")
+    check not fileExists(root / "seat-start-called")
+    check not fileExists(root / "seat-stop-called")
+
+    # Existing Start/Stop button for the roster seat; humans/QA keep "—".
+    check "/bots/start?name=Legix" in
+      renderBotCell(Character(name: "Legix", controlUp: false))
+    check "/bots/stop?name=Legix" in
+      renderBotCell(Character(name: "Legix", controlUp: true))
+    check "/bots/" notin renderBotCell(Character(name: "Kaisel"))
+    check "/bots/" notin renderBotCell(Character(name: "Murist"))
+
+    if findExe("make").len > 0:
+      check startNamedSeat("Legix"){"ok"}.getBool(false)
+      check calledLines(root / "seat-start-called") == @["Legix shadow20 warlock"]
+      writeWedgedSeat(root, "Legix", 5)
+      check stopNamedSeat("Legix"){"ok"}.getBool(false)
+      check calledLines(root / "seat-stop-called") == @["Legix"]

@@ -244,12 +244,23 @@ local rewardQuestId = nil
 local rewardNpcGuid = nil
 -- After a refused reward (live: "Inventory is full"), consume a use-item
 -- stack from the action bar so the next Complete can store the reward.
--- The lua view does not project bags, so the action bar is the only lever.
+-- When the view projects bags, a free slot is read from capacity, not inferred.
 local needBagSlot = false
 local bagUseSettleUntil = nil
 local bagBlockedNpc = nil
 local bagBlockedQuest = nil
 local BAG_USE_SETTLE_SECONDS = 1.2
+-- Free bag slots observed when the reward was refused (nil when the view
+-- does not project bag space). More free slots than this means the reward
+-- may fit now, whatever freed them.
+local bagBlockedFree = nil
+-- Presses spent on the current refusal, the last press awaiting its outcome,
+-- and items whose press did not reduce the carried count. A use-item button
+-- outlives its stack, so pressing it again consumes nothing.
+local bagUsePresses = 0
+local bagUseLast = nil
+local bagUseSpent = {}
+local BAG_USE_MAX_PRESSES = 12
 
 -- Generated quest-giver world positions, lazily loaded and injectable.
 --
@@ -671,16 +682,49 @@ local function reward_choice_reference(view)
   return nil
 end
 
+-- Total carried count of an item, or nil when the view projects no bags.
+local function carried_count(view, itemId)
+  local items = view.inventory_items
+  if type(items) ~= "table" or not itemId then return nil end
+  local total = 0
+  for i = 1, #items do
+    if items[i].item_id == itemId then
+      total = total + (tonumber(items[i].count) or 1)
+    end
+  end
+  return total
+end
+
+local function known_free_slots(view)
+  if not view.bag_space_known then return nil end
+  return tonumber(view.free_bag_slots)
+end
+
+-- The carried use-item with the fewest left frees a slot in the fewest
+-- presses; buttons whose stack is known to be gone are skipped.
 local function use_item_button(view)
+  local best, bestCount = nil, nil
   for i = 1, #(view.action_buttons or {}) do
     local button = view.action_buttons[i]
     local slot = button.slot or 0
+    local itemId = button.item_id
+    local count = carried_count(view, itemId)
     if button.kind == "use-item" and slot >= 1 and slot <= 12 and
-        (button.spell_id or 0) ~= 8690 then
-      return button
+        (button.spell_id or 0) ~= 8690 and
+        not (itemId and bagUseSpent[itemId]) and count ~= 0 then
+      if not best or (count and (not bestCount or count < bestCount)) then
+        best, bestCount = button, count
+      end
     end
   end
-  return nil
+  return best
+end
+
+local function bag_use_reset()
+  bagBlockedFree = nil
+  bagUsePresses = 0
+  bagUseLast = nil
+  bagUseSpent = {}
 end
 
 local function bag_slot_cleared()
@@ -695,6 +739,19 @@ local function bag_slot_cleared()
   bagUseSettleUntil = nil
   bagBlockedNpc = nil
   bagBlockedQuest = nil
+  bag_use_reset()
+end
+
+-- Nothing on the bar can free a slot. Stop pressing, but keep the giver's
+-- cooldown so the seat does other work instead of re-running the refusal.
+local function bag_slot_gave_up(reason)
+  wow.log(string.format("bags: quest %s reward still blocked (%s); retry after cooldown",
+    tostring(bagBlockedQuest), reason))
+  needBagSlot = false
+  bagUseSettleUntil = nil
+  bagBlockedNpc = nil
+  bagBlockedQuest = nil
+  bag_use_reset()
 end
 
 -- Reward Complete that does not close the panel is almost always a full bag
@@ -716,15 +773,47 @@ local function bag_slot_step(view)
   if view.eating or view.drinking then
     return { kind = "hold", reason = "bag_slot_consume" }
   end
+  local free = known_free_slots(view)
+  if free and bagBlockedFree and free > bagBlockedFree then
+    wow.log(string.format("bags: %d free slot(s), refused at %d; retrying quest %s turn-in",
+      free, bagBlockedFree, tostring(bagBlockedQuest)))
+    bag_slot_cleared()
+    return nil
+  end
   local button = use_item_button(view)
   if not button then
-    bag_slot_cleared()
+    -- Without projected bags, a vanished button is the only sign its stack
+    -- (and so a slot) is gone. With projected bags, capacity decides above.
+    if free and bagBlockedFree then
+      bag_slot_gave_up("no consumable left to free a slot")
+    else
+      bag_slot_cleared()
+    end
     return nil
   end
   local now = wow.time()
   if bagUseSettleUntil and now < bagUseSettleUntil then
     return { kind = "hold", reason = "bag_slot_settle" }
   end
+  if bagUseLast then
+    local count = carried_count(view, bagUseLast.item_id)
+    if count and bagUseLast.count and count >= bagUseLast.count then
+      bagUseSpent[bagUseLast.item_id] = true
+      button = use_item_button(view)
+    end
+    bagUseLast = nil
+  end
+  if not button then
+    bag_slot_gave_up("pressing the consumable freed nothing")
+    return nil
+  end
+  if bagUsePresses >= BAG_USE_MAX_PRESSES then
+    bag_slot_gave_up("consumable press budget spent")
+    return nil
+  end
+  bagUsePresses = bagUsePresses + 1
+  bagUseLast = { item_id = button.item_id,
+    count = carried_count(view, button.item_id) }
   bagUseSettleUntil = now + BAG_USE_SETTLE_SECONDS
   return {
     kind = "ui_press",
@@ -799,6 +888,8 @@ local function quest_step(view, allowTurnInTravel, allowAcceptTravel, allowScout
         bagBlockedNpc = npcGuid
         bagBlockedQuest = questId
         bagUseSettleUntil = nil
+        bag_use_reset()
+        bagBlockedFree = known_free_slots(view)
         return { kind = "ui_press", control = "QuestFrameCancelButton",
           reason = "reward_blocked" }
       end
@@ -1180,6 +1271,34 @@ end
 -- objective rows and every one of them is complete. A quest with no objective
 -- rows at all (pure talk-to-someone) is not claimed either way — nothing in
 -- the view says it is done, so it is left to the ordinary marker path.
+-- An accepted quest whose requirement rows ask for no kill, object or item
+-- ("Speak to Dark Cleric Beryl in Brill") is finished the moment it is
+-- accepted; only the walk to its ender remains. Such quests publish no
+-- objective rows (kill and item quests always do), so without this they are
+-- never banked and the turn-in walk never fires (Metus, L9 in gray
+-- Deathknell holding 5651). The Lua view carries no requirement rows, so
+-- the absence of objective rows is the live signal; requirement rows, when
+-- a host provides them, must also be empty.
+local function talk_only(view, entry)
+  if type(entry) ~= "table" or entry.failed then return false end
+  -- The client fills in the quest level and its objective rows only once the
+  -- quest definition arrives; level 0 (after a login or reconnect) means the
+  -- requirements are still unknown, not empty.
+  if (tonumber(entry.level) or 0) <= 0 then return false end
+  local id = entry.quest_id
+  for i = 1, #(view.quest_objectives or {}) do
+    if view.quest_objectives[i].quest_id == id then return false end
+  end
+  if type(entry.requirements) ~= "table" then return id ~= nil end
+  for i = 1, #entry.requirements do
+    local r = entry.requirements[i]
+    if (tonumber(r.object_count) or 0) ~= 0 or (tonumber(r.item_count) or 0) ~= 0 then
+      return false
+    end
+  end
+  return true
+end
+
 local function quest_banked(view, questId)
   local seen = false
   for i = 1, #(view.quest_objectives or {}) do
@@ -1189,7 +1308,28 @@ local function quest_banked(view, questId)
       seen = true
     end
   end
-  return seen
+  if seen then return true end
+  for i = 1, #(view.accepted_quests or {}) do
+    local entry = view.accepted_quests[i]
+    if accepted_quest_id(entry) == questId then return talk_only(view, entry) end
+  end
+  return false
+end
+
+-- Vanilla gray level: kills at or below it give no XP.
+local function gray_level(level)
+  level = tonumber(level) or 1
+  if level <= 5 then return 0 end
+  if level <= 39 then return level - math.floor(level / 10) - 5 end
+  if level <= 59 then return level - math.floor(level / 5) - 1 end
+  return level - 9
+end
+
+local function talk_quest_pending(view)
+  for i = 1, #(view.accepted_quests or {}) do
+    if talk_only(view, view.accepted_quests[i]) then return true end
+  end
+  return false
 end
 
 -- Walk to the GENERATED turn-in of a completed quest. This is the fallback
@@ -1292,6 +1432,7 @@ end
 -- is in sight: a finished objective to bank, or an empty quest log to fill.
 local function hub_step(view, pos)
   local wanted = objective_complete(view) or
+    talk_quest_pending(view) or
     #(view.accepted_quests or {}) == 0
   if not wanted then
     hubGuid, hubSince = nil, nil
@@ -1303,6 +1444,13 @@ local function hub_step(view, pos)
     wow.log("gave up walking to hub " ..
       tostring((questHubs[hubGuid] or {}).name or hubGuid))
     hubGuid, hubSince = nil, nil
+  end
+
+  -- A talk-only quest names its ender, which is rarely a giver already seen
+  -- (5651 points from Deathknell to Brill); go there before any remembered hub.
+  if talk_quest_pending(view) and not objective_complete(view) then
+    local generated = generated_hub_step(view, pos, now)
+    if generated then return generated end
   end
 
   local best, bestDistance = nil, nil
@@ -1358,6 +1506,7 @@ function M.reset()
   bagUseSettleUntil = nil
   bagBlockedNpc = nil
   bagBlockedQuest = nil
+  bag_use_reset()
   exhausted = {}
   hubCooldown = {}
   pursuing, pursuingSince, questBudgetSince, questPausedAt = nil, nil, nil, nil
@@ -1564,7 +1713,11 @@ function M.decide(view)
       -- applies to the WALK BACK too: a completed quest in the log arms the
       -- hub return even in a mob field, or 364 sits finished-unbanked until
       -- every other quest drains (Kargalgan, 2026-08-16).
-      if idleLog or objective_complete(view) or not nearbyHunt then
+      if idleLog or objective_complete(view) or
+          (talk_quest_pending(view) and not (nearbyHunt and
+            ((nearbyHunt.level or 0) > gray_level(view.level) or
+              credits_objective(view, nearbyHunt)))) or
+          not nearbyHunt then
         local hub = hub_step(view, pos)
         if hub then
           hub.status = progress_status(view)
@@ -1702,6 +1855,11 @@ end
 -- same corpse handling as solo kills, and sharing the functions keeps ONE
 -- loot state machine (lootGuid/lootSeen live here) instead of two arguing.
 M.note_kills = note_kills
+--- Skip a unit for `seconds` in every target pick (same table as the stale
+--- swing guard).
+function M.ignore(guid, seconds)
+  if guid and guid ~= 0 then ignoreUntil[guid] = wow.time() + seconds end
+end
 M.loot_step = loot_step
 
 return M

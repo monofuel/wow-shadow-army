@@ -1088,6 +1088,60 @@ check(resume.kind == "interact" and resume.guid == 1661,
   "returns to the turn-in once a bag slot is free")
 grind.reset()
 
+-- With projected bags the loop reads capacity: a button whose stack is gone
+-- is skipped, a freed slot sends the seat back to the giver, and a press that
+-- consumes nothing ends the loop instead of repeating forever.
+local function fullBagRewardView(free)
+  local v = stuckRewardView(376)
+  v.bag_space_known = true
+  v.free_bag_slots = free
+  v.inventory_items = { { item_id = 4604, count = 6 } }
+  return v
+end
+local function bagView(free, items)
+  return view({ giver(1661, 5.0, "Elreth") }, {
+    level = 3,
+    quest_markers = { { questgiver_guid = 1661, status = 6 } },
+    quest_frame = { open = false },
+    accepted_quests = { 376 }, quest_objectives = {}, completed_quest_ids = {},
+    ui_nodes = {},
+    bag_space_known = true, free_bag_slots = free,
+    inventory_items = items or { { item_id = 4604, count = 6 } },
+    action_buttons = {
+      { slot = 11, kind = "use-item", item_id = 159, usable = true,
+        usable_known = true },
+      { slot = 12, kind = "use-item", item_id = 4604, usable = true,
+        usable_known = true },
+    },
+  })
+end
+local function refuseWithFullBags()
+  grind.reset()
+  for _ = 1, REWARD_COMPLETE_ATTEMPTS do
+    grind.decide(fullBagRewardView(0))
+  end
+  check(grind.decide(fullBagRewardView(0)).reason == "reward_blocked",
+    "full-bag refusal closes the panel")
+end
+refuseWithFullBags()
+local food = grind.decide(bagView(0))
+check(food.kind == "ui_press" and food.control == "ActionButton12",
+  "skips a use-item button whose stack is no longer carried")
+clock = clock + 2.0
+local freed = grind.decide(bagView(1))
+check(freed.kind == "interact" and freed.guid == 1661,
+  "a freed slot sends the seat back to the turn-in")
+
+refuseWithFullBags()
+grind.decide(bagView(0))
+clock = clock + 2.0
+local noEffect = grind.decide(bagView(0))
+check(noEffect.reason ~= "bag_slot_use" and noEffect.reason ~= "bag_slot_settle",
+  "a press that consumed nothing is not repeated")
+check(not (noEffect.kind == "interact" and noEffect.guid == 1661),
+  "giving up keeps the refused giver on cooldown")
+grind.reset()
+
 -- Banking a turn-in outranks the next pull. Every Deathknell giver has mobs
 -- inside the hunt radius, so a shared gate stranded finished quests forever.
 local turnInWithHunt = view({
@@ -1531,5 +1585,48 @@ check(grind.decide(liveView(20)).guid == 204, "hp drop is a landing hit")
 clock = clock + 4.0
 check(grind.decide(liveView(20)).guid == 204,
   "under the stale window after a hit, stay")
+
+-- Talk-only quest (no kill/item requirement) in a gray field: walk to its
+-- generated ender instead of grinding grays (Metus, L9, 5651 to Brill).
+grind.set_quests(true)
+grind.reset()
+grind.set_quest_hubs({
+  [5651] = { starter = { 0, 100.0, 100.0, 10.0, "Synthetic Starter" },
+    ender = { 0, 500.0, -1100.0, 40.0, "Synthetic Ender" } },
+})
+local zero = { object_count = 0, item_count = 0 }
+local talkGray = view({ unit(931, 30.0, 3) }, {
+  level = 9,
+  quest_markers = {},
+  quest_frame = { open = false },
+  accepted_quests = {
+    { quest_id = 5651, title = "Synthetic Talk Quest", level = 0 },
+    { quest_id = 6395, title = "Synthetic Hunt Quest", level = 5 },
+  },
+  quest_objectives = { { quest_id = 6395, complete = false, entry = 0 } },
+  completed_quest_ids = {},
+  ui_nodes = {},
+  location = { map_id = 0, position = { x = 120.0, y = -100.0, z = 10.0, o = 0 } },
+  action_buttons = {
+    { slot = 1, spell_id = 5176, usable = true, usable_known = true },
+  },
+})
+-- Level 0: the quest definition has not arrived (login or reconnect), so the
+-- missing objective rows say nothing; the quest is not banked.
+clock = clock + 400.0
+local unknownStep = grind.decide(talkGray)
+check(unknownStep.reason ~= "quest_hub",
+  "a quest with unknown requirements (level 0) is not treated as talk-only")
+talkGray.accepted_quests[1].level = 8
+clock = clock + 400.0
+local talkStep = grind.decide(talkGray)
+check(talkStep.reason == "quest_hub" and math.abs(talkStep.x - 500.0) < 1.0,
+  "a talk-only quest walks a gray-field seat to its generated ender")
+talkGray.level = 3
+clock = clock + 400.0
+local talkGreen = grind.decide(talkGray)
+check(talkGreen.reason ~= "quest_hub",
+  "an XP-bearing hunt nearby still outranks the talk-quest walk")
+grind.set_quests(false)
 
 print("test_accelerated: " .. passed .. " ok")

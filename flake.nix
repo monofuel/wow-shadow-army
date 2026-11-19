@@ -26,6 +26,8 @@
         libxi
         libxext
         libGL
+        # libcurl, loaded at runtime by Curly (tools/bot_requests.nim).
+        curl
       ];
       libPath = pkgs.lib.makeLibraryPath runtimeLibs;
       dockerfileLines = pkgs.lib.splitString "\n" (builtins.readFile ./Dockerfile);
@@ -78,6 +80,12 @@
           export LIBRARY_PATH="${pkgs.openssl.out}/lib:${pkgs.bzip2.out}/lib:${pkgs.jemalloc}/lib''${LIBRARY_PATH:+:$LIBRARY_PATH}"
           export NIX_LDFLAGS="''${NIX_LDFLAGS:+$NIX_LDFLAGS }-rpath ${pkgs.jemalloc}/lib"
           export C_INCLUDE_PATH="${pkgs.openssl.dev}/include''${C_INCLUDE_PATH:+:$C_INCLUDE_PATH}"
+          # Home lua-bot seats build the fork's unheaded player from this shell
+          # (it carries the nginx the local asset path needs); the fork's
+          # launcher adds -d:LuaBotLuaPrefix from this, as the fork's own shell
+          # does.
+          export COWORLD_LUA_BOT_LUA_PREFIX="${pkgs.lua5_3}"
+          export LIBRARY_PATH="${pkgs.lua5_3}/lib:$LIBRARY_PATH"
           # Nim deps live in the dedicated wow-coworld Nimby global profile,
           # shared with the client fork; config.nims reads its generated
           # nim.cfg. Explicit overrides win.

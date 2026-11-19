@@ -7,6 +7,8 @@ local solo = require("accelerated")
 -- runtime even though the test harness puts lua/tools on LUA_PATH.
 local road_route = require("tools.road_route")
 local disposition = require("tools.item_disposition")
+local life = require("tools.lifecycle")
+local requests = require("tools.requests")
 -- Home is the dogfood pen, not a scored league: run the soft-quest path here
 -- so the new quest stack gets exercised where monofuel can watch. Scored
 -- leagues stay grind-only until a rerun A/B beats the 4.791 baseline.
@@ -19,6 +21,9 @@ local NEAR_YARDS = 8.0
 local HARD_LEASH_YARDS = 18.0
 local HEAL_RANGE_YARDS = 30.0
 local RES_WAIT_SECONDS = 20.0
+-- A release asks the server to relocate the ghost; repeat it only if the
+-- seat is still a corpse after this long.
+local RELEASE_RETRY_SECONDS = 10.0
 local PROMOTE_RETRY_SECONDS = 5.0
 -- Cloth dies in two hits from what Murist pulls. Below this, stop
 -- swinging and step out so the healer has a target instead of a corpse.
@@ -117,6 +122,8 @@ local CLASS_WARLOCK = 9
 -- in-combat tap (18% mana / 40% health) because nothing is threatening us
 -- here and the health has to survive the leader's next pull.
 local SUMMON_LIFE_TAP_MIN_HEALTH_PCT = 65.0
+-- A solo pull only gains a nuke above this mana (the grinder's own floor).
+local SOLO_NUKE_MANA_PCT = 35.0
 
 -- Stranded chat box (the 0057 Failure-4 gap): every lifecycle verb —
 -- /reclaim, /acceptgroup, /interact — drives the chat edit box, and an
@@ -139,7 +146,14 @@ local CHAT_MAX_TEXT = 120
 -- relaunch, and a reply to a question asked an hour ago reads as a ghost.
 local CHAT_STALE_SECONDS = 60.0
 
+-- Persistent progression state (lua/tools/lifecycle.lua): pet, binding,
+-- gear, training and class-quest bookkeeping for this seat.
+local lstate = life.new_state()
+-- The player's accepted requests (tools/bot_requests.nim on the host) are
+-- durable jobs in this seat's directory; they survive reload and restart.
+local rstate = requests.from_env()
 local dead_since = nil
+local release_sent_at = nil
 local last_promote_at = nil
 local stuckAnchor = nil
 local stuckSince = nil
@@ -798,17 +812,78 @@ end
 -- carries the rows, the seat LOGS the shortlist it would sell at every vendor
 -- it opens, so monofuel can read the policy's judgement out of wow.log before
 -- any item actually moves.
-local VENDOR_SELL_GAP_SECONDS = 0.6
-local vendor_last_sell_at = nil
+-- One sale at a time, owned until the bags prove it. The host shares one
+-- 0.6 s item-verb floor between `interact` and `sell_item` (bots/lua_bot/
+-- pilot.nim ItemVerbCooldownSeconds) and refuses an early sale silently, and
+-- the merchant usually opens inside that floor — so the first sale of every
+-- visit is throttled. The pending sale is therefore re-sent every tick (the
+-- host floor decides when it actually leaves) and only counts as sold once
+-- the carried row disappears or shrinks. Returning an intent every tick also
+-- keeps the merchant ours: a nil here falls through to the quest stack, which
+-- closes any merchant it did not open.
+local VENDOR_SALE_TIMEOUT_SECONDS = 4.0
+-- Consecutive unconfirmed sales before the visit stops; the walk back then
+-- waits VENDOR_RETRY_SECONDS so a host that cannot finish a sale costs one
+-- visit per window instead of an open/close loop.
+local VENDOR_MAX_UNCONFIRMED = 3
+local VENDOR_RETRY_SECONDS = 300.0
 local vendor_merchant = nil
 local vendor_sold = {}
 local vendor_reported = false
 local vendor_gap_logged = false
+local vendor_pending = nil
+local vendor_unconfirmed = 0
+local vendor_seek_after = nil
 
 local function vendor_forget()
   vendor_merchant = nil
   vendor_sold = {}
   vendor_reported = false
+  vendor_pending = nil
+  vendor_unconfirmed = 0
+end
+
+local function carried_row(items, guid)
+  for i = 1, #items do
+    if tostring(items[i].item_guid or "0") == guid then return items[i] end
+  end
+  return nil
+end
+
+local function vendor_settle(view, items, now)
+  -- Resolve the pending sale from the bags. Returns true while it still owns
+  -- the merchant (the caller re-sends it), false once it is settled.
+  local p = vendor_pending
+  local row = carried_row(items, p.guid)
+  local left = row and (tonumber(row.count) or 0) or 0
+  if left < p.count_before then
+    vendor_sold[p.guid] = true
+    vendor_pending = nil
+    vendor_unconfirmed = 0
+    local copper = tonumber(view.copper)
+    wow.log(string.format(
+      "vendor: sold %s x%d (carried %d->%d) copper %s->%s free %s->%s",
+      p.name, p.count_before - left, p.count_before, left,
+      tostring(p.copper_before), view.copper_known and tostring(copper) or "?",
+      tostring(p.free_before), tostring(view.free_bag_slots)))
+    return false
+  end
+  if now - p.sent_at > VENDOR_SALE_TIMEOUT_SECONDS then
+    vendor_sold[p.guid] = "unconfirmed"
+    vendor_pending = nil
+    vendor_unconfirmed = vendor_unconfirmed + 1
+    wow.log(string.format(
+      "vendor: sale of %s unconfirmed after %.1fs (still carried x%d)",
+      p.name, VENDOR_SALE_TIMEOUT_SECONDS, left))
+    if vendor_unconfirmed >= VENDOR_MAX_UNCONFIRMED then
+      vendor_seek_after = now + VENDOR_RETRY_SECONDS
+      wow.log(string.format(
+        "vendor: %d sales in a row unconfirmed — leaving the merchant, " ..
+        "next vendor walk in %.0fs", vendor_unconfirmed, VENDOR_RETRY_SECONDS))
+    end
+    return false
+  end
+  return true
 end
 
 local function vendor_sell_step(view, now)
@@ -818,9 +893,8 @@ local function vendor_sell_step(view, now)
   end
   local merchant = tostring(view.merchant_guid or "0")
   if merchant ~= vendor_merchant then
+    vendor_forget()
     vendor_merchant = merchant
-    vendor_sold = {}
-    vendor_reported = false
   end
 
   local items = view.inventory_items
@@ -854,20 +928,32 @@ local function vendor_sell_step(view, now)
   -- Everything above is observation and is safe on any host. Only this last
   -- step moves an item, and only a host that says it can.
   if not view.sell_supported then return nil end
-  if vendor_last_sell_at and now - vendor_last_sell_at < VENDOR_SELL_GAP_SECONDS then
-    return nil
+  -- A fight outranks a sale; the merchant closes and the visit restarts later.
+  if view.in_combat then return nil end
+  if vendor_unconfirmed >= VENDOR_MAX_UNCONFIRMED then return nil end
+  if vendor_pending and vendor_settle(view, items, now) then
+    local p = vendor_pending
+    return { kind = "sell_item", guid = view.merchant_guid,
+      item_guid = p.item_guid, count = p.count_before,
+      reason = p.reason }
   end
+  if vendor_unconfirmed >= VENDOR_MAX_UNCONFIRMED then return nil end
   for i = 1, #plan.sell do
     local row = plan.sell[i]
     local guid = tostring(row.item_guid or "0")
     if guid ~= "0" and not vendor_sold[guid] then
-      vendor_sold[guid] = true
-      vendor_last_sell_at = now
+      vendor_pending = {
+        guid = guid, item_guid = row.item_guid, name = tostring(row.name),
+        count_before = tonumber(row.count) or 1, sent_at = now,
+        copper_before = view.copper_known and tonumber(view.copper) or "?",
+        free_before = view.free_bag_slots,
+        reason = "vendor_sell_" .. tostring(row.tag):lower(),
+      }
       wow.log(string.format("vendor: selling %s x%d — %s",
         tostring(row.name), row.count, row.reason))
       return { kind = "sell_item", guid = view.merchant_guid,
         item_guid = row.item_guid, count = row.count,
-        reason = "vendor_sell_" .. tostring(row.tag):lower() }
+        reason = vendor_pending.reason }
     end
   end
   return nil
@@ -989,10 +1075,12 @@ end
 -- vendor and interact; vendor_sell_step takes the next ticks.
 local VENDOR_SEEK_FREE_SLOTS = 2
 local VENDOR_INTERACT_STOP = 3.5
--- Live 2026-08-16: first-frame `interact` open_vendor freezes decide the
--- same way 0074 equip_item does (Baran/Kargalgan status stuck sequence=1).
--- Flip this when interact no longer kills the pilot.
-local VENDOR_SEEK_EMIT = false
+local VENDOR_STEER_YARDS = 8
+-- The August first-frame interact freeze did not recur: a live vendor
+-- interact opens the merchant and decide keeps running. Sales stalled only
+-- because nothing owned the merchant through the item-verb floor, which
+-- vendor_sell_step now does.
+local VENDOR_SEEK_EMIT = true
 
 local function unit_has_service(unit, name)
   for i = 1, #(unit.services or {}) do
@@ -1001,12 +1089,59 @@ local function unit_has_service(unit, name)
   return false
 end
 
+-- Last pure vendor this seat actually saw (guid, position, map). Visible
+-- units stop near 100 yd, so a full-bag seat grinding outside the village
+-- would otherwise never seek; it walks back to where it last saw one.
+local vendor_seen = nil
+
+-- With no vendor ever seen, head for the nearest turn-in of an accepted quest
+-- from the generated hub table (lua/data/bot_quest_hubs.lua, private and
+-- ignored). Starter villages keep their vendors beside the givers, so the
+-- vendor comes into view on the way; arriving without one ends the attempt
+-- for the retry window.
+local VENDOR_HUB_ARRIVE = 15
+local vendor_hubs_loaded, vendor_hubs = false, nil
+
+local function vendor_hub(view)
+  if not vendor_hubs_loaded then
+    vendor_hubs_loaded = true
+    local ok, data = pcall(require, "data.bot_quest_hubs")
+    vendor_hubs = ok and type(data) == "table" and data or nil
+  end
+  local me = view_point(view)
+  if not vendor_hubs or not me or not me.x then return nil end
+  local map = math.floor((view.location or {}).map_id or 0)
+  local best, best_d = nil, nil
+  for _, q in ipairs(view.accepted_quests or {}) do
+    local hub = vendor_hubs[tonumber(type(q) == "table" and q.quest_id or q) or 0]
+    local e = hub and hub.ender
+    if e and math.floor(e[1] or -1) == map then
+      local d = math.sqrt((e[2] - me.x) ^ 2 + (e[3] - me.y) ^ 2)
+      if not best_d or d < best_d then best, best_d = e, d end
+    end
+  end
+  return best, best_d
+end
+
+-- A vendor the seat walked toward for VENDOR_TARGET_PATIENCE without the
+-- merchant opening is skipped for VENDOR_RETRY_SECONDS, so a fenced-off
+-- approach rotates to the next vendor in view instead of looping unstick.
+local VENDOR_TARGET_PATIENCE = 25.0
+local vendor_skip = {}
+local vendor_target, vendor_target_since = nil, nil
+-- Unreached vendors in a row before the whole attempt waits out the retry
+-- window (Beru in Brill: indoor vendors, router stuck planning, ten in view).
+local VENDOR_MAX_UNREACHED = 3
+local vendor_unreached = 0
+
 local function nearest_vendor(view)
   local best, best_d = nil, nil
   local pure, pure_d = nil, nil
   for _, unit in ipairs(view.units or {}) do
     if unit_has_service(unit, "vendor") and
         not (unit.death_known and unit.is_dead) and
+        not (vendor_skip[tostring(unit.guid)] and
+          (view.simulation_time or 0) < vendor_skip[tostring(unit.guid)]) and
         unit.object_kind ~= "player" then
       local d = tonumber(unit.distance) or 1e9
       if not best_d or d < best_d then best, best_d = unit, d end
@@ -1014,6 +1149,12 @@ local function nearest_vendor(view)
       -- (Baran vs Joshua Kien, 2026-08-16). Prefer a pure vendor.
       if not unit_has_service(unit, "questgiver") then
         if not pure_d or d < pure_d then pure, pure_d = unit, d end
+        local pos = point(unit)
+        if pos and pos.x then
+          vendor_seen = { guid = unit.guid, name = unit.name,
+            x = pos.x, y = pos.y, z = pos.z,
+            map_id = unit.location and unit.location.map_id }
+        end
       end
     end
   end
@@ -1021,10 +1162,13 @@ local function nearest_vendor(view)
   return best, best_d
 end
 
-local function vendor_seek_step(view)
+local function vendor_seek_step(view, now)
   if not VENDOR_SEEK_EMIT then return nil end
+  -- Every tick, so the position is known before the bags fill.
+  nearest_vendor(view)
+  if vendor_seek_after and now < vendor_seek_after then return nil end
   if view.in_combat or view.is_dead or view.is_ghost then return nil end
-  if view.merchant_open then return nil end
+  if view.merchant_open then vendor_target = nil; vendor_unreached = 0; return nil end
   if not view.sell_supported then return nil end
   if party_member(view, MURIST) then return nil end
   if not view.bag_space_known then return nil end
@@ -1039,7 +1183,62 @@ local function vendor_seek_step(view)
   })
   if #plan.sell == 0 then return nil end
   local vendor, vendor_d = nearest_vendor(view)
-  if not vendor then return nil end
+  if vendor then
+    local key = tostring(vendor.guid)
+    if vendor_target ~= key then
+      vendor_target, vendor_target_since = key, now
+    elseif now - vendor_target_since > VENDOR_TARGET_PATIENCE then
+      vendor_skip[key] = now + VENDOR_RETRY_SECONDS
+      wow.log(string.format("vendor: %s not reached in %.0fs — trying the next vendor",
+        tostring(vendor.name), VENDOR_TARGET_PATIENCE))
+      vendor_target = nil
+      vendor_unreached = vendor_unreached + 1
+      if vendor_unreached >= VENDOR_MAX_UNREACHED then
+        vendor_unreached = 0
+        vendor_seek_after = now + VENDOR_RETRY_SECONDS
+        wow.log(string.format("vendor: %d vendors unreachable — next vendor walk in %.0fs",
+          VENDOR_MAX_UNREACHED, VENDOR_RETRY_SECONDS))
+        return nil
+      end
+      vendor, vendor_d = nearest_vendor(view)
+    end
+  end
+  if not vendor and not vendor_seen then
+    local hub, hub_d = vendor_hub(view)
+    if not hub then return nil end
+    if hub_d <= VENDOR_HUB_ARRIVE then
+      vendor_seek_after = now + VENDOR_RETRY_SECONDS
+      wow.log(string.format("vendor: no vendor in view at %s — next vendor walk in %.0fs",
+        tostring(hub[5]), VENDOR_RETRY_SECONDS))
+      return nil
+    end
+    return {
+      kind = "navigate", x = hub[2], y = hub[3], z = hub[4],
+      map_id = math.floor(hub[1]), stop_distance = VENDOR_HUB_ARRIVE - 5,
+      route_profile = "prefer_ground", reason = "vendor_walk_hub",
+    }
+  end
+  if not vendor then
+    local here = view.location or {}
+    if not vendor_seen or (here.map_id and vendor_seen.map_id and
+        math.floor(here.map_id) ~= math.floor(vendor_seen.map_id)) then
+      return nil
+    end
+    local me = view_point(view)
+    if me and me.x and math.abs(me.x - vendor_seen.x) + math.abs(me.y - vendor_seen.y) < 10 then
+      -- Standing where it was and it is not in view: it moved or died.
+      vendor_seen = nil
+      return nil
+    end
+    return {
+      kind = "navigate",
+      x = vendor_seen.x, y = vendor_seen.y, z = vendor_seen.z,
+      map_id = vendor_seen.map_id and math.floor(vendor_seen.map_id),
+      stop_distance = VENDOR_INTERACT_STOP,
+      route_profile = "prefer_ground",
+      reason = "vendor_walk_remembered",
+    }
+  end
   if (view.quest_frame or {}).open or view.gossip_open then
     if free > 0 then return nil end
     return { kind = "ui_press", control = "QuestFrameCancelButton",
@@ -1051,6 +1250,20 @@ local function vendor_seek_step(view)
   local d = tonumber(vendor_d) or tonumber(vendor.distance) or 1e9
   local nav = wow.nav_progress()
   local nav_state = nav and nav.state or ""
+  -- Beyond the last few yards a planning stall gets the router, not a
+  -- straight steer: steering from the wrong side of the chapel fence
+  -- (Vulcan) only grinds into it.
+  if pos and d > VENDOR_STEER_YARDS and
+      (nav_state == "unavailable" or nav_state == "planning") then
+    return {
+      kind = "navigate",
+      x = pos.x, y = pos.y, z = pos.z,
+      map_id = vendor.location and math.floor(vendor.location.map_id or 0),
+      stop_distance = VENDOR_INTERACT_STOP,
+      route_profile = "prefer_ground",
+      reason = "open_vendor_route",
+    }
+  end
   if pos and d > VENDOR_INTERACT_STOP and
       (nav_state == "unavailable" or nav_state == "planning") then
     return {
@@ -1166,9 +1379,16 @@ local function death_intent(view, now)
     if beru_can_resurrect(view) and now - dead_since < RES_WAIT_SECONDS then
       return { kind = "hold", reason = "wait_for_beru_resurrection" }, "waiting_for_beru"
     end
-    -- CMSG_REPOP_REQUEST drops the world session on this host. A corpse
-    -- can still take a rez; ghost reclaim does not teleport the session.
-    return { kind = "hold", reason = "skip_release" }, "waiting_for_rez"
+    -- A corpse keeps a short window for a resurrection offer, then releases
+    -- like a player and walks back as a ghost.
+    if now - dead_since < RES_WAIT_SECONDS then
+      return { kind = "hold", reason = "wait_for_resurrection" }, "waiting_for_rez"
+    end
+    if release_sent_at and now - release_sent_at < RELEASE_RETRY_SECONDS then
+      return { kind = "hold", reason = "release_pending" }, "releasing"
+    end
+    release_sent_at = now
+    return { kind = "release", reason = "release_spirit" }, "releasing"
   end
   if view.is_ghost then
     if view.can_reclaim_corpse then
@@ -1209,6 +1429,7 @@ local function death_intent(view, now)
     return { kind = "hold", reason = "ghost_without_known_corpse" }, "corpse_unknown"
   end
   dead_since = nil
+  release_sent_at = nil
   return nil, nil
 end
 
@@ -1640,6 +1861,74 @@ local function fortitude_action(view)
   return nil
 end
 
+local function log_gear(outcome)
+  if outcome and outcome.equipped then
+    local e = outcome.equipped
+    wow.log(string.format("home: equipped %s (%s, score %s) into slot %d replacing item %s",
+      tostring(e.name), tostring(e.item_id), tostring(e.score), e.slot,
+      tostring(e.replaced)))
+  elseif outcome and outcome.refused then
+    wow.log(string.format("home: equip of %s (%s) never reached slot %d; set aside",
+      tostring(outcome.refused.name), tostring(outcome.refused.item_id),
+      outcome.refused.slot))
+  end
+end
+
+-- An open dialog belongs to the class quest only when it is Venya's or
+-- already shows quest 1470; every other dialog stays with the quest stack.
+local function class_quest_dialog_open(view)
+  local frame = view.quest_frame or {}
+  if frame.open and frame.quest_id == life.QUEST_PIERCING_THE_VEIL then return true end
+  local npc = (frame.open and frame.npc_guid) or
+    (view.gossip_open and view.gossip_guid) or 0
+  if npc == 0 then return false end
+  local unit = visible_unit(view, npc)
+  return unit ~= nil and unit.entry == life.CREATURE_VENYA_MARTHAND
+end
+
+-- What a character that lives for days does between fights, ahead of the
+-- quest/grind brain: train a rank it leveled into, answer its class quest,
+-- bind newly learned spells, keep its imp out, loot its own corpses, wear
+-- legal upgrades and walk its class quest. Every outcome is judged by the
+-- world (lua/tools/lifecycle.lua).
+local function progression_step(view, now)
+  life.note_class_quest(view, lstate)
+  if lstate.train_since and (view.trainer_open or view.gossip_open) then
+    local train = life.train_step(view, lstate, now, false)
+    if train then return train end
+  end
+  if life.class_quest_phase(view) and class_quest_dialog_open(view) then
+    local answer = life.class_quest_dialog(view)
+    if answer then return answer end
+  end
+  local busy = life.fighting(view)
+  local bind = life.bind_step(view, lstate, now, busy)
+  if bind then return bind end
+  local pet = life.pet_step(view, lstate, now, busy)
+  if pet then return pet end
+  if busy then return nil end
+  -- Kill events are not on every route; the corpse's own lootable flag arms
+  -- the shared loot taker instead.
+  local corpse = life.loot_corpse(view, lstate)
+  if corpse then
+    lstate.loot_tried[corpse.guid] = true
+    lstate.loot_armed = (lstate.loot_armed or 0) + 1
+    solo.note_kills({ player_guid = view.player_guid,
+      combat_kill_events = { { target_guid = corpse.guid,
+        source_guid = view.player_guid } } })
+  end
+  local loot = solo.loot_step(view)
+  if loot then return loot end
+  local gear, outcome = life.gear_step(view, lstate, now, busy)
+  log_gear(outcome)
+  if gear then return gear end
+  local train = life.train_step(view, lstate, now, busy)
+  if train then return train end
+  local quest = life.class_quest_step(view, lstate)
+  if quest then return life.with_pet(view, lstate, quest) end
+  return nil
+end
+
 local function chat_outbox_path()
   if chat_outbox ~= nil then
     if chat_outbox == false then return nil end
@@ -1831,7 +2120,9 @@ local function formation_fidget(view, now)
 end
 
 function M.reset()
+  lstate = life.new_state()
   dead_since = nil
+  release_sent_at = nil
   last_promote_at = nil
   forget_stuck()
   stuckSeenAt = nil
@@ -1841,7 +2132,12 @@ function M.reset()
   chat_last_sent_at = nil
   chat_pending = nil
   vendor_forget()
-  vendor_last_sell_at = nil
+  vendor_seek_after = nil
+  vendor_seen = nil
+  vendor_hubs_loaded = false
+  vendor_skip = {}
+  vendor_target, vendor_target_since = nil, nil
+  vendor_unreached = 0
   equip_last_at = nil
   equip_tried = {}
   equip_attempts = 0
@@ -1884,7 +2180,7 @@ function M.decide(view)
     if wear then return finish(wear, view, "vendor", role) end
   end
 
-  local seek = vendor_seek_step(view)
+  local seek = vendor_seek_step(view, now)
   if seek then
     -- interact has no navigation_mode, so a 90yd chapel walk that wedges
     -- at planning (Vulcan, 2026-08-16) never reaches stuck_step otherwise.
@@ -1936,6 +2232,12 @@ function M.decide(view)
     end
     return finish(death, view, "recovery", role, nil, nil, recovery)
   end
+
+  -- An accepted request from the player outranks autonomous play, never
+  -- survival: the death branch above and any fight below still come first.
+  local req = requests.step(view, rstate, now, { life = life, lstate = lstate,
+    fighting = view.in_combat or life.fighting(view) })
+  if req then return finish(req, view, "request", role) end
 
   local party = view.party or {}
   if party.invite_pending and lower(party.invite_from) == MURIST then
@@ -1993,11 +2295,28 @@ function M.decide(view)
       return finish({ kind = "hold", reason = "finish_active_cast" },
         view, "solo", role)
     end
-    if not view.in_combat then
-      local pet = summon_demon(view, role)
-      if pet then return finish(pet, view, "solo", role) end
+    local progress = progression_step(view, now)
+    if progress then
+      -- Class-quest, trainer and loot legs walk through the same route engine
+      -- as a rejoin and wedge the same way (Vulcan, 2026-11-19: a dropper
+      -- attack from his Deathknell logout spot returned to one pose).
+      if not view.in_combat and (progress.kind == "navigate" or
+          progress.kind == "interact" or progress.kind == "attack") then
+        local escape = stuck_step(view, now, false, "progress_unstick")
+        if escape then
+          life.note_progress(view, lstate, now, escape)
+          return finish(escape, view, "solo", role)
+        end
+      else
+        forget_stuck()
+      end
+      life.note_progress(view, lstate, now, progress)
+      return finish(progress, view, "solo", role)
     end
-    local intent = solo.decide(view)
+    local intent = life.avoid_evading(view, lstate, solo.decide(view), now, solo.ignore)
+    intent = life.with_pet(view, lstate, intent)
+    intent = life.upgrade_attack(view, intent, mana_pct(view) >= SOLO_NUKE_MANA_PCT)
+    life.note_progress(view, lstate, now, intent)
     return finish(intent, view, "solo", role)
   end
 
@@ -2127,6 +2446,8 @@ function M.decide(view)
     -- most of a low-level lock's bar, and after every wipe the seat came back
     -- with a partial pool: buffing first spent exactly the mana the summon
     -- needed and the imp never arrived (Igris, 2026-08-16).
+    local bind = life.bind_step(view, lstate, now, false)
+    if bind then return finish(bind, view, "escort", role, leader) end
     local buff = role == "healer" and fortitude_action(view) or nil
     if not buff then buff = summon_demon(view, role) end
     if not buff then buff = self_buff(view, role) end
