@@ -210,12 +210,15 @@ check(read(dir .. "/inbox.json") == nil and aside == "1", "an unreadable inbox i
 
 -- If the active job cannot be made durable the inbox is left for a retry.
 write(dir .. "/inbox.json", job("w1", "hold_here"))
-os.execute("chmod 555 " .. dir)
+-- Block the temporary write for every effective UID, including CI's root.
+-- Directory permissions alone do not make writes fail for root.
+os.execute("mkdir " .. dir .. "/active.json.tmp")
+check(io.open(dir .. "/active.json.tmp", "w") == nil, "the durable-write obstruction is in place")
 rs8.last_poll = nil
 requests.step(view(), rs8, 10, ctx)
-os.execute("chmod 755 " .. dir)
+os.execute("rmdir " .. dir .. "/active.json.tmp")
 check(read(dir .. "/inbox.json") and not receipts():find('"key":"w1"'),
-  "an unwritable active job keeps the inbox and records no acceptance")
+  "a failed durable active-job write keeps the inbox and records no acceptance")
 rs8.last_poll = nil
 requests.step(view(), rs8, 11, ctx)
 check(read(dir .. "/inbox.json") == nil and receipts():find('"key":"w1".-"state":"accepted"'),
