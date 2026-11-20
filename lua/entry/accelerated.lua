@@ -600,31 +600,135 @@ local function targeted_by_hostile(view)
   return false
 end
 
--- A mob that pays an objective is worth more than an equally close one that
--- does not. Defined before pick_target so the local binding is visible.
-local function credits_objective(view, unit)
+-- Objective payout of a kill. One main-chunk local: Lua caps those at 200.
+local payout = {}
+
+-- Quest ids the log marks failed; an unknown flag is not failed.
+function payout.failed_quests(view)
+  local failed = {}
+  for _, q in ipairs(view.accepted_quests or {}) do
+    if type(q) == "table" and q.failed == true then failed[q.quest_id] = true end
+  end
+  return failed
+end
+
+-- The unfinished objective rows killing `unit` can pay, row index -> "kill"
+-- (a kill row naming its entry: certain credit) or "item" (an item row it
+-- is known to drop: a chance), and their count. `first` stops at one and is
+-- the plain credit predicate. Without it, rows that failed or belong to a
+-- quest the log marks failed are not counted: they pay nothing worth
+-- ranking or travelling for.
+function payout.rows(view, unit, first)
+  local failed = first and {} or payout.failed_quests(view)
+  local paid, n = {}, 0
   for i = 1, #(view.quest_objectives or {}) do
     local objective = view.quest_objectives[i]
+    local pays = nil
     if objective.complete then
+    elseif not first and (objective.failed or failed[objective.quest_id]) then
     elseif objective.entry ~= 0 and objective.entry == unit.entry then
-      return true
+      pays = "kill"
     elseif (objective.item_id or 0) ~= 0 then
       local needle = ITEM_DROPPER[objective.item_id]
       local name = unit.name or ""
-      if needle and name:find(needle, 1, true) then
-        return true
+      if (needle and name:find(needle, 1, true)) or
+          area_drops_from(area_objective(view, i), unit.name) then
+        pays = "item"
       end
-      if area_drops_from(area_objective(view, i), unit.name) then
-        return true
+    end
+    if pays then
+      paid[i], n = pays, n + 1
+      if first then break end
+    end
+  end
+  return paid, n
+end
+
+-- A mob that pays an objective is worth more than an equally close one that
+-- does not. Defined before pick_target so the local binding is visible.
+local function credits_objective(view, unit)
+  local _, n = payout.rows(view, unit, true)
+  return n > 0
+end
+
+-- Whether the guide objective paired with live item row `row` lists
+-- creature `entry` among its typed corpse droppers (`from_entries`, emitted
+-- by gen_objective_areas --dropper-ids only on typed item objectives). Every
+-- key must be a positive integer and every value a positive integer entry;
+-- holes are harmless. A missing, malformed or untyped list proves nothing.
+function payout.drops(guide, row, entry)
+  if not guide or guide.kind ~= "item" or type(guide.from_entries) ~= "table" or
+      guide.item_id == nil or guide.item_id ~= row.item_id then
+    return false
+  end
+  local found = false
+  for k, e in pairs(guide.from_entries) do
+    if type(k) ~= "number" or k < 1 or k ~= math.floor(k) or
+        type(e) ~= "number" or e <= 0 or e ~= math.floor(e) then
+      return false
+    end
+    if e == entry then found = true end
+  end
+  return found
+end
+
+-- Area keys (quest:position) of unfinished kill rows whose own creature is
+-- a typed corpse dropper of every item row `target` pays, so killing it
+-- pays the same drop chances plus certain kill credit. Only a target paying
+-- drop chances alone (no kill row) is dominated. Nil when none qualifies;
+-- guides without typed droppers never qualify.
+function payout.dominating(view, target)
+  local paid, n = payout.rows(view, target)
+  if n == 0 then return nil end
+  for _, how in pairs(paid) do
+    if how == "kill" then return nil end
+  end
+  local rows = view.quest_objectives or {}
+  local failed = payout.failed_quests(view)
+  local keys = nil
+  for i = 1, #rows do
+    local row = rows[i]
+    if not row.complete and not row.failed and not failed[row.quest_id] and
+        objective_class(row) == "kill" then
+      local guide, _, position = area_objective(view, i)
+      local covered = guide ~= nil and guide.kind == "mob"
+      for j in pairs(paid) do
+        covered = covered and payout.drops(area_objective(view, j), rows[j], row.entry)
       end
+      if covered then
+        keys = keys or {}
+        keys[row.quest_id .. ":" .. position] = true
+      end
+    end
+  end
+  return keys
+end
+
+-- `payout.walk`: the area keys of the last dominated walk that returned a
+-- step. Later frames with no target or a filler target keep walking to
+-- them, so a nearer item spot of the dominated rows cannot flip the walk
+-- whenever the local mobs drop out of view. The area step's own filters
+-- and patience end it; a fresh payer outside it ends it too.
+
+-- Whether `unit` pays an unfinished row of the remembered walk.
+function payout.on_walk(view, unit)
+  local rows = view.quest_objectives or {}
+  for j in pairs(payout.rows(view, unit)) do
+    local _, _, position = area_objective(view, j)
+    if position and payout.walk[rows[j].quest_id .. ":" .. position] then
+      return true
     end
   end
   return false
 end
 
-local function pick_target(view, freshPull)
+-- `rank` (an owner's objective-first request) prefers, among payers, the one
+-- paying the most live unfinished rows, then the nearest. Under any threat
+-- the nearest payer stays, so no farther pull is chosen while being hit.
+local function pick_target(view, freshPull, rank)
   local best, bestScore = nil, nil
-  local credit, creditScore = nil, nil
+  local credit, creditScore, creditRows = nil, nil, nil
+  rank = rank and not view.in_combat and not targeted_by_hostile(view)
   for i = 1, #(view.units or {}) do
     local unit = view.units[i]
     local pays = QUESTS and credits_objective(view, unit)
@@ -632,8 +736,14 @@ local function pick_target(view, freshPull)
     if huntable(view, unit, freshPull, reach) then
       local score = unit_distance(unit)
       if pays then
-        if not creditScore or score < creditScore then
-          credit, creditScore = unit, score
+        local n = 1
+        if rank then
+          local _, count = payout.rows(view, unit)
+          n = count
+        end
+        if not creditScore or n > creditRows or
+            (n == creditRows and score < creditScore) then
+          credit, creditScore, creditRows = unit, score, n
         end
       elseif not bestScore or score < bestScore then
         best, bestScore = unit, score
@@ -1788,7 +1898,8 @@ local function area_progress_mark(view)
   return table.concat(parts, ":")
 end
 
-local function objective_area_step(view, pos, now)
+-- `only`, when given, limits the walk to those area keys (quest:position).
+local function objective_area_step(view, pos, now, only)
   if not OBJECTIVE_TRAVEL or not objective_area_data() then return nil end
   local rows = view.quest_objectives or {}
   -- Keys are quest id + guide objective position, independent of where the
@@ -1864,6 +1975,7 @@ local function objective_area_step(view, pos, now)
     local guide, quest = area_objective(view, i)
     local key = keyed[i]
     if guide and not row.complete and not row.failed and
+        not (only and not only[key]) and
         not failed[row.quest_id] and area_travelable(guide) and
         (quest.level or 0) <= (view.level or 1) + AREA_LEVEL_MARGIN and
         not (areaCooldown[key] and now < areaCooldown[key]) then
@@ -2122,6 +2234,7 @@ function M.reset()
   areaFailed = {}
   areaLastCredit = {}
   areaSpotRest = {}
+  payout.walk = nil
 end
 
 --- One frame's intent. `policy` is optional and nil for every host-driven
@@ -2129,6 +2242,7 @@ end
 --- area outrank a fresh pull that pays no objective (an owner's quest
 --- request). An engaged or known-hostile fight is never left for it.
 function M.decide(view, policy)
+  if not (policy and policy.objective_first == true) then payout.walk = nil end
   -- Death first: everything else is unreachable from a corpse.
   if view.is_dead and not view.is_ghost then
     wow.set_status("dead: releasing")
@@ -2379,6 +2493,7 @@ function M.decide(view, policy)
 
   -- Keep fighting what is already engaged; only fresh pulls face the gates.
   local target = engaged
+  local objectiveFirst = policy ~= nil and policy.objective_first == true
   if not target then
     local rested = health >= RECOVERY_HEALTH_PCT and mana >= RECOVERY_MANA_PCT
     if not view.in_combat and not rested then
@@ -2397,20 +2512,42 @@ function M.decide(view, policy)
         status = progress_status(view),
       }
     end
-    target = pick_target(view, true)
+    target = pick_target(view, true, objectiveFirst)
   end
 
   -- A gray pull that pays nothing is not progress while an accepted quest
   -- still needs kills or drops somewhere else. Out of combat that includes
   -- our own auto-attack on one: nothing is hitting us yet. Under an
   -- objective-first policy any fresh pull that pays nothing yields too.
-  local filler = target and not engaged and policy and
-    policy.objective_first == true and not credits_objective(view, target) and
-    not targeted_by_hostile(view)
-  if not view.in_combat and (not target or filler or
+  local filler = target and not engaged and objectiveFirst and
+    not credits_objective(view, target) and not targeted_by_hostile(view)
+  -- Under the same policy a fresh pull that only rolls drops which an
+  -- unfinished kill row's own creature is a typed corpse dropper of yields
+  -- to that kill row's area: the same drops there come with certain kill
+  -- credit. Its area step is limited to those rows; with none eligible the
+  -- pull stands. Area patience counts any XP as progress, so fights on the
+  -- way keep such a walk alive until the request's own bounds end it.
+  local dominated = target and not engaged and not filler and objectiveFirst and
+    not targeted_by_hostile(view) and payout.dominating(view, target) or nil
+  if payout.walk and target and not engaged and not filler and not dominated and
+      not view.in_combat and not targeted_by_hostile(view) and
+      not payout.on_walk(view, target) then
+    payout.walk = nil
+  end
+  if not view.in_combat and (not target or filler or dominated or
       (target.level_known and target.level <= gray_level(view.level) and
         not credits_objective(view, target))) then
-    local area = objective_area_step(view, pos, wow.time())
+    local area
+    if dominated then
+      area = objective_area_step(view, pos, wow.time(), dominated)
+      payout.walk = area and dominated or nil
+    else
+      if payout.walk and (not target or filler) then
+        area = objective_area_step(view, pos, wow.time(), payout.walk)
+        if not area then payout.walk = nil end
+      end
+      area = area or objective_area_step(view, pos, wow.time())
+    end
     if area then
       area.status = progress_status(view)
       return area
@@ -2418,7 +2555,7 @@ function M.decide(view, policy)
   end
 
   if target and note_swing(target, pos, wow.time()) then
-    target = pick_target(view, true)
+    target = pick_target(view, true, objectiveFirst)
   end
 
   if target then

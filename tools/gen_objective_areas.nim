@@ -53,10 +53,26 @@
 ##
 ## Without --objective-ids the output is byte-identical to the legacy tool.
 ##
+## Corpse droppers (opt-in, --dropper-ids=PATH, needs --objective-ids)
+## --------------------------------------------------------------------
+## --dropper-ids reads known item -> creature entry relations: a creature
+## whose NORMAL corpse loot (no skinning or pickpocket) can drop the item.
+## The file is tab-separated with exactly the header `item_id\tcreature_entry`
+## and two positive integer cells per row. Loot ids and reference-loot chains
+## are resolved by whoever exports it; this tool never treats a loot id as a
+## creature entry. Duplicate rows collapse; entries are emitted sorted.
+##
+## Only an `item` objective that already carries its typed `item_id` (so its
+## whole quest passed the identity proof above) receives
+## `from_entries = {entry, ...}`. An item with no relation in the file gets
+## no field: absence means unknown, never "dropped by nothing". Without
+## --dropper-ids the output is unchanged; --dropper-ids without
+## --objective-ids is refused, since no objective could prove its identity.
+##
 ## Usage: gen_objective_areas --quest-data=PATH --dbc=PATH --out=PATH
-##          [--objective-ids=PATH [--max-patch=N]]
+##          [--objective-ids=PATH [--max-patch=N] [--dropper-ids=PATH]]
 
-import std/[parseopt, strutils, strformat, tables, algorithm, streams]
+import std/[parseopt, strutils, strformat, tables, algorithm, streams, sequtils]
 
 type
   Box* = object
@@ -72,6 +88,7 @@ type
     spots*: seq[Spot]
     idField*: string        ## "entry", "object_entry", "item_id" or ""
     id*: int
+    fromEntries*: seq[int]  ## corpse-dropper creature entries, sorted
   Quest* = object
     level*: int
     objectives*: seq[Objective]
@@ -83,6 +100,8 @@ type
   IdStats* = object
     defs*, attributed*, noDefinition*, dropped*, mismatch*, duplicate*,
       conflict*: int
+
+const DropperHeader = "item_id\tcreature_entry"
 
 const IdColumns = block:
   var cols = @["entry", "patch", "SrcItemId"]
@@ -268,13 +287,84 @@ proc idSummary*(stats: IdStats, questCount, maxPatch: int): string =
     &"{stats.dropped} mismatch {stats.mismatch} duplicate {stats.duplicate} " &
     &"conflict {stats.conflict}, no definition {stats.noDefinition}"
 
+proc positiveCell(cell: string, lineNo: int, col: string): int =
+  ## Parses one dropper cell: ASCII digits only, value above zero.
+  if cell.len == 0 or not cell.allCharsInSet(Digits):
+    raise newException(ValueError,
+      &"dropper ids line {lineNo}: {col} is not a positive integer")
+  try: result = parseInt(cell)
+  except ValueError:
+    raise newException(ValueError,
+      &"dropper ids line {lineNo}: {col} is out of range")
+  if result <= 0:
+    raise newException(ValueError,
+      &"dropper ids line {lineNo}: {col} is not a positive integer")
+
+proc parseDropperIds*(text: string): Table[int, seq[int]] =
+  ## `item_id\tcreature_entry` rows -> item id -> sorted, distinct creature
+  ## entries. Malformed input is fatal rather than partially read: a missing
+  ## or different header (extra, duplicate or reordered columns included),
+  ## a row without exactly two cells, or a cell that is not a positive
+  ## integer. Blank lines are skipped; a header alone yields no relations.
+  var sawHeader = false
+  var lineNo = 0
+  for raw in text.splitLines():
+    inc lineNo
+    let line = raw.strip(leading = false, chars = {'\r'})
+    if line.len == 0: continue
+    if not sawHeader:
+      if line != DropperHeader:
+        raise newException(ValueError,
+          "dropper ids: header must be exactly item_id<TAB>creature_entry")
+      sawHeader = true
+      continue
+    let cells = line.split('\t')
+    if cells.len != 2:
+      raise newException(ValueError,
+        &"dropper ids line {lineNo}: {cells.len} cells, expected 2")
+    let item = positiveCell(cells[0], lineNo, "item_id")
+    let entry = positiveCell(cells[1], lineNo, "creature_entry")
+    result.mgetOrPut(item, @[]).add entry
+  if not sawHeader:
+    raise newException(ValueError, "dropper ids: empty input")
+  for entries in result.mvalues:
+    entries.sort()
+    entries = entries.deduplicate(isSorted = true)
+
+proc applyDroppers*(quests: var Table[int, Quest],
+                    droppers: Table[int, seq[int]]): int =
+  ## Gives each typed item objective its known corpse droppers. Returns the
+  ## number of objectives tagged. Untyped quests and items without a known
+  ## relation are left as they are.
+  for q in quests.mvalues:
+    for o in q.objectives.mitems:
+      if o.kind == "item" and o.idField == "item_id" and droppers.hasKey(o.id):
+        o.fromEntries = droppers[o.id]
+        inc result
+
+proc requireTypedForDroppers*(idsPath, droppersPath: string) =
+  ## Refuses --dropper-ids without --objective-ids: without typed ids no
+  ## objective can be tied to an item, so the relations could only be
+  ## attached by name or position.
+  if droppersPath != "" and idsPath == "":
+    raise newException(ValueError,
+      "--dropper-ids requires --objective-ids (typed item ids)")
+
+proc dropperSummary*(droppers: Table[int, seq[int]], tagged: int): string =
+  ## The provenance line the CLI writes after attaching droppers.
+  var edges = 0
+  for entries in droppers.values: edges += entries.len
+  &"dropper ids: normal corpse loot item -> creature entry; items " &
+    &"{droppers.len}, relations {edges}, typed item objectives tagged {tagged}"
+
 proc luaStr(s: string): string =
   ## Quotes a string as a Lua literal.
   "\"" & s.replace("\\", "\\\\").replace("\"", "\\\"") & "\""
 
-proc render*(quests: Table[int, Quest], boxes: Table[int, Box],
-             idHeader = ""): tuple[body: string, emitted, dropped: int] =
-  ## Emits the Lua table. `idHeader` != "" adds one provenance comment line.
+proc render*(quests: Table[int, Quest], boxes: Table[int, Box], idHeader = "",
+             dropperHeader = ""): tuple[body: string, emitted, dropped: int] =
+  ## Emits the Lua table. `idHeader` and `dropperHeader`, when not "", each
+  ## add one provenance comment line.
   var ids: seq[int]
   for id in quests.keys: ids.add id
   ids.sort()
@@ -283,6 +373,7 @@ proc render*(quests: Table[int, Quest], boxes: Table[int, Box],
   body.add "-- source: QuestData.lua objective spots + WorldMapArea.dbc\n"
   body.add "-- spots are WORLD yards {map,x,y}; objective order = QuestData order\n"
   if idHeader != "": body.add "-- " & idHeader & "\n"
+  if dropperHeader != "": body.add "-- " & dropperHeader & "\n"
   body.add "return {\n"
   var emitted, dropped = 0
   for id in ids:
@@ -305,7 +396,10 @@ proc render*(quests: Table[int, Quest], boxes: Table[int, Box],
       let fromList = names.join(",")
       let spotList = spots.join(",")
       let ident = if o.idField != "": &"{o.idField} = {o.id}, " else: ""
-      parts.add &"{{kind = {luaStr(o.kind)}, {ident}from = {{{fromList}}}, spots = {{{spotList}}}}}"
+      let entryList = o.fromEntries.join(",")
+      let entries =
+        if o.fromEntries.len > 0: &"from_entries = {{{entryList}}}, " else: ""
+      parts.add &"{{kind = {luaStr(o.kind)}, {ident}from = {{{fromList}}}, {entries}spots = {{{spotList}}}}}"
     if any:
       inc emitted
       let objList = parts.join(", ")
@@ -315,7 +409,7 @@ proc render*(quests: Table[int, Quest], boxes: Table[int, Box],
 
 proc main() =
   ## Command-line entry point.
-  var questData, dbc, outPath, idsPath = ""
+  var questData, dbc, outPath, idsPath, droppersPath = ""
   var maxPatch = 10
   for kind, key, val in getopt():
     if kind == cmdLongOption:
@@ -324,11 +418,14 @@ proc main() =
       of "dbc": dbc = val
       of "out": outPath = val
       of "objective-ids": idsPath = val
+      of "dropper-ids": droppersPath = val
       of "max-patch": maxPatch = parseInt(val)
       else: quit("unknown option " & key)
   if questData == "" or dbc == "" or outPath == "":
     quit("usage: gen_objective_areas --quest-data=PATH --dbc=PATH --out=PATH" &
-         " [--objective-ids=PATH [--max-patch=N]]")
+         " [--objective-ids=PATH [--max-patch=N] [--dropper-ids=PATH]]")
+  try: requireTypedForDroppers(idsPath, droppersPath)
+  except ValueError as e: quit(e.msg)
   let boxes = readBoxes(dbc)
   var quests = parseQuests(questData)
   var idHeader = ""
@@ -339,11 +436,19 @@ proc main() =
       except ValueError as e: quit(e.msg)
     stats = applyIds(quests, defs)
     idHeader = idSummary(stats, quests.len, maxPatch)
-  let r = render(quests, boxes, idHeader)
+  var dropperHeader = ""
+  if droppersPath != "":
+    let droppers =
+      try: parseDropperIds(readFile(droppersPath))
+      except ValueError as e: quit(e.msg)
+    dropperHeader = dropperSummary(droppers, applyDroppers(quests, droppers))
+  let r = render(quests, boxes, idHeader, dropperHeader)
   writeFile(outPath, r.body)
   stderr.writeLine &"quests parsed {quests.len}, emitted {r.emitted}, spots without box {r.dropped}"
   if idsPath != "":
     stderr.writeLine idHeader & &", definitions read {stats.defs}"
+  if dropperHeader != "":
+    stderr.writeLine dropperHeader
 
 when isMainModule:
   main()

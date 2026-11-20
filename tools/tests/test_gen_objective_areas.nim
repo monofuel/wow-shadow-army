@@ -8,6 +8,11 @@
 ## lua/tests/test_objective_identity.lua runs the consumer against that same
 ## golden, so producer drift fails here and consumer drift fails there.
 ##
+## Corpse droppers (--dropper-ids) use fixtures/dropper_ids the same way: the
+## table rendered with typed ids and relations must equal its
+## expected_areas.lua, which lua/tests/test_objective_payout.lua feeds to the
+## accelerated brain.
+##
 ## Run: nim r --hints:off --warnings:off tools/tests/test_gen_objective_areas.nim
 
 import std/[os, streams, strutils, tables, tempfiles]
@@ -25,6 +30,18 @@ proc check(cond: bool, name: string) =
 proc rejects(tsv: string): bool =
   ## True when the definition parser refuses the whole input.
   try: discard parseObjectiveDefs(tsv, 10)
+  except ValueError: return true
+  false
+
+proc rejectsDroppers(tsv: string): bool =
+  ## True when the dropper parser refuses the whole input.
+  try: discard parseDropperIds(tsv)
+  except ValueError: return true
+  false
+
+proc refusesFlags(idsPath, droppersPath: string): bool =
+  ## True when the CLI flag check refuses the combination.
+  try: requireTypedForDroppers(idsPath, droppersPath)
   except ValueError: return true
   false
 
@@ -154,6 +171,78 @@ proc run(tmp: string) =
     "typed render equals fixtures/objective_ids/expected_areas.lua byte for byte")
   if typed.body != golden:
     stderr.writeLine "---- actual render ----\n" & typed.body
+
+  # Corpse droppers: item -> creature entry relations on typed item rows.
+  let dropperDir = currentSourcePath().parentDir / "fixtures" / "dropper_ids"
+  let droppers = parseDropperIds(readFile(dropperDir / "dropper_ids.synthetic.tsv"))
+  check(droppers.len == 4 and droppers[7301] == @[5301, 5302, 5303] and
+    droppers[7302] == @[5301], "relations sorted and deduplicated per item")
+  let headerOnly = parseDropperIds("item_id\tcreature_entry\n")
+  check(headerOnly.len == 0, "header alone: no relations")
+  check(parseDropperIds("item_id\tcreature_entry\r\n7301\t5301\r\n")[7301] ==
+    @[5301], "control: CRLF line ends accepted")
+
+  check(rejectsDroppers(""), "dropper ids: empty input rejected")
+  check(rejectsDroppers("7301\t5301\n"), "dropper ids: missing header rejected")
+  check(rejectsDroppers("creature_entry\titem_id\n5301\t7301\n"),
+    "dropper ids: reordered header rejected")
+  check(rejectsDroppers("item_id\tcreature_entry\tchance\n7301\t5301\t40\n"),
+    "dropper ids: extra column rejected")
+  check(rejectsDroppers("item_id\titem_id\n7301\t7301\n"),
+    "dropper ids: duplicate column rejected")
+  check(rejectsDroppers(" item_id\tcreature_entry\n7301\t5301\n"),
+    "dropper ids: padded header rejected")
+  check(rejectsDroppers("item_id\tcreature_entry\nitem_id\tcreature_entry\n"),
+    "dropper ids: repeated header rejected")
+  for bad in ["7301\t5301\t1", "7301", "7301\t", "\t5301", "0\t5301",
+              "7301\t0", "-7301\t5301", "7301\t-5301", "+7301\t5301",
+              " 7301\t5301", "7301\t5301 ", "7301.0\t5301", "NULL\t5301",
+              "7301\t99999999999999999999999"]:
+    check(rejectsDroppers("item_id\tcreature_entry\n7301\t5302\n" & bad & "\n"),
+      "dropper ids: bad row rejected: " & bad.escape)
+
+  check(refusesFlags("", "droppers.tsv"),
+    "--dropper-ids without --objective-ids refused")
+  check(not refusesFlags("ids.tsv", "droppers.tsv") and
+    not refusesFlags("ids.tsv", "") and not refusesFlags("", ""),
+    "control: other flag combinations accepted")
+
+  # Untyped (legacy) quests never receive relations, even for a listed item.
+  var untyped = parseQuests(questData)
+  check(applyDroppers(untyped, {7101: @[5101], 7191: @[5190]}.toTable) == 0 and
+    render(untyped, boxes).body == legacy.body,
+    "untyped quests: no from_entries, legacy table unchanged")
+  # Typed quests without a listed item render the current typed table.
+  var parity = parseQuests(questData)
+  discard applyIds(parity, defs)
+  check(applyDroppers(parity, headerOnly) == 0 and
+    render(parity, boxes, header).body == golden,
+    "typed quests without relations: typed table unchanged")
+
+  var dq = parseQuests(dropperDir / "QuestData.synthetic.lua")
+  let dstats = applyIds(dq, parseObjectiveDefs(
+    readFile(dropperDir / "objective_ids.synthetic.tsv"), 10))
+  let tagged = applyDroppers(dq, droppers)
+  check(tagged == 2 and dq[9301].objectives[2].fromEntries == @[5301, 5302, 5303] and
+    dq[9302].objectives[0].fromEntries == @[5301],
+    "typed item objectives tagged with their relations")
+  check(dq[9301].objectives[0].fromEntries.len == 0 and
+    dq[9301].objectives[1].fromEntries.len == 0, "kill objectives never tagged")
+  check(ids(dq, 9303) == @["-", "-"] and dq[9303].objectives[1].fromEntries.len == 0,
+    "quest refused typed ids: listed item stays untagged")
+  var missing = parseQuests(dropperDir / "QuestData.synthetic.lua")
+  discard applyIds(missing, parseObjectiveDefs(
+    readFile(dropperDir / "objective_ids.synthetic.tsv"), 10))
+  discard applyDroppers(missing, {7301: @[5302]}.toTable)
+  check("{kind = \"item\", item_id = 7302, from = {\"North Raider\"}, spots = " in
+    render(missing, boxes).body, "item without a relation: field omitted")
+  let dropperRender = render(dq, boxes, idSummary(dstats, dq.len, 10),
+    dropperSummary(droppers, tagged))
+  let dropperGolden = readFile(dropperDir / "expected_areas.lua")
+  check(dropperRender.body == dropperGolden,
+    "dropper render equals fixtures/dropper_ids/expected_areas.lua byte for byte")
+  if dropperRender.body != dropperGolden:
+    stderr.writeLine "---- actual dropper render ----\n" & dropperRender.body
 
 let tmp = createTempDir("gen_objective_areas_", "")
 try:

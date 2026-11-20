@@ -1,0 +1,4 @@
+entry	patch	SrcItemId	ReqCreatureOrGOId1	ReqCreatureOrGOId2	ReqCreatureOrGOId3	ReqCreatureOrGOId4	ReqCreatureOrGOCount1	ReqCreatureOrGOCount2	ReqCreatureOrGOCount3	ReqCreatureOrGOCount4	ReqItemId1	ReqItemId2	ReqItemId3	ReqItemId4	ReqItemCount1	ReqItemCount2	ReqItemCount3	ReqItemCount4
+9301	0	0	5301	5302	0	0	8	5	0	0	7301	0	0	0	8	0	0	0
+9302	0	0	0	0	0	0	0	0	0	0	7302	0	0	0	4	0	0	0
+9303	0	0	5311	0	0	0	6	0	0	0	7303	0	0	0	2	0	0	0
