@@ -6,7 +6,7 @@
 ## No network, no docker, no realm — pure functions on fixture strings.
 
 import
-  std/[json, options, sets, strutils, tables, times, unittest],
+  std/[json, options, os, sets, strutils, tables, times, unittest],
   ../system_server
 
 const
@@ -715,3 +715,48 @@ suite "renderRealmInvCell — real icons":
     let html = renderRealmInvCell(it, info, initHashSet[int]())
     check "cell-face" in html
     check "/icons/" notin html
+
+suite "iconIdsOnDisk — icons generated or removed while serving":
+  test "missing -> present -> removed follows the directory":
+    # Synthetic fixtures only: the cache keys on file names, not image data.
+    let dir = getTempDir() / ("sa_icon_cache_" & $getCurrentProcessId())
+    removeDir(dir)
+    defer: removeDir(dir)
+    let info = {4306: ItemInfo(name: "Silk Cloth", quality: 1)}.toTable
+    let silk = RealmInvItem(itemId: 4306, total: 1, stacks: 1)
+    check iconIdsOnDisk(dir).len == 0
+    createDir(dir)
+    check iconIdsOnDisk(dir).len == 0
+    check "cell-face" in renderRealmInvCell(silk, info, iconIdsOnDisk(dir))
+
+    writeFile(dir / "item_4306.png", "\x89PNG\r\n\x1a\n")
+    writeFile(dir / "item_bogus.png", "")
+    writeFile(dir / "manifest.tsv", "")
+    check iconIdsOnDisk(dir) == [4306].toHashSet
+    let shown = renderRealmInvCell(silk, info, iconIdsOnDisk(dir))
+    check "/icons/item_4306.png" in shown
+    check "cell-face" notin shown
+
+    removeFile(dir / "item_4306.png")
+    check iconIdsOnDisk(dir).len == 0
+    check "cell-face" in renderRealmInvCell(silk, info, iconIdsOnDisk(dir))
+
+    removeDir(dir)
+    check iconIdsOnDisk(dir).len == 0
+
+  test "a settled directory is served from cache until its mtime moves":
+    let dir = getTempDir() / ("sa_icon_settle_" & $getCurrentProcessId())
+    removeDir(dir)
+    defer: removeDir(dir)
+    createDir(dir)
+    writeFile(dir / "item_2589.png", "")
+    let old = getTime() - initDuration(hours = 1)
+    setLastModificationTime(dir, old)
+    check iconIdsOnDisk(dir) == [2589].toHashSet
+    # Same stamp, settled: the cached set is returned without a rescan.
+    writeFile(dir / "item_4306.png", "")
+    setLastModificationTime(dir, old)
+    check iconIdsOnDisk(dir) == [2589].toHashSet
+    # A removal moves the directory mtime, which forces the rescan.
+    removeFile(dir / "item_2589.png")
+    check iconIdsOnDisk(dir) == [4306].toHashSet

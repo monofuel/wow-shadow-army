@@ -5469,33 +5469,55 @@ proc renderRealmInvItemTable*(
       </div>"""
 
 ## Real item icons, extracted by tools/gen_item_icons.py (make item-icons)
-## into system/static/icons/item_<id>.png. The set of ids with a PNG on disk
-## is scanned once and cached; a cell whose id is in the set renders the
-## image, anything else keeps the abbreviation face — a new item looted after
-## the last `make item-icons` degrades gracefully, never blanks.
-const IconStaticDir = "system" / "static" / "icons"
+## into system/static/icons/item_<id>.png. A cell whose id has a PNG on disk
+## renders the image; anything else keeps the abbreviation face, so an item
+## looted after the last `make item-icons` degrades gracefully, never blanks.
+const
+  IconStaticDir = "system" / "static" / "icons"
+  ## Directory mtimes come from a coarse kernel clock, so a file created in the
+  ## same tick as a scan can share its stamp. Stamps younger than this window
+  ## are not trusted as unchanged and the directory is rescanned.
+  IconDirSettleSec = 2
 
 var gIconIdsLock: Lock
 initLock(gIconIdsLock)
 var gIconIds: HashSet[int]
-var gIconIdsLoaded = false
+var gIconIdsDir = ""
+var gIconIdsStamp: Time
+var gIconIdsSettled = false
 
-proc iconIdsOnDisk*(): HashSet[int] {.gcsafe.} =
+proc scanIconIds(dir: string): HashSet[int] =
+  ## Collect the item ids of every item_<id>.png directly inside `dir`.
+  ## A missing directory yields an empty set.
+  for kind, path in walkDir(dir):
+    if kind != pcFile: continue
+    let base = path.extractFilename
+    if base.startsWith("item_") and base.endsWith(".png"):
+      try:
+        result.incl(parseInt(base[5 ..< base.len - 4]))
+      except ValueError:
+        discard
+
+proc iconIdsOnDisk*(dir = IconStaticDir): HashSet[int] {.gcsafe.} =
+  ## Item ids with an icon PNG in `dir`. Cached per directory and revalidated
+  ## with one stat of the directory per call: adding or removing an icon
+  ## changes the directory mtime and triggers a rescan, so icons generated
+  ## after startup appear and deleted ones fall back to the text face.
   {.gcsafe.}:
     withLock gIconIdsLock:
-      if not gIconIdsLoaded:
-        gIconIdsLoaded = true
-        try:
-          for kind, path in walkDir(IconStaticDir):
-            if kind != pcFile: continue
-            let base = path.extractFilename
-            if base.startsWith("item_") and base.endsWith(".png"):
-              try:
-                gIconIds.incl(parseInt(base[5 ..< base.len - 4]))
-              except ValueError:
-                discard
-        except OSError:
-          discard
+      var stamp: Time
+      try:
+        stamp = getLastModificationTime(dir)
+      except OSError:
+        stamp = Time()
+      let stale = dir != gIconIdsDir or stamp != gIconIdsStamp or
+        not gIconIdsSettled
+      if stale:
+        gIconIds = scanIconIds(dir)
+        gIconIdsDir = dir
+        gIconIdsStamp = stamp
+        gIconIdsSettled =
+          getTime() - stamp > initDuration(seconds = IconDirSettleSec)
       result = gIconIds
 
 proc renderRealmInvCell*(it: RealmInvItem, info: Table[int, ItemInfo],
@@ -7022,7 +7044,7 @@ proc iconHandler(request: Request) {.gcsafe.} =
       itemId = parseInt(base[5 ..< base.len - 4])
     except ValueError:
       itemId = 0
-  if itemId <= 0 or itemId notin iconIdsOnDisk():
+  if itemId <= 0:
     request.respond(404, emptyHttpHeaders(), "")
     return
   try:
