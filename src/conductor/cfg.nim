@@ -64,14 +64,11 @@ type
 proc defaultConductorConfig*(): ConductorConfig =
   ConductorConfig(
     agents: ConductorAgents(
-      coding: AgentConfig(harness: harnessClaudeCode, model: "claude-opus-5",
+      coding: AgentConfig(harness: harnessClaudeCode, model: "claude-opus-5-5",
         reasoningEffort: "", hardTimeout: 3_600_000,
         noOutputTimeout: 300_000, progressTimeout: 900_000),
-      # Review is a verdict task: grok-4.6's default xhigh reasoning goes
-      # silent >300s on large diffs (probed 2026-08-13: 127KB review =
-      # 5s at low effort vs >5min with silent gaps at xhigh).
-      reviewer: AgentConfig(harness: harnessGrokBuild, model: "grok-4.6",
-        reasoningEffort: "low", hardTimeout: 1_800_000,
+      reviewer: AgentConfig(harness: harnessClaudeCode, model: "claude-opus-5-5",
+        reasoningEffort: "", hardTimeout: 1_800_000,
         noOutputTimeout: 600_000, progressTimeout: 600_000),
     ),
     maxAttemptsPerTicket: 3,
@@ -110,6 +107,10 @@ proc loadConductorConfig*(rootPath: string): ConductorConfig =
         "invalid JSON in " & path & ": " & e.msg)
   let merged = deepMerge(parseJson(defaults.toJson()), userJson)
   result = ($merged).fromJson(ConductorConfig)
+  for agent in [result.agents.coding, result.agents.reviewer]:
+    if agent.harness == harnessGrokBuild:
+      raise newException(ValueError,
+        "Grok delegation is disabled; use claude-code / claude-opus-5-5")
 
 proc league*(cfg: ConductorConfig, name: string): LeagueConfig =
   if name notin cfg.leagues:

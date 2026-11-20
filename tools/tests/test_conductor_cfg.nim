@@ -19,7 +19,9 @@ createDir(tmp)
 let bare = loadConductorConfig(tmp)
 check(bare.maxAttemptsPerTicket == 3, "default maxAttemptsPerTicket")
 check(bare.agents.coding.harness == harnessClaudeCode, "default coding harness")
-check(bare.agents.reviewer.harness == harnessGrokBuild, "default reviewer harness")
+check(bare.agents.reviewer.harness == harnessClaudeCode, "default reviewer harness")
+check(bare.agents.coding.model == "claude-opus-5-5", "current coding model")
+check(bare.agents.reviewer.model == "claude-opus-5-5", "current reviewer model")
 check(bare.leagues.len == 0, "no leagues without a config file")
 
 # --- partial config deep-merges over defaults ---
@@ -50,7 +52,7 @@ check(merged.maxAttemptsPerTicket == 5, "user value overrides default")
 check(merged.agents.coding.model == "test-model", "nested override merges")
 check(merged.agents.coding.hardTimeout == 3_600_000,
   "sibling default survives partial agent override")
-check(merged.agents.reviewer.harness == harnessGrokBuild,
+check(merged.agents.reviewer.harness == harnessClaudeCode,
   "untouched agent keeps defaults")
 check(merged.leagues.len == 1, "league parsed")
 let lc = merged.league("traverse")
@@ -67,6 +69,15 @@ try:
 except ValueError:
   raised = true
 check(raised, "unknown league raises ValueError")
+
+# A stale direct-harness config must not revive a forbidden provider.
+writeFile(tmp / "conductor.json", """{"agents":{"coding":{"harness":"grok-build","model":"grok-4.6"}}}""")
+raised = false
+try:
+  discard loadConductorConfig(tmp)
+except ValueError as e:
+  raised = e.msg.contains("Grok delegation is disabled")
+check(raised, "legacy Grok config is refused without launching a worker")
 
 # --- invalid JSON raises ValueError with path ---
 writeFile(tmp / "conductor.json", "{ nope")
