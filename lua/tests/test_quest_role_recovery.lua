@@ -898,6 +898,177 @@ case(i and i.status.mode == "request" and i.kind == "interact" and i.guid == TRA
 rs.active = nil
 os.remove(dir .. "/active.json")
 
+-- Warrior Hamstring on a fleeing engaged mob ------------------------------
+-- Row shape follows the parent-sanitized level 10 Tusk fact for 1715 (range
+-- 0-5, cost 100, needs a weapon, hostile target). is_fleeing is the unit
+-- flag as the native view sets it: true only when the flags are known.
+-- Default execution is the ordinary spellbook path (learned, not on the
+-- bar); a returned intent is a request, not a cast, a slow or a server effect.
+local HAM = 1715
+local function ham(extra)
+  return fact(HAM, "Hamstring", 1, merge({ power_cost = 100, range_max = 5,
+    requires_equipped_item = true, execution = "spellbook" }, extra))
+end
+local function fleeing(extra)
+  return mob(MOB, merge({ is_fleeing = true, health = 6, max_health = 40, target_guid = 0 }, extra))
+end
+-- The kit with each spellbook-path fact taken off the bar, as the native
+-- view reports a learned spell absent from every keyed button.
+local function hkit(facts, bar_only)
+  local k = kit(facts, bar_only)
+  local buttons = {}
+  for _, b in ipairs(k.action_buttons) do
+    local book = false
+    for _, f in ipairs(facts) do
+      if f.spell_id == b.spell_id and f.execution == "spellbook" then book = true f.bound_slot = 0 end
+    end
+    if not book then buttons[#buttons + 1] = b end
+  end
+  k.action_buttons = buttons
+  return k
+end
+local function hview(facts, extra) return merge(hkit(facts), merge({ units = { fleeing() } }, extra)) end
+local function no_ham(r) return r ~= nil and r.spell ~= HAM end
+
+t = t + 1000
+i = fresh(t, hview({ ham(), fact(REND, "Rend", 1), fact(HS, "Heroic Strike", 1) }))
+case(i and i.kind == "attack" and i.guid == MOB and i.spell == HAM and i.stop_distance == 4.0 and
+  i.reason == "warrior_hamstring_fleeing" and i.status.mode == "solo",
+  "hamstring: fleeing engaged mob, unbound learned rank via the spellbook path, ahead of Rend/HS", i)
+local ham_frames, ham_windows_seq = 0, {}
+for s = 1, 20 do
+  local at = t + s * 0.5
+  local r = tick(at, hview({ ham(), fact(REND, "Rend", 1), fact(HS, "Heroic Strike", 1) }))
+  ham_windows_seq[#ham_windows_seq + 1] = { at = at, intent = r }
+  if r and r.spell == HAM then ham_frames = ham_frames + 1 end
+end
+case(ham_frames == 2 and windows(ham_windows_seq, HAM) == 1,
+  "hamstring: one 1.5s request window per mob over 10s of fleeing, not a press every GCD", nil)
+
+t = t + 100
+i = fresh(t, merge(hkit({ ham({ execution = "action_bar" }), fact(HS, "Heroic Strike", 1) }, true),
+  { units = { fleeing() } }))
+case(i and i.spell == HAM, "hamstring: a bar-only live seat (empty spell_facts) uses the bound button", i)
+
+t = t + 100
+i = fresh(t, hview({ ham(), fact(HS, "Heroic Strike", 1) },
+  { units = { fleeing({ active_aura_spell_ids = { HAM } }) } }))
+case(i and i.kind == "attack" and i.spell == HS, "hamstring control: observed Hamstring already up, no reapply", i)
+i = fresh(t + 1, hview({ ham(), fact(HS, "Heroic Strike", 1) },
+  { units = { fleeing({ active_aura_spell_ids = {} }) } }))
+case(i and i.spell == HAM, "hamstring: observed row without the aura is requested", i)
+
+t = t + 100
+local controls = {
+  { "not fleeing", { units = { mob(MOB, { health = 6 }) } } },
+  { "moving but not flagged fleeing", { units = { mob(MOB, { unit_is_moving = true, is_fleeing = false }) } } },
+  { "flag field absent (no inference)", { units = { mob(MOB, { unit_is_moving = true, target_guid = 0 }) } } },
+  { "not swinging at it", { auto_attack_guid = 0 } },
+  { "seat out of combat", { in_combat = false } },
+}
+for _, c in ipairs(controls) do
+  t = t + 10
+  i = fresh(t, hview({ ham(), fact(HS, "Heroic Strike", 1) }, c[2]))
+  case(no_ham(i), "hamstring control: " .. c[1] .. " -> no Hamstring", i)
+end
+
+t = t + 10
+local runner = mob(902, { is_fleeing = true, health = 6, target_guid = 0, distance = 4, combat_distance = 4 })
+i = fresh(t, hview({ ham(), fact(HS, "Heroic Strike", 1) },
+  { selected_target_guid = 902, units = { mob(MOB), runner } }))
+case(no_ham(i), "hamstring control: a selected runner we are not swinging at is not engaged", i)
+t = t + 10
+i = fresh(t, hview({ ham(), fact(HS, "Heroic Strike", 1) },
+  { selected_target_guid = 902, units = { fleeing(), mob(902, { distance = 4, combat_distance = 4 }) } }))
+case(no_ham(i), "hamstring control: swinging at a runner while another unit is selected", i)
+
+t = t + 10
+local fleeing_guard = mob(950, { name = "Synthetic Guard", player_can_attack = false,
+  is_fleeing = true, target_guid = 0 })
+i = fresh(t, hview({ ham(), fact(HS, "Heroic Strike", 1) },
+  { selected_target_guid = 950, auto_attack_guid = 950, units = { fleeing_guard } }))
+case(no_ham(i), "hamstring control: a fleeing friendly is never a target", i)
+
+t = t + 10
+i = fresh(t, hview({ fact(HS, "Heroic Strike", 1) }, { in_combat = false, units = {} }))
+case(no_ham(i), "hamstring control: no hostile at all", i)
+
+local fact_controls = {
+  { "unnamed row (metadata unknown)", { name_known = false, name = "" } },
+  { "no ordinary input (execution unavailable)", { execution = "unavailable",
+      execution_reason = "spellbook_unbound" } },
+  { "cooling down", { cooldown_ms = 4000, readiness = "cooldown" } },
+  { "no rage (Tusk's sampled shape)", { usable = false, not_enough_mana = true, readiness = "resources" } },
+  { "wrong stance (client usability false)", { usable = false } },
+  { "weapon requirement unmet", { equipped_item_requirement_met = false, readiness = "equipped_item" } },
+}
+for _, c in ipairs(fact_controls) do
+  t = t + 10
+  i = fresh(t, hview({ ham(c[2]), fact(HS, "Heroic Strike", 1) }))
+  case(no_ham(i) and i.kind == "attack" and i.guid == MOB,
+    "hamstring control: " .. c[1] .. " -> no Hamstring, the fight goes on", i)
+end
+t = t + 10
+i = fresh(t, merge(hview({ fact(HS, "Heroic Strike", 1) }), { known_spells = { HS, HAM } }))
+case(no_ham(i), "hamstring control: known id with no fact row stays unknown, never pressed", i)
+
+t = t + 10
+local queued_hs = { ham(), fact(HS, "Heroic Strike", 1, { active = true, next_melee_swing = true }) }
+i = fresh(t, hview(queued_hs))
+case(i and i.kind == "attack" and i.guid == MOB and i.spell == HAM and
+  i.reason == "warrior_hamstring_fleeing",
+  "hamstring: a queued Heroic Strike does not hold the slow; 1715 is requested, never 284", i)
+i = tick(t + 2, hview(queued_hs))
+case(i and i.kind == "attack" and i.guid == MOB and i.spell == nil and i.reason == "tank_swing_queued",
+  "hamstring: after its 1.5s window the still-queued Heroic Strike is held, not re-pressed", i)
+t = t + 10
+i = fresh(t, hview({ ham(), fact(HS, "Heroic Strike", 1) }, { active_cast_spell_id = 2457 }))
+case(i and i.kind == "hold" and i.reason == "finish_active_cast",
+  "hamstring control: an active cast is finished first", i)
+t = t + 10
+i = fresh(t, hview({ ham(), fact(HS, "Heroic Strike", 1) }, { health = 10 }))
+case(i and i.reason == "survive_flee", "hamstring control: survival outranks Hamstring", i)
+
+t = t + 10
+i = fresh(t, hview({ ham(), fact(HS, "Heroic Strike", 1) },
+  { units = { fleeing({ distance = 12, combat_distance = 12, in_range = false }) } }))
+local closing_ok = i and i.kind == "attack" and i.guid == MOB and i.stop_distance == 4.0
+i = tick(t + 3, hview({ ham(), fact(HS, "Heroic Strike", 1) }))
+case(closing_ok and i and i.spell == HAM,
+  "hamstring: a runner at 12yd is chased on the same target/stop; the one request starts in melee", i)
+
+-- Escort tank: Taunt for a mob on Murist still comes first; a fleeing mob on
+-- nobody gets Hamstring through the same warrior rotation.
+local TAUNT = 355
+local function escort_ham(at, facts, unit)
+  return tick(at, merge(hkit(facts), {
+    level = 10, party = { in_group = true, leader_guid = 100, leader_name = "Murist",
+      invite_pending = false, invite_from = "", members = {
+        { guid = SEAT, name = "Tusk", health_known = true, health = 100, max_health = 100,
+          level_known = true, level = 10, death_state_known = true, is_dead = false,
+          is_ghost = false, location_known = true, elevation_known = true,
+          location = { map_id = 0, x = 100, y = 100, z = 10 } },
+        { guid = 100, name = "Murist", leader = true, health_known = true, health = 100,
+          max_health = 100, level_known = true, level = 10, death_state_known = true,
+          is_dead = false, is_ghost = false, location_known = true, elevation_known = true,
+          location = { map_id = 0, x = 102, y = 100, z = 10 } } } },
+    units = { { guid = 100, name = "Murist", is_player_controlled = true,
+      player_can_attack = false, death_known = true, is_dead = false, combat_known = true,
+      is_in_combat = true, target_guid_known = true, target_guid = MOB, distance = 2,
+      location = { map_id = 0, position = { x = 102, y = 100, z = 10 } } }, unit } }))
+end
+t = t + 100
+home.reset()
+grind.reset()
+i = escort_ham(t, { fact(TAUNT, "Taunt", 1), ham(), fact(HS, "Heroic Strike", 1) },
+  fleeing({ target_guid = 100 }))
+case(i and i.status.mode == "escort" and i.spell == TAUNT,
+  "hamstring escort control: Taunt for a mob on Murist still comes first", i)
+home.reset()
+i = escort_ham(t + 1, { ham(), fact(HS, "Heroic Strike", 1) }, fleeing())
+case(i and i.status.mode == "escort" and i.spell == HAM and i.guid == MOB,
+  "hamstring escort: the tank slows its fleeing engaged mob", i)
+
 print(string.format("test_quest_role_recovery: passed=%d failed=%d", passed, failed))
 drop_scratch()
 if failed > 0 then os.exit(1) end

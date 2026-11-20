@@ -1801,6 +1801,23 @@ local function warrior_action(view, target)
         stop_distance = 4.0, reason = "tank_taunt_party_attacker" }
     end
   end
+  -- Hamstring is for the mob already in this fight that turns and runs:
+  -- swung at, selected, and flagged fleeing (is_fleeing is true only when
+  -- the unit flags are known, so plain movement never counts). A runner
+  -- drags the fight into whatever it reaches. Requested once per mob
+  -- (debuff_due). A queued Heroic Strike does not hold it back: Hamstring
+  -- is a separate instant and leaves the next-swing queue alone. Stance,
+  -- rage and cooldown arrive in the fact's own usability, which pick_spell
+  -- already requires.
+  if view.in_combat and target.is_fleeing == true and
+      guid_equal(view.auto_attack_guid, target.guid) and
+      guid_equal(view.selected_target_guid, target.guid) then
+    local hamstring, family = pick_spell(view, { "Hamstring" })
+    if hamstring and debuff_due(view, target, hamstring, family, 4.0) then
+      return { kind = "attack", guid = target.guid, spell = hamstring.spell_id,
+        stop_distance = 4.0, reason = "warrior_hamstring_fleeing" }
+    end
+  end
   if not view.in_combat then
     local d = target.combat_distance_known and target.combat_distance
       or target.distance
