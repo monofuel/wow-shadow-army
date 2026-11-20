@@ -150,7 +150,40 @@ jobs:
           nimby sync -g "$(dirname "$GITHUB_WORKSPACE")/monofuel-vanilla-wow/nimby.lock"
           nimby sync -g "$GITHUB_WORKSPACE/nimby.lock"
       - name: Nim unit suite + compile smoke
-        run: make test-nim test-smoke-nim
+        run: |
+          set -euo pipefail
+          # Isolate our compiler/test scratch and remove only what this job
+          # created. This does not add capacity when /tmp and checkout share
+          # a backing filesystem; report the actual namespace/headroom.
+          echo '[ci scratch] before directory creation'
+          df -P -B1 /tmp "$GITHUB_WORKSPACE" "$HOME" || true
+          df -Pi /tmp "$GITHUB_WORKSPACE" "$HOME" || true
+          scratch="$(mktemp -d "$GITHUB_WORKSPACE/.ci-nim-tmp.XXXXXXXX")"
+          report_disk() {
+            echo "[ci scratch] $1"
+            df -P -B1 /tmp "$scratch" "$HOME" || true
+            df -Pi /tmp "$scratch" "$HOME" || true
+            if command -v findmnt >/dev/null 2>&1; then
+              findmnt -n -o TARGET,SOURCE,FSTYPE,SIZE,AVAIL -T "$scratch" || true
+            fi
+            du -sk "$scratch" "$HOME/.cache/nim" 2>/dev/null || true
+          }
+          cleanup() {
+            status=$?
+            report_disk "exit=$status"
+            case "$scratch" in
+              "$GITHUB_WORKSPACE"/.ci-nim-tmp.*) find "$scratch" -xdev -depth -delete ;;
+              *) exit 1 ;;
+            esac
+            exit "$status"
+          }
+          trap cleanup EXIT
+          trap 'exit 1' HUP INT TERM
+          chmod 700 "$scratch"
+          export TMPDIR="$scratch"
+          export WSA_CI_SCRATCH_DIAGNOSTICS=1
+          report_disk before
+          make test-nim test-smoke-nim
 
   # Pin drift only (pure shell pin-check). No docker, no realm, no Python.
   # Needs the private mirror checkout as a sibling path.

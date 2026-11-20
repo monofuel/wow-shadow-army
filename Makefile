@@ -396,7 +396,16 @@ test-nim:
 		for t in system/tests/test_*.nim tools/tests/test_*.nim; do \
 			[ -f "$$t" ] || continue; \
 			echo "== $$t =="; \
+			if [ "$${WSA_CI_SCRATCH_DIAGNOSTICS:-}" = 1 ]; then \
+				echo "[ci scratch] before $$t"; \
+				df -P -B1 "$${TMPDIR:-/tmp}" "$$HOME" || true; \
+			fi; \
 			nim r --hints:off --warnings:off "$$t" || rc=1; \
+			if [ "$${WSA_CI_SCRATCH_DIAGNOSTICS:-}" = 1 ]; then \
+				echo "[ci scratch] after $$t"; \
+				df -P -B1 "$${TMPDIR:-/tmp}" "$$HOME" || true; \
+				df -Pi "$${TMPDIR:-/tmp}" "$$HOME" || true; \
+			fi; \
 		done; \
 		exit $$rc; \
 	elif [ -f flake.nix ] || [ -f shell.nix ]; then \
