@@ -24,10 +24,20 @@
 ##
 ## A human operator can also enqueue a request with `--to/--text`; it is
 ## labelled origin=operator end to end and never presented as game chat.
+##
+## Model admission: each addressed request is one request chain (see
+## `broker_admission`). While a hold applies, new chains are not admitted:
+## chat rows are kept in the seat's `jobs/deferred.jsonl` and operator files
+## stay pending, then both are handled once after release or expiry. The
+## deferred file is replaced atomically, so a failed write leaves its earlier
+## rows and the chat cursor as they were and the row is deferred again on the
+## next tick. Handing a request is at-least-once: a crash after its job is
+## queued but before its key reaches the ledger hands it again.
 
 import
   std/[json, os, osproc, parseopt, sequtils, sets, streams, strutils, tables, times],
-  curly, webby
+  curly, webby,
+  ./broker_admission
 
 type
   Scope* = enum
@@ -92,6 +102,7 @@ const
   ## A seat whose observation is older than this is not a live responder.
   LiveObservationSeconds = 30
   JobProtocol = "wow_shadow_army.private_request.v1"
+  DeferredFile = "deferred.jsonl"
 
 var
   modelClient: Curly ## Shared HTTP client for model calls; opened by the broker loop.
@@ -102,6 +113,7 @@ var
       headers["Authorization"] = "Bearer " & apiKey
       modelClient.post(url, headers, body, timeout = timeoutMs div 1000)
     ## Model HTTP transport; tests replace it with synthetic responses.
+  gate*: Gate ## Model admission control; disabled until the broker opens it.
 
 proc lowerName(value: string): string =
   ## Case-folded, trimmed character name.
@@ -418,6 +430,8 @@ proc callModel(cfg: Config; body: JsonNode): tuple[content, requestId, served, f
   ## One blocking routed request through the shared Curly client; failures
   ## raise with their status. The broker makes one call at a time.
   let started = epochTime()
+  gate.beginPost()
+  defer: gate.endPost()
   let response = postJson(cfg.baseUrl & "/chat/completions", cfg.apiKey, $body, cfg.timeoutMs)
   result.seconds = epochTime() - started
   if response.code < 200 or response.code > 299:
@@ -438,6 +452,8 @@ proc callRoute(cfg: Config; body: JsonNode): tuple[route: Route, served: string,
     usage: JsonNode, seconds: float] =
   ## One blocking System One request to Kev on the direct endpoint.
   let started = epochTime()
+  gate.beginPost()
+  defer: gate.endPost()
   let response = postJson(cfg.routeBaseUrl & "/systemone", cfg.routeApiKey, $body, cfg.timeoutMs)
   result.seconds = epochTime() - started
   if response.code < 200 or response.code > 299:
@@ -563,6 +579,59 @@ proc claimOperator*(jobs: string): string =
     moveFile(pending, claim)
     result = claim
 
+proc runAdmitted(cfg: Config; seat: var SeatState; obs: JsonNode; origin, actor,
+    actorGuid, text: string; scope: Scope; key: string; seen: var HashSet[string];
+    speaks = true): bool =
+  ## Run one request chain if the admission gate admits it now; false means
+  ## it was not admitted and the caller keeps the request.
+  if key in seen: return true
+  if not gate.admit(): return false
+  try:
+    handle(cfg, seat, obs, origin, actor, actorGuid, text, scope, key, seen, speaks)
+  finally:
+    gate.finish()
+  true
+
+proc deferRow(seat: SeatState; origin, actor, actorGuid, text: string;
+    scope: Scope; key: string; speaks: bool) =
+  ## Keep an addressed chat row the gate did not admit, so the chat cursor
+  ## may pass it without losing it. The file is rewritten whole and renamed
+  ## into place: an IO failure raises before the cursor is saved and leaves
+  ## the earlier rows byte for byte.
+  let path = seat.dir / "jobs" / DeferredFile
+  var body = if fileExists(path): readFile(path) else: ""
+  if body.len > 0 and not body.endsWith("\n"): body.add "\n"
+  body.add $(%*{"key": key, "origin": origin, "actor": actor,
+    "actor_guid": actorGuid, "text": text, "scope": $scope, "speaks": speaks}) & "\n"
+  writeAtomic(path, body)
+  inc gate.deferredByInstanceThisHold
+  logLine(seat.dir, %*{"at": epochTime(), "seat": seat.name, "key": key,
+    "origin": origin, "deferred": gate.token})
+
+proc replayDeferred(cfg: Config; seat: var SeatState; obs: JsonNode;
+    seen: var HashSet[string]): bool =
+  ## Handle deferred rows oldest first and report whether none remain. The
+  ## file is removed only after every row was handled; the per-key ledger
+  ## keeps a row replayed after a crash exactly-once.
+  let path = seat.dir / "jobs" / DeferredFile
+  if not fileExists(path): return true
+  for line in readFile(path).splitLines:
+    if line.strip.len == 0: continue
+    var row: JsonNode
+    try:
+      row = parseJson(line)
+    except JsonParsingError:
+      appendLine(seat.dir / "jobs" / "deferred.bad.jsonl", line)
+      continue
+    let scope = try: parseEnum[Scope](row{"scope"}.getStr)
+      except ValueError: scopeDirect
+    if not runAdmitted(cfg, seat, obs, row{"origin"}.getStr, row{"actor"}.getStr,
+        row{"actor_guid"}.getStr, row{"text"}.getStr, scope, row{"key"}.getStr,
+        seen, row{"speaks"}.getBool(true)):
+      return false
+  removeFile(path)
+  true
+
 proc deliver(seat: SeatState) =
   ## Move the oldest queued job into the seat's empty one-slot inbox.
   let jobs = seat.dir / "jobs"
@@ -596,6 +665,7 @@ proc runningSeats(cfg: Config): seq[string] =
 proc tick*(cfg: Config; seats: var Table[string, SeatState]) =
   ## One poll over every running seat: refresh observations, choose this
   ## tick's conversation responders, then handle each seat's new chat.
+  gate.refresh()
   let names = runningSeats(cfg)
   let now = getTime()
   var live: seq[(string, JsonNode)]
@@ -629,7 +699,9 @@ proc tick*(cfg: Config; seats: var Table[string, SeatState]) =
   let partyResponder = responder(live, "party", cfg.authorityGuid)
   let sayResponder = responder(live, "say", cfg.authorityGuid)
   for name in names:
-    if not seats.hasKey(name) or not seats[name].pending: continue
+    if not seats.hasKey(name) or seats[name].obs.isNil: continue
+    if not seats[name].pending and
+        not fileExists(seats[name].dir / "jobs" / DeferredFile): continue
     var seat = seats[name]
     seat.pending = false
     let dir = seat.dir
@@ -642,6 +714,8 @@ proc tick*(cfg: Config; seats: var Table[string, SeatState]) =
       seat.episode = episode
       seat.cursor = obs{"chat_messages_last_sequence"}.getBiggestInt
     var seen = seenKeys(dir)
+    # Once one row waits, every later row waits behind it in order.
+    var backlog = not replayDeferred(cfg, seat, obs, seen)
     for node in obs{"chat_messages"}.getElems:
       let row = ChatRow(sequence: node{"sequence"}.getBiggestInt, kind: node{"kind"}.getStr,
         senderGuid: node{"sender_guid"}.getStr, senderName: node{"sender_name"}.getStr,
@@ -662,11 +736,17 @@ proc tick*(cfg: Config; seats: var Table[string, SeatState]) =
             "scope": $a.scope, "sequence": row.sequence,
             "skipped": "no live seat shares the authority's party or view"})
         continue
-      handle(cfg, seat, obs, row.kind, row.senderName, row.senderGuid, a.text, a.scope,
-        jobKey(seatGuid, episode, row.sequence, row.kind), seen,
-        speaks = a.scope != scopeGroup or answering)
-    let claim = claimOperator(dir / "jobs")
+      let key = jobKey(seatGuid, episode, row.sequence, row.kind)
+      let speaks = a.scope != scopeGroup or answering
+      if backlog or not runAdmitted(cfg, seat, obs, row.kind, row.senderName,
+          row.senderGuid, a.text, a.scope, key, seen, speaks):
+        backlog = true
+        deferRow(seat, row.kind, row.senderName, row.senderGuid, a.text, a.scope,
+          key, speaks)
+    # Operator files are not touched while a hold applies.
+    let claim = if backlog or gate.state != gsOpen: "" else: claimOperator(dir / "jobs")
     if claim.len > 0:
+      var unfinished = false
       for line in readFile(claim).splitLines:
         if line.strip.len == 0: continue
         var req: JsonNode
@@ -676,13 +756,19 @@ proc tick*(cfg: Config; seats: var Table[string, SeatState]) =
           # A malformed line is set aside instead of failing every tick.
           appendLine(dir / "jobs" / "operator.bad.jsonl", line)
           continue
-        handle(cfg, seat, obs, "operator", req{"actor"}.getStr("operator"), "",
-          req{"text"}.getStr, scopeDirect, req{"key"}.getStr, seen)
-      removeFile(claim)
+        if not runAdmitted(cfg, seat, obs, "operator", req{"actor"}.getStr("operator"), "",
+            req{"text"}.getStr, scopeDirect, req{"key"}.getStr, seen):
+          # The claim stays; handled lines are in the ledger.
+          unfinished = true
+          break
+      if not unfinished: removeFile(claim)
     writeAtomic(dir / "jobs" / "chat_cursor.json",
       $(%*{"episode": seat.episode, "sequence": seat.cursor}))
     deliver(seat)
     seats[name] = seat
+  # Publish what this tick left behind (deferred rows, held after a chain),
+  # so a receipt never reports an older picture than the work on disk.
+  gate.refresh()
 
 proc enqueueOperator(cfg: Config) =
   ## Record a human-directed operator request for the named seats. It keeps
@@ -698,6 +784,16 @@ proc enqueueOperator(cfg: Config) =
       "actor": "operator", "text": cfg.operatorText}))
     f.close()
     echo "queued operator request for ", name.strip
+
+proc profile*(cfg: Config): JsonNode =
+  ## Nonsecret routing identity published with admission status: home,
+  ## seats, authority name and GUID, poll interval, endpoints, models, output
+  ## allowance and deadline. No keys.
+  %*{"homeDir": cfg.homeDir, "seats": cfg.seats, "authority": cfg.authorityName,
+    "authorityGuid": cfg.authorityGuid, "pollSeconds": cfg.poll,
+    "baseUrl": cfg.baseUrl, "model": cfg.model, "routeBaseUrl": cfg.routeBaseUrl,
+    "routeModel": cfg.routeModel, "outputTokens": RoutedOutputTokens,
+    "timeoutMs": cfg.timeoutMs}
 
 proc defaultConfig*(homeDir: string): Config =
   ## Broker defaults: Lightning through Switchyard `local`, Kev direct.
@@ -770,6 +866,7 @@ proc main() =
     " route=", (if cfg.routeModel.len > 0: cfg.routeModel & " via " & cfg.routeBaseUrl else: "lightning")
   modelClient = newCurly()
   defer: modelClient.close()
+  gate = openGate(cfg.homeDir, profile(cfg))
   var seats = initTable[string, SeatState]()
   var
     retention: Process
