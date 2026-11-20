@@ -143,8 +143,11 @@ HOME_DEBUG_PORT_BASE ?=
 # (tools/private_seat_identity.sh), character creation stays off, the client
 # runs unheaded (no window, display, GPU or renderer), and its geometry comes
 # from the same current extracted-data install as make play. Like make play,
-# it runs in this repo's dev shell: the fork's pinned Nim and Lua prefix plus
-# the nginx the local asset path needs.
+# it runs in this repo's dev shell with the fork's pinned Nim and Lua prefix.
+# Terrain and media come from the shared wow-home-assets listener: once
+# home-assets-ready proves it serves the prepared version, the seat passes
+# that URL as the player's --assets source, so the launcher neither prepares
+# nor serves a second per-seat copy.
 HOME_SEAT_PREFLIGHT = \
 	if [ ! -d "$(LEAGUE_DATA)/dbc" ] || [ ! -d "$(LEAGUE_DATA)/mmaps" ]; then \
 		echo "error: extracted client data missing (needs dbc/ and mmaps/): $(LEAGUE_DATA_DIR)" >&2; exit 1; \
@@ -154,6 +157,7 @@ HOME_SEAT_PREFLIGHT = \
 define launch_home_seat
 	@set -e; \
 	$(HOME_SEAT_PREFLIGHT) "$(1)" "$(2)" "$(4)"; \
+	assets_url=$$(cat "$(HOME_ASSETS_URL_FILE)"); test -n "$$assets_url"; \
 	seat_dir="$(HOME_ARMY_DIR)/$(1)"; \
 	mkdir -p "$$seat_dir/status" "$$seat_dir/observer"; \
 	debug_dir=""; \
@@ -174,7 +178,7 @@ define launch_home_seat
 		--lua-repo="$(CURDIR)" --lua-entry="$(HOME_ENTRY)" \
 		--lua-status-dir="$$seat_dir/status" \
 		--username="$(2)" --password="$(3)" --character-name="$(1)" \
-		--skip-cinematic
+		--skip-cinematic --assets="$$assets_url"
 endef
 
 define start_home_seat
@@ -1405,6 +1409,7 @@ seat-bot: seat-guard
 	@set -e; \
 	if [ -z "$(SEAT_USER)" ]; then echo "error: SEAT_USER=<account> is required" >&2; exit 1; fi; \
 	$(HOME_SEAT_PREFLIGHT) "$(SEAT)" "$(SEAT_USER)" "$(SEAT_CLASS)"; \
+	assets_url=$$(cat "$(HOME_ASSETS_URL_FILE)"); test -n "$$assets_url"; \
 	seat_dir="$(HOME_ARMY_DIR)/$(SEAT)"; \
 	mkdir -p "$$seat_dir/status" "$$seat_dir/observer"; \
 	debug_dir=""; \
@@ -1430,7 +1435,7 @@ seat-bot: seat-guard
 		--lua-status-dir="$$seat_dir/status" \
 		--username="$(SEAT_USER)" --password="$(SEAT_PASS)" \
 		--character-name="$(SEAT)" \
-		--skip-cinematic
+		--skip-cinematic --assets="$$assets_url"
 
 # Shared checkout assets for every home seat: one nginx owned by the
 # wow-home-assets user unit (app.slice), never by a seat launcher, so stopping

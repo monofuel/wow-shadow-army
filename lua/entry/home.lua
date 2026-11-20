@@ -9,6 +9,7 @@ local road_route = require("tools.road_route")
 local disposition = require("tools.item_disposition")
 local life = require("tools.lifecycle")
 local requests = require("tools.requests")
+local talents = require("tools.talent_plan")
 -- Home is the dogfood pen, not a scored league: run the soft-quest path here
 -- so the new quest stack gets exercised where monofuel can watch. Scored
 -- leagues stay grind-only until a rerun A/B beats the 4.791 baseline.
@@ -153,6 +154,8 @@ local lstate = life.new_state()
 -- The player's accepted requests (tools/bot_requests.nim on the host) are
 -- durable jobs in this seat's directory; they survive reload and restart.
 local rstate = requests.from_env()
+-- One learn_talent at a time, acknowledged by the observed rank.
+local tstate = talents.new_state()
 local dead_since = nil
 local release_sent_at = nil
 local last_promote_at = nil
@@ -642,8 +645,13 @@ local function hostile(unit)
   return true
 end
 
-local function spell_ready(spell)
+local function spell_ready(spell, friendly)
   if not spell or spell.passive or spell.from_item then return false end
+  -- A friendly cast addressed by target_guid is judged on the host's
+  -- target-independent readiness (learned, cooldown, mana, reagents,
+  -- equipment, aura state): with a mob selected, stock usable reports every
+  -- heal unusable. Only hosts that honor target_guid export it.
+  if friendly and spell.readiness ~= nil then return spell.readiness == "ready" end
   if spell.usable_known and not spell.usable then return false end
   if spell.not_enough_mana then return false end
   if (spell.cooldown_ms or 0) > 0 then return false end
@@ -663,7 +671,16 @@ end
 -- whole kit; facts win whenever they do exist.
 local function spell_candidates(view)
   local facts = view.spell_facts or {}
-  if #facts > 0 then return facts end
+  if #facts > 0 then
+    -- The host says which learned spells the seat has an ordinary input for
+    -- (a keyed bar button or its spellbook entry). A higher rank it cannot
+    -- cast would otherwise win every pick and never fire.
+    local out = {}
+    for _, fact in ipairs(facts) do
+      if fact.execution ~= "unavailable" then out[#out + 1] = fact end
+    end
+    return out
+  end
   local out = {}
   for _, button in ipairs(view.action_buttons or {}) do
     if (button.spell_id or 0) ~= 0 then
@@ -715,7 +732,7 @@ end
 -- of the cast overhealed and all of the mana spent. Bar-derived candidates all
 -- report rank 0, so on a live seat this is a no-op tiebreak until the ranks
 -- come from real facts.
-local function pick_spell(view, priorities, prefer_low_rank)
+local function pick_spell(view, priorities, prefer_low_rank, friendly)
   for _, wanted in ipairs(priorities) do
     local want = normalized(wanted)
     local best = nil
@@ -724,7 +741,7 @@ local function pick_spell(view, priorities, prefer_low_rank)
       local better = not best or (prefer_low_rank
         and (spell.rank or 0) < (best.rank or 0)
         or not prefer_low_rank and (spell.rank or 0) > (best.rank or 0))
-      if spell.name_known ~= false and spell_ready(spell) and
+      if spell.name_known ~= false and spell_ready(spell, friendly) and
           (name == want or name:find(want, 1, true)) and better then
         best = spell
       end
@@ -732,6 +749,14 @@ local function pick_spell(view, priorities, prefer_low_rank)
     if best then return best, want end
   end
   return nil, nil
+end
+
+-- A spell cast on a teammate by target_guid. On a host that drops
+-- target_guid the cast lands on the current selection, so its stock
+-- selection-relative usability still has to gate it there.
+local function pick_friendly_spell(view, priorities, prefer_low_rank)
+  return pick_spell(view, priorities, prefer_low_rank,
+    view.cast_target_supported == true)
 end
 
 local function aura_present(ids, family, selected_spell_id)
@@ -1317,6 +1342,7 @@ local function status_for(view, mode, role, leader, target, recovery)
     -- log dive: the seat is holding what is left of the bar for heals.
     conserving = (role == "healer" and mana_pct(view) < CONSERVE_MANA_PCT)
       or false,
+    talent = talents.status(view, tstate),
   }
 end
 
@@ -1502,13 +1528,13 @@ local function tank_upkeep(view)
   local auras = row.active_aura_spell_ids or {}
   local hp = health_pct(row)
   if hp < TANK_SHIELD_PCT and not aura_present(auras, "weakened soul") then
-    local shield = pick_spell(view, { "Power Word: Shield" })
+    local shield = pick_friendly_spell(view, { "Power Word: Shield" })
     if shield and not aura_present(auras, "power word shield", shield.spell_id) then
       return cast(shield, "shield_tank", row.guid)
     end
   end
   if hp < TANK_RENEW_PCT and mana_pct(view) >= CONSERVE_MANA_PCT then
-    local renew = pick_spell(view, { "Renew" })
+    local renew = pick_friendly_spell(view, { "Renew" })
     if renew and not aura_present(auras, "renew", renew.spell_id) then
       return cast(renew, "renew_tank", row.guid)
     end
@@ -1535,7 +1561,7 @@ local function healer_action(view, emergency_only)
   end
   local auras = row.active_aura_spell_ids or {}
   if hp < 50 and row.active_auras_known ~= false then
-    local shield = pick_spell(view, { "Power Word: Shield" })
+    local shield = pick_friendly_spell(view, { "Power Word: Shield" })
     if shield and not aura_present(auras, "power word shield", shield.spell_id) and
         not aura_present(auras, "weakened soul") then
       return cast(shield, "shield_low_party_member", row.guid)
@@ -1543,21 +1569,21 @@ local function healer_action(view, emergency_only)
   end
   local heal = nil
   if hp < 20 then
-    heal = pick_spell(view, { "Flash Heal", "Heal", "Lesser Heal" })
+    heal = pick_friendly_spell(view, { "Flash Heal", "Heal", "Lesser Heal" })
   elseif hp < 45 then
-    heal = pick_spell(view, { "Heal", "Lesser Heal", "Flash Heal" })
+    heal = pick_friendly_spell(view, { "Heal", "Lesser Heal", "Flash Heal" })
   elseif hp < 70 then
     -- Shallow deficit: the cheapest rank that exists covers it, and a renew
     -- that is already ticking covers it for free.
     if row.active_auras_known ~= false then
-      local renew = pick_spell(view, { "Renew" })
+      local renew = pick_friendly_spell(view, { "Renew" })
       if renew and not aura_present(auras, "renew", renew.spell_id) then
         return cast(renew, "renew_party_member", row.guid)
       end
     end
-    heal = pick_spell(view, { "Heal", "Lesser Heal", "Flash Heal" }, true)
+    heal = pick_friendly_spell(view, { "Heal", "Lesser Heal", "Flash Heal" }, true)
   elseif hp < 90 and row.active_auras_known ~= false then
-    local renew = pick_spell(view, { "Renew" })
+    local renew = pick_friendly_spell(view, { "Renew" })
     if renew and not aura_present(auras, "renew", renew.spell_id) then
       return cast(renew, "renew_party_member", row.guid)
     end
@@ -1567,7 +1593,7 @@ end
 
 local function resurrection_action(view)
   if view.in_combat then return nil end
-  local spell = pick_spell(view, { "Resurrection" })
+  local spell = pick_friendly_spell(view, { "Resurrection" })
   if not spell then return nil end
   local candidates = {}
   for _, member in ipairs((view.party and view.party.members) or {}) do
@@ -1854,7 +1880,7 @@ local function summon_demon(view, role)
 end
 
 local function fortitude_action(view)
-  local spell = pick_spell(view, { "Power Word: Fortitude" })
+  local spell = pick_friendly_spell(view, { "Power Word: Fortitude" })
   if not spell then return nil end
   for _, member in ipairs((view.party and view.party.members) or {}) do
     -- SMSG_GROUP_LIST rosters players only, so pets never reach this loop and
@@ -2099,6 +2125,36 @@ local function party_engaged(view, leader, target)
     guid_equal(row.target_guid, target.guid)
 end
 
+-- The nearest hostile whose current target is authoritatively one of the
+-- party's (self, a member, or a party pet), within peel range. A mob that is
+-- merely selected, or whose target field is unknown or stale, is not a fight
+-- the party is in.
+local function engaged_threat(view)
+  local best, best_d = nil, nil
+  for _, unit in ipairs(view.units or {}) do
+    if hostile(unit) and unit.target_guid_known == true and
+        (unit.target_guid or 0) ~= 0 and
+        is_party_property(view, unit.target_guid) then
+      local d = unit.combat_distance_known and unit.combat_distance
+        or unit.distance or 1e9
+      if d <= PEEL_RANGE_YARDS and (not best_d or d < best_d) then
+        best, best_d = unit, d
+      end
+    end
+  end
+  return best
+end
+
+-- The role's answer to one hostile: tank threat, healer damage, or the
+-- class's own nuke/melee line.
+local function role_action(view, role, target)
+  return role == "tank" and warrior_action(view, target)
+    or role == "healer" and priest_damage(view, target)
+    or view.class_id == CLASS_MAGE and mage_action(view, target)
+    or view.class_id == CLASS_ROGUE and rogue_action(view, target)
+    or warlock_action(view, target)
+end
+
 -- Step off the mob that is about to finish us. A hold at 20% is a corpse.
 local function survive_step(view)
   if view.is_dead or view.is_ghost then return nil end
@@ -2152,6 +2208,7 @@ end
 
 function M.reset()
   lstate = life.new_state()
+  tstate = talents.new_state()
   dead_since = nil
   release_sent_at = nil
   last_promote_at = nil
@@ -2312,9 +2369,34 @@ function M.decide(view)
       if escape then return finish(escape, view, "rejoin", role) end
       return finish(rejoin, view, "rejoin", role)
     end
+    -- Murist unseen is no reason to stand in a fight the party is already
+    -- in. Same order as the escort: emergency heal, flee, heal, then the
+    -- role's attack, with the pet only on that engaged hostile.
+    local threat = engaged_threat(view)
+    if threat then
+      if role == "healer" then
+        local emergency = healer_action(view, true)
+        if emergency then return finish(emergency, view, "escort", role, nil, threat) end
+      end
+      local flee = survive_step(view)
+      if flee then return finish(flee, view, "escort", role, nil, threat) end
+      if role == "healer" then
+        local heal = healer_action(view, false)
+        if heal then return finish(heal, view, "escort", role, nil, threat) end
+      end
+      local action = role_action(view, role, threat)
+      if action and action.kind == "attack" and party_engaged(view, nil, threat) then
+        action = life.with_pet(view, lstate, action)
+      end
+      return finish(action, view, "escort", role, nil, threat)
+    end
     -- In Murist's party we never fall through to solo.decide.
     local fidget = formation_fidget(view, now)
     if fidget then return finish(fidget, view, "escort", role) end
+    -- Murist is out of sight or offline and nothing above moves the seat:
+    -- a banked talent point is idle work here, never a reason to walk.
+    local talent = talents.step(view, tstate, now, role)
+    if talent then return finish(talent, view, "escort", role) end
     return finish({ kind = "hold", reason = "hold_for_murist" },
       view, "escort", role)
   end
@@ -2326,6 +2408,10 @@ function M.decide(view)
       return finish({ kind = "hold", reason = "finish_active_cast" },
         view, "solo", role)
     end
+    -- A banked talent point is one idle frame or two of stock input; it runs
+    -- after the owner's requests and survival, before the leveling legs.
+    local talent = talents.step(view, tstate, now, role)
+    if talent then return finish(talent, view, "solo", role) end
     local progress = progression_step(view, now)
     if progress then
       -- Class-quest, trainer and loot legs walk through the same route engine
@@ -2465,11 +2551,7 @@ function M.decide(view)
   end
 
   if target then
-    local action = role == "tank" and warrior_action(view, target)
-      or role == "healer" and priest_damage(view, target)
-      or view.class_id == CLASS_MAGE and mage_action(view, target)
-      or view.class_id == CLASS_ROGUE and rogue_action(view, target)
-      or warlock_action(view, target)
+    local action = role_action(view, role, target)
     if action and action.kind == "attack" and party_engaged(view, leader, target) then
       action = life.with_pet(view, lstate, action)
     end
@@ -2488,6 +2570,12 @@ function M.decide(view)
     -- and standing on the corpse is exactly where the fight ended anyway.
     local loot = solo.loot_step(view)
     if loot then return finish(loot, view, "escort", role, leader) end
+    -- Spend a point only while Murist stands still: the talent frame never
+    -- costs a follow leg, and a fight or a moving leader pauses the plan.
+    if not moving then
+      local talent = talents.step(view, tstate, now, role)
+      if talent then return finish(talent, view, "escort", role, leader) end
+    end
     -- Pet before armor. Demon Skin is a cheap 30-minute rebuy, Summon Imp is
     -- most of a low-level lock's bar, and after every wipe the seat came back
     -- with a partial pool: buffing first spent exactly the mana the summon

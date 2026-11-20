@@ -93,3 +93,6 @@ tools/libpetrel.so
 /docs/quest-crash-forensics.md
 /docs/wow/professions-economy.md
 /docs/wow/world-and-travel.md
+
+# Private local build preferences; original talent policy loads these locally.
+/lua/config/talent_builds_private.lua
