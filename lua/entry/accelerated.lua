@@ -238,7 +238,11 @@ local questHubs = {}
 -- Either a unit guid (a giver we have SEEN) or the string key "quest:<id>"
 -- (a generated turn-in position we have never laid eyes on).
 local hubGuid = nil
-local hubSince = nil
+-- The leg toward hubGuid: `since` starts its budget; `issued` is the leg this
+-- decide handed the route engine ({key, seq, x, y, tx, ty}: source pose and
+-- issued goal); `failed` is the source pose and its goal distance ({x, y, d})
+-- of the leg's last anchoring "unavailable" verdict.
+local hubLeg = {}
 local hubCooldown = {}
 -- Consecutive Complete presses on the same reward panel that did not close it.
 local rewardAttempts = 0
@@ -1382,7 +1386,7 @@ local function quest_step(view, allowTurnInTravel, allowAcceptTravel, allowScout
         end
         if hubGuid == npcGuid or
             (questId ~= 0 and hubGuid == "quest:" .. questId) then
-          hubGuid, hubSince = nil, nil
+          hubGuid, hubLeg.since = nil, nil
         end
         exhausted[npcGuid] = true
         needBagSlot = true
@@ -2049,7 +2053,7 @@ local function generated_hub_step(view, pos, now)
     end
   end
   if not best then return nil end
-  if hubGuid ~= bestKey then hubGuid, hubSince = bestKey, now end
+  if hubGuid ~= bestKey then hubGuid, hubLeg.since, hubLeg.failed = bestKey, now, nil end
   wow.set_status(string.format("walking to turn-in %s (quest %d)",
     tostring(best[5] or "?"), bestId))
   return {
@@ -2094,7 +2098,7 @@ local function generated_starter_step(view, pos, now)
     end
   end
   if not best then return nil end
-  if hubGuid ~= bestKey then hubGuid, hubSince = bestKey, now end
+  if hubGuid ~= bestKey then hubGuid, hubLeg.since, hubLeg.failed = bestKey, now, nil end
   wow.set_status("walking to starter " .. tostring(bestName or "?"))
   return {
     kind = "navigate",
@@ -2125,15 +2129,44 @@ local function hub_step(view, pos)
     talk_quest_pending(view) or
     #(view.accepted_quests or {}) == 0
   if not wanted then
-    hubGuid, hubSince = nil, nil
+    hubGuid, hubLeg.since = nil, nil
     return nil
   end
   local now = wow.time()
-  if hubGuid and hubSince and now - hubSince > HUB_BUDGET_SECONDS then
+  -- nav_progress reports how the previous decide's intent ended. Only when
+  -- that decide was the one that handed this leg to the route engine is an
+  -- "unavailable" the leg's own verdict; a walkout reports "walkout" and
+  -- planning is no verdict at all. A verdict repeated from a second source
+  -- pose belongs to the goal, not to the pose the walkout and unstick legs
+  -- own, so the leg takes its budget cooldown now and other work runs. A
+  -- verdict from a pose PROGRESS_YARDS closer to the issued goal is coasting
+  -- progress: it re-anchors instead. An installed corridor clears the anchor.
+  local issued, perf = hubLeg.issued, wow.perf and wow.perf()
+  hubLeg.issued = nil
+  if issued and perf and hubGuid and issued.key == hubGuid and
+      perf.decision_count == issued.seq + 1 then
+    local nav = wow.nav_progress()
+    local state, first = nav.state, hubLeg.failed
+    local d = distance2d(issued.x, issued.y, issued.tx, issued.ty)
+    if state == "following" or state == "reached" then
+      hubLeg.failed = nil
+    elseif state == "unavailable" and
+        (not first or d <= first.d - PROGRESS_YARDS) then
+      hubLeg.failed = { x = issued.x, y = issued.y, d = d }
+    elseif state == "unavailable" and
+        distance2d(issued.x, issued.y, first.x, first.y) >= UNSTICK_YARDS then
+      hubCooldown[hubGuid] = now + HUB_COOLDOWN_SECONDS
+      wow.log("route to hub " ..
+        tostring((questHubs[hubGuid] or {}).name or hubGuid) ..
+        " unavailable from two poses: " .. tostring(nav.error))
+      hubGuid, hubLeg.since, hubLeg.failed = nil, nil, nil
+    end
+  end
+  if hubGuid and hubLeg.since and now - hubLeg.since > HUB_BUDGET_SECONDS then
     hubCooldown[hubGuid] = now + HUB_COOLDOWN_SECONDS
     wow.log("gave up walking to hub " ..
       tostring((questHubs[hubGuid] or {}).name or hubGuid))
-    hubGuid, hubSince = nil, nil
+    hubGuid, hubLeg.since = nil, nil
   end
 
   -- A banked quest whose ender the generated table names goes there before
@@ -2184,10 +2217,10 @@ local function hub_step(view, pos)
   if not best then
     generated = generated_starter_step(view, pos, now)
     if generated then return generated end
-    hubGuid, hubSince = nil, nil
+    hubGuid, hubLeg.since = nil, nil
     return nil
   end
-  if hubGuid ~= best then hubGuid, hubSince = best, now end
+  if hubGuid ~= best then hubGuid, hubLeg.since, hubLeg.failed = best, now, nil end
 
   local hub = questHubs[best]
   wow.set_status("walking back to " .. hub.name)
@@ -2445,6 +2478,10 @@ function M.decide(view, policy)
           not nearbyHunt then
         local hub = hub_step(view, pos)
         if hub then
+          local perf = wow.perf and wow.perf()
+          local seq = perf and perf.decision_count
+          hubLeg.issued = type(seq) == "number" and { key = hubGuid, seq = seq,
+            x = pos.x, y = pos.y, tx = hub.x, ty = hub.y } or nil
           hub.status = progress_status(view)
           return hub
         end

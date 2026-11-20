@@ -9,11 +9,18 @@ package.path = "lua/entry/?.lua;lua/?.lua;lua/tools/?.lua;;"
 
 local clock = 1000.0
 local nav = { state = "following", failed_here = false, walkout_available = false }
+-- The host's decision_count: one per decide, as the pilot counts them.
+-- `perfNoCount` serves a perf table without decision_count.
+local seq, perfNoCount = 0, false
 _G.wow = {
   log = function() end,
   set_status = function() end,
   time = function() return clock end,
   nav_progress = function() return nav end,
+  perf = function()
+    if perfNoCount then return {} end
+    return { decision_count = seq }
+  end,
 }
 
 local passed, failed = 0, 0
@@ -98,6 +105,7 @@ end
 
 local function step(m, v, dt)
   clock = clock + (dt or 1.0)
+  seq = seq + 1
   return m.decide(v)
 end
 
@@ -400,6 +408,170 @@ do
     describe(s))
   s = step(m, view(100.0, {}, banked({ Q, P })), 1.0)
   check(to_x(s, 600.0), "leg: Q on cooldown is not re-chosen", describe(s))
+end
+
+-- 11. A relevant remote ender the route engine cannot serve (ticket 0161).
+--     X is banked and its generated ender stands 1870yd out; W still needs
+--     field work at (300, 0). The stub route engine answers each frame's
+--     intent the way the pilot reports it to the next decide: a hub leg
+--     plans, and one plan in 21 ends "unavailable". Anything else follows.
+local AREA_W = { [W] = { level = 5, objectives = {
+  { kind = "mob", from = {}, spots = { { 1, 300.0, 0.0 } } } } } }
+local REMOTE = { 1, 2000.0, 0.0, 125.8, "Synthetic Remote Ender" }
+local BLOCKED = { [X] = { ender = REMOTE } }
+local function load_area(hubs)
+  local m = load(hubs)
+  m.set_objective_travel(true)
+  m.set_objective_areas(AREA_W)
+  return m
+end
+local function hub_at(s, x)
+  return s and s.reason == "quest_hub" and math.abs((s.x or 1e9) - x) < 1.0
+end
+local function area_w(s)
+  return s and s.reason == "objective_area" and math.abs((s.x or 0) - 300.0) < 1.0
+end
+-- 10 Hz frames. By default the seat alternates x between 130 and 132.5, a
+-- 2.5yd flip every 0.1s (~25yd/s): this exercises the verdict wiring only.
+-- It is not production movement, and frame counts measured with it are not
+-- production fallback timing. `pinned` holds the seat at 130; `xAt(f)`
+-- gives the seat's x on frame f instead.
+local function drive(m, log, seconds, answer, pinned, startFrame, xAt)
+  local out, hubs = {}, 0
+  for f = 1, math.floor(seconds * 10 + 0.5) do
+    local g = (startFrame or 0) + f
+    local x = xAt and xAt(f) or (pinned and 130.0 or 130.0 + (g % 2) * 2.5)
+    local s = step(m, view(x, {}, log), 0.1)
+    out[f] = s
+    if s and s.reason == "quest_hub" then hubs = hubs + 1 end
+    nav.state = answer(s, hubs, f)
+  end
+  nav.state = "following"
+  return out
+end
+local function first(out, pred, from)
+  for f = from or 1, #out do if pred(out[f]) then return f end end
+  return nil
+end
+local function all(out, pred, from, to)
+  for f = from or 1, to or #out do
+    if not pred(out[f]) then return false, f end
+  end
+  return true
+end
+local function remote(s) return hub_at(s, 2000.0) end
+local function blocked(s, hubs)
+  if remote(s) then return hubs % 21 == 0 and "unavailable" or "planning" end
+  return "following"
+end
+
+-- 11a. Counter-case: the blocked leg yields to W's local area within seconds,
+--      stays retired for its cooldown, is asked again after it, and a retry
+--      that is still blocked yields again the same way.
+do
+  local m = load_area(BLOCKED)
+  local out = drive(m, BANKED, 260.0, blocked)
+  check(remote(out[1]), "blocked: the remote ender is tried first", describe(out[1]))
+  local y = first(out, area_w)
+  check(y ~= nil and y <= 60,
+    "blocked: two own verdicts yield to W's area (fixture frames, not production time)",
+    tostring(y))
+  y = y or #out
+  local quiet, at = all(out, function(s) return not remote(s) end, y, y + 2350)
+  check(quiet, "blocked: no remote leg during its cooldown", tostring(at))
+  local again = first(out, remote, y + 1)
+  check(again ~= nil and again >= y + 2380,
+    "blocked: retried after the 240s cooldown", tostring(again) .. " vs " .. y)
+  again = again or #out
+  local back = first(out, function(s) return not remote(s) end, again)
+  check(back ~= nil and back <= again + 60, "blocked: a blocked retry yields again",
+    tostring(back))
+end
+-- Changed facts: the retry after the cooldown gets a corridor and is kept.
+do
+  local m = load_area(BLOCKED)
+  local out = drive(m, BANKED, 243.0, blocked)
+  local y = first(out, area_w) or #out
+  check(all(out, function(s) return not remote(s) end, y),
+    "served retry: retired until the cooldown")
+  local later = drive(m, BANKED, 30.0, function() return "following" end, false, #out)
+  local r = first(later, remote)
+  check(r ~= nil and #out + r >= y + 2400, "served retry: the leg is asked again",
+    tostring(r))
+  check(r and all(later, remote, r), "served retry: the served leg is kept")
+end
+
+-- 11b. Controls: the same remote leg is kept for 100s when it is served,
+--      still planning, walking out, failing at one pinned pose, or when the
+--      failure belongs to another decide.
+local function kept(name, answer, pinned, seconds)
+  local m = load_area(BLOCKED)
+  local out = drive(m, BANKED, seconds or 100.0, answer, pinned)
+  local ok, at = all(out, remote)
+  check(ok, "control: " .. name .. " keeps the remote leg",
+    tostring(at) .. " " .. describe(out[at or 1]))
+end
+kept("served corridor", function() return "following" end)
+kept("planning with no verdict", function() return "planning" end)
+kept("walkout", function(s, hubs)
+  return hubs % 21 == 0 and "walkout" or "planning"
+end)
+-- Pinned for 10s (the still-seat watchdog owns longer pins): four verdicts,
+-- one source pose.
+kept("one source pose", blocked, true, 10.0)
+-- Another decide ran in between (a trainer walk, a loot leg) and its own
+-- route failed: the verdict the next hub decide reads is not this leg's.
+kept("another decide's failure", function(s, hubs)
+  if hubs % 7 == 0 then seq = seq + 1; return "unavailable" end
+  return "planning"
+end)
+-- One verdict, then a corridor, then one more from another pose.
+kept("a corridor between verdicts", function(s, hubs)
+  if hubs == 21 or hubs == 60 then return "unavailable" end
+  return hubs > 21 and hubs < 30 and "following" or "planning"
+end)
+
+-- 11c. Other legitimate banked work is next: W's ender at (-2500, 0) is served.
+do
+  local m = load_area({ [X] = { ender = REMOTE },
+    [W] = { ender = { 1, -2500.0, 0.0, 50.0, "Synthetic Served Ender" } } })
+  local both = banked({ X, W })
+  local out = drive(m, both, 30.0, blocked)
+  local y = first(out, function(s) return hub_at(s, -2500.0) end)
+  check(remote(out[1]) and y ~= nil and y <= 60,
+    "blocked: the next banked ender is walked", tostring(y))
+  check(y and all(out, function(s) return hub_at(s, -2500.0) end, y),
+    "blocked: the served ender leg is kept")
+end
+
+-- 11d. A reachable hub the seat is closing on by coast keeps its leg even
+--      though plans keep failing. The ender is 370yd out (inside the pilot's
+--      400yd plan coast); the seat runs 0.7yd per 0.1s frame (7yd/s) for 30s
+--      and ends 160yd short, still beyond QUESTGIVER_YARDS, so no arrival
+--      path ends the leg. Each verdict lands 21 hub frames (14.7yd) later.
+do
+  local NEAR = { 1, 500.0, 0.0, 125.8, "Synthetic Coasting Ender" }
+  local m = load_area({ [X] = { ender = NEAR } })
+  local out = drive(m, BANKED, 30.0, function(s, hubs)
+    if hub_at(s, 500.0) then return hubs % 21 == 0 and "unavailable" or "planning" end
+    return "following"
+  end, false, 0, function(f) return 130.0 + 0.7 * f end)
+  local ok, at = all(out, function(s) return hub_at(s, 500.0) end)
+  check(ok, "control: closing under unavailable keeps the reachable hub",
+    tostring(at) .. " " .. describe(out[at or 1]))
+end
+
+-- 11e. A host whose perf table lacks decision_count records no issued leg:
+--      decide does not throw, and the blocked leg stays on its 120s budget.
+do
+  local m = load_area(BLOCKED)
+  perfNoCount = true
+  local ok, out = pcall(drive, m, BANKED, 100.0, blocked)
+  perfNoCount = false
+  check(ok, "control: perf without decision_count does not throw", tostring(out))
+  local kept100, at = ok and all(out, remote)
+  check(kept100, "control: perf without decision_count takes no early cooldown",
+    tostring(at))
 end
 
 print(string.format("test_hub_relevance: passed=%d failed=%d", passed, failed))
