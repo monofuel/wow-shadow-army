@@ -15,6 +15,7 @@ const
     "baseUrl", "model", "routeBaseUrl", "routeModel", "outputTokens", "timeoutMs"]
   Malformed = ["--seconds=nan", "--seconds=inf", "--seconds=-inf", "--seconds=1e400",
     "--seconds=abc", "--seconds=", "--wait=nan", "--wait=inf", "--wait=abc", "--wait=-1"]
+  UnprivilegedId = 65534 ## The conventional nobody/nogroup id, which owns none of the suite's inputs.
 
 var
   posts: seq[string] ## Each synthetic model POST in order: kev, decision or reply.
@@ -136,6 +137,59 @@ proc expire(dir: string) =
   control["requestedAt"] = %(now - 61.0)
   control["expiresAt"] = %(now - 1.0)
   writeFile(controlPath(dir), $control)
+
+proc setgroups(size: csize_t; list: ptr Gid): cint {.importc, header: "<grp.h>".}
+
+proc runUnprivileged(): int =
+  ## Run this whole suite as an unprivileged child and return its exit status.
+  ## Root ignores directory permissions, so the read-only fault cases would not
+  ## fault. The child gets a private /tmp directory it owns, holding copies of
+  ## this test and the CLI built here first, so it needs no compiler, no
+  ## configuration and no private path. Only the child drops its groups, gid and
+  ## uid; this process keeps its credentials and removes the directory.
+  var owned = "/tmp/test_broker_admission_root_XXXXXX"
+  # mkdtemp fills in the X's in place; a literal's buffer is read-only.
+  prepareMutation(owned)
+  if mkdtemp(owned.cstring) == nil: raiseOSError(osLastError())
+  try:
+    let exe = owned / "test_broker_admission"
+    let bin = owned / "broker_admission_cli"
+    copyFile(getAppFilename(), exe)
+    copyFile(cli(), bin)
+    for path in [exe, bin]:
+      setFilePermissions(path, {fpUserRead, fpUserWrite, fpUserExec})
+    for path in [owned, exe, bin]:
+      if chown(path.cstring, Uid(UnprivilegedId), Gid(UnprivilegedId)) != 0:
+        raiseOSError(osLastError())
+    var env = @["TMPDIR=" & owned, "HOME=" & owned, "BROKER_ADMISSION_BIN=" & bin,
+      "PATH=" & getEnv("PATH")]
+    if existsEnv("LD_LIBRARY_PATH"):
+      env.add "LD_LIBRARY_PATH=" & getEnv("LD_LIBRARY_PATH")
+    let argv = allocCStringArray([exe])
+    let envp = allocCStringArray(env)
+    defer:
+      deallocCStringArray(argv)
+      deallocCStringArray(envp)
+    flushFile(stdout)
+    flushFile(stderr)
+    let pid = fork()
+    if pid < 0: raiseOSError(osLastError())
+    if pid == 0:
+      if setgroups(0, nil) == 0 and setgid(Gid(UnprivilegedId)) == 0 and
+          setuid(Uid(UnprivilegedId)) == 0 and geteuid() != 0 and
+          chdir(owned.cstring) == 0:
+        discard execve(exe.cstring, argv, envp)
+      exitnow(127)
+    var status: cint
+    while waitpid(pid, status, 0) < 0:
+      if osLastError() != OSErrorCode(EINTR): raiseOSError(osLastError())
+    result = if WIFEXITED(status): int(WEXITSTATUS(status))
+      else: 128 + int(WTERMSIG(status))
+  finally:
+    removeDir(owned)
+
+if geteuid() == 0:
+  quit(runUnprivileged())
 
 suite "broker admission":
   test "a hold before admission defers chat and operator work; release replays it once":
