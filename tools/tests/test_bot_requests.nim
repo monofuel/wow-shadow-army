@@ -116,12 +116,46 @@ suite "menu":
     check "come_here" notin keys and "train" notin keys and "resume" notin keys
     let withPet = %*{"class_id": 9, "known_spells": [688], "active_pet_guid": "77",
       "active_pet_dead": false, "copper": 300, "level": 5,
-      "inventory_items": [{"upgrade_score": 4, "required_level": 3}]}
+      "inventory_items": [{"item_guid": "900000001", "item_id": 900001,
+        "definition_known": true, "inventory_type": 7, "required_level": 3}],
+      "equipment_upgrade": {"found": true, "item_guid": "900000001",
+        "item_id": 900001, "equipment_slot": 6, "item_level": 11,
+        "equipped_item_level": 1, "capacity_upgrade": false, "bag_slots": 0}}
     keys = @[]
     for item in menu(withPet, true, true): keys.add item.key
     check "summon_pet" notin keys
     check "come_here" in keys and "wear_upgrades" in keys and "train" in keys and
       "resume" in keys
+
+  test "wear_upgrades follows the observed equipment_upgrade summary":
+    proc offersUpgrade(obs: JsonNode): bool =
+      for item in menu(obs, requesterVisible = false, jobActive = false):
+        if item.key == "wear_upgrades": return true
+    let row = %*{"item_guid": "900000001", "item_id": 900001,
+      "definition_known": true, "inventory_type": 7, "required_level": 6}
+    let found = %*{"found": true, "item_guid": "900000001",
+      "item_id": 900001, "equipment_slot": 6, "item_level": 11,
+      "equipped_item_level": 1, "capacity_upgrade": false, "bag_slots": 0}
+    var obs = %*{"level": 11, "inventory_items": [row], "equipment_upgrade": found}
+    check offersUpgrade(obs)
+    obs["level"] = %5
+    check not offersUpgrade(obs)
+    obs["level"] = %11
+    obs["equipment_upgrade"]["capacity_upgrade"] = %true
+    check not offersUpgrade(obs)
+    obs["equipment_upgrade"]["capacity_upgrade"] = %false
+    obs["equipment_upgrade"]["found"] = %false
+    check not offersUpgrade(obs)
+    obs["equipment_upgrade"]["found"] = %true
+    obs["inventory_items"] = %*[]
+    check not offersUpgrade(obs)
+    obs["inventory_items"] = %*[row]
+    obs.delete("equipment_upgrade")
+    check not offersUpgrade(obs)
+    obs["equipment_upgrade"] = found
+    obs["inventory_items"][0]["upgrade_score"] = %4
+    obs["equipment_upgrade"]["found"] = %false
+    check not offersUpgrade(obs)
 
   test "quest work is offered only for an observed live quest or giver marker":
     proc offersQuests(value: JsonNode): bool =

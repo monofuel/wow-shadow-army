@@ -210,11 +210,19 @@ proc knowsSpell(obs: JsonNode; spell: int): bool =
     if value.getInt == spell: return true
 
 proc upgradeInBags(obs: JsonNode): bool =
-  ## Whether a bag item carries a positive SDK upgrade score at a legal level.
+  ## Whether the observation's `equipment_upgrade` summary names a wearable
+  ## (non-bag) upgrade that is still a carried bag row at a legal level. The
+  ## raw rows carry no per-item score; the seat's Lua makes the final checks.
+  let upgrade = obs{"equipment_upgrade"}
+  if upgrade.isNil or not upgrade{"found"}.getBool or
+      upgrade{"capacity_upgrade"}.getBool:
+    return false
+  let guid = upgrade{"item_guid"}.guidStr
+  if guid.len == 0 or guid == "0": return false
   let level = obs.num("level")
   for item in obs{"inventory_items"}.getElems:
-    if item.num("upgrade_score") > 0 and item.num("required_level") <= level:
-      return true
+    if item{"item_guid"}.guidStr == guid:
+      return item.num("required_level") <= level
 
 proc petOut(obs: JsonNode): bool =
   ## Whether the authoritative pet link names a living pet.

@@ -957,8 +957,10 @@ function M.gear_step(view, state, now, busy)
     name = item.name, item_id = item.item_id, score = item.upgrade_score,
     replaced = before and before.item_id or 0 }
   state.equip_last_at = now
+  -- The upgrade was chosen from the seat's own bags, so accept the stock
+  -- bind-on-equip prompt; without it a bind-on-equip item never leaves it.
   return { kind = "equip_item", item_guid = item.item_guid,
-    reason = "equip_upgrade" }
+    confirm_bind = true, reason = "equip_upgrade" }
 end
 
 -- Class quest -------------------------------------------------------------

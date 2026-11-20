@@ -204,6 +204,7 @@ do
   local st = life.new_state()
   local i = life.gear_step(v, st, 0, false)
   check(i and i.kind == "equip_item" and i.item_guid == 501, "the upgrade is equipped")
+  check(i.confirm_bind == true, "the chosen upgrade accepts its bind prompt")
   check(life.gear_step(v, st, 1, false).reason == "equip_settling", "equip waits for the slot")
   local landed = warlock({ inventory_items = {},
     equipment_items = { { item_guid = 501, item_id = 1, equipment_slot = 4 } } })
