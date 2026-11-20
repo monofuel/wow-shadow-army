@@ -555,5 +555,133 @@ do
     describe(step))
 end
 
+-- Provider exhaustion follows the row memory (ticket 0156). A provider left
+-- because every offered row was remembered unfinished is skipped only while
+-- that memory holds: an objective change (level and log/completed counts the
+-- same) or HUB_COOLDOWN_SECONDS sends the seat back exactly once. Nothing
+-- about readiness is assumed; the revisit simply probes the rows again.
+local function closed_view(extra)
+  local e = { quest_markers = { { questgiver_guid = GIVER, status = 7 } } }
+  for k, val in pairs(extra or {}) do e[k] = val end
+  return base_view(unknown_view(e))
+end
+-- The seat keeps doing other work between visits; moving it each tick keeps
+-- the unrelated stall recovery out of a long unchanged-facts window.
+local roam = 0
+local function roaming_view()
+  roam = roam + 1
+  local v = closed_view()
+  v.location.position.x = (roam % 2) * 30.0
+  return v
+end
+local function interacts(step) return step and step.kind == "interact" and step.guid == GIVER end
+local A6 = { quest_objectives = {
+  { quest_id = A, entry = 1, current = 6, required = 7, complete = false } } }
+-- Probe A and K unfinished at a greeting and leave; returns the time A was
+-- remembered (the memory's start).
+local function close_greeting(m)
+  probe_a(m)
+  local t0 = clock
+  press_in(m, ugreeting(AK, akNodes), qg(K), "closed: second row probed")
+  control_in(m, panel("progress", K, false), "QuestFrameGoodbyeButton",
+    "closed: unfinished K says goodbye")
+  local step = step_in(m, ugreeting(AK, akNodes))
+  check(step and step.reason == "nothing_offered", "closed: all rows unfinished leaves",
+    describe(step))
+  return t0
+end
+-- Positive control: the closed view really reaches provider selection.
+do
+  check(interacts(step_in(load(), closed_view())),
+    "closed: fresh module walks to the reward-marked provider")
+end
+-- Objective progress while level/accepted/completed counts stay constant.
+do
+  local m = load()
+  close_greeting(m)
+  check(not interacts(step_in(m, closed_view())),
+    "closed: unchanged facts keep the provider skipped")
+  check(interacts(step_in(m, closed_view(A6))),
+    "closed: objective progress with constant counts reopens the provider")
+  press_in(m, ugreeting(AK, akNodes, A6), qg(A),
+    "closed: reopened visit probes rows again from the first")
+end
+-- Unchanged facts: skipped on every tick until the 240s boundary, one visit
+-- after it, then skipped again until the next lapse.
+do
+  local m = load()
+  local t0 = close_greeting(m)
+  local early = 0
+  while clock + 5.0 < t0 + 239.0 do
+    clock = clock + 4.0
+    if interacts(step_in(m, roaming_view())) then early = early + 1 end
+  end
+  check(early == 0, "closed: repeated unchanged ticks never revisit", tostring(early))
+  clock = t0 + 238.0
+  check(not interacts(step_in(m, roaming_view())), "closed: 239s still skipped")
+  local step = step_in(m, roaming_view())
+  check(interacts(step), "closed: 240s reopens once", describe(step))
+  local t1 = close_greeting(m)
+  local again = 0
+  while clock + 5.0 < t1 + 239.0 do
+    clock = clock + 4.0
+    if interacts(step_in(m, roaming_view())) then again = again + 1 end
+  end
+  check(again == 0, "closed: after the revisit the provider is skipped again",
+    tostring(again))
+  clock = t1 + 239.0
+  step = step_in(m, roaming_view())
+  check(interacts(step), "closed: the next lapse allows one more visit", describe(step))
+end
+-- Same through gossip quest offers.
+do
+  local m = load()
+  local offers = { offer(A), offer(K) }
+  local nodes = { node(gq(A)), node(gq(K)) }
+  local function gv() return gossip(offers, nodes, unknown_view()) end
+  press_in(m, gv(), gq(A), "closed gossip: opens A")
+  local t0 = clock + 1.0
+  control_in(m, panel("progress", A, false), "QuestFrameGoodbyeButton",
+    "closed gossip: unfinished A")
+  press_in(m, gv(), gq(K), "closed gossip: opens K")
+  control_in(m, panel("progress", K, false), "QuestFrameGoodbyeButton",
+    "closed gossip: unfinished K")
+  local step = step_in(m, gv())
+  check(step and step.reason == "gossip_done", "closed gossip: leaves", describe(step))
+  check(not interacts(step_in(m, closed_view())), "closed gossip: skipped while remembered")
+  clock = t0 + 239.0
+  check(interacts(step_in(m, closed_view())), "closed gossip: expiry reopens")
+end
+-- A truly questless provider stays exhausted through expiry and objective
+-- changes, including one that had rows remembered earlier.
+do
+  local m = load()
+  local step = step_in(m, ugreeting({}, {}))
+  check(step and step.reason == "nothing_offered", "questless: empty greeting leaves",
+    describe(step))
+  clock = clock + 500.0
+  check(not interacts(step_in(m, closed_view(A6))),
+    "questless: expiry and objective progress keep it skipped")
+end
+do
+  local m = load()
+  probe_a(m)
+  local step = step_in(m, ugreeting({}, {}))
+  check(step and step.reason == "nothing_offered",
+    "questless: emptied greeting leaves", describe(step))
+  clock = clock + 500.0
+  check(not interacts(step_in(m, closed_view(A6))),
+    "questless: earlier row memory does not reopen an emptied greeting")
+end
+do
+  local m = load()
+  local step = step_in(m, gossip({ offer(A, 777) }, { node(gq(A)) }, unknown_view()))
+  check(step and step.reason == "gossip_done", "questless gossip: no own offers leaves",
+    describe(step))
+  clock = clock + 500.0
+  check(not interacts(step_in(m, closed_view(A6))),
+    "questless gossip: stays skipped")
+end
+
 print(string.format("test_dialog_priority: passed=%d failed=%d", passed, failed))
 os.exit(failed == 0 and 0 or 1)

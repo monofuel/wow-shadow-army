@@ -208,7 +208,9 @@ local buffedAt = nil
 local wandPressedAt = nil
 local wandPressedGuid = nil
 -- Questgivers with nothing left for us, forgotten again whenever our quest
--- state changes and they might have something new.
+-- state changes and they might have something new. "rows" marks a provider
+-- left only because dialogRows remembers every offered row unfinished; it
+-- lasts exactly as long as that memory (see dialogRows.reopen).
 local exhausted = {}
 local questSignature = nil
 local pursuing = nil
@@ -943,6 +945,26 @@ function dialogRows.remember(view, guid, questId)
   end
 end
 
+-- Reopen providers left as "rows" whose remembered rows no longer hold:
+-- changed quest facts or HUB_COOLDOWN_SECONDS elapsed. Each lapse allows one
+-- more visit; nothing here says any row became ready.
+function dialogRows.reopen(view)
+  for guid, why in pairs(exhausted) do
+    if why == "rows" and not dialogRows.entry(view, guid, nil) then
+      exhausted[guid] = nil
+    end
+  end
+end
+
+-- How to mark a provider whose offered rows yield nothing to press: "rows"
+-- while the memory of its current rows stands behind that, else for good.
+function dialogRows.exhaustion(view, guid, rowsKey)
+  if rowsKey ~= "" and guid ~= 0 and dialogRows.entry(view, guid, rowsKey) then
+    return "rows"
+  end
+  return true
+end
+
 function dialogRows.greeting_row(view)
   local rows = view.quest_frame and view.quest_frame.greeting_rows or {}
   -- A turn-in is worth more than a new quest, so answer active rows first.
@@ -1299,7 +1321,8 @@ local function quest_step(view, allowTurnInTravel, allowAcceptTravel, allowScout
       end
       -- An empty greeting leaves no marker behind, so without this the scout
       -- rank would walk right back to the same NPC forever.
-      exhausted[frame.npc_guid or 0] = true
+      exhausted[frame.npc_guid or 0] = dialogRows.exhaustion(view,
+        frame.npc_guid or 0, dialogRows.greeting_key(frame.greeting_rows or {}))
       return { kind = "ui_press", control = "QuestFrameGreetingGoodbyeButton",
         reason = "nothing_offered" }
     end
@@ -1314,7 +1337,9 @@ local function quest_step(view, allowTurnInTravel, allowAcceptTravel, allowScout
         rows = dialogRows.gossip_key(view.quest_offers or {}, guid) }
       return { kind = "ui_press", reference = reference, reason = "gossip_row" }
     end
-    exhausted[view.gossip_guid or 0] = true
+    exhausted[view.gossip_guid or 0] = dialogRows.exhaustion(view,
+      view.gossip_guid or 0,
+      dialogRows.gossip_key(view.quest_offers or {}, view.gossip_guid or 0))
     return { kind = "ui_press", control = "GossipFrameGreetingGoodbyeButton",
       reason = "gossip_done" }
   end
@@ -1335,6 +1360,7 @@ local function quest_step(view, allowTurnInTravel, allowAcceptTravel, allowScout
   -- Scout is the markerless fallback only: a visible !/? means we already
   -- have work, so do not walk Deathguards / vendors (Bellion, 2026-08-16).
   local allowUnmarked = allowScout and not marked_giver_visible(view)
+  dialogRows.reopen(view)
   local best, bestDistance, bestRank = nil, nil, nil
   for i = 1, #(view.units or {}) do
     local unit = view.units[i]
@@ -1883,8 +1909,11 @@ local function generated_hub_step(view, pos, now)
   local data = quest_hub_data()
   if not data then return nil end
   local map = math.floor(view.location.map_id or 0)
-  -- Log order: the first banked quest we can actually reach wins, and the
-  -- budget/cooldown above retires it to the next one if the walk fails.
+  -- The nearest reachable ender wins, so a far one earlier in the log does
+  -- not pull the seat away from a nearby turn-in. The leg already walking
+  -- stays chosen while it is still eligible, so log reordering or proximity
+  -- changes cannot flip it; the budget/cooldown above retires a failed walk.
+  local best, bestD, bestId, bestKey = nil, nil, nil, nil
   for i = 1, #(view.accepted_quests or {}) do
     local questId = accepted_quest_id(view.accepted_quests[i])
     local hub = questId and data[questId]
@@ -1896,22 +1925,29 @@ local function generated_hub_step(view, pos, now)
         local d = distance2d(pos.x, pos.y, ender[2], ender[3])
         -- Inside QUESTGIVER_YARDS the visible-marker path already owns this.
         if d > QUESTGIVER_YARDS then
-          if hubGuid ~= key then hubGuid, hubSince = key, now end
-          wow.set_status(string.format("walking to turn-in %s (quest %d)",
-            tostring(ender[5] or "?"), questId))
-          return {
-            kind = "navigate",
-            x = ender[2], y = ender[3], z = ender[4],
-            map_id = map,
-            stop_distance = HUB_ARRIVE_YARDS,
-            route_profile = "safe_ground",
-            reason = "quest_hub",
-          }
+          if key == hubGuid then
+            best, bestD, bestId, bestKey = ender, d, questId, key
+            break
+          end
+          if not bestD or d < bestD then
+            best, bestD, bestId, bestKey = ender, d, questId, key
+          end
         end
       end
     end
   end
-  return nil
+  if not best then return nil end
+  if hubGuid ~= bestKey then hubGuid, hubSince = bestKey, now end
+  wow.set_status(string.format("walking to turn-in %s (quest %d)",
+    tostring(best[5] or "?"), bestId))
+  return {
+    kind = "navigate",
+    x = best[2], y = best[3], z = best[4],
+    map_id = map,
+    stop_distance = HUB_ARRIVE_YARDS,
+    route_profile = "safe_ground",
+    reason = "quest_hub",
+  }
 end
 
 -- Empty log, no remembered giver: walk to the nearest generated starter
@@ -1988,16 +2024,43 @@ local function hub_step(view, pos)
     hubGuid, hubSince = nil, nil
   end
 
-  -- A talk-only quest names its ender, which is rarely a giver already seen
-  -- (5651 points from Deathknell to Brill); go there before any remembered hub.
-  if talk_quest_pending(view) and not objective_complete(view) then
-    local generated = generated_hub_step(view, pos, now)
-    if generated then return generated end
+  -- A banked quest whose ender the generated table names goes there before
+  -- any remembered hub (5651 points from Deathknell to Brill).
+  local generated = generated_hub_step(view, pos, now)
+  if generated then return generated end
+
+  -- A remembered giver is business only for an empty log or a banked quest
+  -- nobody names an ender for. One whose ender is known (here, elsewhere, or
+  -- on cooldown) is not a reason to walk back to whichever giver is nearest.
+  local accepted = #(view.accepted_quests or {})
+  local unbound = accepted == 0
+  if not unbound then
+    local data = quest_hub_data() or {}
+    local done = {}
+    for i = 1, #(view.quest_objectives or {}) do
+      local o = view.quest_objectives[i]
+      local q = o.quest_id or 0
+      done[q] = done[q] ~= false and (o.complete and true or false)
+    end
+    for q, all in pairs(done) do
+      if all and not (data[q] and data[q].ender) then unbound = true end
+    end
+    for i = 1, accepted do
+      local entry = view.accepted_quests[i]
+      local q = accepted_quest_id(entry)
+      if talk_only(view, entry) and not (data[q] and data[q].ender) then
+        unbound = true
+      end
+    end
   end
 
+  -- Exhausted givers (truthy: true or "rows") have nothing for us; "rows"
+  -- marks lapse with their row memory first.
+  dialogRows.reopen(view)
   local best, bestDistance = nil, nil
-  for guid, hub in pairs(questHubs) do
+  for guid, hub in pairs(unbound and questHubs or {}) do
     if hub.map_id == math.floor(view.location.map_id or 0) and
+        not exhausted[guid] and
         not (hubCooldown[guid] and now < hubCooldown[guid]) then
       local d = distance2d(pos.x, pos.y, hub.x, hub.y)
       -- Inside QUESTGIVER_YARDS the visible-marker path already owns this.
@@ -2007,10 +2070,6 @@ local function hub_step(view, pos)
     end
   end
   if not best then
-    -- Nothing remembered is reachable. A banked quest still has a known
-    -- turn-in in the generated table, even though we have never seen it.
-    local generated = generated_hub_step(view, pos, now)
-    if generated then return generated end
     generated = generated_starter_step(view, pos, now)
     if generated then return generated end
     hubGuid, hubSince = nil, nil
