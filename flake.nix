@@ -67,6 +67,7 @@
           gnumake
           git
           curl
+          jq
           which
         ];
 

@@ -170,9 +170,10 @@ local chat_outbox = nil
 local chat_last_poll_at = nil
 local chat_last_sent_at = nil
 local chat_pending = nil
-local wand_pressed_at = nil
-local wand_pressed_guid = nil
-local last_shout_at = nil
+-- Class-tactic memory in one table (the main chunk sits at Lua's 200-local
+-- limit): the seat's own last wand press (WAND_REPRESS_SECONDS), its last
+-- Battle Shout, and its own target-debuff requests per mob (see debuff_due).
+local tactic = { wand_at = nil, wand_guid = nil, shout_at = nil, debuffs = {} }
 -- Vanilla AFK is ~5 min with no movement. Formation hold is silent.
 local FIDGET_SECONDS = 90.0
 local fidget_at = nil
@@ -1343,6 +1344,7 @@ local function status_for(view, mode, role, leader, target, recovery)
     conserving = (role == "healer" and mana_pct(view) < CONSERVE_MANA_PCT)
       or false,
     talent = talents.status(view, tstate),
+    training = life.training_status(lstate),
   }
 end
 
@@ -1613,24 +1615,121 @@ local function resurrection_action(view)
   return nil
 end
 
+-- The wand: free damage, and the one button a healer must never press twice.
+-- See WAND_REPRESS_SECONDS. Returns the "keep firing, touch nothing" intent
+-- while the shot train is alive, and only asks for the button when the client
+-- says the wand is idle AND we have not just pressed it ourselves.
+-- Every class that shoots goes through here (`who` names the reason: the
+-- healer's by default, "warlock"/"mage" for their fillers), so no rotation
+-- presses Shoot a second time and toggles its own wand off.
+-- "Running" is judged before readiness: while the shot train is alive the
+-- button can read a cooldown or unusable for a frame, and that must not drop
+-- the seat into a 4yd melee close that stops the wand. Running needs a Shoot
+-- the host still offers (learned with an ordinary input, so bound) whose
+-- equipped-item requirement is not known to be unmet; an unbound or
+-- unequipped wand is never held. pick_spell gates only a NEW press.
+local function wand_intent(view, target, who)
+  who = who or "healer"
+  local want = normalized("Shoot")
+  local shoot = nil
+  for _, spell in ipairs(spell_candidates(view)) do
+    local name = normalized(spell.name)
+    if spell.name_known ~= false and not spell.passive and not spell.from_item and
+        (name == want or name:find(want, 1, true)) and
+        not (spell.requires_equipped_item and spell.equipped_item_requirement_known and
+          not spell.equipped_item_requirement_met) and
+        (not shoot or spell.active == true) then
+      shoot = spell
+    end
+  end
+  if not shoot then return nil end
+  local now = tonumber(view.simulation_time) or 0
+  local just_pressed = tactic.wand_at ~= nil and
+    guid_equal(tactic.wand_guid, target.guid) and
+    (now - tactic.wand_at) < WAND_REPRESS_SECONDS
+  if shoot.active == true or just_pressed then
+    return { kind = "attack", guid = target.guid, stop_distance = 22.0,
+      reason = who .. "_wanding" }
+  end
+  local wand = pick_spell(view, { "Shoot" })
+  if not wand then return nil end
+  tactic.wand_at, tactic.wand_guid = now, target.guid
+  return { kind = "attack", guid = target.guid, spell = wand.spell_id,
+    stop_distance = 22.0, reason = who .. "_wand" }
+end
+
+-- Target debuffs -- Rend, Sunder Armor, Demoralizing Shout, Shadow Word:
+-- Pain, the warlock's curse and DoTs -- are requested per mob, never as a
+-- blind refresh every global cooldown. A unit row carrying
+-- `active_aura_spell_ids` (the fork's unit aura export; an empty list means
+-- no aura is shown on the unit) that shows the debuff means it is up: never
+-- refreshed. Otherwise the seat requests it: the request starts on the first
+-- frame the pilot could press it -- the mob selected and engaged, the spell
+-- not out of range, the seat at its stop distance -- stays due for 1.5s of
+-- pilot presses (0.4s throttle, then the spell's own GCD), and is then not
+-- due again until it is forgotten. A row that shows auras forgets it after
+-- 10s: an immune or resisting mob costs one press window in ten seconds and
+-- the rest of the rotation keeps its damage, while a dodged or fallen-off
+-- debuff comes back. A row WITHOUT the field (a native view that does not
+-- export unit auras) cannot show the debuff landing and forgets after 60s, so
+-- a long fight or a respawn under the same guid gets one more. A request is
+-- an attempt, not a landed aura. Stack counts are not in the Lua view either
+-- way, so Sunder Armor is one application, not five.
+local function debuff_due(view, target, spell, family, stop_distance)
+  local ids = target.active_aura_spell_ids
+  if ids ~= nil and aura_present(ids, family, spell.spell_id) then return false end
+  local forget = ids ~= nil and 10.0 or 60.0
+  local now = tonumber(view.simulation_time) or 0
+  local key = tostring(target.guid) .. ":" .. family
+  local asked = tactic.debuffs[key]
+  if asked and now - asked >= forget then
+    asked = nil
+    tactic.debuffs[key] = nil
+  end
+  if asked then return now - asked < 1.5 end
+  local d = target.combat_distance_known and target.combat_distance
+    or target.distance
+  if guid_equal(view.selected_target_guid, target.guid) and
+      guid_equal(view.auto_attack_guid, target.guid) and
+      not (spell.in_range_known and spell.in_range == false) and
+      d and d <= stop_distance then
+    -- One entry per mob and debuff; past the longest forget time an entry
+    -- can no longer gate anything, so dead mobs do not accumulate.
+    for k, at in pairs(tactic.debuffs) do
+      if now - at >= 60.0 then tactic.debuffs[k] = nil end
+    end
+    tactic.debuffs[key] = now
+  end
+  return true
+end
+
+-- Life Tap spends health, so it needs health the client actually reports:
+-- the projection sends health_known=false with zeroed health/max_health, and
+-- the percent helpers read that as a full bar. An unknown bar never taps;
+-- the rest of the rotation (DoTs, an affordable bolt, the wand, the stack's
+-- melee) still answers.
 local function warlock_action(view, target)
-  if mana_pct(view) < 18 and self_health_pct(view) >= 40 then
+  if mana_pct(view) < 18 and view.health_known == true and
+      self_health_pct(view) >= 40 then
     local tap = pick_spell(view, { "Life Tap" })
     if tap then return cast(tap, "life_tap") end
   end
-  local auras = target.active_aura_spell_ids or {}
   for _, name in ipairs({ "Curse of Agony", "Corruption", "Immolate" }) do
     local spell, family = pick_spell(view, { name })
-    if spell and not aura_present(auras, family, spell.spell_id) then
+    if spell and debuff_due(view, target, spell, family, 22.0) then
       return { kind = "attack", guid = target.guid, spell = spell.spell_id,
         stop_distance = 22.0, reason = "warlock_" .. family:gsub(" ", "_") }
     end
   end
-  local filler = pick_spell(view, { "Shadow Bolt", "Shoot" })
-  return { kind = "attack", guid = target.guid,
-    spell = filler and filler.spell_id or nil,
-    stop_distance = filler and 22.0 or 4.0,
-    reason = filler and "warlock_filler" or "warlock_melee_fallback" }
+  local bolt = pick_spell(view, { "Shadow Bolt" })
+  if bolt then
+    return { kind = "attack", guid = target.guid, spell = bolt.spell_id,
+      stop_distance = 22.0, reason = "warlock_filler" }
+  end
+  local wand = wand_intent(view, target, "warlock")
+  if wand then return wand end
+  return { kind = "attack", guid = target.guid, stop_distance = 4.0,
+    reason = "warlock_melee_fallback" }
 end
 
 -- How badly a mob needs peeling, low number first. A mob already on the tank
@@ -1720,26 +1819,27 @@ local function warrior_action(view, target)
   local shout, shout_family = pick_spell(view, { "Battle Shout" })
   if shout and
       not aura_present(view.active_aura_spell_ids, shout_family, shout.spell_id) and
-      (not last_shout_at or now - last_shout_at >= SHOUT_RETRY_SECONDS) then
-    last_shout_at = now
+      (not tactic.shout_at or now - tactic.shout_at >= SHOUT_RETRY_SECONDS) then
+    tactic.shout_at = now
     return cast(shout, "tank_battle_shout")
   end
-  -- Debuffs before the dump, aura-gated so a DoT is applied once per mob
-  -- instead of clipping itself with a refresh every tick.
-  local auras = target.active_aura_spell_ids or {}
-  for _, name in ipairs({ "Rend", "Demoralizing Shout" }) do
+  -- Debuffs before the dump, once per mob (debuff_due): Sunder Armor is a
+  -- debuff ON the mob, so it belongs here and not in the filler, where a
+  -- warrior with 15 rage pressed it every global cooldown and never reached
+  -- Heroic Strike again. One application per mob is the bounded rule; the
+  -- view carries no stack count, so stacking Sunder to five is not done.
+  for _, name in ipairs({ "Rend", "Sunder Armor", "Demoralizing Shout" }) do
     local spell, family = pick_spell(view, { name })
-    if spell and not aura_present(auras, family, spell.spell_id) then
+    if spell and debuff_due(view, target, spell, family, 4.0) then
       return { kind = "attack", guid = target.guid, spell = spell.spell_id,
         stop_distance = 4.0, reason = "tank_" .. family:gsub(" ", "_") }
     end
   end
   -- Threat filler in rage-cost order, not damage order: Revenge is nearly
-  -- free off a block, Sunder is the threat-per-rage king, and Heroic Strike
-  -- is the DUMP -- last, because it is what a tank presses with rage left
-  -- over, not what he opens with.
+  -- free off a block, and Heroic Strike is the DUMP -- last, because it is
+  -- what a tank presses with rage left over, not what he opens with.
   local threat = pick_spell(view, {
-    "Revenge", "Sunder Armor", "Thunder Clap", "Heroic Strike",
+    "Revenge", "Thunder Clap", "Heroic Strike",
   })
   -- Heroic Strike is queued on the NEXT swing, and the client reports the
   -- queue as the button being active. Pressing it again cancels the queue,
@@ -1755,26 +1855,6 @@ local function warrior_action(view, target)
     reason = threat and "tank_threat" or "tank_melee" }
 end
 
--- The wand: free damage, and the one button a healer must never press twice.
--- See WAND_REPRESS_SECONDS. Returns the "keep firing, touch nothing" intent
--- while the shot train is alive, and only asks for the button when the client
--- says the wand is idle AND we have not just pressed it ourselves.
-local function wand_intent(view, target)
-  local wand = pick_spell(view, { "Shoot" })
-  if not wand then return nil end
-  local now = tonumber(view.simulation_time) or 0
-  local just_pressed = wand_pressed_at ~= nil and
-    guid_equal(wand_pressed_guid, target.guid) and
-    (now - wand_pressed_at) < WAND_REPRESS_SECONDS
-  if wand.active == true or just_pressed then
-    return { kind = "attack", guid = target.guid, stop_distance = 22.0,
-      reason = "healer_wanding" }
-  end
-  wand_pressed_at, wand_pressed_guid = now, target.guid
-  return { kind = "attack", guid = target.guid, spell = wand.spell_id,
-    stop_distance = 22.0, reason = "healer_wand" }
-end
-
 local function priest_damage(view, target)
   local mana = mana_pct(view)
   -- Conserve floor: what is left belongs to the next heal. The seat stops
@@ -1785,10 +1865,9 @@ local function priest_damage(view, target)
     return { kind = "attack", guid = target.guid, stop_distance = 22.0,
       reason = "healer_conserve_mana" }
   end
-  local auras = target.active_aura_spell_ids or {}
   local pain, family = pick_spell(view, { "Shadow Word: Pain" })
   if pain and mana >= DOT_MANA_PCT and
-      not aura_present(auras, family, pain.spell_id) then
+      debuff_due(view, target, pain, family, 22.0) then
     return { kind = "attack", guid = target.guid, spell = pain.spell_id,
       stop_distance = 22.0, reason = "priest_shadow_word_pain" }
   end
@@ -1813,11 +1892,15 @@ local function mage_action(view, target)
     return { kind = "attack", guid = target.guid, spell = blast.spell_id,
       stop_distance = 22.0, reason = "mage_fire_blast" }
   end
-  local filler = pick_spell(view, { "Fireball", "Frostbolt", "Shoot" })
-  return { kind = "attack", guid = target.guid,
-    spell = filler and filler.spell_id or nil,
-    stop_distance = filler and 22.0 or 4.0,
-    reason = filler and "mage_nuke" or "mage_melee_fallback" }
+  local filler = pick_spell(view, { "Fireball", "Frostbolt" })
+  if filler then
+    return { kind = "attack", guid = target.guid, spell = filler.spell_id,
+      stop_distance = 22.0, reason = "mage_nuke" }
+  end
+  local wand = wand_intent(view, target, "mage")
+  if wand then return wand end
+  return { kind = "attack", guid = target.guid, stop_distance = 4.0,
+    reason = "mage_melee_fallback" }
 end
 
 local function rogue_action(view, target)
@@ -1870,6 +1953,7 @@ local function summon_demon(view, role)
     -- is the warlock's own funding mechanism -- out of combat the health is
     -- idle capital, so trade it for the imp instead of standing there broke.
     if not view.in_combat and mana_blocked_spell(view, "Summon Imp") and
+        view.health_known == true and
         self_health_pct(view) >= SUMMON_LIFE_TAP_MIN_HEALTH_PCT then
       local tap = pick_spell(view, { "Life Tap" })
       if tap then return cast(tap, "life_tap_for_summon") end
@@ -1930,7 +2014,7 @@ end
 -- bind newly learned spells, keep its imp out, loot its own corpses, wear
 -- legal upgrades and walk its class quest. Every outcome is judged by the
 -- world (lua/tools/lifecycle.lua).
-local function progression_step(view, now)
+local function progression_step(view, now, policy)
   life.note_class_quest(view, lstate)
   if lstate.train_since and (view.trainer_open or view.gossip_open) then
     local train = life.train_step(view, lstate, now, false)
@@ -1961,7 +2045,8 @@ local function progression_step(view, now)
   local gear, outcome = life.gear_step(view, lstate, now, busy)
   log_gear(outcome)
   if gear then return gear end
-  local train = life.train_step(view, lstate, now, busy)
+  local train = life.train_step(view, lstate, now, busy,
+    policy ~= nil and policy.objective_first == true)
   if train then return train end
   local quest = life.class_quest_step(view, lstate)
   if quest then return life.with_pet(view, lstate, quest) end
@@ -2230,9 +2315,8 @@ function M.reset()
   equip_tried = {}
   equip_attempts = 0
   equip_gave_up = false
-  wand_pressed_at = nil
-  wand_pressed_guid = nil
-  last_shout_at = nil
+  tactic.wand_at, tactic.wand_guid, tactic.shout_at = nil, nil, nil
+  tactic.debuffs = {}
   fidget_at = nil
   last_lead = nil
 end
@@ -2308,6 +2392,12 @@ function M.decide(view)
 
   local death, recovery = death_intent(view, now)
   if death then
+    -- The owner's request keeps its identity and bounds through death; the
+    -- request runner returns no intent for a dead or ghost seat, so the
+    -- physical recovery below still owns every frame.
+    if view.is_dead or view.is_ghost then
+      requests.step(view, rstate, now, { life = life, lstate = lstate, fighting = false })
+    end
     -- Only the walking legs of recovery can wedge; a hold or a /reclaim is
     -- standing still because it was told to.
     if death.kind == "navigate" then
@@ -2321,10 +2411,127 @@ function M.decide(view)
     return finish(death, view, "recovery", role, nil, nil, recovery)
   end
 
+  -- The solo leveling pipeline: survival, the active cast, banked talents,
+  -- progression legs, then the accelerated quest stack with its road, pet
+  -- and attack wrappers. The owner's do_quests request runs exactly this
+  -- pipeline with an objective-first policy; a local of decide because the
+  -- chunk is at Lua's local limit.
+  --
+  -- The class tactics the escort fights with, on the very hostile the solo
+  -- stack chose: the warrior's, priest's and warlock's own rotations, target
+  -- debuffs once per mob (debuff_due). Other classes keep the stack's attack
+  -- (role_action's warlock fallback is not their rotation). A spell-less
+  -- answer is adopted only when it protects a queued swing or a running
+  -- wand; plain melee leaves the stack's intent as it was.
+  local function class_tactic(intent)
+    if intent.kind ~= "attack" or not (view.class_id == CLASS_WARRIOR or
+        view.class_id == CLASS_PRIEST or view.class_id == CLASS_WARLOCK) then
+      return nil
+    end
+    local target = visible_unit(view, intent.guid)
+    if not hostile(target) then return nil end
+    local action = role_action(view, role, target)
+    if type(action) ~= "table" then return nil end
+    -- Under the conserve floor the escort healer stands at 22 yards pressing
+    -- nothing. Solo, that stand only makes sense while a wand fires: keep a
+    -- running wand (or start an equipped, idle one) through wand_intent's
+    -- no-repress guard; with no ready wand the stack's melee stays.
+    if action.reason == "healer_conserve_mana" then
+      action = wand_intent(view, target)
+      if not action then return nil end
+    end
+    if action.kind == "attack" then
+      if not guid_equal(action.guid, target.guid) then return nil end
+      if not action.spell and action.reason ~= "tank_swing_queued" and
+          not tostring(action.reason):find("_wanding$") then
+        return nil
+      end
+      action.route_profile = intent.route_profile
+      return action
+    end
+    if action.kind == "cast_spell" and action.target_guid == nil then return action end
+    return nil
+  end
+
+  local function solo_step(policy)
+    local flee = survive_step(view)
+    if flee then return flee end
+    if (view.active_cast_spell_id or 0) ~= 0 or
+        (view.active_channel_spell_id or 0) ~= 0 then
+      return { kind = "hold", reason = "finish_active_cast" }
+    end
+    -- A banked talent point is one idle frame or two of stock input; it runs
+    -- after the owner's requests and survival, before the leveling legs.
+    local talent = talents.step(view, tstate, now, role)
+    if talent then return talent end
+    local progress = progression_step(view, now, policy)
+    if progress then
+      -- Class-quest, trainer and loot legs walk through the same route engine
+      -- as a rejoin and wedge the same way (Vulcan, 2026-11-19: a dropper
+      -- attack from his Deathknell logout spot returned to one pose).
+      if not view.in_combat and (progress.kind == "navigate" or
+          progress.kind == "interact" or progress.kind == "attack") then
+        local escape = stuck_step(view, now, false, "progress_unstick")
+        if escape then
+          life.note_progress(view, lstate, now, escape)
+          return escape
+        end
+      else
+        forget_stuck()
+      end
+      life.note_progress(view, lstate, now, progress)
+      return progress
+    end
+    local intent = life.avoid_evading(view, lstate, solo.decide(view, policy), now,
+      solo.ignore)
+    -- A long walk to an objective area rides the roads like a far rejoin.
+    if intent.kind == "navigate" and intent.reason == "objective_area" then
+      local mine, goal = view_point(view), { x = intent.x, y = intent.y }
+      if mine and distance2d(mine, goal) > ROAD_MIN_YARDS then
+        local wp = road_waypoint(mine, goal, intent.map_id)
+        if wp then
+          intent.x, intent.y, intent.z = wp.x, wp.y, wp.z
+          intent.stop_distance = ROAD_WAYPOINT_STOP
+          intent.reason = "objective_area_road"
+        end
+      end
+    end
+    local tactic_intent = class_tactic(intent)
+    if tactic_intent then
+      intent = life.with_pet(view, lstate, tactic_intent)
+      local ranks = life.NUKE_RANKS[view.class_id] or {}
+      local mine, best = nil, nil
+      local nuke = intent.kind == "attack" and intent.spell and life.best_nuke(view)
+      for i, id in ipairs(ranks) do
+        if id == intent.spell then mine = i end
+        if id == nuke then best = i end
+      end
+      -- Only a lower rank of the class nuke itself is raised; any other
+      -- class ability the tactic chose stays as chosen.
+      if mine and best and best < mine then
+        intent = life.upgrade_attack(view, intent, true)
+      end
+    else
+      intent = life.with_pet(view, lstate, intent)
+      intent = life.upgrade_attack(view, intent, mana_pct(view) >= SOLO_NUKE_MANA_PCT)
+    end
+    life.note_progress(view, lstate, now, intent)
+    return intent
+  end
+
   -- An accepted request from the player outranks autonomous play, never
   -- survival: the death branch above and any fight below still come first.
+  -- A quest request runs the solo pipeline itself, behind the healer's
+  -- emergency heal so a party member falling still outranks its pull.
   local req = requests.step(view, rstate, now, { life = life, lstate = lstate,
-    fighting = view.in_combat or life.fighting(view) })
+    fighting = view.in_combat or life.fighting(view),
+    quest = function()
+      if role == "healer" then
+        local emergency = healer_action(view, true)
+        if emergency then return emergency end
+      end
+      return solo_step({ objective_first = true })
+    end })
   if req then return finish(req, view, "request", role) end
 
   local party = view.party or {}
@@ -2401,52 +2608,7 @@ function M.decide(view)
       view, "escort", role)
   end
   if not party.in_group or not murist_member then
-    local flee = survive_step(view)
-    if flee then return finish(flee, view, "solo", role) end
-    if (view.active_cast_spell_id or 0) ~= 0 or
-        (view.active_channel_spell_id or 0) ~= 0 then
-      return finish({ kind = "hold", reason = "finish_active_cast" },
-        view, "solo", role)
-    end
-    -- A banked talent point is one idle frame or two of stock input; it runs
-    -- after the owner's requests and survival, before the leveling legs.
-    local talent = talents.step(view, tstate, now, role)
-    if talent then return finish(talent, view, "solo", role) end
-    local progress = progression_step(view, now)
-    if progress then
-      -- Class-quest, trainer and loot legs walk through the same route engine
-      -- as a rejoin and wedge the same way (Vulcan, 2026-11-19: a dropper
-      -- attack from his Deathknell logout spot returned to one pose).
-      if not view.in_combat and (progress.kind == "navigate" or
-          progress.kind == "interact" or progress.kind == "attack") then
-        local escape = stuck_step(view, now, false, "progress_unstick")
-        if escape then
-          life.note_progress(view, lstate, now, escape)
-          return finish(escape, view, "solo", role)
-        end
-      else
-        forget_stuck()
-      end
-      life.note_progress(view, lstate, now, progress)
-      return finish(progress, view, "solo", role)
-    end
-    local intent = life.avoid_evading(view, lstate, solo.decide(view), now, solo.ignore)
-    -- A long walk to an objective area rides the roads like a far rejoin.
-    if intent.kind == "navigate" and intent.reason == "objective_area" then
-      local mine, goal = view_point(view), { x = intent.x, y = intent.y }
-      if mine and distance2d(mine, goal) > ROAD_MIN_YARDS then
-        local wp = road_waypoint(mine, goal, intent.map_id)
-        if wp then
-          intent.x, intent.y, intent.z = wp.x, wp.y, wp.z
-          intent.stop_distance = ROAD_WAYPOINT_STOP
-          intent.reason = "objective_area_road"
-        end
-      end
-    end
-    intent = life.with_pet(view, lstate, intent)
-    intent = life.upgrade_attack(view, intent, mana_pct(view) >= SOLO_NUKE_MANA_PCT)
-    life.note_progress(view, lstate, now, intent)
-    return finish(intent, view, "solo", role)
+    return finish(solo_step(), view, "solo", role)
   end
 
   if (view.active_cast_spell_id or 0) ~= 0 or

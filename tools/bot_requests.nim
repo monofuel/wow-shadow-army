@@ -96,6 +96,9 @@ const
   MaxReplyChars = 120
   GroupWords = ["all", "party", "everyone"]
   Intents = ["question", "action", "chatter"]
+  ## Raw SMSG_QUESTGIVER_STATUS values for a giver with a quest to offer or a
+  ## reward to hand over.
+  QuestMarkerWork = [5, 6, 7]
   ## A message Kev routes away from action still goes to Lightning's action
   ## decision when Kev gives action at least this probability.
   ActionProbabilityFloor = 0.3
@@ -218,6 +221,29 @@ proc petOut(obs: JsonNode): bool =
   let guid = obs{"active_pet_guid"}.getStr("0")
   guid != "0" and guid != "" and not obs{"active_pet_dead"}.getBool
 
+proc repairVendorUsable(obs, unit: JsonNode): bool =
+  ## Mirror the seat's repair vendor filter: an observed repair service that
+  ## is not known dead, not hostile, and on the seat's own observed map.
+  var repairs = false
+  for service in unit{"services"}.getElems:
+    if service.getStr == "repair": repairs = true
+  let dead = (unit{"death_known"}.getBool and unit{"is_dead"}.getBool) or
+    (unit{"health_known"}.getBool and unit.num("health") <= 0)
+  let here = obs{"location"}
+  let there = unit{"location"}
+  repairs and not dead and not unit{"player_reaction_hostile"}.getBool and
+    not here{"map_id"}.isNil and not there{"map_id"}.isNil and
+    here.num("map_id") == there.num("map_id")
+
+proc questWork*(obs: JsonNode): bool =
+  ## Whether the seat observes ordinary quest work it can act on: an accepted
+  ## quest that has not failed, or a visible giver whose server marker offers
+  ## a quest or a reward.
+  for quest in obs{"accepted_quests"}.getElems:
+    if not quest{"failed"}.getBool: return true
+  for marker in obs{"quest_markers"}.getElems:
+    if marker.num("status").int in QuestMarkerWork: return true
+
 proc menu*(obs: JsonNode; requesterVisible, jobActive: bool): seq[MenuItem] =
   ## Actions this seat can perform now, from its own observation.
   result.add ("hold_here", "stop and stay at the current spot until told to resume")
@@ -228,6 +254,18 @@ proc menu*(obs: JsonNode; requesterVisible, jobActive: bool): seq[MenuItem] =
     result.add ("summon_pet", "summon the imp")
   if obs.upgradeInBags:
     result.add ("wear_upgrades", "equip the better gear already in the bags")
+  var damaged = false
+  for item in obs{"equipment_items"}.getElems:
+    if item{"durability_known"}.getBool and item{"max_durability_known"}.getBool and
+        item.num("max_durability") > 0 and item.num("durability") < item.num("max_durability"):
+      damaged = true
+  var repairVendor = false
+  for unit in obs{"units"}.getElems:
+    if obs.repairVendorUsable(unit): repairVendor = true
+  if damaged and repairVendor and obs{"equipped_durability_known"}.getBool:
+    result.add ("repair_gear", "visit the observed repair vendor and repair worn gear if the actual quote is affordable")
+  if obs.questWork:
+    result.add ("do_quests", "quest on its own, handing in whichever quests it can finish and taking up the ones offered next, until it runs out of reachable quest work or the request window ends; it cannot pick a named quest (the player says do quests, go quest)")
   if obs.num("copper") >= 100:
     result.add ("train", "visit the class trainer and learn new ranks")
   if jobActive:
@@ -244,14 +282,24 @@ proc stateLine*(obs: JsonNode; activeJob: string): string =
   var quests: seq[string]
   for q in obs{"accepted_quests"}.getElems:
     quests.add $q{"quest_id"}.getInt
+  let health = if obs{"health_known"}.getBool and obs.num("max_health") > 0:
+      $obs.num("health").int & "/" & $obs.num("max_health").int
+    else: "unobserved"
+  var broken = 0
+  for item in obs{"equipment_items"}.getElems:
+    if item{"durability_known"}.getBool and item{"max_durability_known"}.getBool and
+        item.num("max_durability") > 0 and item.num("durability") == 0:
+      inc broken
   result = "level " & $obs.num("level").int & ", " & $obs.num("xp").int & "/" &
-    $obs.num("next_level_xp").int & " xp, " & pet & ", " &
+    $obs.num("next_level_xp").int & " xp, health " & health & ", " & pet & ", " &
     $obs.num("copper").int & " copper, " &
     (if obs{"in_combat"}.getBool: "in combat" else: "not in combat") &
     ", position " & $obs{"location"}.num("x").int & "," & $obs{"location"}.num("y").int &
     ", quests in log: " & (if quests.len == 0: "none" else: quests.join(" ")) &
     ", party: " & (if party.len == 0: "none" else: party.join(" ")) &
-    ", task from the player: " & (if activeJob.len == 0: "none" else: activeJob)
+    ", task from the player: " & (if activeJob.len == 0: "none" else: activeJob) &
+    ", broken worn items: " & (if obs{"equipped_durability_known"}.getBool: $broken else: "unobserved") &
+    ", unspent talent points: " & (if obs{"talent_points_known"}.getBool: $obs.num("unspent_talent_points").int else: "unobserved")
 
 proc decisionBody*(model, seat, className, state, message: string;
     offered: seq[MenuItem]): JsonNode =
@@ -821,6 +869,9 @@ proc parseConfig(): Config =
     of "once": result.once = true
     of "to": result.operatorTo = value
     of "text": result.operatorText = value
+    of "help", "h":
+      echo "Usage: bot_requests [--home-dir=DIR] [--seats=NAME,...] [--to=NAME --text=REQUEST]"
+      quit(0)
     else:
       quit("unknown option: " & key, 2)
 

@@ -172,7 +172,7 @@ define launch_home_seat
 	VANILLA_WOW_EXTRACTED_DATA_DIR="$(LEAGUE_DATA)" \
 	SHADOW_SEAT_DIR="$$seat_dir" \
 	COWORLD_PLAYER_OBSERVER_DIR="$$seat_dir/observer" \
-	nix develop "$(CURDIR)" --command nim r tools/launch_nim_player.nim -- \
+	nix develop "$(CURDIR)" --command "$(CURDIR)/tools/private_native_launch.sh" \
 		--controller=embedded --presentation=unheaded --bot=lua-bot \
 		--owner=home-$(1) \
 		--lua-repo="$(CURDIR)" --lua-entry="$(HOME_ENTRY)" \
@@ -277,7 +277,11 @@ endef
 # failing bare CI hosts. Smoke tier parse/compile-checks code no unit test
 # executes (including addon Lua) — doctrine: a cheap compile-check is a
 # legitimate leg for a binary with no unit tests yet.
-test: test-lua test-nim-soft test-smoke test-traverse-soap test-traverse-checkpoint traverse-lint-soft
+test: test-lua test-nim-soft test-smoke test-private-native-launch test-traverse-soap test-traverse-checkpoint traverse-lint-soft
+
+.PHONY: test-private-native-launch
+test-private-native-launch:
+	@bash tools/tests/test_private_native_launch.sh
 
 .PHONY: test-traverse-soap test-traverse-checkpoint test-road-artifacts traverse-lint traverse-lint-soft
 test-traverse-soap:
@@ -328,7 +332,7 @@ test-smoke: test-smoke-lua test-smoke-nim-soft test-smoke-sh
 # test-smoke-lua: a compile-check is a legitimate leg for code with no unit
 # suite). `bash -n` never executes a line.
 SH_CHECK_FILES = tools/home_army_scale.sh tools/soap.sh tools/realm_op.sh tools/private_seat_identity.sh \
-	tools/home_assets.sh tools/retain_seat_runtime.sh
+	tools/home_assets.sh tools/retain_seat_runtime.sh tools/private_native_launch.sh
 test-smoke-sh:
 	@rc=0; for f in $(SH_CHECK_FILES); do \
 		[ -f "$$f" ] || continue; \
@@ -1428,7 +1432,7 @@ seat-bot: seat-guard
 	VANILLA_WOW_EXTRACTED_DATA_DIR="$(LEAGUE_DATA)" \
 	SHADOW_SEAT_DIR="$$seat_dir" \
 	COWORLD_PLAYER_OBSERVER_DIR="$$seat_dir/observer" \
-	nix develop "$(CURDIR)" --command nim r tools/launch_nim_player.nim -- \
+	nix develop "$(CURDIR)" --command "$(CURDIR)/tools/private_native_launch.sh" \
 		--controller=embedded --presentation=unheaded --bot=lua-bot \
 		--owner=home-$(SEAT) \
 		--lua-repo="$(CURDIR)" --lua-entry="$(SEAT_ENTRY)" \

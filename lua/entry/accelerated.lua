@@ -508,6 +508,23 @@ local function engaged_unit(view)
   return nil
 end
 
+-- A live attackable unit whose current target is known to be this seat or
+-- its pet. A retained target GUID without target_guid_known is not proof.
+local function targeted_by_hostile(view)
+  local me = view.player_guid or 0
+  local pet = view.pet and view.pet.guid or 0
+  for i = 1, #(view.units or {}) do
+    local unit = view.units[i]
+    local target = unit.target_guid or 0
+    if unit.target_guid_known == true and target ~= 0 and
+        (target == me or target == pet) and unit.player_can_attack == true and
+        not (unit.death_known and unit.is_dead) then
+      return true
+    end
+  end
+  return false
+end
+
 -- A mob that pays an objective is worth more than an equally close one that
 -- does not. Defined before pick_target so the local binding is visible.
 local function credits_objective(view, unit)
@@ -723,30 +740,210 @@ local function marked_giver_visible(view)
   return false
 end
 
-local function greeting_row(view)
-  local rows = view.quest_frame and view.quest_frame.greeting_rows or {}
-  -- A turn-in is worth more than a new quest, so answer active rows first.
-  for i = 1, #rows do
-    if rows[i].active then return rows[i].quest_id end
-  end
-  if rows[1] then return rows[1].quest_id end
-  return nil
-end
-
-local function gossip_row(view)
-  local offers = view.quest_offers or {}
-  local guid = view.gossip_guid or 0
-  for i = 1, #offers do
-    if offers[i].questgiver_guid == guid then return offers[i].quest_id end
-  end
-  return nil
-end
-
 local function control_for(view, reference)
   for i = 1, #(view.ui_nodes or {}) do
     local node = view.ui_nodes[i]
     if node.reference_id == reference and node.enabled and node.hit_testable then
       return reference
+    end
+  end
+  return nil
+end
+
+-- Quests whose objectives are done while still in the log.
+local function ready_to_turn_in(view)
+  local ready = {}
+  for i = 1, #(view.completed_quest_ids or {}) do
+    ready[view.completed_quest_ids[i]] = true
+  end
+  return ready
+end
+
+-- Quest ids a new accept could actually take: the log has room, and the
+-- client reported both its log and its completion facts. Without those facts
+-- an active row might still be a turn-in, so nil keeps the old order.
+local function new_quest_room(view)
+  local accepted = view.accepted_quests
+  if not accepted or not view.completed_quest_ids or
+      #accepted >= QUEST_LOG_LIMIT then
+    return nil
+  end
+  local inLog = {}
+  for i = 1, #accepted do inLog[accepted[i].quest_id] = true end
+  return inLog
+end
+
+-- Active rows a provider showed unfinished (progress panel, Complete not
+-- offered), so the next visit tries the rows after them. One entry per
+-- provider, dropped whenever the quest log, objective counts, completion or
+-- reward facts or that provider's offered rows change, and after
+-- HUB_COOLDOWN_SECONDS regardless, so a quest that became ready is asked again.
+-- `pick` is the row last pressed at a provider with that provider's
+-- offered-row key. Row selection lives in this table too: the module is at
+-- Lua's 200-local limit.
+local dialogRows = { LIMIT = 8, by_npc = {}, count = 0, pick = nil }
+
+function dialogRows.state_key(view)
+  local parts = {}
+  for i = 1, #(view.accepted_quests or {}) do
+    local quest = view.accepted_quests[i]
+    parts[#parts + 1] = string.format("a%d%s", quest.quest_id or 0,
+      quest.failed and "f" or "")
+  end
+  for i = 1, #(view.quest_objectives or {}) do
+    local o = view.quest_objectives[i]
+    parts[#parts + 1] = string.format("o%d.%d=%d%s", o.quest_id or 0,
+      o.entry or 0, o.current or 0, o.complete and "c" or "")
+  end
+  for i = 1, #(view.completed_quest_ids or {}) do
+    parts[#parts + 1] = "c" .. tostring(view.completed_quest_ids[i])
+  end
+  for i = 1, #(view.rewarded_quest_ids or {}) do
+    parts[#parts + 1] = "r" .. tostring(view.rewarded_quest_ids[i])
+  end
+  return table.concat(parts, ",")
+end
+
+function dialogRows.greeting_key(rows)
+  local parts = {}
+  for i = 1, #rows do
+    parts[i] = tostring(rows[i].quest_id) .. (rows[i].active and "a" or "n")
+  end
+  return table.concat(parts, ",")
+end
+
+function dialogRows.gossip_key(offers, guid)
+  local parts = {}
+  for i = 1, #offers do
+    if offers[i].questgiver_guid == guid then
+      parts[#parts + 1] = tostring(offers[i].quest_id)
+    end
+  end
+  return table.concat(parts, ",")
+end
+
+function dialogRows.forget(guid)
+  if dialogRows.by_npc[guid] then
+    dialogRows.by_npc[guid] = nil
+    dialogRows.count = dialogRows.count - 1
+  end
+end
+
+-- Still-valid entry for this provider, or nil. `rowsKey` is the offered rows
+-- now on screen; nil when no row list is visible (progress panel).
+function dialogRows.entry(view, guid, rowsKey)
+  local entry = dialogRows.by_npc[guid]
+  if not entry then return nil end
+  if entry.state ~= dialogRows.state_key(view) or wow.time() >= entry.expires or
+      (rowsKey and entry.rows and entry.rows ~= rowsKey) then
+    dialogRows.forget(guid)
+    return nil
+  end
+  return entry
+end
+
+function dialogRows.unfinished(view, guid, rowsKey)
+  local entry = guid ~= 0 and dialogRows.entry(view, guid, rowsKey)
+  return entry and entry.quests or {}
+end
+
+function dialogRows.remember(view, guid, questId)
+  if guid == 0 or questId == 0 then return end
+  local entry = dialogRows.entry(view, guid, nil)
+  if not entry then
+    if dialogRows.count >= dialogRows.LIMIT then
+      dialogRows.by_npc, dialogRows.count = {}, 0
+    end
+    entry = {
+      state = dialogRows.state_key(view),
+      rows = dialogRows.pick and dialogRows.pick.npc == guid and dialogRows.pick.rows or nil,
+      expires = wow.time() + HUB_COOLDOWN_SECONDS,
+      quests = {},
+    }
+    dialogRows.by_npc[guid] = entry
+    dialogRows.count = dialogRows.count + 1
+  end
+  if not entry.quests[questId] then
+    entry.quests[questId] = true
+    wow.log(string.format("quest dialog: %s unfinished at %s; next visit tries other rows",
+      tostring(questId), tostring(guid)))
+  end
+end
+
+function dialogRows.greeting_row(view)
+  local rows = view.quest_frame and view.quest_frame.greeting_rows or {}
+  -- A turn-in is worth more than a new quest, so answer active rows first.
+  -- Active also covers unfinished quests; a row known ready to turn in goes
+  -- ahead of them, or an earlier unfinished row is reopened forever.
+  local ready = ready_to_turn_in(view)
+  for i = 1, #rows do
+    local questId = rows[i].quest_id
+    if rows[i].active and ready[questId] and
+        control_for(view, "quest-greeting:" .. questId) then
+      return questId
+    end
+  end
+  -- Reopening a known-unfinished quest only says goodbye again, so a new
+  -- quest offered beside it is taken first.
+  local inLog = new_quest_room(view)
+  if inLog then
+    for i = 1, #rows do
+      local questId = rows[i].quest_id
+      if not rows[i].active and not inLog[questId] and
+          control_for(view, "quest-greeting:" .. questId) then
+        return questId
+      end
+    end
+  end
+  -- Completion facts only ever name quests known ready; a quest without
+  -- objective rows can be ready and still be missing there. Probe each
+  -- active row in turn, skipping ones this provider just showed unfinished,
+  -- and leave once every offered active row has said goodbye.
+  local probed = dialogRows.unfinished(view, (view.quest_frame or {}).npc_guid or 0,
+    dialogRows.greeting_key(rows))
+  local anyActive = false
+  for i = 1, #rows do
+    local questId = rows[i].quest_id
+    if rows[i].active then
+      anyActive = true
+      if not probed[questId] and
+          control_for(view, "quest-greeting:" .. questId) then
+        return questId
+      end
+    end
+  end
+  if anyActive then return nil end
+  if rows[1] then return rows[1].quest_id end
+  return nil
+end
+
+function dialogRows.gossip_row(view)
+  local offers = view.quest_offers or {}
+  local guid = view.gossip_guid or 0
+  local ready = ready_to_turn_in(view)
+  for i = 1, #offers do
+    local questId = offers[i].quest_id
+    if offers[i].questgiver_guid == guid and ready[questId] and
+        control_for(view, "gossip-quest:" .. questId) then
+      return questId
+    end
+  end
+  local inLog = new_quest_room(view)
+  if inLog then
+    for i = 1, #offers do
+      local questId = offers[i].quest_id
+      if offers[i].questgiver_guid == guid and not inLog[questId] and
+          control_for(view, "gossip-quest:" .. questId) then
+        return questId
+      end
+    end
+  end
+  local probed = dialogRows.unfinished(view, guid, dialogRows.gossip_key(offers, guid))
+  for i = 1, #offers do
+    local questId = offers[i].quest_id
+    if offers[i].questgiver_guid == guid and not probed[questId] and
+        control_for(view, "gossip-quest:" .. questId) then
+      return questId
     end
   end
   return nil
@@ -1001,6 +1198,13 @@ local function quest_step(view, allowTurnInTravel, allowAcceptTravel, allowScout
         return { kind = "ui_press", control = "QuestFrameCompleteButton",
           reason = "complete" }
       end
+      local npcGuid = frame.npc_guid or 0
+      local questId = frame.quest_id or 0
+      if dialogRows.pick and (npcGuid == 0 or npcGuid == dialogRows.pick.npc) then
+        if npcGuid == 0 then npcGuid = dialogRows.pick.npc end
+        if questId == 0 then questId = dialogRows.pick.quest end
+      end
+      dialogRows.remember(view, npcGuid, questId)
       return { kind = "ui_press", control = "QuestFrameGoodbyeButton",
         reason = "unfinished" }
     end
@@ -1013,9 +1217,11 @@ local function quest_step(view, allowTurnInTravel, allowAcceptTravel, allowScout
         reason = "accept" }
     end
     if frame.panel == "greeting" then
-      local questId = greeting_row(view)
+      local questId = dialogRows.greeting_row(view)
       local reference = questId and control_for(view, "quest-greeting:" .. questId)
       if reference then
+        dialogRows.pick = { npc = frame.npc_guid or 0, quest = questId,
+          rows = dialogRows.greeting_key(frame.greeting_rows or {}) }
         return { kind = "ui_press", reference = reference, reason = "greeting_row" }
       end
       -- An empty greeting leaves no marker behind, so without this the scout
@@ -1027,9 +1233,12 @@ local function quest_step(view, allowTurnInTravel, allowAcceptTravel, allowScout
   end
   if view.gossip_open then
     questBudgetSince = nil
-    local questId = gossip_row(view)
+    local questId = dialogRows.gossip_row(view)
     local reference = questId and control_for(view, "gossip-quest:" .. questId)
     if reference then
+      local guid = view.gossip_guid or 0
+      dialogRows.pick = { npc = guid, quest = questId,
+        rows = dialogRows.gossip_key(view.quest_offers or {}, guid) }
       return { kind = "ui_press", reference = reference, reason = "gossip_row" }
     end
     exhausted[view.gossip_guid or 0] = true
@@ -1769,6 +1978,7 @@ function M.reset()
   bag_use_reset()
   exhausted = {}
   hubCooldown = {}
+  dialogRows.by_npc, dialogRows.count, dialogRows.pick = {}, 0, nil
   pursuing, pursuingSince, questBudgetSince, questPausedAt = nil, nil, nil, nil
   wandPressedAt = nil
   wandPressedGuid = nil
@@ -1782,7 +1992,11 @@ function M.reset()
   areaSpotRest = {}
 end
 
-function M.decide(view)
+--- One frame's intent. `policy` is optional and nil for every host-driven
+--- entry; `policy.objective_first` makes a reachable unfinished objective
+--- area outrank a fresh pull that pays no objective (an owner's quest
+--- request). An engaged or known-hostile fight is never left for it.
+function M.decide(view, policy)
   -- Death first: everything else is unreachable from a corpse.
   if view.is_dead and not view.is_ghost then
     wow.set_status("dead: releasing")
@@ -2056,8 +2270,12 @@ function M.decide(view)
 
   -- A gray pull that pays nothing is not progress while an accepted quest
   -- still needs kills or drops somewhere else. Out of combat that includes
-  -- our own auto-attack on one: nothing is hitting us yet.
-  if not view.in_combat and (not target or
+  -- our own auto-attack on one: nothing is hitting us yet. Under an
+  -- objective-first policy any fresh pull that pays nothing yields too.
+  local filler = target and not engaged and policy and
+    policy.objective_first == true and not credits_objective(view, target) and
+    not targeted_by_hostile(view)
+  if not view.in_combat and (not target or filler or
       (target.level_known and target.level <= gray_level(view.level) and
         not credits_objective(view, target))) then
     local area = objective_area_step(view, pos, wow.time())
@@ -2139,5 +2357,8 @@ function M.ignore(guid, seconds)
   if guid and guid ~= 0 then ignoreUntil[guid] = wow.time() + seconds end
 end
 M.loot_step = loot_step
+--- Whether killing `unit` can pay an unfinished objective: a kill objective
+--- naming its entry, or an item objective it is known to drop.
+M.credits_objective = credits_objective
 
 return M

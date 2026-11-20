@@ -145,6 +145,12 @@ local TRAINER_REACH_YARDS = 400.0
 local TRAINER_INTERACT_STOP = 3.0
 local TRAINER_VISIT_SECONDS = 90.0
 local TRAINER_MIN_COPPER = 100
+-- A visit that ends without an exact complete trainer frame is retried at the
+-- same level after a short pause up to TRAIN_MAX_ATTEMPTS times, then at most
+-- once per TRAIN_EXHAUSTED_SECONDS; a complete frame or a new level resets it.
+local TRAIN_MAX_ATTEMPTS = 3
+local TRAIN_RETRY_SECONDS = 300.0
+local TRAIN_EXHAUSTED_SECONDS = 1800.0
 
 local QUESTGIVER_STOP = 3.0
 local DROPPER_YARDS = 80.0
@@ -177,7 +183,10 @@ function M.new_state()
     equip_pending = nil, equip_last_at = nil, equip_refused = {}, equip_tries = {},
     equipped = 0, equip_failures = 0,
     trained_level = nil, train_since = nil, train_known_before = nil,
-    trained_spells = 0,
+    trained_spells = 0, train_visits = 0, train_attempts = 0,
+    train_attempt_level = nil, train_retry_at = nil, train_blocked_cost = nil,
+    train_offered = nil, train_frame = nil, train_forced = nil,
+    train_outcome = nil, train_blocked = nil,
     quest_logged = {},
     progress_key = nil, progress_since = nil, longest_no_progress = 0,
     diagnosed_at = nil, gray_swaps = 0, attack_low = {}, avoid_until = {},
@@ -464,6 +473,168 @@ end
 
 -- Training ------------------------------------------------------------------
 
+local function casting(view)
+  return num(view.active_cast_spell_id, 0) ~= 0 or
+    num(view.active_channel_spell_id, 0) ~= 0
+end
+
+-- Repair uses observed services and worn item identities, never a static NPC
+-- list or an issued click as completion. Autonomous callers only request it
+-- for actually broken gear; an explicit repair job may include ordinary wear.
+function M.repair_needed(view, broken_only)
+  for _, item in ipairs(view.equipment_items or {}) do
+    if item.durability_known == true and item.max_durability_known == true and
+        num(item.max_durability, 0) > 0 and
+        num(item.durability, 0) < item.max_durability and
+        (not broken_only or item.durability == 0) then return true end
+  end
+  return false
+end
+
+local REPAIR_SETTLE, REPAIR_WINDOW_GRACE, REPAIR_VISIT_LIMIT = 6, 10, 90
+
+local function host_call(name)
+  local fn = type(wow) == "table" and wow[name]
+  if type(fn) ~= "function" then return nil end
+  local ok, value = pcall(fn)
+  if ok and type(value) == "table" then return value end
+end
+
+local function decision_count()
+  local perf = host_call("perf")
+  return perf and perf.decision_count
+end
+
+-- nav_progress reports how the previous decide's intent ended, so a
+-- repair_all result is read only on the decide right after the ask. A host
+-- without repair results, or any other state, leaves the ask conservatively
+-- submitted; only an explicit deferral proves nothing was sent.
+local function repair_ask_deferred(asked_at)
+  local now = decision_count()
+  if asked_at == nil or now ~= asked_at + 1 then return false end
+  local nav = host_call("nav_progress")
+  return nav ~= nil and nav.state == "repair_verb_deferred"
+end
+
+-- A new explicit request never inherits an unsent travel visit. A submitted
+-- repair is kept so its payment is reconciled instead of forgotten or paid
+-- twice; once its settle window has passed it is marked adopted.
+function M.request_repair(state, now)
+  state.repair_retry_at, state.repair_outcome = nil, nil
+  local visit = state.repair_visit
+  if visit and not visit.submitted then
+    state.repair_visit = nil
+  elseif visit and now and now - visit.submitted > REPAIR_SETTLE then
+    visit.adopted = true
+  end
+end
+
+local function worn_by_guid(view, guid)
+  for _, worn in ipairs(view.equipment_items or {}) do
+    if worn.item_guid == guid then return worn end
+  end
+end
+
+function M.repair_step(view, state, now, busy)
+  if busy or view.in_combat or casting(view) then return nil end
+  if not view.repair_supported or not view.repair_quote_supported then
+    return nil, { result = "blocked", why = "repair quote observations unavailable" }
+  end
+  if view.equipped_durability_known ~= true then
+    return nil, { result = "blocked", why = "worn durability unobserved" }
+  end
+  local function finish(result, why, paid)
+    local out = { result = result, why = why, paid = paid }
+    state.repair_visit, state.repair_outcome = nil, out
+    state.repair_retry_at = now + 300
+    return nil, out
+  end
+  local visit = state.repair_visit
+  if visit and visit.items and visit.asked then
+    local deferred = repair_ask_deferred(visit.asked_decision)
+    visit.asked, visit.asked_decision = nil, nil
+    if deferred then
+      -- Nothing left the seat: drop the snapshot so the open window asks again.
+      -- The host holds item verbs briefly after a sale, equip, interact or
+      -- repair; a window that never opens ends at the visit deadline below.
+      visit.items, visit.submitted, visit.copper, visit.cost = nil, nil, nil, nil
+    end
+  end
+  if visit and visit.items then
+    -- Settle a submitted repair before any visit timeout can mask it.
+    local complete, untouched = true, true
+    for guid, maximum in pairs(visit.items) do
+      local worn = worn_by_guid(view, guid)
+      local known = worn and worn.durability_known == true and
+        worn.max_durability_known == true and worn.max_durability == maximum
+      if not (known and worn.durability == maximum) then complete = false end
+      if not (known and worn.durability < maximum) then untouched = false end
+    end
+    if complete and view.copper_known == true and view.copper == visit.copper - visit.cost then
+      return finish("complete", "worn durability and payment confirmed", visit.cost)
+    end
+    if visit.adopted and untouched and view.copper_known == true and view.copper == visit.copper then
+      -- Every tracked item is still damaged and no copper moved: the earlier
+      -- submission had no effect, so a fresh visit cannot pay for it twice.
+      state.repair_visit, visit = nil, nil
+    elseif visit.adopted or now - visit.submitted > REPAIR_SETTLE then
+      return finish("incomplete", "repair payment or worn durability not confirmed")
+    else
+      return { kind = "hold", reason = "repair_settling" }
+    end
+  end
+  if not visit then
+    if not M.repair_needed(view, false) then return nil, { result = "complete", why = "no known worn damage", paid = 0 } end
+    if state.repair_retry_at and now < state.repair_retry_at then return nil end
+    local vendor
+    for _, unit in ipairs(view.units or {}) do
+      local repairs = false
+      for _, service in ipairs(unit.services or {}) do if service == "repair" then repairs = true end end
+      if repairs and alive(unit) and not unit.player_reaction_hostile and
+          unit.location and view.location and unit.location.map_id == view.location.map_id and
+          (not vendor or num(unit.distance, math.huge) < num(vendor.distance, math.huge)) then vendor = unit end
+    end
+    if not vendor then return finish("blocked", "no observed repair vendor") end
+    visit = { guid = vendor.guid, since = now }
+    state.repair_visit, state.repair_outcome = visit, nil
+  end
+  if now - visit.since > REPAIR_VISIT_LIMIT then return finish("incomplete", "repair visit timed out") end
+  if view.merchant_open and view.merchant_guid == visit.guid then
+    -- Quote and capability grace runs from the first frame this exact
+    -- merchant's window is open, not from the start of the walk.
+    visit.window_since = visit.window_since or now
+    local waited = now - visit.window_since
+    if not view.merchant_can_repair then
+      if waited > REPAIR_WINDOW_GRACE then return finish("blocked", "merchant cannot repair") end
+      return { kind = "hold", reason = "repair_service_wait" }
+    end
+    if view.repair_all_cost_known ~= true or view.copper_known ~= true then
+      if waited > REPAIR_WINDOW_GRACE then return finish("blocked", "repair price or funds unobserved") end
+      return { kind = "hold", reason = "repair_quote_wait" }
+    end
+    if view.repair_all_cost > view.copper then return finish("blocked", "not enough money for the observed repair quote") end
+    visit.items = {}
+    for _, worn in ipairs(view.equipment_items or {}) do
+      if worn.durability_known == true and worn.max_durability_known == true and
+          num(worn.max_durability, 0) > 0 and worn.durability < worn.max_durability then
+        if worn.item_guid == nil or worn.item_guid == 0 then return finish("blocked", "worn item identity unobserved") end
+        visit.items[worn.item_guid] = worn.max_durability
+      end
+    end
+    if next(visit.items) == nil then return finish("complete", "no known worn damage", 0) end
+    visit.copper, visit.cost, visit.submitted = view.copper, view.repair_all_cost, now
+    visit.asked, visit.asked_decision = true, decision_count()
+    return { kind = "repair_all", guid = visit.guid, reason = "repair_equipment" }
+  end
+  for _, unit in ipairs(view.units or {}) do
+    if unit.guid == visit.guid then
+      return { kind = "interact", guid = visit.guid, stop_distance = 3.0,
+        route_profile = "prefer_ground", reason = "repair_vendor" }
+    end
+  end
+  return finish("blocked", "repair vendor left view")
+end
+
 local function class_trainer(view)
   local entries = M.CLASS_TRAINERS[view.class_id or 0]
   if not entries then return nil end
@@ -474,31 +645,187 @@ local function class_trainer(view)
   return nil
 end
 
---- Visit the class trainer once per level gained, buy what the SDK's trainer
---- action selects, and count only spells that actually appear in
---- known_spells. Returns an intent or nil.
-function M.train_step(view, state, now, busy)
+local function known_set(view)
+  local set = {}
+  for i = 1, #(view.known_spells or {}) do set[view.known_spells[i]] = true end
+  return set
+end
+
+-- The exact open trainer frame summarized the way the SDK's canonical train
+-- action decides completion: a purchase still pending, a level-legal
+-- available (state 0) offer the known copper covers and that is not already
+-- known, or one it does not cover. nil while that frame is not open.
+local function trainer_frame(view, guid)
+  if not view.trainer_open or view.trainer_guid ~= guid then return nil end
   local level = num(view.level, 1)
-  if state.trained_level == nil then state.trained_level = level end
+  local copperKnown = view.copper_known == true
+  local copper = copperKnown and num(view.copper, 0) or 0
+  local known = known_set(view)
+  local frame = { pending = false, affordable = 0, unaffordable = 0,
+    cheapest = nil, copper_known = copperKnown, taught = {} }
+  for _, offer in ipairs(view.trainer_offers or {}) do
+    if offer.pending then frame.pending = true end
+    local taught = num(offer.taught_spell_id, 0)
+    if num(offer.state, -1) == 0 and num(offer.required_level, 0) <= level and
+        not known[taught] then
+      if taught ~= 0 then frame.taught[#frame.taught + 1] = taught end
+      local cost = num(offer.cost, 0)
+      if cost <= copper then
+        frame.affordable = frame.affordable + 1
+      else
+        frame.unaffordable = frame.unaffordable + 1
+        if not frame.cheapest or cost < frame.cheapest then frame.cheapest = cost end
+      end
+    end
+  end
+  return frame
+end
+
+-- Whether this level still owes a trainer visit, and why not when it does
+-- not. A level is settled only by an exact complete trainer frame observed
+-- at that level; startup, an absent trainer or a timeout settle nothing. A
+-- settled level reopens when known copper now covers the cheapest offer that
+-- frame left unaffordable, and an operator request (`train_forced`) reopens it
+-- once. Failed visits wait `train_retry_at`, which is long once the attempt
+-- budget is spent; the spent budget is kept until the level settles or changes.
+local function training_owed(view, state, level, now)
+  if state.train_attempt_level ~= level then
+    state.train_attempt_level, state.train_attempts = level, 0
+    state.train_retry_at = nil
+    if state.trained_level ~= level then state.train_blocked_cost = nil end
+  end
+  local forced = state.train_forced == level
+  local settled = state.trained_level ~= nil and state.trained_level >= level
+  if settled and not forced then
+    local cost = state.train_blocked_cost
+    local copper = view.copper_known == true and num(view.copper, 0) or 0
+    if not cost or copper < cost then return false, "trained" end
+  end
+  if not forced and state.train_retry_at and now < state.train_retry_at then
+    return false, state.train_attempts >= TRAIN_MAX_ATTEMPTS and "attempts exhausted" or
+      "retry wait"
+  end
+  return true, nil
+end
+
+-- An accepted quest the server has not failed: work an objective-first
+-- request can still do, whether objectives or only the turn-in remain.
+local function quest_in_log(view)
+  for _, quest in ipairs(view.accepted_quests or {}) do
+    if type(quest) ~= "table" or quest.failed ~= true then return true end
+  end
+  return false
+end
+
+--- Mark the current level as owing one trainer visit regardless of a prior
+--- complete frame, retry wait or exhausted attempts. Used by an operator's
+--- explicit train request; the visit outcome is still judged by the world.
+function M.request_training(view, state)
+  local level = num(view.level, 1)
+  state.train_forced = level
+  state.train_attempt_level, state.train_attempts, state.train_retry_at = level, 0, nil
+end
+
+--- Compact training account for a status table.
+function M.training_status(state)
+  local o = state.train_outcome or {}
+  return {
+    state = state.train_since and "visiting" or (o.result or "none"),
+    level = o.level or 0, learned = o.learned or 0,
+    affordable = o.affordable or -1, unaffordable = o.unaffordable or -1,
+    attempts = state.train_attempts or 0, blocked = state.train_blocked or "",
+    trained_level = state.trained_level or 0,
+    failure_code = o.failure_code, failed_spell = o.failed_spell,
+  }
+end
+
+--- Visit the class trainer when the current level is not proven trained,
+--- buy what the SDK's trainer action selects, and settle the level only on an
+--- exact trainer frame with no pending purchase and no affordable
+--- level-legal offer left. Learned spells are the offered taught spells that
+--- appear in known_spells. Any other end (timeout, frame lost, trainer out of
+--- reach, unknown copper) is retried after TRAIN_RETRY_SECONDS for the first
+--- TRAIN_MAX_ATTEMPTS failures at a level and after TRAIN_EXHAUSTED_SECONDS for
+--- each failure after that. With `quest_first` (an objective-first quest
+--- request) and a live quest in the log, such a retry starts only once the
+--- trainer is in view: the first visit at a level, an explicit request and a
+--- visit already under way are unaffected, and the retry stays pending.
+--- Returns an intent or nil.
+function M.train_step(view, state, now, busy, quest_first)
+  local level = num(view.level, 1)
   local visiting = state.train_since ~= nil
   if not visiting then
-    if busy or view.in_combat or level <= state.trained_level then return nil end
-    if num(view.copper, 0) < TRAINER_MIN_COPPER then return nil end
-    if not class_trainer(view) then
-      state.trained_level = level
+    local owed, why = training_owed(view, state, level, now)
+    if not owed then
+      state.train_blocked = why
       return nil
     end
+    if busy or view.in_combat or casting(view) then
+      state.train_blocked = "busy"
+      return nil
+    end
+    if num(view.copper, 0) < TRAINER_MIN_COPPER then
+      state.train_blocked = "copper below trainer minimum"
+      return nil
+    end
+    local spot = class_trainer(view)
+    if not spot then
+      state.train_blocked = "no class trainer in reach"
+      return nil
+    end
+    if quest_first and state.train_attempts > 0 and quest_in_log(view) and
+        not visible_entry(view, spot.entry) then
+      state.train_blocked = "retry waits for trainer in view during quest"
+      return nil
+    end
+    state.train_blocked = nil
     state.train_since = now
-    state.train_known_before = #(view.known_spells or {})
+    state.train_known_before = known_set(view)
+    state.train_failure_before = num(view.trainer_failure_sequence, 0)
+    state.train_offered, state.train_frame = {}, nil
+    state.trainer_frame_seen = nil
     wow.log(string.format("raven: level %d, visiting class trainer", level))
   end
-  local function finish(why)
-    local learned = #(view.known_spells or {}) - (state.train_known_before or 0)
-    if learned > 0 then state.trained_spells = state.trained_spells + learned end
-    wow.log(string.format("raven: trainer visit at level %d ended (%s), learned %d",
-      level, why, learned))
+  local function finish(why, rejection)
+    local known = known_set(view)
+    local learned = 0
+    for spell in pairs(state.train_offered or {}) do
+      if known[spell] and not (state.train_known_before or {})[spell] then
+        learned = learned + 1
+      end
+    end
+    state.trained_spells = state.trained_spells + learned
+    local frame = state.train_frame
+    local complete = not rejection and frame ~= nil and frame.copper_known and not frame.pending and
+      frame.affordable == 0
+    state.train_visits = state.train_visits + 1
+    state.train_outcome = {
+      level = level, why = why, learned = learned,
+      result = complete and "complete" or (learned > 0 and "partial" or "incomplete"),
+      affordable = frame and frame.affordable or -1,
+      unaffordable = frame and frame.unaffordable or -1,
+      failure_code = rejection and view.trainer_failure_code or nil,
+      failed_spell = rejection and view.trainer_failure_spell_id or nil,
+    }
+    if state.train_forced == level then state.train_forced = nil end
+    if complete then
+      state.trained_level = level
+      state.train_blocked_cost = frame.cheapest
+      state.train_attempts, state.train_retry_at = 0, nil
+    else
+      state.train_attempt_level = level
+      state.train_attempts = (state.train_attempts or 0) + 1
+      state.train_retry_at = now + (state.train_attempts >= TRAIN_MAX_ATTEMPTS and
+        TRAIN_EXHAUSTED_SECONDS or TRAIN_RETRY_SECONDS)
+    end
+    wow.log(string.format(
+      "raven: trainer visit at level %d ended (%s): %s, learned %d, affordable left %d, " ..
+      "unaffordable %d, attempt %d", level, why, state.train_outcome.result, learned,
+      state.train_outcome.affordable, state.train_outcome.unaffordable,
+      complete and 0 or state.train_attempts))
     state.train_since, state.train_known_before = nil, nil
-    state.trained_level = level
+    state.train_failure_before = nil
+    state.train_offered, state.train_frame, state.trainer_frame_seen = nil, nil, nil
     return nil
   end
   if now - state.train_since > TRAINER_VISIT_SECONDS then return finish("timeout") end
@@ -506,15 +833,30 @@ function M.train_step(view, state, now, busy)
   local spot = class_trainer(view)
   if not spot then return finish("out of reach") end
   local trainer = visible_entry(view, spot.entry)
+  local frame = trainer and trainer_frame(view, trainer.guid)
+  if frame then
+    state.train_frame = frame
+    for i = 1, #frame.taught do state.train_offered[frame.taught[i]] = true end
+  end
+  -- A real rejected buy is an outcome, not permission to hammer an enabled
+  -- button until timeout. Old replies and another provider do not cancel a
+  -- new visit. Error zero is the server's real "unavailable" result.
+  if trainer and view.trainer_failure_guid == trainer.guid and
+      num(view.trainer_failure_sequence, 0) > num(state.train_failure_before, 0) then
+    return finish("trainer refused purchase", true)
+  end
   if (view.trainer_open or view.gossip_open) and trainer and
       (view.trainer_guid == trainer.guid or view.gossip_guid == trainer.guid) then
     state.trainer_frame_seen = true
     return { kind = "train", guid = trainer.guid, reason = "train_ranks" }
   end
-  if state.trainer_frame_seen then
-    state.trainer_frame_seen = nil
+  -- Only a closed trainer frame ends the visit; gossip that closes before
+  -- the trainer list opened is re-approached until the visit times out.
+  if state.trainer_frame_seen and state.train_frame then
     return finish("frame closed")
   end
+  state.trainer_frame_seen = nil
+  if casting(view) then return nil end
   if trainer then
     return { kind = "interact", guid = trainer.guid,
       stop_distance = TRAINER_INTERACT_STOP, route_profile = "prefer_ground",

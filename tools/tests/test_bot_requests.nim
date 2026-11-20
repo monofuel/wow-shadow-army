@@ -59,6 +59,54 @@ suite "decisions":
     check d.intent == "question" and d.choice == "none"
 
 suite "menu":
+  test "repair requires actual known worn damage and an observed repair service":
+    var obs = %*{"equipped_durability_known": true, "equipment_items": [{"durability_known": true,
+      "max_durability_known": true, "durability": 0, "max_durability": 20}],
+      "location": {"map_id": 0, "x": 0, "y": 0, "z": 0},
+      "units": [{"services": ["vendor", "repair"], "health_known": true, "health": 50,
+        "location": {"map_id": 0, "x": 10, "y": 0, "z": 0}}]}
+    proc offersRepair(value: JsonNode): bool =
+      for item in menu(value, false, false):
+        if item.key == "repair_gear": return true
+    check offersRepair(obs)
+    obs["equipped_durability_known"] = %false
+    check not offersRepair(obs)
+    obs["equipped_durability_known"] = %true
+    obs["equipment_items"][0]["durability_known"] = %false
+    check not offersRepair(obs)
+    obs["equipment_items"][0]["durability_known"] = %true
+    obs["equipment_items"][0]["durability"] = %20
+    check not offersRepair(obs)
+    obs["equipment_items"][0]["durability"] = %0
+    obs["units"][0]["services"] = %*["vendor"]
+    check not offersRepair(obs)
+
+  test "repair is not offered for a vendor the seat would refuse":
+    var obs = %*{"equipped_durability_known": true, "equipment_items": [{"durability_known": true,
+      "max_durability_known": true, "durability": 0, "max_durability": 20}],
+      "location": {"map_id": 0, "x": 0, "y": 0, "z": 0},
+      "units": [{"services": ["repair"], "health_known": true, "health": 50,
+        "location": {"map_id": 0, "x": 10, "y": 0, "z": 0}}]}
+    proc offersRepair(value: JsonNode): bool =
+      for item in menu(value, false, false):
+        if item.key == "repair_gear": return true
+    check offersRepair(obs)
+    obs["units"][0]["health"] = %0
+    check not offersRepair(obs)
+    obs["units"][0]["health"] = %50
+    obs["units"][0]["death_known"] = %true
+    obs["units"][0]["is_dead"] = %true
+    check not offersRepair(obs)
+    obs["units"][0]["is_dead"] = %false
+    obs["units"][0]["player_reaction_hostile"] = %true
+    check not offersRepair(obs)
+    obs["units"][0]["player_reaction_hostile"] = %false
+    obs["units"][0]["location"]["map_id"] = %1
+    check not offersRepair(obs)
+    obs["units"][0]["location"]["map_id"] = %0
+    obs.delete("location")
+    check not offersRepair(obs)
+
   test "only feasible actions are offered":
     let petless = %*{"class_id": 9, "known_spells": [686, 688], "active_pet_guid": "0",
       "copper": 35, "level": 5, "inventory_items": []}
@@ -75,9 +123,50 @@ suite "menu":
     check "come_here" in keys and "wear_upgrades" in keys and "train" in keys and
       "resume" in keys
 
+  test "quest work is offered only for an observed live quest or giver marker":
+    proc offersQuests(value: JsonNode): bool =
+      for item in menu(value, false, false):
+        if item.key == "do_quests": return true
+    var obs = %*{"accepted_quests": [], "quest_markers": []}
+    check not offersQuests(obs)
+    obs["accepted_quests"] = %*[{"quest_id": 100, "failed": true}]
+    check not offersQuests(obs)
+    obs["accepted_quests"] = %*[{"quest_id": 100, "failed": false}]
+    check offersQuests(obs)
+    obs["accepted_quests"] = %*[]
+    obs["quest_markers"] = %*[{"questgiver_guid": "900", "status": 3}]
+    check not offersQuests(obs)
+    obs["quest_markers"] = %*[{"questgiver_guid": "900", "status": 5}]
+    check offersQuests(obs)
+    # The job keeps handing in whichever quests it can until its bounds, so
+    # the offer must neither promise one particular quest nor read as ending
+    # at the first turn-in.
+    for item in menu(obs, false, false):
+      if item.key == "do_quests":
+        check "whichever quests" in item.description
+        check "cannot pick a named quest" in item.description
+        check "first quest" notin item.description
+        check "turn that in" notin item.description
+        check "finish your quest" notin item.description
+        check "all quests" notin item.description
+
   test "replies are one printable line within the chat limit":
     check cleanReply("/w Murist \"hi\"\nthere") == "w Murist hi there"
     check cleanReply("x".repeat(200)).len == 120
+
+  test "unknown health, durability and talent points stay unobserved in model context":
+    let unknown = stateLine(%*{"health_known": false, "health": 100,
+      "max_health": 100, "unspent_talent_points": 0}, "")
+    check "health unobserved" in unknown
+    check "broken worn items: unobserved" in unknown
+    check "unspent talent points: unobserved" in unknown
+    let known = stateLine(%*{"health_known": true, "health": 25, "max_health": 100,
+      "equipped_durability_known": true, "equipment_items": [{"durability_known": true,
+        "max_durability_known": true, "durability": 0, "max_durability": 20}],
+      "talent_points_known": true, "unspent_talent_points": 1}, "")
+    check "health 25/100" in known
+    check "broken worn items: 1" in known
+    check "unspent talent points: 1" in known
 
 suite "operator requests":
   test "pending requests are claimed, and a crash-left claim comes first":

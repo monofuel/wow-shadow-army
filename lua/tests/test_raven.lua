@@ -83,7 +83,7 @@ local function warlock(extra)
     quest_objectives = {}, accepted_quests = {},
     completed_quest_ids = { 1470 },
     combat_kill_events = {}, ui_nodes = {}, equip_supported = true,
-    inventory_items = {}, equipment_items = {}, copper = 0,
+    inventory_items = {}, equipment_items = {}, copper_known = true, copper = 0,
     active_aura_spell_ids = {}, pet = { guid_known = true, guid = 0 },
   }
   for k, v2 in pairs(extra or {}) do v[k] = v2 end
@@ -236,15 +236,28 @@ do
   local at = { map_id = 0, position = { x = 1100.0, y = 96.0, z = 10, o = 0 } }
   local st = life.new_state()
   local v = warlock({ level = 4, copper = 500, location = at, units = { trainer } })
-  check(life.train_step(v, st, 0, false) == nil, "first sight only records the level")
+  local verify = life.train_step(v, st, 0, false)
+  check(verify and verify.kind == "interact", "first sight verifies the level at the trainer")
+  life.train_step(warlock({ level = 4, copper = 500, location = at, units = { trainer },
+    trainer_open = true, trainer_guid = 88, trainer_offers = {} }), st, 0.5, false)
+  check(life.train_step(v, st, 0.7, false) == nil and st.trained_level == 4,
+    "an exact frame with nothing to buy settles the level")
   local up = warlock({ level = 6, copper = 500, location = at, units = { trainer },
     known_spells = { 686, 688 } })
   local go = life.train_step(up, st, 1, false)
   check(go and go.kind == "interact" and go.guid == 88, "a new level walks to the trainer")
+  local offer = { service_spell_id = 1, taught_spell_id = 695, state = 0, cost = 100,
+    required_level = 6, pending = false }
   local open = warlock({ level = 6, copper = 500, location = at, units = { trainer },
-    known_spells = { 686, 688 }, trainer_open = true, trainer_guid = 88 })
+    known_spells = { 686, 688 }, trainer_open = true, trainer_guid = 88,
+    trainer_offers = { offer } })
   local buy = life.train_step(open, st, 2, false)
   check(buy and buy.kind == "train" and buy.guid == 88, "an open trainer frame trains")
+  local bought = warlock({ level = 6, copper = 400, location = at, units = { trainer },
+    known_spells = { 686, 688, 695 }, trainer_open = true, trainer_guid = 88,
+    trainer_offers = { { service_spell_id = 1, taught_spell_id = 695, state = 2,
+      cost = 100, required_level = 6, pending = false } } })
+  life.train_step(bought, st, 2.5, false)
   local after = warlock({ level = 6, copper = 400, location = at, units = { trainer },
     known_spells = { 686, 688, 695 } })
   check(life.train_step(after, st, 3, false) == nil and st.trained_spells == 1,
