@@ -1327,6 +1327,33 @@ do
     return "none"
   end
 
+  -- The compass ring: N, E, S, W as SetPoint offsets from the needle origin.
+  -- North-up (facing nil) the letters never move, with N on top, so the
+  -- widget reads as the map's compass and not as a run-this-way arrow. Given
+  -- a facing they turn through the same rotation aim() applies, so a letter
+  -- and a needle aimed at that letter's direction always coincide.
+  HudModel.CARDINALS = { "N", "E", "S", "W" }
+  local HUD_CARDINAL_WORLD = { { 0, 1 }, { 1, 0 }, { 0, -1 }, { -1, 0 } }
+  function HudModel.cardinals(radius, facing, sign)
+    local c, s = 1, 0
+    if facing then
+      local f = facing * (sign or 1)
+      c, s = math.cos(f), math.sin(f)
+    end
+    local out = {}
+    local i = 1
+    while i <= 4 do
+      local wx, wy = HUD_CARDINAL_WORLD[i][1], HUD_CARDINAL_WORLD[i][2]
+      out[i] = {
+        label = HudModel.CARDINALS[i],
+        x = (wx * c - wy * s) * radius,
+        y = (wx * s + wy * c) * radius,
+      }
+      i = i + 1
+    end
+    return out
+  end
+
   ShadowArmy.hudModel = HudModel
 end
 
@@ -2341,7 +2368,7 @@ local F = {}
 
 -- Bump on every edit. The System watches Chat.log for "<SA> loaded rev=..."
 -- after sending a reload — a new rev proves the edit actually loaded.
-local REV = "r60"
+local REV = "r61"
 
 -- Log window (r16): every F.say()/F.emit() line also lands here with a
 -- timestamp, so errors survive chat scroll-off and can be reviewed in-game.
@@ -6940,10 +6967,10 @@ end
 --------------------------------------------------------------------------
 
 do
-  local HUD_W, HUD_H = 190, 164
+  local HUD_W, HUD_H = 190, 184
   local HUD_TOP_Y = -52        -- top-center; keep the widget out of the world
   local HUD_PIP_MAX = 16       -- pool; the presets need 8 (art) and 12 (no art)
-  local HUD_NORTH_R = 56       -- the "N" tick's radius, px
+  local HUD_CARDINAL_R = 60   -- the N/E/S/W ring's radius, px
 
   local HUD_ARROW_ART = "Interface\\Minimap\\ROTATING-MINIMAPARROW"
 
@@ -6973,7 +7000,7 @@ do
 
   -- The needle's origin. Sits above centre so the three text rows below it
   -- clear the tip even when the arrow points straight down.
-  local HUD_CX, HUD_CY = 0, 14
+  local HUD_CX, HUD_CY = 0, 24
 
   local hudPips = {}
   local function hudPip(i)
@@ -6991,9 +7018,19 @@ do
   hudArrow:SetTexture(HUD_ARROW_ART)
   hudArrow:Hide()
 
-  local hudNorth = hudFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-  hudNorth:SetText("|cFF8888AAN|r")
-  hudNorth:Hide()
+  -- N is the loud one: gold, normal size. E/S/W stay small so the ring reads
+  -- as "this is the map's north" without crowding the needle.
+  local hudCardinals = {}
+  do
+    local i = 1
+    while i <= 4 do
+      local font = (i == 1) and "GameFontNormal" or "GameFontNormalSmall"
+      local fs = hudFrame:CreateFontString(nil, "OVERLAY", font)
+      fs:Hide()
+      hudCardinals[i] = fs
+      i = i + 1
+    end
+  end
 
   local hudQuestText = hudFrame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
   hudQuestText:SetPoint("BOTTOM", hudFrame, "BOTTOM", 0, 34)
@@ -7096,29 +7133,37 @@ do
       i = i + 1
     end
     hudArrow:Hide()
-    hudNorth:Hide()
+    local ci = 1
+    while ci <= 4 do
+      hudCardinals[ci]:Hide()
+      ci = ci + 1
+    end
     hudQuestText:SetText("")
     hudDistText:SetText("")
     hudNoteText:SetText("")
     hudFrame:Hide()
   end
 
-  -- Places the "N" tick, so player-relative rotation is visible rather than
-  -- merely claimed: in player mode this letter walks around the needle as you
-  -- turn, and in north-up mode it sits still at the top.
-  local function hudPlaceNorth(facing)
-    local nx, ny = 0, 1
-    if facing then
-      -- World north (0,1) put through the same rotation aim() applies, so
-      -- the letter and the needle can never disagree.
-      local f = facing * hud.sign
-      local c, s = math.cos(f), math.sin(f)
-      nx, ny = -s, c
+  -- Places the N/E/S/W ring. North-up it is a fixed map compass; with a
+  -- facing source the letters walk around the needle as you turn, so the
+  -- mode is visible on screen rather than merely claimed.
+  local function hudPlaceCardinals(facing)
+    local model = ShadowArmy and ShadowArmy.hudModel
+    local ring = model.cardinals(HUD_CARDINAL_R, facing, hud.sign)
+    local i = 1
+    while i <= 4 do
+      local p = ring[i]
+      local fs = hudCardinals[i]
+      if i == 1 then
+        fs:SetText("|cFFFFD100" .. p.label .. "|r")
+      else
+        fs:SetText("|cFF9999BB" .. p.label .. "|r")
+      end
+      fs:ClearAllPoints()
+      fs:SetPoint("CENTER", hudFrame, "CENTER", HUD_CX + p.x, HUD_CY + p.y)
+      fs:Show()
+      i = i + 1
     end
-    hudNorth:ClearAllPoints()
-    hudNorth:SetPoint("CENTER", hudFrame, "CENTER",
-      HUD_CX + nx * HUD_NORTH_R, HUD_CY + ny * HUD_NORTH_R)
-    hudNorth:Show()
   end
 
   function F.hudRefresh()
@@ -7208,7 +7253,7 @@ do
     else
       hudArrow:Hide()
     end
-    hudPlaceNorth(facing)
+    hudPlaceCardinals(facing)
 
     local hex = F.questHex(r, g, b)
     local mark = t.turnIn and (QUEST_MARK_TURNIN .. " ") or ""
@@ -7227,11 +7272,11 @@ do
     -- North-up is not a caveat to bury: the human has to know the arrow is a
     -- COMPASS (up = north) and not a windshield (up = where you are running),
     -- or he will trust it while facing south and walk the wrong way.
-    local note = "north up"
+    local note = "map compass: N is up"
     -- ASCII only in the HUD strings: this text is on screen every second of
     -- play, and a font that cannot draw a glyph draws a box forever.
     if facing then note = (model.relative(ux, uy) or "?") .. " - you-up" end
-    hudNoteText:SetText("|cFF777777" .. note .. "|r")
+    hudNoteText:SetText("|cFFBBBBBB" .. note .. "|r")
   end
 
   -- /sa arrow …  — every knob the arrow has, because the first live minute

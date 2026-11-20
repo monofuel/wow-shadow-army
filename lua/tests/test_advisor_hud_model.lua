@@ -272,4 +272,36 @@ check(model.facingSource({ model = true }) == "model", "a live model is second")
 check(model.facingSource({}) == "none", "stock 1.12 has no facing source")
 check(model.facingSource(nil) == "none", "no environment is no facing source")
 
+--------------------------------------------------------------------------
+-- cardinals: the N/E/S/W ring that makes the widget read as a map compass
+--------------------------------------------------------------------------
+
+-- North-up (stock 5875): fixed, N on top, E right, S down, W left.
+local ring = model.cardinals(60, nil, 1)
+check(ring[1].label == "N" and ring[2].label == "E" and
+  ring[3].label == "S" and ring[4].label == "W", "ring order is N E S W")
+near(ring[1].x, 0, 1e-9, "north-up N is centred")
+near(ring[1].y, 60, 1e-9, "north-up N is on top")
+near(ring[2].x, 60, 1e-9, "north-up E is right")
+near(ring[3].y, -60, 1e-9, "north-up S is at the bottom")
+near(ring[4].x, -60, 1e-9, "north-up W is left")
+
+-- Facing sign or a stray number never moves a north-up ring.
+local ring2 = model.cardinals(60, nil, -1)
+near(ring2[1].y, 60, 1e-9, "sign alone does not rotate a north-up ring")
+
+-- With a facing, every letter sits exactly where the needle points for a
+-- target in that letter's direction: the two can never disagree.
+local dirs = { { 0, -1 }, { 1, 0 }, { 0, 1 }, { -1, 0 } } -- map % deltas N E S W
+for _, f in ipairs({ 0.0, 0.7, math.pi / 2, 2.5, -1.2 }) do
+  for _, sg in ipairs({ 1, -1 }) do
+    local rr = model.cardinals(60, f, sg)
+    for k = 1, 4 do
+      local ux, uy = model.aim(dirs[k][1], dirs[k][2], YX, YY, f, sg)
+      near(rr[k].x, ux * 60, 1e-9, "letter " .. rr[k].label .. " x @" .. f)
+      near(rr[k].y, uy * 60, 1e-9, "letter " .. rr[k].label .. " y @" .. f)
+    end
+  end
+end
+
 print("test_advisor_hud_model: " .. passed .. " checks passed")
