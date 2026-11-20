@@ -306,6 +306,102 @@ local function quest_hub_data()
   end
   return questHubData
 end
+
+-- Generated objective areas: quest id -> {level, objectives = {{kind, from,
+-- spots = {{map,x,y},...}}, ...}} in the quest guide's objective order. Same
+-- class of static guide knowledge as the hub table above. Off unless a brain
+-- opts in, so lanes that never call set_objective_travel keep old behavior.
+local OBJECTIVE_TRAVEL = false
+local objectiveAreaData = nil
+local objectiveAreaLoaded = false
+
+function M.set_objective_travel(on)
+  OBJECTIVE_TRAVEL = not not on
+end
+
+-- nil restores the generated file; a table (including {}) replaces it.
+function M.set_objective_areas(data)
+  objectiveAreaData = data
+  objectiveAreaLoaded = data ~= nil
+end
+
+local function objective_area_data()
+  if not objectiveAreaLoaded then
+    objectiveAreaLoaded = true
+    local ok, data = pcall(require, "data.bot_objective_areas")
+    if ok and type(data) == "table" then
+      objectiveAreaData = data
+    else
+      objectiveAreaData = nil
+      wow.log("objective area data unavailable: " .. tostring(data))
+    end
+  end
+  return objectiveAreaData
+end
+
+-- Objective class of a guide objective (has `kind`) or a live row. Live
+-- game-object rows carry their entry with the high bit set and never pair.
+local function objective_class(t)
+  if t.kind then
+    if t.kind == "mob" then return "kill" end
+    if t.kind == "item" or t.kind == "object" then return "item" end
+    return nil
+  end
+  local entry = t.entry or 0
+  if entry ~= 0 then
+    return (entry > 0 and entry < 2147483648) and "kill" or nil
+  end
+  if (t.item_id or 0) ~= 0 then return "item" end
+  return nil
+end
+
+-- The guide objective behind live objective row `index`, its quest-local
+-- guide position, and the quest, or nil when the pairing is not certain.
+-- Live row order is not the definition order (a credit update can arrive
+-- before the definition), so rows pair by class, never by position: only
+-- the sole live row of its class in its quest pairs with the sole guide
+-- objective of that class. Equal counts alone prove nothing.
+local function area_objective(view, index)
+  if not OBJECTIVE_TRAVEL then return nil end
+  local data = objective_area_data()
+  local rows = view.quest_objectives or {}
+  local row = rows[index]
+  local quest = row and data and data[row.quest_id]
+  if not quest then return nil end
+  local class = objective_class(row)
+  if not class then return nil end
+  for i = 1, #rows do
+    if i ~= index and rows[i].quest_id == row.quest_id and
+        objective_class(rows[i]) == class then
+      return nil
+    end
+  end
+  local guide, position = nil, nil
+  for g = 1, #quest.objectives do
+    if objective_class(quest.objectives[g]) == class then
+      if guide then return nil end
+      guide, position = quest.objectives[g], g
+    end
+  end
+  if not guide then return nil end
+  return guide, quest, position
+end
+
+-- Field work we can honestly travel for: a kill row, or an item row whose
+-- guide names the creatures that drop it. Gathered objects and unpaired rows
+-- are left to the old behavior.
+local function area_travelable(guide)
+  if guide.kind == "mob" then return true end
+  return guide.kind == "item" and #(guide.from or {}) > 0
+end
+
+local function area_drops_from(guide, name)
+  if not guide or guide.kind ~= "item" or not name then return false end
+  for i = 1, #(guide.from or {}) do
+    if guide.from[i] == name then return true end
+  end
+  return false
+end
 -- TEMP (0065): last emit of the accept-leg telemetry probes.
 local questProbeAt = nil
 local travelProbeAt = nil
@@ -424,6 +520,9 @@ local function credits_objective(view, unit)
       local needle = ITEM_DROPPER[objective.item_id]
       local name = unit.name or ""
       if needle and name:find(needle, 1, true) then
+        return true
+      end
+      if area_drops_from(area_objective(view, i), unit.name) then
         return true
       end
     end
@@ -1332,6 +1431,167 @@ local function talk_quest_pending(view)
   return false
 end
 
+-- Objective-area travel. A seat whose only fresh pull is gray (or nothing)
+-- while an accepted quest still needs kills or drops elsewhere walks to the
+-- guide's spots for that objective instead of farming the starter field.
+-- Patience is measured against real progress only: level, XP, finished rows
+-- and carried quest items. Walking, statuses and new targets do not reset it.
+local AREA_ARRIVE_YARDS = 35.0     -- inside this a spot counts as swept
+local AREA_STOP_YARDS = 12.0
+local AREA_MAX_YARDS = 600.0       -- local field work, not a cross-zone trip
+local AREA_LEVEL_MARGIN = 2        -- same ceiling as a fresh pull
+local AREA_PATIENCE_SECONDS = 180.0
+local AREA_COOLDOWN_SECONDS = 600.0
+local AREA_SPOT_REST_SECONDS = 120.0
+local areaKey, areaSince, areaMark = nil, nil, nil
+local areaCooldown = {}
+-- key -> {strikes = fruitless retirements, credit = own credit at the last}
+local areaFailed = {}
+local areaSpotRest = {}
+-- Stable quest/entry/item identity -> last known own credit. Missing or
+-- reordered objective rows retain the same mark while metadata recovers.
+local areaLastCredit = {}
+
+local function area_progress_mark(view)
+  local parts = { tostring(view.level or 0), tostring(view.xp or 0) }
+  local rows = view.quest_objectives or {}
+  for i = 1, #rows do
+    local row = rows[i]
+    local q = row.quest_id or 0
+    local key = q .. ":" .. (row.entry or 0) .. ":" .. (row.item_id or 0)
+    local credit
+    if (row.item_id or 0) ~= 0 then
+      if view.bag_space_known == true then
+        credit = carried_count(view, row.item_id)
+      end
+    else
+      credit = tonumber(row.current)
+    end
+    if credit ~= nil then
+      areaLastCredit[key] = tostring(credit) .. ":" .. (row.complete and "1" or "0")
+    end
+  end
+  local keys = {}
+  for key in pairs(areaLastCredit) do keys[#keys + 1] = key end
+  table.sort(keys)
+  for i = 1, #keys do
+    parts[#parts + 1] = keys[i] .. "=" .. areaLastCredit[keys[i]]
+  end
+  return table.concat(parts, ":")
+end
+
+local function objective_area_step(view, pos, now)
+  if not OBJECTIVE_TRAVEL or not objective_area_data() then return nil end
+  local rows = view.quest_objectives or {}
+  -- Keys are quest id + guide objective position, independent of where the
+  -- quest sits in the log. A key whose quest left the log starts over.
+  -- `present` holds each paired objective's own credit when known: its kill
+  -- count or the carried item count (nil while bags are unknown).
+  local keyed, present = {}, {}
+  for i = 1, #rows do
+    local guide, _, position = area_objective(view, i)
+    if guide then
+      local row = rows[i]
+      keyed[i] = row.quest_id .. ":" .. position
+      local credit
+      if (row.item_id or 0) ~= 0 then
+        -- The actual SDK always supplies an inventory table, even while
+        -- carried-bag observations are incomplete. Empty is not known zero.
+        if view.bag_space_known == true then
+          credit = carried_count(view, row.item_id)
+        end
+      else
+        credit = row.current
+      end
+      present[keyed[i]] = credit ~= nil and tostring(credit) or nil
+    end
+  end
+  local inLog
+  if type(view.accepted_quests) == "table" then
+    inLog = {}
+    for _, q in ipairs(view.accepted_quests) do
+      local id = accepted_quest_id(q)
+      if id then inLog[id] = true end
+    end
+  end
+  for key, fail in pairs(areaFailed) do
+    -- Only a known quest removal or a known change of that objective's own
+    -- credit clears its failures. XP from other pulls, an unpaired row or
+    -- unknown bags do not; an unknown stored credit adopts the first known.
+    local credit = present[key]
+    if inLog and not inLog[tonumber(key:match("^(%-?%d+):"))] then
+      areaFailed[key], areaCooldown[key] = nil, nil
+    elseif credit ~= nil then
+      if fail.credit == nil then
+        fail.credit = credit
+      elseif credit ~= fail.credit then
+        areaFailed[key], areaCooldown[key] = nil, nil
+      end
+    end
+  end
+  local mark = area_progress_mark(view)
+  if mark ~= areaMark then areaMark, areaSince = mark, now end
+  if areaKey and areaSince and now - areaSince > AREA_PATIENCE_SECONDS then
+    local prior = areaFailed[areaKey] or { strikes = 0 }
+    local strikes = prior.strikes + 1
+    areaFailed[areaKey] = { strikes = strikes,
+      credit = present[areaKey] or prior.credit }
+    -- A second fruitless retirement drops the objective until its own
+    -- credit moves or the quest leaves the log.
+    areaCooldown[areaKey] = strikes >= 2 and math.huge or
+      now + AREA_COOLDOWN_SECONDS
+    wow.log("objective area " .. areaKey .. ": no XP or credit, retiring (" ..
+      strikes .. ")")
+    areaKey, areaSince = nil, now
+  end
+  local map = math.floor(view.location.map_id or 0)
+  -- Quests the log marks failed are skipped; an unknown flag is kept.
+  local failed = {}
+  for _, q in ipairs(view.accepted_quests or {}) do
+    if type(q) == "table" and q.failed == true then failed[q.quest_id] = true end
+  end
+  local best, bestD, bestKey, bestQuest = nil, nil, nil, nil
+  for i = 1, #rows do
+    local row = rows[i]
+    local guide, quest = area_objective(view, i)
+    local key = keyed[i]
+    if guide and not row.complete and not row.failed and
+        not failed[row.quest_id] and area_travelable(guide) and
+        (quest.level or 0) <= (view.level or 1) + AREA_LEVEL_MARGIN and
+        not (areaCooldown[key] and now < areaCooldown[key]) then
+      for s = 1, #(guide.spots or {}) do
+        local spot = guide.spots[s]
+        local spotKey = key .. ":" .. s
+        if math.floor(spot[1]) == map and
+            not (areaSpotRest[spotKey] and now < areaSpotRest[spotKey]) then
+          local d = distance2d(pos.x, pos.y, spot[2], spot[3])
+          if d <= AREA_ARRIVE_YARDS then
+            areaSpotRest[spotKey] = now + AREA_SPOT_REST_SECONDS
+          elseif d <= AREA_MAX_YARDS then
+            -- Stay on the objective already being worked; a nearer spot of
+            -- another one would otherwise flip the walk every tick.
+            local score = key == areaKey and d * 0.5 or d
+            if not bestD or score < bestD then
+              best, bestD, bestKey, bestQuest = spot, score, key, row.quest_id
+            end
+          end
+        end
+      end
+    end
+  end
+  if not best then return nil end
+  if bestKey ~= areaKey then areaKey, areaSince = bestKey, now end
+  wow.set_status(string.format("objective area quest %d", bestQuest))
+  return {
+    kind = "navigate",
+    x = best[2], y = best[3], z = pos.z,
+    map_id = map,
+    stop_distance = AREA_STOP_YARDS,
+    route_profile = "safe_ground",
+    reason = "objective_area",
+  }
+end
+
 -- Walk to the GENERATED turn-in of a completed quest. This is the fallback
 -- for the case the seen-givers table structurally cannot cover: an ender we
 -- have never had in view. Same intent shape, stop distance, budget and
@@ -1515,6 +1775,11 @@ function M.reset()
   ignoreUntil = {}
   swingGuid, swingHp, swingSince, swingX, swingY = nil, nil, nil, nil, nil
   swingFrames = 0
+  areaKey, areaSince, areaMark = nil, nil, nil
+  areaCooldown = {}
+  areaFailed = {}
+  areaLastCredit = {}
+  areaSpotRest = {}
 end
 
 function M.decide(view)
@@ -1787,6 +2052,19 @@ function M.decide(view)
       }
     end
     target = pick_target(view, true)
+  end
+
+  -- A gray pull that pays nothing is not progress while an accepted quest
+  -- still needs kills or drops somewhere else. Out of combat that includes
+  -- our own auto-attack on one: nothing is hitting us yet.
+  if not view.in_combat and (not target or
+      (target.level_known and target.level <= gray_level(view.level) and
+        not credits_objective(view, target))) then
+    local area = objective_area_step(view, pos, wow.time())
+    if area then
+      area.status = progress_status(view)
+      return area
+    end
   end
 
   if target and note_swing(target, pos, wow.time()) then

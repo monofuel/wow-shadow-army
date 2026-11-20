@@ -13,6 +13,7 @@ local requests = require("tools.requests")
 -- so the new quest stack gets exercised where monofuel can watch. Scored
 -- leagues stay grind-only until a rerun A/B beats the 4.791 baseline.
 solo.set_quests(true)
+solo.set_objective_travel(true)
 
 local M = {}
 
@@ -2314,6 +2315,18 @@ function M.decide(view)
       return finish(progress, view, "solo", role)
     end
     local intent = life.avoid_evading(view, lstate, solo.decide(view), now, solo.ignore)
+    -- A long walk to an objective area rides the roads like a far rejoin.
+    if intent.kind == "navigate" and intent.reason == "objective_area" then
+      local mine, goal = view_point(view), { x = intent.x, y = intent.y }
+      if mine and distance2d(mine, goal) > ROAD_MIN_YARDS then
+        local wp = road_waypoint(mine, goal, intent.map_id)
+        if wp then
+          intent.x, intent.y, intent.z = wp.x, wp.y, wp.z
+          intent.stop_distance = ROAD_WAYPOINT_STOP
+          intent.reason = "objective_area_road"
+        end
+      end
+    end
     intent = life.with_pet(view, lstate, intent)
     intent = life.upgrade_attack(view, intent, mana_pct(view) >= SOLO_NUKE_MANA_PCT)
     life.note_progress(view, lstate, now, intent)
