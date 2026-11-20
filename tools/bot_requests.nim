@@ -10,8 +10,17 @@
 ##
 ## Addressing: a whisper to the seat, or a party/say line that starts with
 ## `@Seat` (direct) or `@all` / `@party` / `@everyone` (deliberate group).
-## Anything else is not addressed and produces nothing. Authority is the
-## existing one: the configured player's server-reported sender GUID.
+## An unprefixed party/say line from the authority is ambient: exactly one
+## live seat that shares the authority's party (or, for say, sees the
+## authority) handles it with the same authority as an `@Seat` request, so it
+## may answer or take one offered action. Group conversation is likewise
+## answered once; group actions still reach every seat. Anything else produces nothing. Authority is the existing one:
+## the configured player's server-reported sender GUID.
+##
+## Roles: Kev (System One at the direct Azem endpoint) routes each message to
+## question, action or chatter; Lightning (Switchyard `local`) picks the
+## offered action and writes replies grounded in the seat's observed state.
+## If Kev is unreachable, Lightning's own typed decision routes the message.
 ##
 ## A human operator can also enqueue a request with `--to/--text`; it is
 ## labelled origin=operator end to end and never presented as game chat.
@@ -22,7 +31,7 @@ import
 
 type
   Scope* = enum
-    scopeNone, scopeDirect, scopeGroup
+    scopeNone, scopeDirect, scopeGroup, scopeAmbient
 
   Addressed* = object
     scope*: Scope
@@ -37,18 +46,25 @@ type
   Decision* = object
     intent*, choice*: string
 
-  SeatState = object
+  Route* = object
+    intent*: string
+    confidence*, actionProbability*: float
+
+  SeatState* = object
     name, dir: string
     episode: string
     cursor: int64
     lastMtime: Time
+    obs: JsonNode
+    pending: bool
 
-  Config = object
+  Config* = object
     homeDir: string
-    seats: seq[string]
+    seats*: seq[string]
     authorityName: string
     authorityGuid: string
     baseUrl, model, apiKey: string
+    routeBaseUrl, routeModel, routeApiKey: string
     timeoutMs: int
     poll: float
     once: bool
@@ -62,13 +78,30 @@ const
   ## few tokens of it.
   RoutedOutputTokens = 32768
   RoutedTimeoutMs = 120_000
+  ## Kev is reached directly on Azem through System One; it is a decision
+  ## model, not a Switchyard chat route.
+  DefaultRouteBaseUrl = "http://10.11.2.22:1234/v1"
+  DefaultRouteModel = "kev-4b"
   DefaultPoll = 1.0
   MaxReplyChars = 120
   GroupWords = ["all", "party", "everyone"]
+  Intents = ["question", "action", "chatter"]
+  ## A message Kev routes away from action still goes to Lightning's action
+  ## decision when Kev gives action at least this probability.
+  ActionProbabilityFloor = 0.3
+  ## A seat whose observation is older than this is not a live responder.
+  LiveObservationSeconds = 30
   JobProtocol = "wow_shadow_army.private_request.v1"
 
 var
   modelClient: Curly ## Shared HTTP client for model calls; opened by the broker loop.
+  postJson*: proc (url, apiKey, body: string; timeoutMs: int): Response =
+    proc (url, apiKey, body: string; timeoutMs: int): Response =
+      var headers: HttpHeaders
+      headers["Content-Type"] = "application/json"
+      headers["Authorization"] = "Bearer " & apiKey
+      modelClient.post(url, headers, body, timeout = timeoutMs div 1000)
+    ## Model HTTP transport; tests replace it with synthetic responses.
 
 proc lowerName(value: string): string =
   ## Case-folded, trimmed character name.
@@ -101,6 +134,28 @@ proc address*(row: ChatRow; seat, authorityName, authorityGuid: string): Address
   if name.lowerName in GroupWords:
     return Addressed(scope: scopeGroup, text: rest)
 
+proc ambient*(row: ChatRow; authorityName, authorityGuid: string): Addressed =
+  ## An unprefixed party/say line from the authority: conversation meant for
+  ## whoever is with them. A line starting with `@` names its recipients and
+  ## goes through `address` instead; whispers, raid and other senders never
+  ## count.
+  if row.senderGuid != authorityGuid or
+      row.senderName.lowerName != authorityName.lowerName:
+    return
+  let text = row.text.strip
+  if row.kind notin ["party", "say"] or text.len == 0 or text.startsWith("@") or
+      text.startsWith("<SA>"):
+    return
+  Addressed(scope: scopeAmbient, text: text)
+
+proc guidStr(node: JsonNode): string =
+  ## A GUID field as text, whether the observation wrote it as string or number.
+  if node.isNil: return ""
+  case node.kind
+  of JString: node.getStr
+  of JInt: $node.getBiggestInt
+  else: ""
+
 proc num(node: JsonNode; key: string; fallback = 0.0): float =
   ## Numeric field that may be absent or encoded as a string.
   let field = node{key}
@@ -115,7 +170,24 @@ proc num(node: JsonNode; key: string; fallback = 0.0): float =
 proc unitByGuid(obs: JsonNode; guid: string): JsonNode =
   ## Visible unit row with this GUID, or nil.
   for unit in obs{"units"}.getElems:
-    if unit{"guid"}.getStr == guid: return unit
+    if unit{"guid"}.guidStr == guid: return unit
+
+proc eligible*(obs: JsonNode; channel, authorityGuid: string): bool =
+  ## Whether this seat's own observation puts it with the authority for a
+  ## line on this channel: party lines need the authority in the seat's
+  ## current party; say lines also accept the authority being in view.
+  for member in obs{"party"}{"members"}.getElems:
+    if member{"guid"}.guidStr == authorityGuid: return true
+  channel == "say" and not obs.unitByGuid(authorityGuid).isNil
+
+proc responder*(live: seq[(string, JsonNode)]; channel, authorityGuid: string): string =
+  ## The one seat that answers conversation on this channel: the
+  ## alphabetically first live seat eligible for it, or "" when none is.
+  ## Every broker tick computes the same answer from the same observations.
+  for (name, obs) in live:
+    if not obs.eligible(channel, authorityGuid): continue
+    if result.len == 0 or name.lowerName < result.lowerName:
+      result = name
 
 proc knowsSpell(obs: JsonNode; spell: int): bool =
   ## Whether the seat's spellbook holds this spell.
@@ -151,7 +223,11 @@ proc menu*(obs: JsonNode; requesterVisible, jobActive: bool): seq[MenuItem] =
   result.add ("none", "no offered action fits")
 
 proc stateLine*(obs: JsonNode; activeJob: string): string =
-  ## Short factual state the model is grounded on.
+  ## Short factual state the model is grounded on. Only observed facts: the
+  ## seat's activity beyond the player's accepted task is not observed here.
+  var party: seq[string]
+  for member in obs{"party"}{"members"}.getElems:
+    party.add member{"name"}.getStr("?")
   let pet = if obs.petOut: "pet out" else: "no pet out"
   var quests: seq[string]
   for q in obs{"accepted_quests"}.getElems:
@@ -162,7 +238,8 @@ proc stateLine*(obs: JsonNode; activeJob: string): string =
     (if obs{"in_combat"}.getBool: "in combat" else: "not in combat") &
     ", position " & $obs{"location"}.num("x").int & "," & $obs{"location"}.num("y").int &
     ", quests in log: " & (if quests.len == 0: "none" else: quests.join(" ")) &
-    ", current task: " & (if activeJob.len == 0: "leveling on its own" else: activeJob)
+    ", party: " & (if party.len == 0: "none" else: party.join(" ")) &
+    ", task from the player: " & (if activeJob.len == 0: "none" else: activeJob)
 
 proc decisionBody*(model, seat, className, state, message: string;
     offered: seq[MenuItem]): JsonNode =
@@ -236,6 +313,75 @@ proc answerBody*(model, seat, state, question: string): JsonNode =
     ]
   }
 
+proc chatterBody*(model, seat, className, state, message: string): JsonNode =
+  ## A short natural conversational reply from the seat, grounded in its
+  ## observed state. The reply only talks; it never claims an action.
+  %*{
+    "model": model,
+    "max_tokens": RoutedOutputTokens,
+    "temperature": 0.6,
+    "reasoning_effort": "none",
+    "messages": [
+      {"role": "system", "content":
+        "You are " & seat & ", an undead " & className & " in World of Warcraft, " &
+        "chatting with the player you serve and adventure with. Reply naturally " &
+        "in one short friendly sentence under 100 characters, the way a party " &
+        "member would: answer what they said. Any fact about yourself must come " &
+        "from State; do not describe what you are doing, feeling or resting " &
+        "beyond State, and do not invent progress, plans or rules. " &
+        "This reply is only talk: do not say you will do, are doing or did " &
+        "anything that State's task from the player does not show. " &
+        "No emojis, no quotes."},
+      {"role": "user", "content": "State: " & state & "\nPlayer says: " & message}
+    ]
+  }
+
+proc routeBody*(model, seat, className, scope, state, message: string): JsonNode =
+  ## Kev System One request: one keyed choice question routing the message
+  ## to question, action or chatter.
+  let audience = if scope == "ambient":
+      "The player said this in chat to the group around them, not to " & seat & " by name."
+    else: "The player addressed this to " & seat & "."
+  %*{
+    "model": model,
+    "state": seat & " is an undead " & className & " bot in World of Warcraft " &
+      "serving the player. " & audience & "\nState: " & state & "\nMessage: " & message,
+    "questions": {"intent": {"type": "choice",
+      "instructions": "What kind of message is this from the player to " & seat & "?",
+      "criteria": {
+        "question": "asks for information about " & seat & " (level, pet, gold, what it is doing, where it is) without asking it to act",
+        "action": "wants " & seat & " to do something now, including polite requests phrased as questions and go-ahead instructions such as carry on",
+        "chatter": "a greeting, joke, thanks or remark that calls for a conversational reply"}}}
+  }
+
+proc parseRoute*(body: string): Route =
+  ## Validate Kev's System One answer; anything malformed raises.
+  let node = parseJson(body)
+  if node.kind != JObject or (node.hasKey("error") and node["error"].kind != JNull):
+    raise newException(ValueError, "route model failed: " & body[0 ..< min(300, body.len)])
+  let answer = node{"answers"}{"intent"}
+  if answer.isNil or answer{"type"}.getStr != "choice":
+    raise newException(ValueError, "route model omitted its choice answer")
+  result.intent = answer{"choice"}.getStr
+  if result.intent notin Intents:
+    raise newException(ValueError, "route model chose an unknown intent: " & result.intent)
+  result.confidence = answer.num("confidence", -1.0)
+  if answer.hasKey("confidence") and result.confidence notin 0.0 .. 1.0:
+    raise newException(ValueError, "route model returned invalid confidence")
+  let probabilities = answer{"probabilities"}
+  if not probabilities.isNil:
+    var total = 0.0
+    for key, value in probabilities.pairs:
+      let p = if value.kind in {JInt, JFloat}: value.getFloat else: -1.0
+      if key notin Intents or p notin 0.0 .. 1.0:
+        raise newException(ValueError, "route model returned invalid probabilities")
+      total += p
+    if probabilities.len != Intents.len or abs(total - 1.0) > 0.001:
+      raise newException(ValueError, "route model probabilities are incomplete")
+    result.actionProbability = probabilities["action"].getFloat
+  elif result.intent == "action":
+    result.actionProbability = 1.0
+
 proc cleanReply*(text: string): string =
   ## Printable single-line reply within the seat's chat limit.
   for c in text:
@@ -271,23 +417,36 @@ proc callModel(cfg: Config; body: JsonNode): tuple[content, requestId, served, f
     usage: JsonNode, seconds: float] =
   ## One blocking routed request through the shared Curly client; failures
   ## raise with their status. The broker makes one call at a time.
-  var headers: HttpHeaders
-  headers["Content-Type"] = "application/json"
-  headers["Authorization"] = "Bearer " & cfg.apiKey
   let started = epochTime()
-  let response = modelClient.post(cfg.baseUrl & "/chat/completions", headers, $body,
-    timeout = cfg.timeoutMs div 1000)
+  let response = postJson(cfg.baseUrl & "/chat/completions", cfg.apiKey, $body, cfg.timeoutMs)
   result.seconds = epochTime() - started
   if response.code < 200 or response.code > 299:
     raise newException(IOError, "model request failed: " & $response.code & " " &
       response.body[0 ..< min(300, response.body.len)])
   let parsed = parseJson(response.body)
+  let choices = parsed{"choices"}
+  if choices.isNil or choices.kind != JArray or choices.len == 0:
+    raise newException(ValueError, "model returned no completion choices")
   result.content = parsed{"choices"}[0]{"message"}{"content"}.getStr
   result.finish = parsed{"choices"}[0]{"finish_reason"}.getStr
-  result.usage = parsed{"usage"}
+  result.usage = if parsed{"usage"}.isNil: newJNull() else: parsed{"usage"}
   result.served = response.headers["x-model-router-selected-model"]
   if result.served.len == 0: result.served = parsed{"model"}.getStr
   result.requestId = response.headers["x-mle-request-id"]
+
+proc callRoute(cfg: Config; body: JsonNode): tuple[route: Route, served: string,
+    usage: JsonNode, seconds: float] =
+  ## One blocking System One request to Kev on the direct endpoint.
+  let started = epochTime()
+  let response = postJson(cfg.routeBaseUrl & "/systemone", cfg.routeApiKey, $body, cfg.timeoutMs)
+  result.seconds = epochTime() - started
+  if response.code < 200 or response.code > 299:
+    raise newException(IOError, "route request failed: " & $response.code & " " &
+      response.body[0 ..< min(300, response.body.len)])
+  result.route = parseRoute(response.body)
+  let parsed = parseJson(response.body)
+  result.served = parsed{"model"}.getStr
+  result.usage = if parsed{"usage"}.isNil: newJNull() else: parsed{"usage"}
 
 proc readActive(seatDir: string): string =
   ## The choice of the job the seat is running, if any.
@@ -304,8 +463,11 @@ proc seenKeys(seatDir: string): HashSet[string] =
       if line.len > 0: result.incl line.strip
 
 proc handle(cfg: Config; seat: var SeatState; obs: JsonNode; origin, actor,
-    actorGuid, text: string; scope: Scope; key: string; seen: var HashSet[string]) =
+    actorGuid, text: string; scope: Scope; key: string; seen: var HashSet[string];
+    speaks = true) =
   ## Interpret one addressed request and hand any accepted action to the seat.
+  ## `speaks` is false for a group request this seat should act on but not
+  ## answer, so conversation gets one reply rather than one per seat.
   if key in seen: return
   let jobs = seat.dir / "jobs"
   let requester = if actorGuid.len > 0: obs.unitByGuid(actorGuid) else: nil
@@ -315,27 +477,48 @@ proc handle(cfg: Config; seat: var SeatState; obs: JsonNode; origin, actor,
   let state = stateLine(obs, active)
   var event = %*{"at": epochTime(), "seat": seat.name, "key": key, "origin": origin,
     "actor": actor, "scope": $scope, "text": text, "offered": offered.mapIt(it.key)}
-  var decision: Decision
-  try:
-    let call = callModel(cfg, decisionBody(cfg.model, seat.name, className, state, text, offered))
-    event["decision_model"] = %call.served
-    event["decision_request_id"] = %call.requestId
-    event["decision_seconds"] = %call.seconds
-    event["decision_finish"] = %call.finish
-    event["decision_usage"] = call.usage
-    decision = parseDecision(call.content, offered)
-  except CatchableError as error:
-    event["error"] = %error.msg
-    logLine(seat.dir, event)
-    seen.incl key
-    appendLine(jobs / "ledger.txt", key)
-    return
+  var route = ""
+  if cfg.routeModel.len > 0:
+    try:
+      let call = callRoute(cfg, routeBody(cfg.routeModel, seat.name, className,
+        (if scope == scopeAmbient: "ambient" else: "addressed"), state, text))
+      route = call.route.intent
+      event["route_model"] = %call.served
+      event["route_intent"] = %route
+      event["route_confidence"] = %call.route.confidence
+      event["route_action_probability"] = %call.route.actionProbability
+      event["route_seconds"] = %call.seconds
+      event["route_usage"] = call.usage
+      if route != "action" and call.route.actionProbability >= ActionProbabilityFloor:
+        route = "action"
+    except CatchableError as error:
+      event["route_error"] = %error.msg
+  var decision = Decision(intent: route, choice: "none")
+  if route.len == 0 or route == "action":
+    try:
+      let call = callModel(cfg, decisionBody(cfg.model, seat.name, className, state, text, offered))
+      event["decision_model"] = %call.served
+      event["decision_request_id"] = %call.requestId
+      event["decision_seconds"] = %call.seconds
+      event["decision_finish"] = %call.finish
+      event["decision_usage"] = call.usage
+      decision = parseDecision(call.content, offered)
+    except CatchableError as error:
+      event["error"] = %error.msg
+      logLine(seat.dir, event)
+      seen.incl key
+      appendLine(jobs / "ledger.txt", key)
+      return
   event["intent"] = %decision.intent
   event["choice"] = %decision.choice
   var reply = ""
-  if decision.intent == "question":
+  if not speaks:
+    discard
+  elif decision.intent in ["question", "chatter"]:
+    let body = if decision.intent == "question": answerBody(cfg.model, seat.name, state, text)
+      else: chatterBody(cfg.model, seat.name, className, state, text)
     try:
-      let call = callModel(cfg, answerBody(cfg.model, seat.name, state, text))
+      let call = callModel(cfg, body)
       reply = cleanReply(call.content)
       event["answer_model"] = %call.served
       event["answer_request_id"] = %call.requestId
@@ -392,20 +575,31 @@ proc deliver(seat: SeatState) =
   writeAtomic(jobs / "inbox.json", rows[0] & "\n")
   writeAtomic(queue, (if rows.len > 1: rows[1 ..^ 1].join("\n") & "\n" else: ""))
 
+proc launcherAlive(seatDir: string): bool =
+  ## Whether the seat's launcher process is running now.
+  let pidFile = seatDir / "launcher.pid"
+  if not fileExists(pidFile): return false
+  let pid = readFile(pidFile).strip
+  pid.len > 0 and dirExists("/proc/" & pid)
+
 proc runningSeats(cfg: Config): seq[string] =
-  ## Configured seats, or every home seat with a live launcher.
-  if cfg.seats.len > 0: return cfg.seats
+  ## Seats with a live launcher: the configured ones that are running, or
+  ## every running home seat when none are configured.
+  if cfg.seats.len > 0:
+    for name in cfg.seats:
+      if launcherAlive(cfg.homeDir / name.strip): result.add name.strip
+    return
   for kind, path in walkDir(cfg.homeDir):
-    if kind != pcDir: continue
-    let pidFile = path / "launcher.pid"
-    if not fileExists(pidFile): continue
-    let pid = readFile(pidFile).strip
-    if pid.len > 0 and dirExists("/proc/" & pid):
+    if kind == pcDir and launcherAlive(path):
       result.add path.lastPathPart
 
-proc tick(cfg: Config; seats: var Table[string, SeatState]) =
-  ## One poll over every seat.
-  for name in runningSeats(cfg):
+proc tick*(cfg: Config; seats: var Table[string, SeatState]) =
+  ## One poll over every running seat: refresh observations, choose this
+  ## tick's conversation responders, then handle each seat's new chat.
+  let names = runningSeats(cfg)
+  let now = getTime()
+  var live: seq[(string, JsonNode)]
+  for name in names:
     let dir = cfg.homeDir / name
     let obsPath = dir / "observer" / "observation.json"
     if not fileExists(obsPath): continue
@@ -423,11 +617,23 @@ proc tick(cfg: Config; seats: var Table[string, SeatState]) =
     var seat = seats[name]
     deliver(seat)
     let mtime = getLastModificationTime(obsPath)
-    if mtime == seat.lastMtime: continue
-    seat.lastMtime = mtime
-    var obs: JsonNode
-    try: obs = parseFile(obsPath)
-    except CatchableError: continue
+    if mtime != seat.lastMtime:
+      seat.lastMtime = mtime
+      try:
+        seat.obs = parseFile(obsPath)
+        seat.pending = true
+      except CatchableError: discard
+    if not seat.obs.isNil and (now - mtime).inSeconds <= LiveObservationSeconds:
+      live.add (name, seat.obs)
+    seats[name] = seat
+  let partyResponder = responder(live, "party", cfg.authorityGuid)
+  let sayResponder = responder(live, "say", cfg.authorityGuid)
+  for name in names:
+    if not seats.hasKey(name) or not seats[name].pending: continue
+    var seat = seats[name]
+    seat.pending = false
+    let dir = seat.dir
+    let obs = seat.obs
     let episode = obs{"episode_id"}.getStr
     let seatGuid = obs{"player_guid"}.getStr
     if episode != seat.episode:
@@ -442,10 +648,23 @@ proc tick(cfg: Config; seats: var Table[string, SeatState]) =
         text: node{"text"}.getStr)
       if row.sequence <= seat.cursor: continue
       seat.cursor = row.sequence
-      let a = address(row, name, cfg.authorityName, cfg.authorityGuid)
+      var a = address(row, name, cfg.authorityName, cfg.authorityGuid)
+      if a.scope == scopeNone:
+        a = ambient(row, cfg.authorityName, cfg.authorityGuid)
       if a.scope == scopeNone or a.text.len == 0: continue
+      let chosen = if row.kind == "party": partyResponder else: sayResponder
+      let answering = chosen == name
+      # An ambient line is handled by the one responder only; a group
+      # request is handled everywhere but answered by that responder.
+      if a.scope == scopeAmbient and not answering:
+        if chosen.len == 0:
+          logLine(dir, %*{"at": epochTime(), "seat": name, "origin": row.kind,
+            "scope": $a.scope, "sequence": row.sequence,
+            "skipped": "no live seat shares the authority's party or view"})
+        continue
       handle(cfg, seat, obs, row.kind, row.senderName, row.senderGuid, a.text, a.scope,
-        jobKey(seatGuid, episode, row.sequence, row.kind), seen)
+        jobKey(seatGuid, episode, row.sequence, row.kind), seen,
+        speaks = a.scope != scopeGroup or answering)
     let claim = claimOperator(dir / "jobs")
     if claim.len > 0:
       for line in readFile(claim).splitLines:
@@ -480,11 +699,17 @@ proc enqueueOperator(cfg: Config) =
     f.close()
     echo "queued operator request for ", name.strip
 
+proc defaultConfig*(homeDir: string): Config =
+  ## Broker defaults: Lightning through Switchyard `local`, Kev direct.
+  Config(homeDir: homeDir,
+    authorityName: "Murist", authorityGuid: "1000007", baseUrl: DefaultBaseUrl,
+    model: DefaultModel, apiKey: "unused", routeBaseUrl: DefaultRouteBaseUrl,
+    routeModel: DefaultRouteModel, routeApiKey: "none", timeoutMs: RoutedTimeoutMs,
+    poll: DefaultPoll)
+
 proc parseConfig(): Config =
   ## Command line; defaults follow the existing local serving profile.
-  result = Config(homeDir: getCurrentDir() / "local_data" / "home-army",
-    authorityName: "Murist", authorityGuid: "1000007", baseUrl: DefaultBaseUrl,
-    model: DefaultModel, apiKey: "unused", timeoutMs: RoutedTimeoutMs, poll: DefaultPoll)
+  result = defaultConfig(getCurrentDir() / "local_data" / "home-army")
   for kind, key, value in getopt():
     if kind in {cmdArgument, cmdEnd} or key.len == 0: continue
     case key
@@ -494,6 +719,8 @@ proc parseConfig(): Config =
     of "authority-guid": result.authorityGuid = value
     of "base-url": result.baseUrl = value
     of "model": result.model = value
+    of "route-base-url": result.routeBaseUrl = value.strip(leading = false, chars = {'/'})
+    of "route-model": result.routeModel = value
     of "poll": result.poll = parseFloat(value)
     of "once": result.once = true
     of "to": result.operatorTo = value
@@ -508,7 +735,8 @@ proc main() =
     if cfg.operatorText.strip.len == 0: quit("--text is required with --to", 2)
     enqueueOperator(cfg)
     return
-  echo "bot_requests: watching ", cfg.homeDir, " model=", cfg.model, " via ", cfg.baseUrl
+  echo "bot_requests: watching ", cfg.homeDir, " model=", cfg.model, " via ", cfg.baseUrl,
+    " route=", (if cfg.routeModel.len > 0: cfg.routeModel & " via " & cfg.routeBaseUrl else: "lightning")
   modelClient = newCurly()
   defer: modelClient.close()
   var seats = initTable[string, SeatState]()

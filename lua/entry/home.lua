@@ -178,6 +178,9 @@ local fidget_at = nil
 local LEAD_RUN_YDS = 1.5
 local LEAD_STILL_YDS = 0.5
 local LEAD_STILL_SECONDS = 0.4
+-- Re-engage distance for a seat stopped at a moving leader's heels; the
+-- 2yd follow stop below it is the hysteresis band.
+local TRAIL_RESUME_YARDS = 4.0
 local last_lead = nil
 
 local AURA_FAMILIES = {
@@ -345,6 +348,15 @@ local function follow_leader(view, leader, reason, moving)
   elseif wow.nav_progress().state == "unavailable" then
     intent.route_profile = nil
     intent.navigation_mode = "local_steer"
+  end
+  -- Running straight at a runner settles the seat exactly on the edge of
+  -- its stop ball, so each turn or easing-off drops it inside and the pilot
+  -- releases forward: stop-go-stop at his heels. A seat already stopped in
+  -- the ball stays stopped until he is TRAIL_RESUME_YARDS clear, then runs
+  -- a gap that absorbs the next turn instead of chattering on the edge.
+  if moving and d2 and d2 <= TRAIL_RESUME_YARDS and
+      tostring(wow.nav_progress().state or "") == "reached" then
+    intent.stop_distance = TRAIL_RESUME_YARDS
   end
   return intent
 end
@@ -2069,6 +2081,24 @@ local function fight_on(view, leader)
   return false
 end
 
+-- Whether the party is already fighting this hostile, so the imp may join.
+-- A hostile that is merely selected must never be pet-pulled. Engaged means
+-- its target is the party's (combat flags on other units latch lazily, so
+-- this needs none), or it is in combat and is Murist's target, from either
+-- his visible unit row or his roster row.
+local function party_engaged(view, leader, target)
+  if not target then return false end
+  if (target.target_guid or 0) ~= 0 and
+      is_party_property(view, target.target_guid) then
+    return true
+  end
+  if not (target.combat_known and target.is_in_combat) then return false end
+  if leader and guid_equal(leader.target_guid, target.guid) then return true end
+  local row = party_member(view, MURIST)
+  return row ~= nil and row.target_guid_known == true and
+    guid_equal(row.target_guid, target.guid)
+end
+
 -- Step off the mob that is about to finish us. A hold at 20% is a corpse.
 local function survive_step(view)
   if view.is_dead or view.is_ghost then return nil end
@@ -2440,6 +2470,9 @@ function M.decide(view)
       or view.class_id == CLASS_MAGE and mage_action(view, target)
       or view.class_id == CLASS_ROGUE and rogue_action(view, target)
       or warlock_action(view, target)
+    if action and action.kind == "attack" and party_engaged(view, leader, target) then
+      action = life.with_pet(view, lstate, action)
+    end
     return finish(action, view, "escort", role, leader, target)
   end
 

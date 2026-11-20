@@ -1,7 +1,8 @@
 ## Request broker contracts: who is addressed, what may be chosen.
 
 import
-  std/[json, os, strutils, unittest],
+  std/[json, os, strutils, tables, times, unittest],
+  curly,
   ../bot_requests
 
 const
@@ -30,7 +31,7 @@ suite "addressing":
       let a = row("party", "@all summon your pets").address(seat, "Murist", Murist)
       check a.scope == scopeGroup and a.text == "summon your pets"
 
-  test "unaddressed party chat and ordinary phrases trigger nobody":
+  test "unprefixed party chat and ordinary phrases are not @-addressed":
     for text in ["Can you all hear me", "can you come here", "lol", "@Leg come"]:
       check row("party", text).address("Legia", "Murist", Murist).scope == scopeNone
     # A seat literally named Can is not woken by "Can you ...".
@@ -94,3 +95,239 @@ suite "operator requests":
     check readFile(claim) == "{\"key\":\"a\"}\n"
     check fileExists(jobs / "operator.jsonl")
     removeDir(jobs)
+
+suite "ambient conversation":
+  test "Advisor protocol telemetry never becomes conversation":
+    for text in ["<SA> loaded rev=60", "<SA> inv 1/1 25:1", "<SA> invd 1/1 +25:1",
+        "<SA> admin tele_party_to_murist", "<SA> err unavailable"]:
+      check row("say", text).ambient("Murist", Murist).scope == scopeNone
+
+  test "an unprefixed owner line in party or say is ambient":
+    for kind in ["party", "say"]:
+      let a = row(kind, "hello there").ambient("Murist", Murist)
+      check a.scope == scopeAmbient and a.text == "hello there"
+
+  test "whispers, raid, @-addressed lines and other senders are never ambient":
+    check row("whisper", "hello").ambient("Murist", Murist).scope == scopeNone
+    check row("raid", "hello").ambient("Murist", Murist).scope == scopeNone
+    check row("party", "@Vulcan hello").ambient("Murist", Murist).scope == scopeNone
+    check row("party", "   ").ambient("Murist", Murist).scope == scopeNone
+    check row("say", "hello", guid = "1000012", name = "Kaisel").ambient(
+      "Murist", Murist).scope == scopeNone
+    check row("say", "hello", guid = "1000012", name = "Murist").ambient(
+      "Murist", Murist).scope == scopeNone
+
+  test "one responder: the first live seat sharing the owner's party":
+    let inParty = %*{"party": {"members": [{"guid": Murist, "name": "Murist"}]}}
+    let numeric = %*{"party": {"members": [{"guid": 1000007, "name": "Murist"}]}}
+    let onlyNear = %*{"party": {"members": []}, "units": [{"guid": Murist}]}
+    let elsewhere = %*{"party": {"members": [{"guid": "1000012"}]}, "units": []}
+    let live = @[("Zed", inParty), ("Vulcan", numeric), ("Adam", onlyNear),
+      ("Aaron", elsewhere)]
+    check responder(live, "party", Murist) == "Vulcan"
+    check responder(live, "say", Murist) == "Adam"
+    check responder(@[("Aaron", elsewhere)], "say", Murist) == ""
+
+suite "grounding":
+  test "the state line reports the party and never assumes solo leveling":
+    let obs = %*{"level": 5, "party": {"members": [{"guid": Murist, "name": "Murist"},
+      {"guid": "2005", "name": "Vulcan"}]}}
+    let idle = stateLine(obs, "")
+    check "leveling" notin idle and "on its own" notin idle
+    check "party: Murist Vulcan" in idle and "task from the player: none" in idle
+    check "task from the player: follow_me" in stateLine(obs, "follow_me")
+    check "party: none" in stateLine(%*{"level": 5}, "")
+
+suite "route model":
+  test "kev's keyed choice is accepted with its probabilities":
+    let r = parseRoute("""{"model":"kev-4b","answers":{"intent":{"type":"choice",
+      "choice":"chatter","confidence":0.9,"probabilities":{"question":0.05,
+      "action":0.05,"chatter":0.9}}},"usage":{"input_tokens":50,"output_tokens":1}}""")
+    check r.intent == "chatter" and r.confidence == 0.9 and r.actionProbability == 0.05
+
+  test "malformed kev answers are refused, never defaulted":
+    for body in [
+        """{"answers":{"intent":{"type":"choice","choice":"dance"}}}""",
+        """{"answers":{}}""",
+        """{"error":{"message":"no model"}}""",
+        """{"answers":{"intent":{"type":"choice","choice":"action","confidence":2}}}""",
+        """{"answers":{"intent":{"type":"choice","choice":"action",
+          "probabilities":{"action":0.5,"chatter":0.2}}}}"""]:
+      expect ValueError:
+        discard parseRoute(body)
+
+  test "the route request is a System One keyed choice, not a chat completion":
+    let body = routeBody("kev-4b", "Legia", "warlock", "ambient", "level 5", "hello")
+    check body{"messages"}.isNil and body{"model"}.getStr == "kev-4b"
+    let q = body{"questions"}{"intent"}
+    check q{"type"}.getStr == "choice"
+    for key in ["question", "action", "chatter"]: check q{"criteria"}.hasKey(key)
+    check "not to Legia by name" in body{"state"}.getStr
+
+type
+  Stub = object
+    routes, decisions, replies: int
+
+var stub: Stub
+
+proc fakePost(url, apiKey, body: string; timeoutMs: int): Response =
+  ## Synthetic Kev/Lightning: routes by keyword, offers come_here when asked.
+  result.code = 200
+  let req = parseJson(body)
+  if url.endsWith("/systemone"):
+    inc stub.routes
+    let state = req{"state"}.getStr
+    let message = state[state.find("Message: ") + 9 ..^ 1]
+    let intent = if "come" in message or "follow" in message: "action"
+      elif "level" in message: "question" else: "chatter"
+    var probs = %*{"question": 0.0, "action": 0.0, "chatter": 0.0}
+    probs[intent] = %1.0
+    result.body = $(%*{"model": "kev-4b", "answers": {"intent": {"type": "choice",
+      "choice": intent, "confidence": 0.95, "probabilities": probs}},
+      "usage": {"input_tokens": 40, "output_tokens": 1}})
+  elif not req{"response_format"}.isNil:
+    inc stub.decisions
+    let keys = $req{"response_format"}{"json_schema"}{"schema"}{"properties"}{"choice"}{"enum"}
+    let choice = if "come_here" in keys: "come_here" else: "none"
+    result.body = $(%*{"model": "lightning", "choices": [{"finish_reason": "stop",
+      "message": {"content": $(%*{"intent": "action", "choice": choice})}}]})
+  else:
+    inc stub.replies
+    result.body = $(%*{"model": "lightning", "choices": [{"finish_reason": "stop",
+      "message": {"content": "Hey Murist, good to see you."}}]})
+
+proc writeSeat(home, name: string; live, inParty: bool; rows: JsonNode;
+    stale = false) =
+  ## A synthetic seat directory: launcher pid and its own observation.
+  let dir = home / name
+  createDir(dir / "observer")
+  writeFile(dir / "launcher.pid", if live: $getCurrentProcessId() else: "999999999")
+  var last = 0
+  for r in rows: last = max(last, r{"sequence"}.getInt)
+  let obs = %*{"episode_id": "episode-1", "player_guid": "20" & $name.len,
+    "class_id": 9, "level": 5, "xp": 10, "next_level_xp": 400, "copper": 20,
+    "known_spells": [], "active_pet_guid": "0", "inventory_items": [],
+    "location": {"x": 1, "y": 2, "z": 3, "map_id": 0},
+    "units": (if inParty: %*[{"guid": Murist, "location": {"x": 4, "y": 5, "z": 3,
+      "map_id": 0}}] else: %*[]),
+    "party": {"members": (if inParty: %*[{"guid": Murist, "name": "Murist"}] else: %*[])},
+    "chat_messages_last_sequence": last, "chat_messages": rows}
+  let path = dir / "observer" / "observation.json"
+  writeFile(path, $obs)
+  # Distinct mtimes per write; a stale seat's observation is old.
+  let shift = if stale: -600.0 else: float(last) / 1000.0
+  setLastModificationTime(path, fromUnixFloat(epochTime() + shift))
+
+proc chat(sequence: int; kind, text: string; guid = Murist; name = "Murist"): JsonNode =
+  ## One synthetic chat row.
+  %*{"sequence": sequence, "kind": kind, "sender_guid": guid, "sender_name": name,
+    "text": text}
+
+proc jobsOf(home, name: string): seq[JsonNode] =
+  ## Every job handed to a seat: its one-slot inbox, then its queue.
+  let jobs = home / name / "jobs"
+  if fileExists(jobs / "inbox.json"): result.add parseFile(jobs / "inbox.json")
+  if fileExists(jobs / "queue.jsonl"):
+    for line in lines(jobs / "queue.jsonl"):
+      if line.strip.len > 0: result.add parseJson(line)
+
+suite "broker tick":
+  let home = getTempDir() / "test_bot_requests_home"
+  let main = ["Legia", "Vulcan", "Zed"]
+
+  proc everySeat(rows: JsonNode) =
+    ## Main seats in the owner's party, plus an inactive, a stale and an
+    ## unrelated live seat that all heard the same lines.
+    for name in main: writeSeat(home, name, true, true, rows)
+    writeSeat(home, "Aaron", false, true, rows)
+    writeSeat(home, "Abel", true, true, rows, stale = true)
+    writeSeat(home, "Adam", true, false, rows)
+
+  proc clearJobs() =
+    ## Take every delivered job, as the seats would.
+    for name in ["Aaron", "Abel", "Adam", "Legia", "Vulcan", "Zed"]:
+      removeFile(home / name / "jobs" / "inbox.json")
+      removeFile(home / name / "jobs" / "queue.jsonl")
+
+  test "greeting, explicit routing, negatives and restart dedup":
+    removeDir(home)
+    postJson = fakePost
+    stub = Stub()
+    var cfg = defaultConfig(home)
+    cfg.seats = @["Aaron", "Abel", "Adam", "Legia", "Vulcan", "Zed", "Ghost"]
+    var seats = initTable[string, SeatState]()
+
+    # History present at startup is never replayed.
+    var rows = %*[chat(5, "party", "hello from before")]
+    everySeat(rows)
+    tick(cfg, seats)
+    check stub == Stub()
+
+    # One unprefixed greeting gets one reply from the first live party seat;
+    # other users, private whispers to others and raid lines get nothing.
+    rows.add chat(6, "party", "hello everyone")
+    rows.add chat(7, "say", "hi all", guid = "1000012", name = "Kaisel")
+    rows.add chat(8, "whisper", "hello", guid = "1000012", name = "Kaisel")
+    rows.add chat(9, "raid", "hello raid")
+    everySeat(rows)
+    tick(cfg, seats)
+    check stub.routes == 1 and stub.replies == 1 and stub.decisions == 0
+    let greeting = jobsOf(home, "Legia")
+    check greeting.len == 1
+    check greeting[0]{"intent"}.getStr == "chatter"
+    check greeting[0]{"choice"}.getStr == "none"
+    check greeting[0]{"origin"}.getStr == "party"
+    check greeting[0]{"reply"}.getStr == "Hey Murist, good to see you."
+    for name in ["Aaron", "Abel", "Adam", "Vulcan", "Zed"]:
+      check jobsOf(home, name).len == 0
+    clearJobs()
+
+    # Unchanged observations and a restarted broker do not answer again.
+    tick(cfg, seats)
+    var restarted = initTable[string, SeatState]()
+    everySeat(rows)
+    tick(cfg, restarted)
+    check stub.routes == 1 and stub.replies == 1
+
+    # A whisper still reaches its own seat and a question never becomes a
+    # job; a natural owner "follow me" in party has @Seat authority: Kev
+    # routes it to action, Lightning picks an offered key, and exactly the
+    # one responder gets the job.
+    rows.add chat(10, "whisper", "what level are you")
+    rows.add chat(11, "party", "follow me")
+    for name in main:
+      var own = rows.copy
+      if name != "Vulcan": own.elems.delete(own.len - 2)
+      writeSeat(home, name, true, true, own)
+    tick(cfg, restarted)
+    let answer = jobsOf(home, "Vulcan")
+    check answer.len == 1
+    check answer[0]{"intent"}.getStr == "question"
+    check answer[0]{"choice"}.getStr == "none"
+    check answer[0]{"origin"}.getStr == "whisper"
+    check answer[0]{"actor"}.getStr == "Murist"
+    check stub.decisions == 1
+    let follow = jobsOf(home, "Legia")
+    check follow.len == 1
+    check follow[0]{"intent"}.getStr == "action"
+    check follow[0]{"choice"}.getStr == "come_here"
+    check follow[0]{"origin"}.getStr == "party"
+    check follow[0]{"actor"}.getStr == "Murist"
+    check follow[0]{"actor_guid"}.getStr == Murist
+    check follow[0]{"x"}.getFloat == 4.0
+    check jobsOf(home, "Zed").len == 0
+    for name in ["Aaron", "Abel", "Adam"]: check jobsOf(home, name).len == 0
+    clearJobs()
+
+    # @party: the action reaches every main seat; conversation is answered once.
+    rows.add chat(12, "party", "@party come here")
+    rows.add chat(13, "party", "@party hello friends")
+    everySeat(rows)
+    tick(cfg, restarted)
+    for name in main:
+      let jobs = jobsOf(home, name)
+      check jobs.len == (if name == "Legia": 2 else: 1)
+      check jobs[0]{"choice"}.getStr == "come_here"
+    check jobsOf(home, "Legia")[1]{"intent"}.getStr == "chatter"
+    check jobsOf(home, "Legia")[1]{"reply"}.getStr.len > 0
+    removeDir(home)

@@ -355,6 +355,53 @@ v.simulation_time = 100.2
 r = home.decide(v)
 check(idle_ok(r), "a standing Murist inside 8yd still holds")
 
+-- Trailing a runner: a seat that ran into the 2yd ball at his heels stays
+-- stopped until he is clear of the resume band, instead of re-pressing
+-- forward the next frame and stopping again (live 2026-11-20: ~30 stop-go
+-- edges per seat per two minutes of follow, 41 of 106 re-pressed in <=0.2s).
+do
+  local nav_state = "idle"
+  local saved_nav = wow.nav_progress
+  wow.nav_progress = function() return { state = nav_state } end
+  local function trail_step(x, t)
+    v.units = { leader_unit(x, false) }
+    v.simulation_time = t
+    return home.decide(v)
+  end
+  home.reset()
+  v = frame()
+  trail_step(6, 100)
+  r = trail_step(7.5, 100.2)
+  check(r.reason == "follow_murist" and r.stop_distance == 2.0,
+    "a running seat trails a moving Murist with the 2yd stop")
+  nav_state = "reached"
+  r = trail_step(1.5, 100.4)
+  check(r.kind == "navigate" and r.reason == "follow_murist" and
+      r.stop_distance > 1.5,
+    "a seat in the ball at a runner's heels stays stopped")
+  r = trail_step(3.0, 100.6)
+  check(r.kind == "navigate" and r.reason == "follow_murist" and
+      r.stop_distance > 3.0,
+    "a stopped trailing seat does not re-press forward at 3yd")
+  r = trail_step(5.0, 100.8)
+  check(r.kind == "navigate" and r.reason == "follow_murist" and
+      r.stop_distance == 2.0,
+    "a stopped trailing seat resumes once Murist is clear of the band")
+  nav_state = "local_steer"
+  r = trail_step(3.0, 101.0)
+  check(r.kind == "navigate" and r.stop_distance == 2.0,
+    "a seat already running keeps the 2yd stop; no early halt at 3yd")
+  -- A standing Murist is formation, not trail: the band never parks a seat
+  -- that is still outside formation range.
+  nav_state = "reached"
+  home.reset()
+  v = frame()
+  r = trail_step(3.0, 100)
+  r = trail_step(3.0, 100.2)
+  check(idle_ok(r), "a stopped seat next to a standing Murist holds formation")
+  wow.nav_progress = saved_nav
+end
+
 home.reset()
 v = frame()
 v.units = {}
@@ -1858,3 +1905,108 @@ end
 check(escaped and escaped.navigation_mode == "local_steer",
   "a wedged class-quest walk escapes with a local leg")
 print("test_home progress unstick: " .. checks .. " checks passed")
+
+-- Party pet combat: the seat's own living imp joins a fight the party is
+-- already in, and never pulls a hostile that is merely selected.
+local IMP = 0xF1400000000A1234
+local function with_imp(f, summoner, dead)
+  f.pet = { guid_known = true, guid = IMP, dead = dead or false,
+    target_guid_known = true, target_guid = 0 }
+  f.units[#f.units + 1] = {
+    guid = IMP, name = "Imp", entry = 416, summoner_guid = summoner or 200,
+    player_can_attack = false, death_known = true, is_dead = dead or false,
+    health_known = true, health = 100, max_health = 100, distance = 2,
+    location = { map_id = 0, position = { x = 1, y = 0, z = 0 } },
+  }
+  return f
+end
+local function fighting(guid, target_guid)
+  local u = hostile(guid, target_guid)
+  u.combat_known, u.is_in_combat = true, true
+  return u
+end
+
+home.reset()
+v = with_imp(frame(9))
+v.units[1] = leader_unit(3, true)
+v.units[1].target_guid_known = nil
+v.units[1].target_guid = 300
+v.units[#v.units + 1] = fighting(300, 0)
+v.selected_target_guid = 300
+r = home.decide(v)
+check(r.kind == "attack" and r.guid == 300 and r.pet_attack == true,
+  "imp joins the in-combat hostile Murist is targeting")
+
+home.reset()
+v = with_imp(frame(9))
+v.units[#v.units + 1] = hostile(301, 100)
+r = home.decide(v)
+check(r.kind == "attack" and r.guid == 301 and r.pet_attack == true,
+  "imp joins a hostile hitting Murist before any combat flag latches")
+
+home.reset()
+v = with_imp(frame(9))
+v.party.members[3] = member(400, "Beru", 60, 10)
+v.units[#v.units + 1] = hostile(302, 400)
+r = home.decide(v)
+check(r.kind == "attack" and r.guid == 302 and r.pet_attack == true,
+  "imp joins a hostile hitting Beru despite lazy combat flags")
+
+home.reset()
+v = with_imp(frame(9))
+v.party.members[2].target_guid_known = true
+v.party.members[2].target_guid = 303
+v.units[1] = leader_unit(3, true)
+v.units[#v.units + 1] = fighting(303, 0)
+v.selected_target_guid = 303
+r = home.decide(v)
+check(r.kind == "attack" and r.guid == 303 and r.pet_attack == true,
+  "Murist's roster target names the engaged hostile")
+
+home.reset()
+v = frame(9)
+v.pet = { guid_known = true, guid = 0 }
+v.units[#v.units + 1] = hostile(301, 100)
+r = home.decide(v)
+check(r.kind == "attack" and r.guid == 301 and r.pet_attack == nil,
+  "a petless warlock still swings without a pet order")
+
+home.reset()
+v = with_imp(frame(9), 200, true)
+v.units[#v.units + 1] = hostile(301, 100)
+r = home.decide(v)
+check(r.kind == "attack" and r.pet_attack == nil, "a dead imp is never ordered")
+
+home.reset()
+v = with_imp(frame(9), 999)
+v.units[#v.units + 1] = hostile(301, 100)
+r = home.decide(v)
+check(r.kind == "attack" and r.pet_attack == nil,
+  "a pet link naming someone else's summon is never ordered")
+
+home.reset()
+v = with_imp(frame(9))
+v.units[#v.units + 1] = hostile(304)
+v.selected_target_guid = 304
+r = home.decide(v)
+check(r.kind == "attack" and r.guid == 304 and r.pet_attack == nil,
+  "an unengaged cursor target is never pet-pulled")
+
+home.reset()
+v = with_imp(frame(9))
+v.units[1] = leader_unit(3, true, 999)
+v.units[#v.units + 1] = fighting(305, 0)
+v.selected_target_guid = 305
+r = home.decide(v)
+check(r.kind == "attack" and r.guid == 305 and r.pet_attack == nil,
+  "an in-combat hostile that is neither on the party nor Murist's is not pet-pulled")
+
+home.reset()
+v = with_imp(frame(9))
+r = home.decide(v)
+check(idle_ok(r) and r.pet_attack == nil, "idle formation with an imp out issues no pet order")
+v.units[1] = leader_unit(12, false)
+r = home.decide(v)
+check(r.kind == "navigate" and r.reason == "follow_murist" and r.pet_attack == nil,
+  "following Murist with an imp out issues no pet order")
+print("test_home party pet: " .. checks .. " checks passed")
