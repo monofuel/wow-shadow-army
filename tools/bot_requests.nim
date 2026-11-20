@@ -26,7 +26,7 @@
 ## labelled origin=operator end to end and never presented as game chat.
 
 import
-  std/[json, os, parseopt, sequtils, sets, strutils, tables, times],
+  std/[json, os, osproc, parseopt, sequtils, sets, streams, strutils, tables, times],
   curly, webby
 
 type
@@ -728,6 +728,37 @@ proc parseConfig(): Config =
     else:
       quit("unknown option: " & key, 2)
 
+proc serviceArtifactRetention(homeDir: string; child: var Process;
+    lastStarted: var float) =
+  ## Maintain private output off tick in one finite, low-priority child.
+  ## Never delay model/game work on a retention scan or start another daemon.
+  let statusPath = homeDir / "artifact-retention-status.json"
+  try:
+    if child != nil and not child.running:
+      let
+        output = child.outputStream.readAll().strip()
+        code = child.waitForExit()
+      child.close()
+      child = nil
+      writeFile(statusPath, $(%*{"observedAt": epochTime(), "exit": code,
+        "result": output.substr(0, 4095)}))
+    if child == nil and epochTime() - lastStarted >= 600:
+      let script = parentDir(parentDir(expandFilename(homeDir))) /
+        "tools/private_artifact_retention.sh"
+      if not fileExists(script): return
+      lastStarted = epochTime()
+      child = startProcess("nice", args = @["-n", "10", "ionice", "-c", "2",
+        "-n", "7", "timeout", "--kill-after=5s", "90s", "bash", script,
+        "--apply"], options = {poUsePath, poStdErrToStdOut})
+  except CatchableError as error:
+    # A maintenance failure must leave the actual request broker available.
+    lastStarted = epochTime()
+    try:
+      writeFile(statusPath, $(%*{"observedAt": lastStarted,
+        "error": error.msg.substr(0, 4095)}))
+    except CatchableError:
+      discard # A full disk must not turn housekeeping into a chat outage.
+
 proc main() =
   ## Enqueue an operator request, or run the broker loop.
   let cfg = parseConfig()
@@ -740,9 +771,13 @@ proc main() =
   modelClient = newCurly()
   defer: modelClient.close()
   var seats = initTable[string, SeatState]()
+  var
+    retention: Process
+    retentionStarted = 0.0
   while true:
     tick(cfg, seats)
     if cfg.once: break
+    serviceArtifactRetention(cfg.homeDir, retention, retentionStarted)
     sleep(int(cfg.poll * 1000))
 
 when isMainModule:
