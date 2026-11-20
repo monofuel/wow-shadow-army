@@ -355,13 +355,75 @@ local function objective_class(t)
   return nil
 end
 
+-- Scoped so the helpers add no main-chunk locals (Lua caps those at 200).
+local area_objective
+do
+-- Typed identity a generated guide objective carries (gen_objective_areas
+-- --objective-ids): "entry" for a creature, "object_entry" for a game
+-- object, "item_id" for an item. Returns nil when it carries none, false
+-- when what it carries is malformed or disagrees with its kind.
+local GUIDE_ID_KINDS = {
+  entry = { mob = true },
+  object_entry = { object = true },
+  item_id = { item = true, object = true },
+}
+local function guide_identity(g)
+  local field, id = nil, nil
+  for name in pairs(GUIDE_ID_KINDS) do
+    if g[name] ~= nil then
+      if field then return false end
+      field, id = name, g[name]
+    end
+  end
+  if not field then return nil end
+  if type(id) ~= "number" or id <= 0 or id ~= math.floor(id) or
+      not GUIDE_ID_KINDS[field][g.kind] then
+    return false
+  end
+  return field, id
+end
+
+-- Identity pairing: the guide objective carrying the live row's own typed
+-- id. Game-object credit rows never pair (as in class pairing). A live id
+-- shared by two rows, or matched by zero or two guide objectives, is unknown.
+local function area_objective_by_id(rows, index, quest)
+  local row = rows[index]
+  local field, id
+  if objective_class(row) == "kill" then
+    field, id = "entry", row.entry
+  else
+    field, id = "item_id", row.item_id
+  end
+  for i = 1, #rows do
+    if i ~= index and rows[i].quest_id == row.quest_id and
+        objective_class(rows[i]) == objective_class(row) and
+        ((field == "entry" and rows[i].entry == id) or
+         (field == "item_id" and rows[i].item_id == id)) then
+      return nil
+    end
+  end
+  local guide, position = nil, nil
+  for g = 1, #quest.objectives do
+    local gField, gId = guide_identity(quest.objectives[g])
+    if gField == field and gId == id then
+      if guide then return nil end
+      guide, position = quest.objectives[g], g
+    end
+  end
+  if not guide then return nil end
+  return guide, quest, position
+end
+
 -- The guide objective behind live objective row `index`, its quest-local
 -- guide position, and the quest, or nil when the pairing is not certain.
 -- Live row order is not the definition order (a credit update can arrive
--- before the definition), so rows pair by class, never by position: only
--- the sole live row of its class in its quest pairs with the sole guide
--- objective of that class. Equal counts alone prove nothing.
-local function area_objective(view, index)
+-- before the definition), so rows never pair by position. When every guide
+-- objective of the quest carries its typed id, the row pairs by its own
+-- id. A guide carrying ids on some objectives only, or a malformed id,
+-- pairs nothing. A guide without ids pairs by class: only the sole live row
+-- of its class in its quest pairs with the sole guide objective of that
+-- class. Equal counts alone prove nothing.
+function area_objective(view, index)
   if not OBJECTIVE_TRAVEL then return nil end
   local data = objective_area_data()
   local rows = view.quest_objectives or {}
@@ -370,6 +432,16 @@ local function area_objective(view, index)
   if not quest then return nil end
   local class = objective_class(row)
   if not class then return nil end
+  local typed, untyped = 0, 0
+  for g = 1, #quest.objectives do
+    local field = guide_identity(quest.objectives[g])
+    if field == false then return nil end
+    if field then typed = typed + 1 else untyped = untyped + 1 end
+  end
+  if typed > 0 then
+    if untyped > 0 then return nil end
+    return area_objective_by_id(rows, index, quest)
+  end
   for i = 1, #rows do
     if i ~= index and rows[i].quest_id == row.quest_id and
         objective_class(rows[i]) == class then
@@ -385,6 +457,7 @@ local function area_objective(view, index)
   end
   if not guide then return nil end
   return guide, quest, position
+end
 end
 
 -- Field work we can honestly travel for: a kill row, or an item row whose

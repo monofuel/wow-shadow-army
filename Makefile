@@ -322,7 +322,7 @@ traverse-lint:
 # even where no unit suite imports it yet.
 NIM_CHECK_FILES = system/system_server.nim \
 	tools/fair_play_audit.nim tools/party_promote.nim \
-	tools/lua_debug_admin.nim \
+	tools/lua_debug_admin.nim tools/gen_objective_areas.nim \
 	src/conductor.nim
 
 .PHONY: test-smoke test-smoke-lua test-smoke-nim test-smoke-nim-soft test-smoke-sh
