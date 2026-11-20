@@ -40,7 +40,7 @@ jobs:
   nim-tests:
     runs-on: monolab-builder
     env:
-      FORK_PIN: 5b4c879bd871193d018281bab9b3df391b95dd05
+      FORK_PIN: 8aa2a6c66cefcad441f1b5c490cb2fe6861e4f65
       SCRIPTORIUM_PIN: 565d6a84742e21f47374056db7be67589af72982
     steps:
       - uses: actions/checkout@v3
@@ -80,7 +80,7 @@ jobs:
             "https://github.com/monofuel/scriptorium.git" \
             "$SCRIPTORIUM_PIN" master
       # treeform/setup-nim-action ships nim + nimby directly (Racha pattern);
-      # 2.2.4 pinned to match local dev.
+      # Tooling CI stays on 2.2.4; the native player follows its Dockerfile pin.
       - uses: treeform/setup-nim-action@v6
         with:
           nim-version: '2.2.4'
