@@ -426,10 +426,11 @@ end
 -- walking at the leader. nil covers every road bail (no data, a hole in the
 -- bake, a road that would not help) AND the last leg, where the next route
 -- point IS the leader and the plain rejoin intent already says it better.
-function road_waypoint(mine, goal, map_id)
+-- `opts` goes to road_route.route unchanged; nil is the router's defaults.
+function road_waypoint(mine, goal, map_id, opts)
   local graph = road_graph(map_id)
   if not graph then return nil end
-  local pts, meta = road_route.route(graph, mine, goal)
+  local pts, meta = road_route.route(graph, mine, goal, opts)
   if meta.straight then return nil end
   local x, y, z, i = road_route.nextPoint(pts, mine.x, mine.y,
     ROAD_LOOKAHEAD_YARDS)
@@ -2490,7 +2491,11 @@ function M.decide(view)
     end
     local mine, goal = view_point(view), { x = intent.x, y = intent.y }
     if mine and distance2d(mine, goal) > ROAD_MIN_YARDS then
-      local wp = road_waypoint(mine, goal, intent.map_id)
+      -- A tank with a known broken weapon fights poorly, so its repair walk
+      -- weighs off-road yards double and accepts a longer known road.
+      local wp = road_waypoint(mine, goal, intent.map_id,
+        role == "tank" and life.broken_main_hand(view) and
+        { penalty = 2 * road_route.offRoadPenalty } or nil)
       if wp then
         intent.x, intent.y, intent.z = wp.x, wp.y, wp.z
         intent.stop_distance = ROAD_WAYPOINT_STOP
