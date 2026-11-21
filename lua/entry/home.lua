@@ -172,8 +172,12 @@ local chat_last_sent_at = nil
 local chat_pending = nil
 -- Class-tactic memory in one table (the main chunk sits at Lua's 200-local
 -- limit): the seat's own last wand press (WAND_REPRESS_SECONDS), its last
--- Battle Shout, and its own target-debuff requests per mob (see debuff_due).
-local tactic = { wand_at = nil, wand_guid = nil, shout_at = nil, debuffs = {} }
+-- Battle Shout, its own target-debuff requests per mob (see debuff_due), and
+-- its own Fear request, the Fear tries spent on each mob this fight and the
+-- escape leg a landed Fear started (see warlock_fear and fear_escape in
+-- decide).
+local tactic = { wand_at = nil, wand_guid = nil, shout_at = nil, debuffs = {},
+  fear = nil, fear_tries = {}, escape = nil }
 -- Vanilla AFK is ~5 min with no movement. Formation hold is silent.
 local FIDGET_SECONDS = 90.0
 local fidget_at = nil
@@ -191,6 +195,7 @@ local AURA_FAMILIES = {
   ["curse of agony"] = { 980, 1014, 6217, 11711, 11712, 11713 },
   ["corruption"] = { 172, 6222, 6223, 7648, 11671, 11672 },
   ["immolate"] = { 348, 707, 1094, 2941, 11665, 11667, 11668 },
+  ["fear"] = { 5782, 6213, 6215 },
   ["demon skin"] = { 687, 696 },
   ["demon armor"] = { 706, 1086, 11733, 11734, 11735 },
   ["battle shout"] = { 6673, 5242, 6192, 11549, 11550, 11551, 25289 },
@@ -2350,6 +2355,7 @@ function M.reset()
   equip_gave_up = false
   tactic.wand_at, tactic.wand_guid, tactic.shout_at = nil, nil, nil
   tactic.debuffs = {}
+  tactic.fear, tactic.fear_tries, tactic.escape = nil, {}, nil
   fidget_at = nil
   last_lead = nil
 end
@@ -2551,7 +2557,338 @@ function M.decide(view)
     return intent
   end
 
+  -- A mob under Fear: the aura is the only lasting truth. A mob fleeing at
+  -- low health on its own has no aura and is still worth killing.
+  local function feared(unit)
+    return unit ~= nil and aura_present(unit.active_aura_spell_ids, "fear")
+  end
+
+  -- A live hostile that is not known to be on this seat, a party member or
+  -- their pets, within pack_yards of the seat or of the mob to be feared. A
+  -- mob whose target or position is unknown counts. Critters do not.
+  local function unengaged_near(target, pack_yards)
+    local there = point(target)
+    for _, unit in ipairs(view.units or {}) do
+      if hostile(unit) and not guid_equal(unit.guid, target.guid) and
+          not (unit.creature_type_known and unit.creature_type == 8) and
+          not (unit.target_guid_known == true and
+            is_party_property(view, unit.target_guid)) then
+        local here = point(unit)
+        local apart = here and there and distance(here, there)
+        if not here or not there or (unit.distance or 0) <= pack_yards or
+            apart <= pack_yards then
+          return true
+        end
+      end
+    end
+    return false
+  end
+
+  -- Grouped, a seat can still be questing by itself. It is on its own only
+  -- when every other roster row is a member the roster reports offline
+  -- with no known position, or one placed somewhere known and far: on
+  -- another map, or more than alone_yards away on this one. A known
+  -- position outranks the offline bit, so an offline row placed near still
+  -- blocks. No party player or party pet may be visible nearer either way.
+  -- A row whose online bit is unknown is not offline, so it needs a far
+  -- position like an online one. A roster row without a position, a seat
+  -- without one, or a roster with no other row is not alone. Remote rows
+  -- are the server's party-stats position.
+  local function alone(alone_yards)
+    local party = view.party
+    if not party or party.in_group ~= true then return true end
+    local mine, map = view_point(view), view.location and view.location.map_id
+    if not mine or not map then return false end
+    local others = 0
+    for _, member in ipairs(party.members or {}) do
+      if not guid_equal(member.guid, view.player_guid) then
+        others = others + 1
+        local there = member_point(member)
+        if not (member.online_known == true and member.online == false and not there) then
+          if not there or not there.map_id then return false end
+          if there.map_id == map and (distance2d(mine, there) or 0) <= alone_yards then
+            return false
+          end
+        end
+      end
+    end
+    if others == 0 then return false end
+    for _, unit in ipairs(view.units or {}) do
+      local owner = (unit.summoner_guid or 0) ~= 0 and unit.summoner_guid or unit.guid
+      if not guid_equal(owner, view.player_guid) and party_member_by_guid(view, owner) and
+          (unit.distance or 0) <= alone_yards then
+        return false
+      end
+    end
+    return true
+  end
+
+  -- Fear, the warlock's answer to the mob that is about to finish it. It
+  -- runs ahead of survive_step, whose walk away from a melee mob keeps the
+  -- mob swinging at the seat's back and would cancel the 1.5s cast. Only a
+  -- warlock on its own (see alone) in combat whose reported health is under
+  -- FLEE_HP_PCT asks, for a live hostile whose current target is
+  -- authoritatively the seat, inside the spell's own range, in sight and
+  -- not already fleeing, and only with no unengaged mob near either of
+  -- them. An attacker the seat's own swing is not on is preferred.
+  --
+  -- The intent is attack with control=true, which only a host reporting
+  -- attack_control_supported carries: an older one starts a swing on the
+  -- mob and casts with the wand running. The pilot stops the seat's own
+  -- swing and wand and casts without starting a swing; those stops have to
+  -- be ready here, from the pilot's own verdicts, or the existing defense
+  -- stays. The seat's own pet has to be known absent or dead: a living pet
+  -- can attack a mob that is hitting its owner, under Follow too, and its
+  -- damage breaks the Fear. A request lasts press_seconds, or through the
+  -- Fear cast it started, and ends early when a gate above fails or a stop
+  -- it still needs is no longer ready. Every request that ends is one try
+  -- on its mob, landed or not, and its outcome is logged: a mob that keeps
+  -- coming back is feared at most max_tries times this fight, then the
+  -- existing defense stays. The request is kept after it ends, so the hold
+  -- and the escape still know which mob is feared.
+  local function warlock_fear()
+    if view.attack_control_supported ~= true then return nil end
+    if view.class_id ~= CLASS_WARLOCK then return nil end
+    local press_seconds, landing_seconds, max_tries = 4.0, 1.0, 3
+    local pack_yards, alone_yards = 25.0, 100.0
+    local casting = view.active_cast_spell_id or 0
+    if not view.in_combat and casting == 0 then
+      tactic.fear, tactic.fear_tries, tactic.escape = nil, {}, nil
+      return nil
+    end
+    local asked = tactic.fear
+    local function conclude(outcome)
+      local key = tostring(asked.guid)
+      asked.done, asked.outcome = true, outcome
+      if outcome == "landed" then asked.landed_at = now end
+      tactic.fear_tries[key] = (tactic.fear_tries[key] or 0) + 1
+      wow.log(string.format("warlock fear %s on %s (try %d of %d)", outcome, key,
+        tactic.fear_tries[key], max_tries))
+    end
+    local pet = view.pet
+    if type(pet) ~= "table" or pet.guid_known ~= true or
+        ((pet.guid or 0) ~= 0 and pet.dead ~= true) or not alone(alone_yards) then
+      if asked and not asked.done then conclude("gated") end
+      return nil
+    end
+    if asked and not asked.done then
+      local unit = visible_unit(view, asked.guid)
+      local ours = casting ~= 0 and aura_present({ casting }, "fear")
+      if ours then asked.cast_seen = true end
+      if feared(unit) then
+        conclude("landed")
+      elseif not asked.cast_seen and (((view.auto_attack_guid or 0) ~= 0 and
+            view.attack_stop_ready ~= true) or
+          ((view.auto_repeat_spell_id or 0) ~= 0 and
+            view.auto_repeat_stop_ready ~= true)) then
+        conclude("stop_not_ready")
+      elseif ours or (not asked.cast_seen and hostile(unit) and
+          (unit.distance or 1e9) <= asked.intent.stop_distance and
+          now - asked.at < press_seconds) then
+        return asked.intent
+      else
+        -- The aura can arrive a frame after the cast ends; the fleeing flag
+        -- inside that grace only acknowledges the landing.
+        asked.ended_at = asked.ended_at or now
+        if asked.cast_seen and unit and unit.is_fleeing == true and
+            now - asked.ended_at < landing_seconds then
+          conclude("landed")
+        elseif not asked.cast_seen or not hostile(unit) or
+            now - asked.ended_at >= landing_seconds then
+          conclude("missed")
+        else
+          return nil
+        end
+      end
+    end
+    if casting ~= 0 or (view.active_channel_spell_id or 0) ~= 0 then return nil end
+    -- Fear holds one target at a time: a second cast frees the first.
+    if asked and feared(visible_unit(view, asked.guid)) then return nil end
+    if not (view.health_known == true and (view.max_health or 0) > 0 and
+        self_health_pct(view) < FLEE_HP_PCT) then
+      return nil
+    end
+    local fear = pick_spell(view, { "Fear" })
+    if not fear or fear.readiness ~= "ready" or fear.range_known ~= true or
+        (fear.range_max or 0) <= 0 then
+      return nil
+    end
+    -- The seat's own running attacks have to be stoppable.
+    if (view.auto_attack_guid or 0) ~= 0 and view.attack_stop_ready ~= true then
+      return nil
+    end
+    if (view.auto_repeat_spell_id or 0) ~= 0 and view.auto_repeat_stop_ready ~= true then
+      return nil
+    end
+    local best, best_free = nil, false
+    for _, unit in ipairs(view.units or {}) do
+      local d = unit.distance
+      if hostile(unit) and unit.target_guid_known == true and
+          guid_equal(unit.target_guid, view.player_guid) and
+          unit.is_fleeing ~= true and not feared(unit) and
+          unit.line_of_sight_blocked ~= true and d and d <= fear.range_max and
+          (tactic.fear_tries[tostring(unit.guid)] or 0) < max_tries and
+          not (guid_equal(view.selected_target_guid, unit.guid) and
+            fear.in_range_known and fear.in_range == false) then
+        local free = not guid_equal(view.auto_attack_guid, unit.guid)
+        if not unengaged_near(unit, pack_yards) and
+            (not best or (free and not best_free) or
+              (free == best_free and d < best.distance)) then
+          best, best_free = unit, free
+        end
+      end
+    end
+    if not best then return nil end
+    local intent = { kind = "attack", guid = best.guid, spell = fear.spell_id,
+      stop_distance = fear.range_max, control = true, reason = "warlock_fear" }
+    tactic.fear = { guid = best.guid, at = now, intent = intent }
+    return intent
+  end
+
+  -- Damage can break Fear, a direct hit far more often than a periodic tick.
+  -- While a mob shows Fear, the stack's attack on it becomes a hold, and so
+  -- does any attack while the seat's own feared mob is out, unless its
+  -- target is a hostile already on the seat or its party: no fresh pull
+  -- starts behind the fear. survive_step runs first and still moves the seat.
+  local function fear_guard(intent)
+    if intent.kind ~= "attack" or view.class_id ~= CLASS_WARLOCK then return intent end
+    local hold = { kind = "hold", reason = "warlock_fear_hold" }
+    local target = visible_unit(view, intent.guid)
+    if feared(target) then return hold end
+    local ours = tactic.fear and visible_unit(view, tactic.fear.guid)
+    if hostile(ours) and feared(ours) and not (hostile(target) and
+        target.target_guid_known == true and
+        is_party_property(view, target.target_guid)) then
+      return hold
+    end
+    return intent
+  end
+
+  -- A landed Fear at low health is time to leave, not to stand beside the
+  -- feared mob: the seat walks one leg away from it while the Fear holds.
+  -- The leg's goal is chosen once, when the Fear lands, and kept however
+  -- the mob runs: the nearest generated turn-in of an accepted quest on
+  -- this map, when walking at it moves away from the mob (real height,
+  -- routed on safe ground), else a point escape_yards straight away from
+  -- the mob, steered locally like survive_step's step. Only a seat on its
+  -- own (see alone) with no other hostile on it or within flee range
+  -- starts one. The leg ends on arrival; when the Fear is gone, another
+  -- hostile reaches the seat, combat ends (the ordinary recovery and hub
+  -- walks take over) or escape_seconds pass; and when the seat stops
+  -- displacing or, on a routed leg, the navigator reports a failure at this
+  -- pose. A routed leg that fails falls back once to the local step; a
+  -- local step that fails ends the escape. After arrival or a blocked leg
+  -- the seat holds where it is while that Fear lasts in combat and nothing
+  -- else is on it, rather than roam into a fresh pull.
+  -- An ended leg is not rebuilt until another Fear lands.
+  local function fear_escape()
+    if view.class_id ~= CLASS_WARLOCK then return nil end
+    local escape_yards, escape_seconds, stall_seconds, stall_yards = 30.0, 25.0, 3.0, 2.0
+    local near_yards, alone_yards = 12.0, 100.0
+    local asked = tactic.fear
+    if not asked or asked.outcome ~= "landed" then return nil end
+    local leg = tactic.escape
+    if leg and leg.landed_at ~= asked.landed_at then leg = nil end
+    local mob = visible_unit(view, asked.guid)
+    local mine, map = view_point(view), view.location and view.location.map_id
+    local function away_point(from)
+      local there = point(mob)
+      if not there or not from then return nil end
+      local dx, dy = from.x - there.x, from.y - there.y
+      local mag = math.sqrt(dx * dx + dy * dy)
+      if mag < 0.5 then dx, dy, mag = 1, 0, 1 end
+      return { x = from.x + dx / mag * escape_yards, y = from.y + dy / mag * escape_yards,
+        z = from.z, stop = 2.0, routed = false, reason = "warlock_fear_escape" }
+    end
+    local function threatened()
+      for _, unit in ipairs(view.units or {}) do
+        if hostile(unit) and not guid_equal(unit.guid, asked.guid) and not feared(unit) then
+          local d = unit.combat_distance_known and unit.combat_distance or unit.distance or 1e9
+          if d <= near_yards or (unit.target_guid_known == true and
+              guid_equal(unit.target_guid, view.player_guid)) then
+            return true
+          end
+        end
+      end
+      return false
+    end
+    local function after()
+      if (leg.ended == "arrived" or leg.ended == "blocked") and view.in_combat and
+          feared(mob) and not threatened() then
+        return { kind = "hold", reason = "warlock_fear_hold" }
+      end
+      return nil
+    end
+    if leg and leg.ended then return after() end
+    local function stop(why)
+      leg.ended = why
+      wow.log(string.format("warlock fear escape %s ended: %s", leg.goal.reason, why))
+      return after()
+    end
+    if not leg then
+      if not view.in_combat or view.is_dead or view.is_ghost or not mine or not map or
+          not feared(mob) or not (view.health_known == true and
+            (view.max_health or 0) > 0 and self_health_pct(view) < FLEE_HP_PCT) or
+          threatened() or not alone(alone_yards) then
+        return nil
+      end
+      local goal = away_point(mine)
+      if not goal then return nil end
+      local hub = vendor_hub(view)
+      local there = point(mob)
+      if hub and hub[4] and ((hub[2] - mine.x) * (there.x - mine.x) +
+          (hub[3] - mine.y) * (there.y - mine.y)) < 0 then
+        goal = { x = hub[2], y = hub[3], z = hub[4], stop = VENDOR_HUB_ARRIVE,
+          routed = true, reason = "warlock_fear_escape_turnin" }
+      end
+      leg = { landed_at = asked.landed_at, goal = goal, since = now,
+        map_id = math.floor(map), anchor = { x = mine.x, y = mine.y }, anchor_at = now }
+      tactic.escape = leg
+      wow.log(string.format("warlock fear escape %s to %.1f,%.1f", goal.reason, goal.x, goal.y))
+    else
+      if view.is_dead or view.is_ghost then return stop("dead") end
+      if not view.in_combat then return stop("out_of_combat") end
+      if not feared(mob) then return stop("fear_ended") end
+      if threatened() then return stop("attacked") end
+      if now - leg.since >= escape_seconds then return stop("timeout") end
+      if not mine or not map or math.floor(map) ~= leg.map_id then return stop("left_map") end
+      if (distance2d(mine, leg.goal) or 0) <= leg.goal.stop then return stop("arrived") end
+      local nav = wow.nav_progress()
+      local failed = leg.issued and leg.goal.routed and
+        (nav.failed_here == true or nav.state == "unavailable")
+      if view.movement_allowed == false or view.rooted then
+        leg.anchor, leg.anchor_at = { x = mine.x, y = mine.y }, now
+      elseif (distance2d(mine, leg.anchor) or 0) >= stall_yards then
+        leg.anchor, leg.anchor_at = { x = mine.x, y = mine.y }, now
+      elseif now - leg.anchor_at >= stall_seconds then
+        failed = true
+      end
+      if failed then
+        local fallback = leg.goal.routed and away_point(mine)
+        if not fallback then return stop("blocked") end
+        wow.log(string.format("warlock fear escape %s blocked; local step to %.1f,%.1f",
+          leg.goal.reason, fallback.x, fallback.y))
+        leg.goal, leg.issued = fallback, false
+        leg.anchor, leg.anchor_at = { x = mine.x, y = mine.y }, now
+      end
+    end
+    leg.issued = true
+    local goal = leg.goal
+    local intent = { kind = "navigate", x = goal.x, y = goal.y, z = goal.z,
+      map_id = leg.map_id, stop_distance = goal.stop, reason = goal.reason }
+    if goal.routed then
+      intent.route_profile = "safe_ground"
+    else
+      intent.navigation_mode, intent.allow_jump = "local_steer", true
+    end
+    return intent
+  end
+
   local function solo_step(policy)
+    local fear = warlock_fear()
+    if fear then return fear end
+    local escape = fear_escape()
+    if escape then return escape end
     local flee = survive_step(view)
     if flee then return flee end
     if (view.active_cast_spell_id or 0) ~= 0 or
@@ -2600,6 +2937,7 @@ function M.decide(view)
         not life.fighting(view) and life.broken_main_hand(view) then
       intent = { kind = "hold", reason = "broken_weapon_no_fresh_pull" }
     end
+    intent = fear_guard(intent)
     local tactic_intent = class_tactic(intent)
     if tactic_intent then
       intent = life.with_pet(view, lstate, tactic_intent)
