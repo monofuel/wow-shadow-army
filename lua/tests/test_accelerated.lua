@@ -1629,4 +1629,25 @@ check(talkGreen.reason ~= "quest_hub",
   "an XP-bearing hunt nearby still outranks the talk-quest walk")
 grind.set_quests(false)
 
+-- The real projection can report location before the own-object vitals.
+-- No fresh pull, false full-health status, or purposeless roam fills that gap.
+do
+  grind.reset()
+  local unreported = view({ unit(9911, 4.0, 2) }, {
+    class_id = 9, action_buttons = {}, health_known = false, health = 0, max_health = 0,
+    powers = { 0 }, max_powers = { 0 },
+  })
+  clock = clock + 400.0
+  local waiting = grind.decide(unreported)
+  check(waiting.kind == "hold" and waiting.reason == "self_health_unknown",
+    "unreported self health waits without pulling or roaming")
+  check(waiting.status.health_pct == nil, "unreported self health is not published as 100")
+  unreported.health_known, unreported.health, unreported.max_health = true, 100, 100
+  unreported.powers, unreported.max_powers = { 100 }, { 100 }
+  clock = clock + 1.0
+  local reported = grind.decide(unreported)
+  check(reported.kind == "attack", "a reported full bar resumes the same VM immediately")
+  check(reported.status.health_pct == 100, "a reported full bar retains its truthful status")
+end
+
 print("test_accelerated: " .. passed .. " ok")

@@ -2234,12 +2234,16 @@ local function hub_step(view, pos)
   }
 end
 
+-- Self health counts only with health_known and a positive max_health, the
+-- SDK's own test; anything else is unreported, and health_pct's 100 for it
+-- is not a fact to publish or rest on.
 local function progress_status(view)
+  local reported = view.health_known == true and (view.max_health or 0) > 0
   return {
     level = view.level,
     xp = view.xp,
     next_level_xp = view.next_level_xp,
-    health_pct = math.floor(health_pct(view)),
+    health_pct = reported and math.floor(health_pct(view)) or nil,
     mana_pct = math.floor(mana_pct(view)),
   }
 end
@@ -2350,11 +2354,14 @@ function M.decide(view, policy)
   local health = health_pct(view)
   local mana = mana_pct(view)
   local engaged = engaged_unit(view)
+  local reported = view.health_known == true and (view.max_health or 0) > 0
 
   -- A wedged seat cannot grind, quest, or loot; nothing below matters until
-  -- it is displacing again.
+  -- it is displacing again. Waiting out unreported health out of combat is
+  -- standing still on purpose, like an open dialog.
   if QUESTS then
-    local busy = dialog_open(view) or view.chat_input_visible or lootGuid ~= nil
+    local busy = dialog_open(view) or view.chat_input_visible or lootGuid ~= nil or
+      (not reported and not view.in_combat)
     local unstick = unstick_step(view, pos, engaged, busy)
     if unstick then
       unstick.status = progress_status(view)
@@ -2549,7 +2556,11 @@ function M.decide(view, policy)
         status = progress_status(view),
       }
     end
-    target = pick_target(view, true, objectiveFirst)
+    -- health_pct reads an unreported bar as 100, which is not a rested one.
+    -- Out of combat no fresh pull starts on it; combat still picks its attacker.
+    if view.in_combat or reported then
+      target = pick_target(view, true, objectiveFirst)
+    end
   end
 
   -- A gray pull that pays nothing is not progress while an accepted quest
@@ -2638,6 +2649,14 @@ function M.decide(view, policy)
       reason = reason,
       status = progress_status(view),
     }
+  end
+
+  -- No walk makes our own health known; only the client's report does. Wait
+  -- for it in place: the first reported frame resumes the grind, and an
+  -- owner's request keeps its own idle and stall bounds meanwhile.
+  if not reported and not view.in_combat then
+    wow.set_status("self health unreported")
+    return { kind = "hold", reason = "self_health_unknown", status = progress_status(view) }
   end
 
   local tx, ty = roam_target(view, pos)
