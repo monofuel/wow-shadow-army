@@ -40,7 +40,7 @@ jobs:
   nim-tests:
     runs-on: monolab-builder
     env:
-      FORK_PIN: 4868a92d83fe128f36ccd19b1349fe259eb4e7a1
+      FORK_PIN: b58a3d0bc5788c714c7849ecf8079df0f440b4c9
       SCRIPTORIUM_PIN: 565d6a84742e21f47374056db7be67589af72982
     steps:
       - uses: actions/checkout@v3
