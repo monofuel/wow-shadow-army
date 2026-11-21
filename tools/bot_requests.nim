@@ -243,6 +243,29 @@ proc repairVendorUsable(obs, unit: JsonNode): bool =
     not here{"map_id"}.isNil and not there{"map_id"}.isNil and
     here.num("map_id") == there.num("map_id")
 
+proc seatStatus*(dir: string; now = epochTime()): JsonNode =
+  ## The seat's own Lua status file when it parses and was written inside the
+  ## live window, else nil. A status from before a restart or reconnect that
+  ## has not been rewritten since is never read as current.
+  let path = dir / "status" / "status.json"
+  if not fileExists(path): return nil
+  try:
+    let status = parseFile(path)
+    let at = status{"recorded_at_unix_seconds"}
+    if not at.isNil and at.kind in {JInt, JFloat} and
+        now - at.getFloat <= LiveObservationSeconds.float:
+      result = status
+  except CatchableError:
+    discard
+
+proc cataloguedRepairRoute(status: JsonNode): bool =
+  ## Whether the seat's Lua found no usable repairer in view but holds the
+  ## host's catalogued travel anchor for one. A travel hint only: the seat
+  ## still repairs only at an observed living, friendly, quoting provider.
+  ## Only the home entry, which runs the repair job, can vouch for it.
+  not status.isNil and status{"entry"}.getStr == "home" and
+    status{"bot"}{"repair"}{"route"}.getStr == "catalogued"
+
 proc questWork*(obs: JsonNode): bool =
   ## Whether the seat observes ordinary quest work it can act on: an accepted
   ## quest that has not failed, or a visible giver whose server marker offers
@@ -252,8 +275,10 @@ proc questWork*(obs: JsonNode): bool =
   for marker in obs{"quest_markers"}.getElems:
     if marker.num("status").int in QuestMarkerWork: return true
 
-proc menu*(obs: JsonNode; requesterVisible, jobActive: bool): seq[MenuItem] =
-  ## Actions this seat can perform now, from its own observation.
+proc menu*(obs: JsonNode; requesterVisible, jobActive: bool;
+    status: JsonNode = nil): seq[MenuItem] =
+  ## Actions this seat can perform now, from its own observation and, for a
+  ## repairer out of view, its own fresh Lua status.
   result.add ("hold_here", "stop and stay at the current spot until told to resume")
   if requesterVisible:
     result.add ("come_here", "walk over to the player who asked")
@@ -270,8 +295,11 @@ proc menu*(obs: JsonNode; requesterVisible, jobActive: bool): seq[MenuItem] =
   var repairVendor = false
   for unit in obs{"units"}.getElems:
     if obs.repairVendorUsable(unit): repairVendor = true
-  if damaged and repairVendor and obs{"equipped_durability_known"}.getBool:
-    result.add ("repair_gear", "visit the observed repair vendor and repair worn gear if the actual quote is affordable")
+  if damaged and obs{"equipped_durability_known"}.getBool:
+    if repairVendor:
+      result.add ("repair_gear", "visit the observed repair vendor and repair worn gear if the actual quote is affordable")
+    elif status.cataloguedRepairRoute:
+      result.add ("repair_gear", "walk to the known town repairer and repair worn gear if a living repairer there quotes an affordable price")
   if obs.questWork:
     result.add ("do_quests", "quest on its own, handing in whichever quests it can finish and taking up the ones offered next, until it runs out of reachable quest work or the request window ends; it cannot pick a named quest (the player says do quests, go quest)")
   if obs.num("copper") >= 100:
@@ -544,7 +572,7 @@ proc handle(cfg: Config; seat: var SeatState; obs: JsonNode; origin, actor,
   let jobs = seat.dir / "jobs"
   let requester = if actorGuid.len > 0: obs.unitByGuid(actorGuid) else: nil
   let active = readActive(seat.dir)
-  let offered = menu(obs, not requester.isNil, active.len > 0)
+  let offered = menu(obs, not requester.isNil, active.len > 0, seatStatus(seat.dir))
   let className = if obs.num("class_id") == 9: "warlock" else: "adventurer"
   let state = stateLine(obs, active)
   var event = %*{"at": epochTime(), "seat": seat.name, "key": key, "origin": origin,

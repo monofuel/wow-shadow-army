@@ -491,7 +491,25 @@ function M.repair_needed(view, broken_only)
   return false
 end
 
+--- True only when the worn main-hand item is authoritatively known broken.
+function M.broken_main_hand(view)
+  for _, i in ipairs(view.equipment_items or {}) do
+    if i.main_hand == true and i.durability_known == true and
+        i.max_durability_known == true and num(i.max_durability, 0) > 0 and
+        i.durability == 0 then return true end
+  end
+  return false
+end
+
 local REPAIR_SETTLE, REPAIR_WINDOW_GRACE, REPAIR_VISIT_LIMIT = 6, 10, 90
+-- A catalogued walk is bounded on its own: total time, driven time without
+-- the seat moving (a road leg may lead briefly away from the anchor), and a
+-- short look around on arrival. A gap between driven frames (a fight, a
+-- higher-priority leg) does not count as a stall; it still counts in total.
+local REPAIR_TRAVEL_LIMIT, REPAIR_STALL_SECONDS, REPAIR_PROGRESS_YARDS = 240, 30, 5
+local REPAIR_ARRIVAL_YARDS, REPAIR_DISCOVERY_GRACE, REPAIR_PAUSE_GAP = 12, 10, 2
+-- The visible-provider bound an explicit request always had, plus the walk.
+M.REPAIR_REQUEST_SECONDS = 120 + REPAIR_TRAVEL_LIMIT
 
 local function host_call(name)
   local fn = type(wow) == "table" and wow[name]
@@ -520,7 +538,7 @@ end
 -- repair is kept so its payment is reconciled instead of forgotten or paid
 -- twice; once its settle window has passed it is marked adopted.
 function M.request_repair(state, now)
-  state.repair_retry_at, state.repair_outcome = nil, nil
+  state.repair_retry_at, state.repair_outcome, state.repair_travel = nil, nil, nil
   local visit = state.repair_visit
   if visit and not visit.submitted then
     state.repair_visit = nil
@@ -535,6 +553,131 @@ local function worn_by_guid(view, guid)
   end
 end
 
+local function repair_service(unit)
+  for _, service in ipairs(unit.services or {}) do
+    if service == "repair" then return true end
+  end
+  return false
+end
+
+--- The nearest observed repair provider the seat may use: alive, not
+--- hostile, on the seat's map. With none, also the reason the first refused
+--- visible repair service was refused.
+function M.repair_provider(view)
+  local vendor, refused
+  for _, unit in ipairs(view.units or {}) do
+    if repair_service(unit) then
+      local why
+      if not alive(unit) then why = "observed repair provider is dead"
+      elseif unit.player_reaction_hostile then why = "observed repair provider is hostile"
+      elseif not (unit.location and view.location and
+          unit.location.map_id == view.location.map_id) then
+        why = "observed repair provider is on another map"
+      end
+      if why then
+        refused = refused or why
+      elseif not vendor or num(unit.distance, math.huge) < num(vendor.distance, math.huge) then
+        vendor = unit
+      end
+    end
+  end
+  return vendor, refused
+end
+
+--- The host's catalogued same-map repair anchor (travel hint only), or nil
+--- and why there is none.
+function M.repair_destination(view)
+  if view.repair_destination_supported ~= true then
+    return nil, "host has no repair destination catalog"
+  end
+  local dest = view.repair_destination
+  local p = type(dest) == "table" and dest.point
+  if type(p) ~= "table" or not p.x or not p.y then
+    return nil, "no observed or catalogued repair provider"
+  end
+  if not view.location or p.map_id ~= view.location.map_id then
+    return nil, "catalogued repair destination is on another map"
+  end
+  return dest
+end
+
+--- How an ordinary repair could start now: "visible" for an observed usable
+--- provider, "catalogued" when only the host's anchor is known; otherwise nil
+--- and the obstacle. Neither claims a remote provider is alive or will quote.
+function M.repair_route(view)
+  if not view.repair_supported or not view.repair_quote_supported then
+    return nil, "repair quote observations unavailable"
+  end
+  if view.equipped_durability_known ~= true then return nil, "worn durability unobserved" end
+  if not M.repair_needed(view, false) then return nil, "no known worn damage" end
+  local vendor, refused = M.repair_provider(view)
+  if vendor then return "visible" end
+  local dest, why = M.repair_destination(view)
+  if dest then return "catalogued" end
+  return nil, refused or why
+end
+
+--- Repair facts for the seat's status file: how a repair could start now,
+--- what stops it, whether a catalogued walk is under way, and the last
+--- finished attempt.
+function M.repair_status(view, state)
+  local route, obstacle = M.repair_route(view)
+  local last = state.repair_outcome
+  return { route = route or "", obstacle = obstacle or "",
+    travelling = state.repair_travel ~= nil,
+    last_result = last and last.result or "", last_why = last and last.why or "" }
+end
+
+-- Walk toward the catalogued anchor until a usable provider is observed.
+-- Nothing here is ever paid for; arrival without a usable provider, no
+-- progress, or the total bound ends the walk with that obstacle.
+local function repair_travel(view, state, now, refused, finish)
+  local travel = state.repair_travel
+  local here = view.location_known == true and position(view)
+  if not here then
+    if travel and now - travel.since <= REPAIR_TRAVEL_LIMIT then
+      return { kind = "hold", reason = "repair_position_wait" }
+    end
+    return finish("blocked", "own position unobserved")
+  end
+  local dest, why = M.repair_destination(view)
+  if not dest then return finish("blocked", refused or why) end
+  local p = dest.point
+  local x, y = num(here.x, 0), num(here.y, 0)
+  local d = dist2d(x, y, p.x, p.y)
+  if not travel then
+    travel = { hub_id = dest.hub_id, since = now, x = x, y = y, moved_at = now, seen_at = now }
+    state.repair_travel = travel
+  elseif travel.hub_id ~= dest.hub_id then
+    -- The nearest anchor can change mid-walk; the total and stall clocks
+    -- belong to the walk, not to one anchor.
+    travel.hub_id, travel.arrived_at = dest.hub_id, nil
+  end
+  if now - travel.seen_at > REPAIR_PAUSE_GAP then
+    travel.moved_at = travel.moved_at + (now - travel.seen_at)
+  end
+  travel.seen_at = now
+  if dist2d(x, y, travel.x, travel.y) >= REPAIR_PROGRESS_YARDS then
+    travel.x, travel.y, travel.moved_at = x, y, now
+  end
+  if d <= REPAIR_ARRIVAL_YARDS then
+    travel.arrived_at = travel.arrived_at or now
+    if now - travel.arrived_at > REPAIR_DISCOVERY_GRACE then
+      return finish("blocked", refused or "no repair provider observed at the catalogued destination")
+    end
+    return { kind = "hold", reason = "repair_provider_search" }
+  end
+  if now - travel.since > REPAIR_TRAVEL_LIMIT then
+    return finish("blocked", "catalogued repair destination not reached in time")
+  end
+  if now - travel.moved_at > REPAIR_STALL_SECONDS then
+    return finish("blocked", "no movement toward the catalogued repair destination")
+  end
+  return { kind = "navigate", x = p.x, y = p.y, z = p.z, map_id = p.map_id,
+    stop_distance = REPAIR_ARRIVAL_YARDS / 2, route_profile = "prefer_ground",
+    reason = "repair_destination" }
+end
+
 function M.repair_step(view, state, now, busy)
   if busy or view.in_combat or casting(view) then return nil end
   if not view.repair_supported or not view.repair_quote_supported then
@@ -545,7 +688,7 @@ function M.repair_step(view, state, now, busy)
   end
   local function finish(result, why, paid)
     local out = { result = result, why = why, paid = paid }
-    state.repair_visit, state.repair_outcome = nil, out
+    state.repair_visit, state.repair_outcome, state.repair_travel = nil, out, nil
     state.repair_retry_at = now + 300
     return nil, out
   end
@@ -586,15 +729,9 @@ function M.repair_step(view, state, now, busy)
   if not visit then
     if not M.repair_needed(view, false) then return nil, { result = "complete", why = "no known worn damage", paid = 0 } end
     if state.repair_retry_at and now < state.repair_retry_at then return nil end
-    local vendor
-    for _, unit in ipairs(view.units or {}) do
-      local repairs = false
-      for _, service in ipairs(unit.services or {}) do if service == "repair" then repairs = true end end
-      if repairs and alive(unit) and not unit.player_reaction_hostile and
-          unit.location and view.location and unit.location.map_id == view.location.map_id and
-          (not vendor or num(unit.distance, math.huge) < num(vendor.distance, math.huge)) then vendor = unit end
-    end
-    if not vendor then return finish("blocked", "no observed repair vendor") end
+    local vendor, refused = M.repair_provider(view)
+    if not vendor then return repair_travel(view, state, now, refused, finish) end
+    state.repair_travel = nil
     visit = { guid = vendor.guid, since = now }
     state.repair_visit, state.repair_outcome = visit, nil
   end

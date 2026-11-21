@@ -81,6 +81,45 @@ suite "menu":
     obs["units"][0]["services"] = %*["vendor"]
     check not offersRepair(obs)
 
+  test "an out-of-view repair is offered only from the seat's fresh catalogued route":
+    let obs = %*{"equipped_durability_known": true, "equipment_items": [{"durability_known": true,
+      "max_durability_known": true, "durability": 0, "max_durability": 20}],
+      "location": {"map_id": 0, "x": 0, "y": 0, "z": 0}, "units": []}
+    proc repairOffer(value, status: JsonNode): string =
+      for item in menu(value, false, false, status):
+        if item.key == "repair_gear": return item.description
+    let dir = getTempDir() / "bot_requests_repair_status"
+    removeDir(dir)
+    createDir(dir / "status")
+    defer: removeDir(dir)
+    proc writeStatus(route: string; age: float; entry = "home") =
+      writeFile(dir / "status" / "status.json", $(%*{
+        "entry": entry, "recorded_at_unix_seconds": epochTime() - age,
+        "bot": {"repair": {"route": route}}}))
+    check seatStatus(dir).isNil
+    check repairOffer(obs, nil) == ""
+    writeStatus("catalogued", 1.0)
+    check "known town repairer" in repairOffer(obs, seatStatus(dir))
+    writeStatus("catalogued", 120.0)
+    check seatStatus(dir).isNil
+    writeStatus("", 1.0)
+    check repairOffer(obs, seatStatus(dir)) == ""
+    # A status left by another entry never vouches for the home repair job.
+    writeStatus("catalogued", 1.0, "traverse")
+    check repairOffer(obs, seatStatus(dir)) == ""
+    writeFile(dir / "status" / "status.json", "{not json")
+    check seatStatus(dir).isNil
+    # The seat's raw durability still gates the offer; a stale route alone
+    # never offers repair for gear that is not observed damaged.
+    writeStatus("catalogued", 1.0)
+    var whole = obs.copy
+    whole["equipment_items"][0]["durability"] = %20
+    check repairOffer(whole, seatStatus(dir)) == ""
+    var visible = obs.copy
+    visible["units"] = %*[{"services": ["repair"], "health_known": true, "health": 50,
+      "location": {"map_id": 0, "x": 10, "y": 0, "z": 0}}]
+    check "observed repair vendor" in repairOffer(visible, seatStatus(dir))
+
   test "repair is not offered for a vendor the seat would refuse":
     var obs = %*{"equipped_durability_known": true, "equipment_items": [{"durability_known": true,
       "max_durability_known": true, "durability": 0, "max_durability": 20}],

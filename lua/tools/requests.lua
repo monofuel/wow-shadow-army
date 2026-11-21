@@ -807,7 +807,7 @@ function M.step(view, rs, now, ctx)
     if outcome then
       finish(rs, job, outcome.result == "complete" and "done" or "failed", now,
         outcome.why, { paid = outcome.paid and tostring(outcome.paid) or "unknown" })
-    elseif elapsed > 120 then
+    elseif elapsed > life.REPAIR_REQUEST_SECONDS then
       finish(rs, job, "failed", now, "repair did not settle before the request deadline")
     end
     return repair

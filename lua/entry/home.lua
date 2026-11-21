@@ -1345,6 +1345,7 @@ local function status_for(view, mode, role, leader, target, recovery)
       or false,
     talent = talents.status(view, tstate),
     training = life.training_status(lstate),
+    repair = life.repair_status(view, lstate),
   }
 end
 
@@ -2062,6 +2063,18 @@ local function progression_step(view, now, policy)
   local gear, outcome = life.gear_step(view, lstate, now, busy)
   log_gear(outcome)
   if gear then return gear end
+  -- Known broken worn gear is repaired before the next trainer, quest or
+  -- grinding leg. Only this solo pipeline reaches here, never a follow in
+  -- Murist's party; a blocked attempt keeps its obstacle and retry time.
+  if life.repair_needed(view, true) then
+    local repair, fixed = life.repair_step(view, lstate, now, busy)
+    if fixed and fixed.why ~= lstate.repair_logged then
+      lstate.repair_logged = fixed.why
+      wow.log(string.format("home: broken gear repair %s (%s)",
+        tostring(fixed.result), tostring(fixed.why)))
+    end
+    if repair then return repair end
+  end
   local train = life.train_step(view, lstate, now, busy,
     policy ~= nil and policy.objective_first == true)
   if train then return train end
@@ -2470,6 +2483,23 @@ function M.decide(view)
     return nil
   end
 
+  -- A long catalogued repair walk rides the roads like an objective walk.
+  local function repair_road(intent)
+    if not intent or intent.kind ~= "navigate" or intent.reason ~= "repair_destination" then
+      return intent
+    end
+    local mine, goal = view_point(view), { x = intent.x, y = intent.y }
+    if mine and distance2d(mine, goal) > ROAD_MIN_YARDS then
+      local wp = road_waypoint(mine, goal, intent.map_id)
+      if wp then
+        intent.x, intent.y, intent.z = wp.x, wp.y, wp.z
+        intent.stop_distance = ROAD_WAYPOINT_STOP
+        intent.reason = "repair_destination_road"
+      end
+    end
+    return intent
+  end
+
   local function solo_step(policy)
     local flee = survive_step(view)
     if flee then return flee end
@@ -2481,7 +2511,7 @@ function M.decide(view)
     -- after the owner's requests and survival, before the leveling legs.
     local talent = talents.step(view, tstate, now, role)
     if talent then return talent end
-    local progress = progression_step(view, now, policy)
+    local progress = repair_road(progression_step(view, now, policy))
     if progress then
       -- Class-quest, trainer and loot legs walk through the same route engine
       -- as a rejoin and wedge the same way (Vulcan, 2026-11-19: a dropper
@@ -2512,6 +2542,12 @@ function M.decide(view)
           intent.reason = "objective_area_road"
         end
       end
+    end
+    -- A tank with a known broken weapon starts no fresh fight; one already
+    -- under way is still answered, and the repair retry keeps running.
+    if intent.kind == "attack" and role == "tank" and not view.in_combat and
+        not life.fighting(view) and life.broken_main_hand(view) then
+      intent = { kind = "hold", reason = "broken_weapon_no_fresh_pull" }
     end
     local tactic_intent = class_tactic(intent)
     if tactic_intent then
@@ -2549,7 +2585,7 @@ function M.decide(view)
       end
       return solo_step({ objective_first = true })
     end })
-  if req then return finish(req, view, "request", role) end
+  if req then return finish(repair_road(req), view, "request", role) end
 
   local party = view.party or {}
   if party.invite_pending and lower(party.invite_from) == MURIST then
