@@ -426,10 +426,13 @@ end
 -- walking at the leader. nil covers every road bail (no data, a hole in the
 -- bake, a road that would not help) AND the last leg, where the next route
 -- point IS the leader and the plain rejoin intent already says it better.
-function road_waypoint(mine, goal, map_id)
+-- `opts` goes to road_route.route unchanged; nil is the router's defaults.
+-- The route and the waypoint's index in it come back too, for a caller that
+-- keeps walking one route instead of re-asking every frame.
+function road_waypoint(mine, goal, map_id, opts)
   local graph = road_graph(map_id)
   if not graph then return nil end
-  local pts, meta = road_route.route(graph, mine, goal)
+  local pts, meta = road_route.route(graph, mine, goal, opts)
   if meta.straight then return nil end
   local x, y, z, i = road_route.nextPoint(pts, mine.x, mine.y,
     ROAD_LOOKAHEAD_YARDS)
@@ -438,7 +441,7 @@ function road_waypoint(mine, goal, map_id)
   -- closer_on_plane: a waypoint farther from the goal than we already are
   -- is pavement behind us. Walk at the goal instead.
   if not closer_on_plane(mine, wp, goal) then return nil end
-  return wp
+  return wp, pts, i
 end
 
 -- Height is not evidence of progress here: a seat wedged against the
@@ -2483,19 +2486,67 @@ function M.decide(view)
     return nil
   end
 
-  -- A long catalogued repair walk rides the roads like an objective walk.
+  -- A long catalogued repair walk rides the roads like an objective walk,
+  -- but decides road or crow line ONCE per anchor and owning job, and keeps
+  -- that journey on the lifecycle's walk record. The record lasts through
+  -- fights and position gaps and is gone at arrival, failure, a visible
+  -- provider or a new repair request; a different owning job (or none) on
+  -- the same record replans from where the seat stands. Re-deciding from
+  -- every pose can alternate the goal between a road waypoint and the anchor
+  -- while the seat makes no useful progress; one decision per journey
+  -- removes that per-frame choice. A tank with a known broken weapon
+  -- fights poorly, so its plan weighs off-road yards double and accepts a
+  -- longer known road.
   local function repair_road(intent)
     if not intent or intent.kind ~= "navigate" or intent.reason ~= "repair_destination" then
       return intent
     end
-    local mine, goal = view_point(view), { x = intent.x, y = intent.y }
-    if mine and distance2d(mine, goal) > ROAD_MIN_YARDS then
-      local wp = road_waypoint(mine, goal, intent.map_id)
-      if wp then
-        intent.x, intent.y, intent.z = wp.x, wp.y, wp.z
-        intent.stop_distance = ROAD_WAYPOINT_STOP
-        intent.reason = "repair_destination_road"
+    local travel, mine = lstate.repair_travel, view_point(view)
+    if not travel then return intent end
+    local owner = rstate and rstate.active and rstate.active.key or false
+    local trip = travel.road
+    if not trip or trip.owner ~= owner or trip.hub_id ~= travel.hub_id or
+        trip.map_id ~= intent.map_id or trip.x ~= intent.x or trip.y ~= intent.y then
+      if not mine then return intent end
+      trip = { owner = owner, hub_id = travel.hub_id, map_id = intent.map_id,
+        x = intent.x, y = intent.y }
+      travel.road = trip
+      if distance2d(mine, trip) > ROAD_MIN_YARDS then
+        local _
+        _, trip.pts, trip.i = road_waypoint(mine, trip, intent.map_id,
+          role == "tank" and life.broken_main_hand(view) and
+          { penalty = 2 * road_route.offRoadPenalty } or nil)
       end
+    end
+    local pts = trip.pts
+    if pts and mine then
+      -- Forward only: the farthest unfinished route point the seat is
+      -- standing at is reached, and the next handhold is a lookahead past it.
+      -- An unreached point stays the target however the pose wanders.
+      local reached = nil
+      for j = trip.i, #pts - 1 do
+        if distance2d(mine, pts[j]) <= ROAD_WAYPOINT_STOP then reached = j end
+      end
+      if reached then
+        local i, run = reached + 1, 0
+        while i < #pts do
+          run = run + distance2d(pts[i - 1], pts[i])
+          if run > ROAD_LOOKAHEAD_YARDS then break end
+          i = i + 1
+        end
+        trip.i = i
+      end
+      -- The last leg, or inside one road step of the anchor: the plain walk
+      -- at the anchor finishes the journey and the road is not resumed.
+      if trip.i >= #pts or distance2d(mine, trip) <= ROAD_MIN_YARDS then
+        trip.pts, pts = nil, nil
+      end
+    end
+    if pts then
+      local wp = pts[trip.i]
+      intent.x, intent.y, intent.z = wp.x, wp.y, wp.z
+      intent.stop_distance = ROAD_WAYPOINT_STOP
+      intent.reason = "repair_destination_road"
     end
     return intent
   end
