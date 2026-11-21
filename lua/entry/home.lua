@@ -956,6 +956,7 @@ local function vendor_sell_step(view, now)
 
   local plan = disposition.evaluate({
     items = items,
+    keep_item_ids = require("tools.quest_material").objective_item_ids(view),
     equipment = view.equipment_items,
     player = { class_id = view.class_id, level = view.level },
   })
@@ -1225,6 +1226,7 @@ local function vendor_seek_step(view, now)
   if type(items) ~= "table" then return nil end
   local plan = disposition.evaluate({
     items = items,
+    keep_item_ids = require("tools.quest_material").objective_item_ids(view),
     equipment = view.equipment_items,
     player = { class_id = view.class_id, level = view.level },
   })
@@ -1330,6 +1332,140 @@ local function vendor_seek_step(view, now)
     route_profile = "prefer_ground",
     reason = "open_vendor",
   }
+end
+
+-- Quest materials at a merchant the seat already has open. An accepted
+-- quest's incomplete item objective that the open merchant lists at a known
+-- price buys the smallest legal bundle count once. The pilot answers on the
+-- next tick: deferred queued nothing and may be asked again; refused queued
+-- nothing; issued may have bought. An issued buy is proven only when the
+-- carried count reaches the baseline plus the full delivered count. Anything
+-- else (timeout, partial delivery, window closed or another merchant, no
+-- readback) leaves that ITEM blocked, on any merchant, until the bags prove it
+-- or the window lapses; the pilot keeps its own guard, which also survives a
+-- Lua reload, so a lapsed window is answered with a refusal, never a second
+-- purchase. There is no retry and no vendor search here.
+-- One local: the main chunk sits at Lua's 200-local ceiling.
+local mat = {
+  lib = require("tools.quest_material"),
+  SETTLE_SECONDS = 4.0, WINDOW = 600.0,
+  pending = nil, -- the one buy awaiting its readback or its bag proof
+  blocked = {}, -- item id -> { until_t, have_before?, items? }
+  logged = {},
+}
+
+function mat.reset()
+  mat.pending, mat.blocked, mat.logged = nil, {}, {}
+end
+
+function mat.log_once(key, msg)
+  if mat.logged[key] then return end
+  mat.logged[key] = true
+  wow.log(msg)
+end
+
+-- An issued buy without its proof blocks the item with no deadline; only the
+-- bags end it.
+function mat.block(p, why)
+  mat.blocked[p.item_id] = { have_before = p.have_before, items = p.items }
+  wow.log(string.format("material: buy of item %d unconfirmed (%s); item blocked",
+    p.item_id, why))
+end
+
+-- Bookkeeping for every tick the step is reached, before anything may yield:
+-- late bag proof of a blocked buy, the pilot's answer to the last ask, and the
+-- bag proof of an issued buy. A need for the item again soon after a proven
+-- purchase means something took the bought items away; buying straight back
+-- would loop, so a proven item waits out the window.
+function mat.observe(view, now)
+  for item_id, b in pairs(mat.blocked) do
+    if b.items and mat.lib.carried(view, item_id) >= b.have_before + b.items then
+      wow.log(string.format("material: late bag proof for item %d", item_id))
+      mat.blocked[item_id] = { until_t = now + mat.WINDOW }
+    elseif b.until_t and now >= b.until_t then
+      mat.blocked[item_id] = nil
+    end
+  end
+  local p = mat.pending
+  if p and p.stage == "sent" then
+    local nav = tostring((wow.nav_progress() or {}).state or "")
+    if nav == "buy_verb_issued" then
+      p.stage, p.issued_at = "issued", now
+    elseif nav == "buy_verb_deferred" then
+      mat.pending = nil
+    elseif nav == "buy_verb_refused" then
+      mat.blocked[p.item_id] = { until_t = now + mat.WINDOW }
+      wow.log(string.format("material: buy of item %d refused by the pilot", p.item_id))
+      mat.pending = nil
+    else
+      mat.block(p, "no buy readback: " .. nav)
+      mat.pending = nil
+    end
+  end
+  p = mat.pending
+  if p and p.stage == "issued" then
+    local have = mat.lib.carried(view, p.item_id)
+    if have >= p.have_before + p.items then
+      wow.log(string.format(
+        "material: bought item %d for quest %d (carried %d->%d) copper %s->%s",
+        p.item_id, p.quest_id, p.have_before, have, tostring(p.copper_before),
+        tostring(view.copper_known and view.copper or "?")))
+      mat.blocked[p.item_id] = { until_t = now + mat.WINDOW }
+      mat.pending = nil
+    elseif not view.merchant_open or tostring(view.merchant_guid) ~= p.merchant then
+      mat.block(p, "merchant window closed or changed")
+      mat.pending = nil
+    elseif now - p.issued_at > mat.SETTLE_SECONDS then
+      mat.block(p, string.format("carried %d, wanted %d", have,
+        p.have_before + p.items))
+      mat.pending = nil
+    end
+  end
+end
+
+-- Fights, death, a line being typed, an owner request other than questing,
+-- and the escort's follow all outrank a purchase.
+function mat.yields(view)
+  if view.in_combat or life.fighting(view) or view.is_dead or view.is_ghost or
+      chat_pending then
+    return true
+  end
+  local job = rstate and rstate.active
+  if job then return job.choice ~= "do_quests" end
+  return party_member(view, MURIST) ~= nil
+end
+
+function mat.buy_step(view, now)
+  mat.observe(view, now)
+  if not view.merchant_open or not view.buy_supported or mat.yields(view) then
+    return nil
+  end
+  if mat.pending then return { kind = "hold", reason = "material_buy_settle" } end
+  local merchant = tostring(view.merchant_guid or "0")
+  for _, need in ipairs(mat.lib.needs(view)) do
+    if not mat.blocked[need.item_id] then
+      local plan, why = mat.lib.plan(view, need)
+      if plan then
+        mat.pending = {
+          stage = "sent", merchant = merchant, item_id = need.item_id,
+          quest_id = need.quest_id, items = plan.items,
+          have_before = mat.lib.carried(view, need.item_id),
+          copper_before = tonumber(view.copper),
+        }
+        wow.log(string.format(
+          "material: buying item %d x%d (%d bundles) for quest %d, need %d/%d, cost %dc",
+          need.item_id, plan.items, plan.bundles, need.quest_id, need.have,
+          need.required, plan.cost))
+        return { kind = "buy_item", guid = view.merchant_guid,
+          item_id = need.item_id, count = plan.bundles,
+          expected_price = plan.price, reason = "quest_material_buy" }
+      elseif why ~= "not_listed" then
+        mat.log_once(merchant .. ":" .. need.item_id .. ":" .. why, string.format(
+          "material: item %d listed here but not bought: %s", need.item_id, why))
+      end
+    end
+  end
+  return nil
 end
 
 local function role_for(view)
@@ -2358,6 +2494,7 @@ function M.reset()
   tactic.fear, tactic.fear_tries, tactic.escape = nil, {}, nil
   fidget_at = nil
   last_lead = nil
+  mat.reset()
 end
 
 function M.decide(view)
@@ -2376,6 +2513,10 @@ function M.decide(view)
   -- bags into the view (tickets/open/0073).
   local sale = vendor_sell_step(view, now)
   if sale then return finish(sale, view, "vendor", role) end
+
+  -- The same open window, after the sale: selling first frees bags and copper.
+  local buy = mat.buy_step(view, now)
+  if buy then return finish(buy, view, "vendor", role) end
 
   -- Wearing a carried bag costs one tick and needs no vendor, so it runs
   -- right behind the sale and ahead of the escort: a seat with zero free

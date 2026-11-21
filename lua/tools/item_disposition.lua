@@ -220,6 +220,9 @@ function M.decide(item, player, context)
   if M.NEVER_SELL_ITEM_IDS[num(item.item_id, 0)] then
     return { tag = M.KEEP, reason = "never sell" }
   end
+  if (context.keep_item_ids or {})[num(item.item_id, 0)] then
+    return { tag = M.KEEP, reason = "quest objective" }
+  end
 
   -- 3. Bind status is not knowable from these rows, so uncommon and better
   --    is out of scope for an unattended seat. Also: nothing worth 0 copper
@@ -303,6 +306,7 @@ function M.evaluate(snapshot)
   local context = {
     bags = M.equipped_bags(snapshot.equipment),
     worn = M.equipped_by_slot(snapshot.equipment),
+    keep_item_ids = snapshot.keep_item_ids or {},
   }
   local out = { items = {}, sell = {}, sell_copper = 0 }
   for i = 1, #items do

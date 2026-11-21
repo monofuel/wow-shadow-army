@@ -222,4 +222,26 @@ for i = 1, #snap_items do
     "evaluate row " .. i .. " carries item_id/name/count")
 end
 
+-- Accepted quest objectives can use ordinary non-quest-class items. Keep
+-- those while still selling unrelated junk; without that context the same
+-- unusable weapon remains a normal sale.
+local material_weapon = {
+  item_guid = 51, item_id = 7001, name = "Synthetic objective weapon", count = 2,
+  definition_known = true, item_class_id = 2, item_subclass_id = 1,
+  quality = 1, sell_price = 5,
+}
+local unrelated_junk = {
+  item_guid = 61, item_id = 9999, name = "Synthetic junk", count = 1,
+  definition_known = true, item_class_id = 15, quality = 0, sell_price = 2,
+}
+local protected = D.evaluate({ items = { material_weapon, unrelated_junk },
+  player = warlock, keep_item_ids = { [7001] = true } })
+check(protected.items[1].tag == D.KEEP and
+  protected.items[1].reason == "quest objective", "required ordinary weapon stays for turn-in")
+check(#protected.sell == 1 and protected.sell[1].item_id == 9999,
+  "unrelated junk still sells with objective protection")
+local unprotected = D.evaluate({ items = { material_weapon }, player = warlock })
+check(#unprotected.sell == 1 and unprotected.sell[1].item_id == 7001,
+  "the same weapon remains sellable after the quest no longer needs it")
+
 print("test_item_disposition: " .. checks .. " checks passed")
